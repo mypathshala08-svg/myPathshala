@@ -22,11 +22,14 @@
     return;
   }
 
+  const already = document.querySelector('script[src*="pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"]');
+  if (!already) {
   const s = document.createElement("script");
   s.async = true;
   s.crossOrigin = "anonymous";
   s.src = "https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=" + encodeURIComponent(cfg.adsenseClient);
   document.head.appendChild(s);
+  }
 
   slots.forEach(el => {
     const slotId = (cfg.adSlots || {})[el.dataset.slot];

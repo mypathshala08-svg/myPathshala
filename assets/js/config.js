@@ -11,7 +11,7 @@
 window.MP_CONFIG = {
   siteName: "MyPhatshala",
   siteUrl: "https://myphatshala.in",   // change to your real domain
-  adsenseClient: "",                    // "ca-pub-XXXXXXXXXXXXXXXX"
+  adsenseClient: "ca-pub-5906362345660187",
   adSlots: {
     top: "",      // leaderboard below the hero
     mid: "",      // between sections

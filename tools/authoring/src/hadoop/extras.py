@@ -30,6 +30,7 @@ def shell(slug, title, desc, minutes, h1, lead, main, extra_head='', extra_js=''
 <link rel="stylesheet" href="{UP}assets/css/lesson.css">
 {extra_head}
 <script src="{UP}assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
 <script>try {{ const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; }} catch (e) {{}}</script>
 </head>
 <body style="--track:{COLOR}">

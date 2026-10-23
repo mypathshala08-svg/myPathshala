@@ -77,6 +77,7 @@ def main(src, root):
 <link rel="stylesheet" href="{R}assets/css/style.css">
 <link rel="stylesheet" href="{R}assets/css/lesson.css">
 <script src="{R}assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
 <script>try {{ const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; }} catch (e) {{}}</script>
 <script type="application/ld+json">{ld}</script>
 </head>

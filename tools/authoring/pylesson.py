@@ -396,6 +396,7 @@ def page(S, root):
 <link rel="stylesheet" href="{up}assets/css/style.css">
 <link rel="stylesheet" href="{up}assets/css/lesson.css">
 <script src="{up}assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
 <script>try {{ const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; }} catch (e) {{}}</script>
 <script type="application/ld+json">{json.dumps(ld, ensure_ascii=False)}</script>
 </head>
