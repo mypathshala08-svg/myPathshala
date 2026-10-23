@@ -1,0 +1,2075 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Custom Writable types | MyPhatshala</title>
+<meta name="description" content="Hadoop Writable and WritableComparable explained with a real job on Hadoop 3.5.0: a composite (student, day) key and an (orders, total, max) value over 5 lakh orders. The naive Writable (writeUTF + int/long) produced 17.5 MB of map output, more than the Text version (12.5 MB); a compact Writable with VInt/VLong produced 4.1 MB, 4.3× smaller, with identical 59,946 output rows. write/readFields order, compareTo, hashCode, the no-arg constructor (NoSuchMethodException on the cluster), object reuse, built-in types and sizes, RawComparator, Writable vs Serializable. Python byte-size simulation, quiz and interview scenarios.">
+<meta name="mp:minutes" content="26">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/09-mapreduce-in-depth/03-custom-writable-types/">
+<meta property="og:title" content="Custom Writable types · MyPhatshala">
+<meta property="og:description" content="A custom Writable made the shuffle 40% bigger, until we encoded it properly: 35 → 8 bytes per record on a real cluster.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Custom Writable types", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="09-mapreduce-in-depth/03-custom-writable-types" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 9.3</b></nav>
+    <h1>Custom Writable types</h1>
+    <p class="lead">Every key and value in MapReduce is turned into bytes, sorted, copied and turned back into objects. Writable is how you control those bytes. This lesson builds a composite key and a value type, measures three encodings of the same record on a real cluster, and shows the one mistake that compiles fine and fails on every task.</p>
+    <div class="lesson-meta"><span>Module 9 · MapReduce in depth</span><span>⏱ 26 min</span><span>Intermediate</span><span>35 vs 25 vs 8 bytes, measured</span><span>Real NoSuchMethodException</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>The “efficient” version that was bigger</h2>
+  <div class="story">
+    <p class="narration">Kabir wants, for every student and every day, three numbers: how many orders, how much money, and the biggest single order. His first version glues everything into strings: the key is <code>"S0001\t2026-09-01"</code>, the value <code>"1,20,20"</code>. Riya says strings are wasteful and writes proper Java types instead: a key class with two fields and a value class with an <code>int</code>, a <code>long</code> and an <code>int</code>. They run both on 5 lakh orders. Riya's version moves <b>40% more bytes</b> through the shuffle.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="Bytes per map output record: custom Writable with writeUTF 35 bytes, Text 25 bytes, compact Writable with variable-length numbers about 8 bytes.">
+        <g font-size="10">
+          <text x="320" y="20" text-anchor="middle" font-weight="700" class="s-ink">One map output record, (S1413, 2026-09-10) → (1 order, ₹45, max ₹45)</text>
+          <text x="24" y="54" font-size="9.4" class="s-ink">Writable, writeUTF + int/long</text>
+          <rect x="200" y="40" width="385" height="22" rx="4" class="s-soft-acc" style="stroke:var(--track)"/>
+          <text x="590" y="55" font-size="9" class="s-acc">35 B</text>
+          <text x="24" y="94" font-size="9.4" class="s-ink">Text "S1413\t2026-09-10" + "1,45,45"</text>
+          <rect x="200" y="80" width="275" height="22" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/>
+          <text x="480" y="95" font-size="9" class="s-blue">25 B</text>
+          <text x="24" y="134" font-size="9.4" class="s-ink">Writable, VInt numbers</text>
+          <rect x="200" y="120" width="88" height="22" rx="4" class="s-soft-green" style="stroke:var(--green)"/>
+          <text x="293" y="135" font-size="9" class="s-green">8 B</text>
+          <text x="330" y="135" font-size="8.6" class="s-ink2">→ 17.5 MB · 12.5 MB · 4.1 MB for 5 lakh records</text>
+        </g>
+        <text x="320" y="178" text-anchor="middle" font-size="9.6" class="s-ink2">Same job, same 59,946 output rows. What you write in write() decides the size, not the word “Writable”.</text>
+        <text x="632" y="194" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, I used real types instead of strings. How can mine be bigger?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Look at what your <code>write()</code> does. <code>writeUTF("2026-09-10")</code> writes a 2-byte length and 10 characters: 12 bytes for a date. Then <code>writeInt</code> is always 4 bytes and <code>writeLong</code> always 8, even when the number is 1 or 45. Kabir's text <code>"1,45,45"</code> is only 7 characters.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>So Writable is just “you decide the bytes”. Decide badly and you pay in the shuffle.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Exactly. Today we write a composite key and a value type, see what Hadoop needs from them (and what happens when you forget the empty constructor), then shrink the same record to 8 bytes with variable-length numbers: 4.3 times smaller than the first try.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Writable and WritableComparable</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Writable</b> (<code>org.apache.hadoop.io.Writable</code>) is Hadoop's serialization interface. A type implements <code>write(DataOutput out)</code>, which writes its fields as bytes, and <code>readFields(DataInput in)</code>, which reads them back in the same order into an existing object. MapReduce uses Writables for all keys and values that are transferred between tasks or stored in SequenceFiles. Keys must implement <b>WritableComparable</b>, which adds <code>compareTo()</code>: it defines the order in which keys are sorted during the shuffle. The default partitioner uses the key's <code>hashCode()</code> to choose a reducer, so equal keys must have equal hash codes. Because the framework creates instances by reflection and reuses them for many records, a Writable must have a public no-argument constructor and <code>readFields()</code> must overwrite every field. A <b>RawComparator</b> can compare keys directly in their serialized form, avoiding deserialization during sorting.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>A Writable is a class that knows how to turn itself into bytes and back. You choose which bytes. A key also needs to know how to compare itself, because the shuffle sorts by it.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Serialization</b><span>Turning an object into bytes to send or store; deserialization is the reverse.</span></div>
+    <div class="term"><b>write() / readFields()</b><span>The two methods of Writable. Same fields, same order, or the data is garbage.</span></div>
+    <div class="term"><b>Composite key</b><span>A key made of several fields, e.g. (student, day).</span></div>
+    <div class="term"><b>compareTo()</b><span>Sort order of keys in the shuffle and in the output.</span></div>
+    <div class="term"><b>hashCode()</b><span>Used by HashPartitioner to choose the reducer.</span></div>
+    <div class="term"><b>VInt / VLong</b><span>Variable-length numbers: 1 byte for -112 to 127, up to 5 (int) or 9 (long).</span></div>
+    <div class="term"><b>No-arg constructor</b><span>Hadoop creates keys and values with <code>new X()</code> by reflection.</span></div>
+    <div class="term"><b>RawComparator</b><span>Compares two keys as bytes, without building objects.</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, 5 lakh orders → 59,946 student-days)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>Writable, writeUTF + int/long/int</th><td>Map output bytes 17,500,000 (35 per record), materialized 5,604,593, CPU 8,360 ms</td></tr>
+    <tr><th>Text key and value</th><td>12,500,000 (25 per record), materialized 4,132,541, CPU 7,290 ms</td></tr>
+    <tr><th>Writable, VInt/VLong, student and day as numbers</th><td>4,068,724 (about 8 per record), materialized 1,601,326, CPU 8,600 ms</td></tr>
+    <tr><th>Results</th><td>All three wrote the same 59,946 rows, e.g. <code>S0001 2026-09-01 124 3224 80</code>; each job took 24–25 s</td></tr>
+    <tr><th>No-arg constructor removed</th><td><code>NoSuchMethodException: StudentDayNoCtor$StudentDayKey.&lt;init&gt;()</code>, “Initialization of all the collectors failed”, job FAILED</td></tr>
+  </table>
+
+  <h3 id="levels">Writables at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Packing a parcel</h4>
+      <ul>
+        <li>Sending a parcel by courier: you decide how to pack it. Every map output record is packed (<code>write</code>), sent through the shuffle, and unpacked (<code>readFields</code>) on the other side.</li>
+        <li>The receiver unpacks in the same order you packed: first the student, then the day. Change the order on one side only and you get nonsense.</li>
+        <li>A big box for a small thing still costs postage. A 4-byte <code>int</code> for the number 1 is a big box.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> What Hadoop needs from your class</h4>
+      <ul>
+        <li><b>Value types</b> implement <code>Writable</code>: <code>write()</code> and <code>readFields()</code>.</li>
+        <li><b>Key types</b> implement <code>WritableComparable</code>: also <code>compareTo()</code> (sort order), and override <code>hashCode()</code> and <code>equals()</code> (partitioning).</li>
+        <li>A <b>public no-argument constructor</b>. Without it the map task cannot even start its output collector: our job failed on every attempt.</li>
+        <li><code>toString()</code> decides how the type looks in <code>TextOutputFormat</code> output: our key prints <code>S0001&lt;TAB&gt;2026-09-01</code>.</li>
+        <li>Objects are reused: <code>readFields()</code> must set every field, and never store the object itself (Lesson 8.5).</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Making records small and sorting fast</h4>
+      <ul>
+        <li>Shuffle cost is per byte: map output is buffered, spilled, compressed, copied and merged. Smaller records mean fewer spills (Lesson 8.4).</li>
+        <li>Encode the information, not the text: an ID like <code>S1413</code> is the number 1413; a date in one month is a day-of-year number; small counts fit in a VInt.</li>
+        <li>Fixed sizes (<code>writeInt</code>) are simpler and slightly faster to decode; VInts are smaller for small numbers. Our compact job used a little more CPU (8,600 ms vs 8,360) for 4.3× fewer bytes.</li>
+        <li>Sorting calls <code>compareTo()</code> millions of times. The default <code>WritableComparator</code> deserializes both keys first; a <b>RawComparator</b> that compares the bytes directly (as <code>Text</code> and <code>IntWritable</code> do) is faster. Register it with <code>WritableComparator.define()</code> or <code>job.setSortComparatorClass()</code>.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “Why does Hadoop use Writable instead of Java Serializable?”, give three points: compact (no class names or metadata per object, only the fields), fast (objects are reused, no new object per record), and comparable in serialized form (RawComparator for sorting). Mention that keys must be <code>WritableComparable</code>.</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Built-in Writables and their sizes</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Type</th><th>Java value</th><th>Bytes on the wire</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td><b>Text</b></td><td>String (UTF-8)</td><td>VInt length + UTF-8 bytes</td><td>Words, IDs, lines</td></tr>
+      <tr><td><b>IntWritable / LongWritable</b></td><td>int / long</td><td>always 4 / 8</td><td>Counts, offsets (TextInputFormat key)</td></tr>
+      <tr><td><b>VIntWritable / VLongWritable</b></td><td>int / long</td><td>1 to 5 / 1 to 9</td><td>Mostly small numbers</td></tr>
+      <tr><td><b>DoubleWritable, BooleanWritable</b></td><td>double, boolean</td><td>8, 1</td><td>Measurements, flags</td></tr>
+      <tr><td><b>NullWritable</b></td><td>nothing</td><td>0</td><td>Key-only or value-only output</td></tr>
+      <tr><td><b>BytesWritable</b></td><td>byte[]</td><td>4-byte length + bytes</td><td>Binary blobs</td></tr>
+      <tr><td><b>ArrayWritable, MapWritable</b></td><td>arrays, maps of Writables</td><td>count + elements (MapWritable adds type ids)</td><td>Quick prototypes; a custom class is usually smaller</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Ways to serialize records in Hadoop</h3>
+  <div class="cards">
+    <div class="card"><h4>Text with separators</h4><p>Easiest to write and debug; numbers become characters, and you parse them again in the reducer.</p><span class="tag">simple</span></div>
+    <div class="card"><h4>Custom Writable</h4><p>Exactly the fields you choose. As small as you make it: 35 B or 8 B for the same record in our lab.</p><span class="tag">this lesson</span></div>
+    <div class="card"><h4>Java Serializable</h4><p>Writes class metadata and creates new objects per record. Hadoop does not use it for keys and values.</p><span class="tag">avoid</span></div>
+    <div class="card"><h4>Avro (and Parquet)</h4><p>Schema-based binary records that other tools and languages can read; used for files that outlive one job (Module 10).</p><span class="tag">data files</span></div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>Before writing a custom type, check the counter <b>Map output bytes</b> of the Text version. It tells you the bytes per record (divide by Map output records), so you can see whether a Writable would actually save anything.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>A composite key, a value type, and three sizes</h2>
+  <p>Run on the Module 8 lab cluster with <code>writable_lab.sh</code> and <code>student_orders.csv</code> (5 lakh orders, 2,000 students, September 2026). Files are in “Run it on your PC”.</p>
+  <ol class="stepper">
+    <li><h4>The key: (student, day)</h4>
+      <div class="code" data-lang="java" data-file="StudentDay.java (key)"><pre><code>public static class StudentDayKey implements WritableComparable&lt;StudentDayKey&gt; {
+  private String student = "", day = "";
+  public StudentDayKey() { }                       // Hadoop needs this
+  public void write(DataOutput out) throws IOException { out.writeUTF(student); out.writeUTF(day); }
+  public void readFields(DataInput in) throws IOException { student = in.readUTF(); day = in.readUTF(); }
+  public int compareTo(StudentDayKey o) {
+    int c = student.compareTo(o.student);
+    return c != 0 ? c : day.compareTo(o.day);       // sort by student, then day
+  }
+  public int hashCode() { return student.hashCode() * 31 + day.hashCode(); }
+  public String toString() { return student + "\t" + day; }
+}</code></pre></div>
+      <span class="behind"><code>compareTo</code> makes the output come out sorted by student and then by day. <code>hashCode</code> decides the reducer. Both must agree with <code>equals</code>: equal keys, equal hash.</span></li>
+    <li><h4>The value: orders, total, max</h4>
+      <div class="code" data-lang="java" data-file="StudentDay.java (value)"><pre><code>public static class SpendWritable implements Writable {
+  private int orders; private long total; private int max;
+  public SpendWritable() { }
+  public void write(DataOutput out) throws IOException { out.writeInt(orders); out.writeLong(total); out.writeInt(max); }
+  public void readFields(DataInput in) throws IOException { orders = in.readInt(); total = in.readLong(); max = in.readInt(); }
+}</code></pre></div>
+      <span class="behind">The reducer adds orders and totals and keeps the maximum, which is also safe as a combiner (Lesson 9.1). Combine output records: 151,475 instead of 500,000.</span></li>
+    <li><h4>Run the Writable version and the Text version</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr9.jar StudentDay     /user/hadoop/data/student_orders.csv /out/StudentDay
+hadoop jar mr9.jar StudentDayText /user/hadoop/data/student_orders.csv /out/StudentDayText</code></pre><div class="output">== StudentDay   24815 ms
+  Map output records=500000
+  Map output bytes=17500000
+  Map output materialized bytes=5604593
+== StudentDayText   24363 ms
+  Map output records=500000
+  Map output bytes=12500000
+  Map output materialized bytes=4132541</div></div>
+      <span class="behind">17,500,000 / 500,000 = 35 bytes per record for the Writable, 25 for Text. Key: 2+5 (S1413) + 2+10 (the date) = 19 bytes; value: 4+8+4 = 16 bytes. Text: 1+16 for the key and 1+7 for <code>"1,45,45"</code>.</span></li>
+    <li><h4>Shrink it: numbers instead of strings, VInts instead of fixed sizes</h4>
+      <div class="code" data-lang="java" data-file="StudentDayCompact.java (core)"><pre><code>private int student;   // "S1413" -&gt; 1413
+private int day;       // 2026-09-10 -&gt; day of year 253
+public void write(DataOutput out) throws IOException {
+  WritableUtils.writeVInt(out, student);   // 1413 -&gt; 3 bytes
+  WritableUtils.writeVInt(out, day);       // 253  -&gt; 2 bytes (256 and above need 3)
+}
+// value: writeVInt(orders), writeVLong(total), writeVInt(max) -&gt; 1 + 1 + 1 bytes for small amounts</code></pre><div class="output">== StudentDayCompact   25126 ms
+  Map output records=500000
+  Map output bytes=4068724
+  Map output materialized bytes=1601326</div></div>
+      <span class="behind">About 8 bytes per record (6 to 9, depending on the student number and the date): 4.3 times smaller than the first Writable and 3 times smaller than Text. Students S0001–S0127 even fit in 1 byte. CPU time barely moved (8,600 ms).</span></li>
+    <li><h4>Check that all three agree</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs dfs -cat /out/StudentDay/part-r-00000 | head -3
+diff &lt;(hdfs dfs -cat /out/StudentDay/part-r-00000) &lt;(hdfs dfs -cat /out/StudentDayCompact/part-r-00000)</code></pre><div class="output">S0001	2026-09-01	124	3224	80
+S0001	2026-09-02	134	3411	80
+S0001	2026-09-03	124	3064	80
+compact: same rows
+text: same rows</div></div>
+      <span class="behind">Same 59,946 rows. The compact key's <code>toString()</code> turns the numbers back into <code>S0001</code> and a date, so the output looks identical.</span></li>
+    <li><h4>Forget the no-argument constructor</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code># replace  public StudentDayKey() { }  with  public StudentDayKey(String s, String d) { … }
+hadoop jar nc.jar StudentDayNoCtor /user/hadoop/data/student_orders.csv /out/nc</code></pre><div class="output">Caused by: java.lang.NoSuchMethodException: StudentDayNoCtor$StudentDayKey.&lt;init&gt;()
+Error: java.io.IOException: Initialization of all the collectors failed. …
+Job job_1792643020992_0034 failed with state FAILED due to: Task failed task_1792643020992_0034_m_000000</div></div>
+      <span class="behind">It compiles fine; it fails only on the cluster. The map output collector creates key objects by reflection (<code>ReflectionUtils.newInstance</code>), which needs <code>new StudentDayKey()</code>.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p><code>write()</code> and <code>readFields()</code> must handle the same fields in the same order and with the same methods. If <code>write</code> uses <code>writeVInt</code> and <code>readFields</code> uses <code>readInt</code>, nothing fails at compile time; the reducer silently reads wrong numbers or crashes with an EOFException.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>One record, packed and unpacked</h2>
+  <p>Six steps: one record from <code>map()</code> to <code>reduce()</code>, first in the naive Writable, then in the compact one.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">write() and readFields() <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="The Java code and the counters">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">map() and the job counters</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">key.set("S1413", "2026-09-10");</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#9FD3B8">val.set(1, 45, 45);</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#F5C77E">ctx.write(key, val);</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">key.write(out):</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#9FD3B8">  out.writeUTF(student)  7 B</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#9FD3B8">  out.writeUTF(day)     12 B</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">val.write(out):</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#9FD3B8">  writeInt 4 · writeLong 8 · writeInt 4</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#F5C77E">35 bytes for this record</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">reduce side:</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#9FD3B8">k.readFields(in)  // same object,</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#9FD3B8">v.readFields(in)  // refilled</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">compact write(out):</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#9FD3B8">writeVInt(1413)  3 B</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#9FD3B8">writeVInt(253)   2 B</text><text x="26" y="104" font-size="8.2" class="mono" style="fill:#9FD3B8">writeVInt(1), VLong(45), VInt(45)  3 B</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#F5C77E">Map output bytes</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">  Writable (UTF)  17,500,000</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">  Text            12,500,000</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#9FD3B8">  Writable (VInt)  4,068,724</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The mapper fills its reusable key and value and calls ctx.write.</li>
+          <li>The framework calls key.write(): two writeUTF calls, 19 bytes.</li>
+          <li>Then value.write(): 16 bytes of fixed-size numbers. 35 in total.</li>
+          <li>On the reduce side, readFields() refills the same objects for each record.</li>
+          <li>The compact version writes the same information in 8 bytes.</li>
+          <li>Over 5 lakh records: 17.5 MB, 12.5 MB, 4.1 MB of map output.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="The bytes of one record">
+          <text x="180" y="24" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">bytes in the map output buffer</text>
+          <g data-on="1"><rect x="40" y="60" width="130" height="50" rx="6" class="s-card2"/><text x="105" y="80" text-anchor="middle" font-size="8.4" class="s-ink">key: S1413</text><text x="105" y="96" text-anchor="middle" font-size="8.4" class="s-ink">2026-09-10</text><rect x="190" y="60" width="130" height="50" rx="6" class="s-card2"/><text x="255" y="80" text-anchor="middle" font-size="8.4" class="s-ink">value: 1, 45, 45</text><text x="255" y="96" text-anchor="middle" font-size="8.4" class="s-ink2">Java objects</text></g>
+          <g data-on="2"><g font-size="7.6" class="mono"><rect x="20" y="60" width="22" height="22" class="s-soft-acc" style="stroke:var(--track)"/><text x="31" y="75" text-anchor="middle" class="s-acc">0 5</text><rect x="42" y="60" width="60" height="22" class="s-soft-blue" style="stroke:var(--blue)"/><text x="72" y="75" text-anchor="middle" class="s-blue">S1413</text><rect x="102" y="60" width="22" height="22" class="s-soft-acc" style="stroke:var(--track)"/><text x="113" y="75" text-anchor="middle" class="s-acc">0 10</text><rect x="124" y="60" width="120" height="22" class="s-soft-blue" style="stroke:var(--blue)"/><text x="184" y="75" text-anchor="middle" class="s-blue">2026-09-10</text></g><text x="180" y="120" text-anchor="middle" font-size="8.4" class="s-ink">writeUTF: 2-byte length, then the characters</text><text x="180" y="134" text-anchor="middle" font-size="8.4" class="s-ink">key = 7 + 12 = 19 bytes</text></g>
+          <g data-on="3"><g font-size="7.6" class="mono"><rect x="20" y="60" width="48" height="22" class="s-soft-green" style="stroke:var(--green)"/><text x="44" y="75" text-anchor="middle" class="s-green">00 00 00 01</text><rect x="68" y="60" width="96" height="22" class="s-soft-green" style="stroke:var(--green)"/><text x="116" y="75" text-anchor="middle" class="s-green">00 … 00 2D</text><rect x="164" y="60" width="48" height="22" class="s-soft-green" style="stroke:var(--green)"/><text x="188" y="75" text-anchor="middle" class="s-green">00 00 00 2D</text></g><text x="180" y="120" text-anchor="middle" font-size="8.4" class="s-ink">int 1 → 4 bytes, long 45 → 8 bytes, int 45 → 4</text><text x="180" y="134" text-anchor="middle" font-size="8.4" class="s-red">mostly zeros: 16 bytes for three small numbers</text></g>
+          <g data-on="4"><rect x="40" y="60" width="280" height="22" rx="4" class="s-card2"/><text x="180" y="75" text-anchor="middle" font-size="8" class="mono s-ink">bytes → readFields() → the SAME key object</text><text x="180" y="120" text-anchor="middle" font-size="8.4" class="s-ink">read in exactly the order written:</text><text x="180" y="134" text-anchor="middle" font-size="8.4" class="s-ink">student, day, orders, total, max</text></g>
+          <g data-on="5"><g font-size="7.6" class="mono"><rect x="40" y="60" width="54" height="22" class="s-soft-green" style="stroke:var(--green)"/><text x="67" y="75" text-anchor="middle" class="s-green">8E 05 85</text><rect x="94" y="60" width="38" height="22" class="s-soft-green" style="stroke:var(--green)"/><text x="113" y="75" text-anchor="middle" class="s-green">8F FD</text><rect x="132" y="60" width="54" height="22" class="s-soft-green" style="stroke:var(--green)"/><text x="159" y="75" text-anchor="middle" class="s-green">01 2D 2D</text></g><text x="180" y="120" text-anchor="middle" font-size="8.4" class="s-ink">VInt: 1 byte up to 127; otherwise a length byte</text><text x="180" y="134" text-anchor="middle" font-size="8.4" class="s-ink">then only the bytes needed → 8 bytes in total</text></g>
+          <g data-on="6"><rect x="40" y="56" width="245" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="292" y="69" font-size="8" class="s-acc">35</text><rect x="40" y="82" width="175" height="18" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="222" y="95" font-size="8" class="s-blue">25</text><rect x="40" y="108" width="57" height="18" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="104" y="121" font-size="8" class="s-green">≈8</text><text x="180" y="150" text-anchor="middle" font-size="8.4" class="s-ink">bytes per record, × 5 lakh records</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Before writing, the key and value are just Java objects in the map task.</li>
+          <li>writeUTF writes a 2-byte length and then each character: 19 bytes for the key.</li>
+          <li>Fixed-size numbers are mostly zero bytes: 16 bytes for 1, 45 and 45.</li>
+          <li>The reducer reads the bytes back into reused objects, in exactly the same order.</li>
+          <li>Variable-length encoding stores 1413, 253, 1, 45, 45 in 8 bytes.</li>
+          <li>Per record: 35, 25 or about 8 bytes. Multiply by every record of the job.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Custom types at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="26" width="42" height="38" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="37" y="49" text-anchor="middle" font-size="8.4" class="s-blue">user</text><rect x="62" y="26" width="42" height="38" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="83" y="49" text-anchor="middle" font-size="8.4" class="s-acc">date</text></svg></div>
+    <div><h4>1. Composite keys for daily aggregates</h4>
+      <p>Telecom and payments jobs aggregate per (customer, day) or (merchant, hour). A composite WritableComparable keeps the key typed and sorts output by customer and then by time.</p>
+      <div class="uc-flow"><span>Transactions</span><i>→</i><span class="java">key = (customer, day)</span><i>→</i><span>Daily totals</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="20" y="24" width="80" height="42" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="44" text-anchor="middle" font-size="8.6" class="s-green">(sum, count, max)</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">one value</text></svg></div>
+    <div><h4>2. Statistics values for combiners</h4>
+      <p>A value type holding sum, count, min and max lets one job compute several statistics with a correct combiner, instead of one job per statistic.</p>
+      <div class="uc-flow"><span>(1, amount, amount)</span><i>→</i><span class="java">combine: add, max</span><i>→</i><span>avg, max per key</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="28" width="84" height="34" rx="6" class="s-card2"/><text x="60" y="49" text-anchor="middle" font-size="8.6" class="s-ink">SequenceFile</text></svg></div>
+    <div><h4>3. Intermediate data between chained jobs</h4>
+      <p>When one job feeds another, output is often written as a SequenceFile of the same Writables, so the next job reads binary records without parsing text.</p>
+      <div class="uc-flow"><span>Job 1</span><i>→</i><span class="java">SequenceFile of Writables</span><i>→</i><span>Job 2</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><text x="60" y="40" text-anchor="middle" font-size="9" class="s-ink">Text, LongWritable</text><text x="60" y="58" text-anchor="middle" font-size="9" class="s-acc">inside Hive, HBase</text></svg></div>
+    <div><h4>4. Inside the ecosystem</h4>
+      <p>Hive, HBase and Mahout define their own Writables (HBase's <code>ImmutableBytesWritable</code>, Hive's row Writables). Knowing the interface helps when reading their code or their errors.</p>
+      <div class="uc-flow"><span>Your job</span><i>→</i><span class="java">Writable interface</span><i>→</i><span>Hive, HBase types</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Count the bytes of one record, three ways</h2>
+  <p>Python's <code>struct</code> module can write the same bytes as Java's <code>DataOutput</code>. This code serializes one map output record the way each of our three jobs did, and also implements Hadoop's VInt encoding (<code>WritableUtils.writeVLong</code>).</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>import struct
+
+def write_utf(s):                      # DataOutput.writeUTF: 2-byte length + UTF-8 bytes
+    b = s.encode()
+    return struct.pack(&quot;&gt;H&quot;, len(b)) + b
+
+def write_vint(i):                     # WritableUtils.writeVInt / writeVLong (for i &gt;= 0)
+    if -112 &lt;= i &lt;= 127:
+        return bytes([i &amp; 0xFF])
+    data = i.to_bytes((i.bit_length() + 7) // 8, &quot;big&quot;)
+    return bytes([(-112 - len(data)) &amp; 0xFF]) + data
+
+def text(s):                           # Text: VInt length + UTF-8 bytes
+    b = s.encode()
+    return write_vint(len(b)) + b
+
+student, day, amount = &quot;S1413&quot;, &quot;2026-09-10&quot;, 45
+naive = write_utf(student) + write_utf(day) + struct.pack(&quot;&gt;iqi&quot;, 1, amount, amount)
+as_text = text(student + &quot;\t&quot; + day) + text(f&quot;1,{amount},{amount}&quot;)
+compact = write_vint(1413) + write_vint(253) + write_vint(1) + write_vint(amount) + write_vint(amount)
+
+for name, b in [(&quot;Writable (UTF)&quot;, naive), (&quot;Text&quot;, as_text), (&quot;Writable (VInt)&quot;, compact)]:
+    print(f&quot;{name:16} {len(b):2} bytes  {b.hex(&#x27; &#x27;)}&quot;)</code></pre><div class="output">Writable (UTF)   35 bytes  00 05 53 31 34 31 33 00 0a 32 30 32 36 2d 30 39 2d 31 30 00 00 00 01 00 00 00 00 00 00 00 2d 00 00 00 2d
+Text             25 bytes  10 53 31 34 31 33 09 32 30 32 36 2d 30 39 2d 31 30 07 31 2c 34 35 2c 34 35
+Writable (VInt)   8 bytes  8e 05 85 8f fd 01 2d 2d</div></div>
+  <ul class="anno"><li><code>    return struct.pack(&quot;&gt;H&quot;, len(b)) + b</code><span>writeUTF always spends 2 bytes on the length: "2026-09-10" costs 12 bytes.</span></li><li><code>naive = write_utf(student) + write_utf(day) + struct.pack(&quot;&gt;iqi&quot;, 1, amount, amount)</code><span>">iqi" = int, long, int, big-endian: 4 + 8 + 4 = 16 bytes, mostly zeros.</span></li><li><code>    return bytes([(-112 - len(data)) &amp; 0xFF]) + data</code><span>One marker byte saying how many bytes follow, then only those bytes: 1413 → 8e 05 85.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Three encodings",
+   "hint": "Press <b>Run<\/b>. Check the sizes against the lab: 17,500,000 / 12,500,000 / 4,068,724 bytes for 5 lakh records.",
+   "code": "import struct\n\ndef write_utf(s):                      # DataOutput.writeUTF: 2-byte length + UTF-8 bytes\n    b = s.encode()\n    return struct.pack(\">H\", len(b)) + b\n\ndef write_vint(i):                     # WritableUtils.writeVInt / writeVLong (for i >= 0)\n    if -112 <= i <= 127:\n        return bytes([i & 0xFF])\n    data = i.to_bytes((i.bit_length() + 7) // 8, \"big\")\n    return bytes([(-112 - len(data)) & 0xFF]) + data\n\ndef text(s):                           # Text: VInt length + UTF-8 bytes\n    b = s.encode()\n    return write_vint(len(b)) + b\n\nstudent, day, amount = \"S1413\", \"2026-09-10\", 45\nnaive = write_utf(student) + write_utf(day) + struct.pack(\">iqi\", 1, amount, amount)\nas_text = text(student + \"\\t\" + day) + text(f\"1,{amount},{amount}\")\ncompact = write_vint(1413) + write_vint(253) + write_vint(1) + write_vint(amount) + write_vint(amount)\n\nfor name, b in [(\"Writable (UTF)\", naive), (\"Text\", as_text), (\"Writable (VInt)\", compact)]:\n    print(f\"{name:16} {len(b):2} bytes  {b.hex(' ')}\")\n"
+  },
+  {
+   "label": "2 · Bytes for the whole job",
+   "hint": "<b>Predict first:<\/b> multiply the naive and Text sizes by 5 lakh. Do you get the lab's Map output bytes exactly?",
+   "code": "records = 500_000\nfor name, per_record, lab in [(\"Writable (UTF)\", 35, 17_500_000), (\"Text\", 25, 12_500_000)]:\n    print(f\"{name:15} {per_record * records:>12,}  lab: {lab:>12,}  match: {per_record * records == lab}\")\nprint(\"compact average:\", round(4_068_724 / records, 3), \"bytes per record\")\n"
+  },
+  {
+   "label": "3 · VInt sizes",
+   "hint": "How many bytes does a VInt need for 1, 127, 128, 255, 256, 2000 and 1 lakh? Where do the student numbers and days of September fall?",
+   "code": "def vint_len(i):\n    if -112 <= i <= 127:\n        return 1\n    return 1 + (i.bit_length() + 7) // 8\n\nfor n in [1, 127, 128, 255, 256, 2000, 100_000]:\n    print(f\"{n:>7} -> {vint_len(n)} byte(s)\")\nprint(\"September days of year:\", 244, \"to\", 273)\n"
+  },
+  {
+   "label": "4 · Sort by a composite key",
+   "hint": "Keys sort by student, then day, like <code>compareTo<\/code>. Python tuples compare the same way. Sort these keys.",
+   "code": "keys = [(\"S0002\", \"2026-09-03\"), (\"S0001\", \"2026-09-02\"), (\"S0002\", \"2026-09-01\"),\n        (\"S0001\", \"2026-09-10\"), (\"S0001\", \"2026-09-01\")]\nfor k in sorted(keys):                 # tuple order = field by field, like compareTo\n    print(*k)\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "write() and readFields() disagree: one writes a long, the other reads an int. Make readFields match.",
+   "code": "import struct, io\ndef write(orders, total, mx):\n    return struct.pack(\">iqi\", orders, total, mx)\ndef read_fields(b):\n    f = io.BytesIO(b)\n    orders, total, mx = struct.unpack(\">iii\", f.read(12))\n    rest = f.read()\n    if rest:\n        raise ValueError(f\"{len(rest)} bytes left over: the next record would start in the wrong place\")\n    return orders, total, mx\nprint(read_fields(write(1, 45, 45)))\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: three encodings of the same job</h3>
+  <p>Use the Module 8 lab cluster (Lesson 8.1) and <code>student_orders.csv</code> from <code>make_student_orders.py</code> (Lesson 9.1). Copy the three Java files and <code>writable_lab.sh</code> into <code>/tmp/mr9</code> in the namenode container, compile them into <code>mr9.jar</code>, and run the script. It takes about 2 minutes.</p>
+  <div class="pcrun"><h4>Composite key and value with writeUTF and fixed-size numbers</h4>
+  <div class="code" data-lang="bash" data-file="StudentDay.java"><pre><code>// StudentDay.java: a composite WritableComparable key (student, day) and a custom Writable value.
+// Job: for every student and day, the number of orders, total spend and the biggest order.
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.Writable;
+import org.apache.hadoop.io.WritableComparable;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+
+public class StudentDay {
+
+  /** Key: (student, day). Sorted by student, then day. */
+  public static class StudentDayKey implements WritableComparable&lt;StudentDayKey&gt; {
+    private String student = &quot;&quot;;
+    private String day = &quot;&quot;;
+    public StudentDayKey() { }                                   // Hadoop needs a no-argument constructor
+    public void set(String s, String d) { student = s; day = d; }
+    @Override public void write(DataOutput out) throws IOException { out.writeUTF(student); out.writeUTF(day); }
+    @Override public void readFields(DataInput in) throws IOException { student = in.readUTF(); day = in.readUTF(); }
+    @Override public int compareTo(StudentDayKey o) {
+      int c = student.compareTo(o.student);
+      return c != 0 ? c : day.compareTo(o.day);
+    }
+    @Override public int hashCode() { return student.hashCode() * 31 + day.hashCode(); }   // used by HashPartitioner
+    @Override public boolean equals(Object o) {
+      return o instanceof StudentDayKey &amp;&amp; compareTo((StudentDayKey) o) == 0;
+    }
+    @Override public String toString() { return student + &quot;\t&quot; + day; }
+  }
+
+  /** Value: orders, total and max amount. Small and fixed size: 3 numbers. */
+  public static class SpendWritable implements Writable {
+    private int orders; private long total; private int max;
+    public SpendWritable() { }
+    public void set(int o, long t, int m) { orders = o; total = t; max = m; }
+    @Override public void write(DataOutput out) throws IOException { out.writeInt(orders); out.writeLong(total); out.writeInt(max); }
+    @Override public void readFields(DataInput in) throws IOException { orders = in.readInt(); total = in.readLong(); max = in.readInt(); }
+    @Override public String toString() { return orders + &quot;\t&quot; + total + &quot;\t&quot; + max; }
+  }
+
+  public static class M extends Mapper&lt;LongWritable, Text, StudentDayKey, SpendWritable&gt; {
+    private final StudentDayKey key = new StudentDayKey();
+    private final SpendWritable val = new SpendWritable();
+    @Override
+    protected void map(LongWritable k, Text line, Context ctx) throws IOException, InterruptedException {
+      String[] f = line.toString().split(&quot;,&quot;);        // order_id,student_id,time,item,amount
+      int amount = Integer.parseInt(f[4]);
+      key.set(f[1], f[2].substring(0, 10));          // &quot;2026-09-20 08:36&quot; -&gt; &quot;2026-09-20&quot;
+      val.set(1, amount, amount);
+      ctx.write(key, val);
+    }
+  }
+
+  public static class R extends Reducer&lt;StudentDayKey, SpendWritable, StudentDayKey, SpendWritable&gt; {
+    private final SpendWritable out = new SpendWritable();
+    @Override
+    protected void reduce(StudentDayKey k, Iterable&lt;SpendWritable&gt; vals, Context ctx) throws IOException, InterruptedException {
+      int orders = 0, max = 0; long total = 0;
+      for (SpendWritable v : vals) { orders += v.orders; total += v.total; max = Math.max(max, v.max); }
+      out.set(orders, total, max);
+      ctx.write(k, out);
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] rest = new GenericOptionsParser(conf, args).getRemainingArgs();
+    Job job = Job.getInstance(conf, &quot;student day&quot;);
+    job.setJarByClass(StudentDay.class);
+    job.setMapperClass(M.class);
+    job.setCombinerClass(R.class);                    // orders, total and max are all safe to combine
+    job.setReducerClass(R.class);
+    job.setOutputKeyClass(StudentDayKey.class);
+    job.setOutputValueClass(SpendWritable.class);
+    FileInputFormat.addInputPath(job, new Path(rest[0]));
+    FileOutputFormat.setOutputPath(job, new Path(rest[1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+
+// Inside the namenode container, in /tmp/mr9:
+//   mkdir -p classes &amp;&amp; javac -cp $(hadoop classpath) -d classes *.java &amp;&amp; jar cf mr9.jar -C classes .
+//   hadoop jar mr9.jar StudentDay /user/hadoop/data/student_orders.csv /out/StudentDay</code></pre><div class="output">Map output records=500000
+Map output bytes=17500000
+Map output materialized bytes=5604593
+Combine output records=151475
+Reduce output records=59946</div></div>
+  <p class="muted">Real counters from the run in the next item. 35 bytes per record.</p></div>
+  <div class="pcrun"><h4>The same job with Text</h4>
+  <div class="code" data-lang="bash" data-file="StudentDayText.java"><pre><code>// StudentDayText.java: the same job as StudentDay, but key and value travel as Text strings.
+import java.io.IOException;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+
+public class StudentDayText {
+  public static class M extends Mapper&lt;LongWritable, Text, Text, Text&gt; {
+    private final Text key = new Text(), val = new Text();
+    @Override
+    protected void map(LongWritable k, Text line, Context ctx) throws IOException, InterruptedException {
+      String[] f = line.toString().split(&quot;,&quot;);
+      key.set(f[1] + &quot;\t&quot; + f[2].substring(0, 10));
+      val.set(&quot;1,&quot; + f[4] + &quot;,&quot; + f[4]);
+      ctx.write(key, val);
+    }
+  }
+  public static class R extends Reducer&lt;Text, Text, Text, Text&gt; {
+    @Override
+    protected void reduce(Text k, Iterable&lt;Text&gt; vals, Context ctx) throws IOException, InterruptedException {
+      int orders = 0, max = 0; long total = 0;
+      for (Text v : vals) {
+        String[] p = v.toString().split(&quot;,&quot;);
+        orders += Integer.parseInt(p[0]); total += Long.parseLong(p[1]); max = Math.max(max, Integer.parseInt(p[2]));
+      }
+      ctx.write(k, new Text(orders + &quot;,&quot; + total + &quot;,&quot; + max));
+    }
+  }
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] rest = new GenericOptionsParser(conf, args).getRemainingArgs();
+    Job job = Job.getInstance(conf, &quot;student day text&quot;);
+    job.setJarByClass(StudentDayText.class);
+    job.setMapperClass(M.class);
+    job.setCombinerClass(R.class);
+    job.setReducerClass(R.class);
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(Text.class);
+    FileInputFormat.addInputPath(job, new Path(rest[0]));
+    FileOutputFormat.setOutputPath(job, new Path(rest[1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}</code></pre><div class="output">Map output records=500000
+Map output bytes=12500000
+Map output materialized bytes=4132541
+Combine output records=151475
+Reduce output records=59946</div></div>
+  <p class="muted">25 bytes per record: the strings are short and every number here has two digits.</p></div>
+  <div class="pcrun"><h4>Compact encoding with VInt and VLong</h4>
+  <div class="code" data-lang="bash" data-file="StudentDayCompact.java"><pre><code>// StudentDayCompact.java: the same job as StudentDay, with compact variable-length encodings:
+// student &quot;S0001&quot; stored as the number 1, the day as a day-of-year number, every number as a VInt/VLong.
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.Writable;
+import org.apache.hadoop.io.WritableComparable;
+import org.apache.hadoop.io.WritableUtils;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+
+public class StudentDayCompact {
+
+  /** Key: (student, day). Sorted by student, then day. */
+  public static class StudentDayKey implements WritableComparable&lt;StudentDayKey&gt; {
+    private int student;                                         // &quot;S0001&quot; -&gt; 1
+    private int day;                                             // day of the year, 2026-09-01 -&gt; 244
+    public StudentDayKey() { }
+    public void set(String s, String d) { student = Integer.parseInt(s.substring(1)); day = java.time.LocalDate.parse(d).getDayOfYear(); }
+    @Override public void write(DataOutput out) throws IOException { WritableUtils.writeVInt(out, student); WritableUtils.writeVInt(out, day); }
+    @Override public void readFields(DataInput in) throws IOException { student = WritableUtils.readVInt(in); day = WritableUtils.readVInt(in); }
+    @Override public int compareTo(StudentDayKey o) {
+      int c = Integer.compare(student, o.student);
+      return c != 0 ? c : Integer.compare(day, o.day);
+    }
+    @Override public int hashCode() { return student * 31 + day; }
+    @Override public boolean equals(Object o) {
+      return o instanceof StudentDayKey &amp;&amp; compareTo((StudentDayKey) o) == 0;
+    }
+    @Override public String toString() { return String.format(&quot;S%04d\t%s&quot;, student, java.time.LocalDate.ofYearDay(2026, day)); }
+  }
+
+  /** Value: orders, total and max amount, each written in as few bytes as the number needs. */
+  public static class SpendWritable implements Writable {
+    private int orders; private long total; private int max;
+    public SpendWritable() { }
+    public void set(int o, long t, int m) { orders = o; total = t; max = m; }
+    @Override public void write(DataOutput out) throws IOException { WritableUtils.writeVInt(out, orders); WritableUtils.writeVLong(out, total); WritableUtils.writeVInt(out, max); }
+    @Override public void readFields(DataInput in) throws IOException { orders = WritableUtils.readVInt(in); total = WritableUtils.readVLong(in); max = WritableUtils.readVInt(in); }
+    @Override public String toString() { return orders + &quot;\t&quot; + total + &quot;\t&quot; + max; }
+  }
+
+  public static class M extends Mapper&lt;LongWritable, Text, StudentDayKey, SpendWritable&gt; {
+    private final StudentDayKey key = new StudentDayKey();
+    private final SpendWritable val = new SpendWritable();
+    @Override
+    protected void map(LongWritable k, Text line, Context ctx) throws IOException, InterruptedException {
+      String[] f = line.toString().split(&quot;,&quot;);        // order_id,student_id,time,item,amount
+      int amount = Integer.parseInt(f[4]);
+      key.set(f[1], f[2].substring(0, 10));          // &quot;2026-09-20 08:36&quot; -&gt; &quot;2026-09-20&quot;
+      val.set(1, amount, amount);
+      ctx.write(key, val);
+    }
+  }
+
+  public static class R extends Reducer&lt;StudentDayKey, SpendWritable, StudentDayKey, SpendWritable&gt; {
+    private final SpendWritable out = new SpendWritable();
+    @Override
+    protected void reduce(StudentDayKey k, Iterable&lt;SpendWritable&gt; vals, Context ctx) throws IOException, InterruptedException {
+      int orders = 0, max = 0; long total = 0;
+      for (SpendWritable v : vals) { orders += v.orders; total += v.total; max = Math.max(max, v.max); }
+      out.set(orders, total, max);
+      ctx.write(k, out);
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] rest = new GenericOptionsParser(conf, args).getRemainingArgs();
+    Job job = Job.getInstance(conf, &quot;student day compact&quot;);
+    job.setJarByClass(StudentDayCompact.class);
+    job.setMapperClass(M.class);
+    job.setCombinerClass(R.class);                    // orders, total and max are all safe to combine
+    job.setReducerClass(R.class);
+    job.setOutputKeyClass(StudentDayKey.class);
+    job.setOutputValueClass(SpendWritable.class);
+    FileInputFormat.addInputPath(job, new Path(rest[0]));
+    FileOutputFormat.setOutputPath(job, new Path(rest[1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}</code></pre><div class="output">Map output records=500000
+Map output bytes=4068724
+Map output materialized bytes=1601326
+Combine output records=151475
+Reduce output records=59946</div></div>
+  <p class="muted">About 8 bytes per record. toString() prints the student and date back in their usual form.</p></div>
+  <div class="pcrun"><h4>Run all three, compare, then break the constructor</h4>
+  <div class="code" data-lang="bash" data-file="writable_lab.sh"><pre><code># writable_lab.sh: a custom key and value vs the same job with Text; then forget the no-arg constructor
+cd /tmp/mr9
+D=/user/hadoop/data/student_orders.csv
+for job in StudentDay StudentDayText StudentDayCompact; do
+  hdfs dfs -rm -r -f -skipTrash /out/$job &gt; /dev/null 2&gt;&amp;1
+  start=$(date +%s%N)
+  hadoop jar mr9.jar $job $D /out/$job &gt; /tmp/$job.log 2&gt;&amp;1
+  echo &quot;== $job   $(( ($(date +%s%N) - start) / 1000000 )) ms&quot;
+  grep -E &quot;Map output records|Map output bytes|Map output materialized bytes|Combine output records|Reduce output records|CPU time spent&quot; /tmp/$job.log | sed &#x27;s/^\s*/  /&#x27;
+done
+echo &quot;-- output (custom Writable), first lines and student S0001&quot;
+hdfs dfs -cat /out/StudentDay/part-r-00000 2&gt;/dev/null | head -3
+hdfs dfs -cat /out/StudentDay/part-r-00000 | grep -P &quot;^S0001\t&quot; 2&gt;/dev/null | head -3
+echo &quot;-- the Text and Compact versions agree?&quot;
+diff &lt;(hdfs dfs -cat /out/StudentDay/part-r-00000) &lt;(hdfs dfs -cat /out/StudentDayCompact/part-r-00000) &gt; /dev/null &amp;&amp; echo &quot;compact: same rows&quot; || echo &quot;compact: rows differ&quot;
+diff &lt;(hdfs dfs -cat /out/StudentDay/part-r-00000 | tr &#x27;\t&#x27; &#x27;,&#x27; | sed -E &#x27;s/^([^,]*),([^,]*),/\1\t\2\t/&#x27;) &lt;(hdfs dfs -cat /out/StudentDayText/part-r-00000) &gt; /dev/null &amp;&amp; echo &quot;text: same rows&quot; || echo &quot;text: rows differ&quot;
+echo &quot;== remove the no-argument constructor of the key&quot;
+sed -e &#x27;s/StudentDay\b/StudentDayNoCtor/g&#x27; -e &#x27;s/public StudentDayKey() { }.*/public StudentDayKey(String s, String d) { set(s, d); }/&#x27; \
+    -e &#x27;s/new StudentDayKey()/new StudentDayKey(&quot;&quot;, &quot;&quot;)/&#x27; StudentDay.java &gt; StudentDayNoCtor.java
+mkdir -p nc &amp;&amp; javac -cp $(hadoop classpath) -d nc StudentDayNoCtor.java &amp;&amp; jar cf nc.jar -C nc .
+hdfs dfs -rm -r -f -skipTrash /out/nc &gt; /dev/null 2&gt;&amp;1
+hadoop jar nc.jar StudentDayNoCtor $D /out/nc 2&gt;&amp;1 | grep -E &quot;Error|Caused by|NoSuchMethod|failed with state&quot; | sed -E &#x27;s/^[0-9-]+ [0-9:]+ INFO  //&#x27; | cut -c1-170 | sort -u | head -5
+
+# Inside the namenode container:  bash /tmp/mr9/writable_lab.sh</code></pre><div class="output">== StudentDay   24815 ms
+  Map output records=500000
+  Map output bytes=17500000
+  Map output materialized bytes=5604593
+  Combine output records=151475
+  Reduce output records=59946
+  CPU time spent (ms)=8360
+== StudentDayText   24363 ms
+  Map output records=500000
+  Map output bytes=12500000
+  Map output materialized bytes=4132541
+  Combine output records=151475
+  Reduce output records=59946
+  CPU time spent (ms)=7290
+== StudentDayCompact   25126 ms
+  Map output records=500000
+  Map output bytes=4068724
+  Map output materialized bytes=1601326
+  Combine output records=151475
+  Reduce output records=59946
+  CPU time spent (ms)=8600
+-- output (custom Writable), first lines and student S0001
+S0001	2026-09-01	124	3224	80
+S0001	2026-09-02	134	3411	80
+S0001	2026-09-03	124	3064	80
+S0001	2026-09-01	124	3224	80
+S0001	2026-09-02	134	3411	80
+S0001	2026-09-03	124	3064	80
+-- the Text and Compact versions agree?
+compact: same rows
+text: same rows
+== remove the no-argument constructor of the key
+Caused by: java.lang.NoSuchMethodException: StudentDayNoCtor$StudentDayKey.&lt;init&gt;()
+Caused by: java.lang.RuntimeException: java.lang.NoSuchMethodException: StudentDayNoCtor$StudentDayKey.&lt;init&gt;()
+Error: java.io.IOException: Initialization of all the collectors failed. Error in last collector was:java.lang.RuntimeException: java.lang.NoSuchMethodException: StudentD
+Job:1767 - Job job_1792643020992_0034 failed with state FAILED due to: Task failed task_1792643020992_0034_m_000000</div></div>
+  <p class="muted">Real output. The output lines for S0001 appear twice because the first rows of the file are S0001's. The constructor test is done with sed on a copy, so StudentDay.java is unchanged.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>write() then readFields() into a reused object</h2>
+  <p>Follow one record through <code>write</code> and <code>readFields</code>. Notice that reading fills an existing object instead of creating a new one.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import struct, io",
+  "class Spend:",
+  "    def __init__(self):",
+  "        self.orders, self.total, self.max = 0, 0, 0",
+  "buf = struct.pack(\">iqi\", 1, 45, 45) + struct.pack(\">iqi\", 2, 65, 45)",
+  "reused = Spend()",
+  "f = io.BytesIO(buf)",
+  "for _ in range(2):",
+  "    reused.orders, reused.total, reused.max = struct.unpack(\">iqi\", f.read(16))",
+  "    print(id(reused) % 1000, reused.orders, reused.total, reused.max)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>Spend()<\/code> is called: a new frame is pushed.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    },
+    {
+     "frame": "Spend()",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    },
+    {
+     "frame": "Spend()",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The function is defined (not run yet).",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    },
+    {
+     "frame": "Spend()",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Return",
+   "note": "<code>Spend()<\/code> returns <b>None<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 5,
+   "phase": "Bytes",
+   "note": "Two serialized values, 16 bytes each, one after the other. <code>buf<\/code> is created: b&#x27;\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\….",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "buf"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>__init__()<\/code> is called: a new frame is pushed with <code>self<\/code> = &lt;__main__.Spend object at 0x7f5437e2a660&gt;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ]
+     ]
+    },
+    {
+     "frame": "__init__()",
+     "vars": [
+      [
+       "self",
+       "<__main__.Spend object at 0x7f5437e2a660>"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "self"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ]
+     ]
+    },
+    {
+     "frame": "__init__()",
+     "vars": [
+      [
+       "self",
+       "<__main__.Spend object at 0x7f5437e2a660>"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 6,
+   "phase": "Return",
+   "note": "<code>__init__()<\/code> returns <b>None<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ],
+      [
+       "reused",
+       "<__main__.Spend object at 0x7f5437e2a660>"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>f<\/code> is created: &lt;_io.BytesIO object at 0x7f5437efe570&gt;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ],
+      [
+       "reused",
+       "<__main__.Spend object at 0x7f5437e2a660>"
+      ],
+      [
+       "f",
+       "<_io.BytesIO object at 0x7f5437efe570>"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "f"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>_<\/code> is created: 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ],
+      [
+       "reused",
+       "<__main__.Spend object at 0x7f5437e2a660>"
+      ],
+      [
+       "f",
+       "<_io.BytesIO object at 0x7f5437efe570>"
+      ],
+      [
+       "_",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "_"
+  },
+  {
+   "line": 9,
+   "phase": "readFields",
+   "note": "The same object is refilled for every record, as Hadoop does.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ],
+      [
+       "reused",
+       "<__main__.Spend object at 0x7f5437e2a660>"
+      ],
+      [
+       "f",
+       "<_io.BytesIO object at 0x7f5437efe570>"
+      ],
+      [
+       "_",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 10,
+   "phase": "Same id",
+   "note": "One object, two different contents. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ],
+      [
+       "reused",
+       "<__main__.Spend object at 0x7f5437e2a660>"
+      ],
+      [
+       "f",
+       "<_io.BytesIO object at 0x7f5437efe570>"
+      ],
+      [
+       "_",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "24 1 45 45\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>_<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ],
+      [
+       "reused",
+       "<__main__.Spend object at 0x7f5437e2a660>"
+      ],
+      [
+       "f",
+       "<_io.BytesIO object at 0x7f5437efe570>"
+      ],
+      [
+       "_",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "_"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ],
+      [
+       "reused",
+       "<__main__.Spend object at 0x7f5437e2a660>"
+      ],
+      [
+       "f",
+       "<_io.BytesIO object at 0x7f5437efe570>"
+      ],
+      [
+       "_",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ],
+      [
+       "reused",
+       "<__main__.Spend object at 0x7f5437e2a660>"
+      ],
+      [
+       "f",
+       "<_io.BytesIO object at 0x7f5437efe570>"
+      ],
+      [
+       "_",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "24 2 65 45\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "buf",
+       "b'\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00-\\x00\\x00\\x00-\\x00\\x00\\…"
+      ],
+      [
+       "reused",
+       "<__main__.Spend object at 0x7f5437e2a660>"
+      ],
+      [
+       "f",
+       "<_io.BytesIO object at 0x7f5437efe570>"
+      ],
+      [
+       "_",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three design problems: sizing a record, choosing an encoding, and a key that partitions wrongly.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Sizing · bytes</span></div>
+    <h4>How big is this record?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A key holds a city name written with <code>writeUTF</code> ("Mumbai") and a year as <code>writeInt</code>. The value is a <code>writeLong</code> total. How many bytes per record, and how many MB for 2 crore records?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>writeUTF(&quot;Mumbai&quot;) + int + long</pre></div><div><small>Expected output</small><pre>20 bytes per record, 381 MB</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>writeUTF = 2 + number of bytes.</li><li>int = 4, long = 8.</li><li>Multiply by the number of records.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Store the city as a small code number with writeVInt instead: about 1 + 3 + 3 bytes.",
+   "code": "per = (2 + len(\"Mumbai\")) + 4 + 8\nprint(per, \"bytes per record,\", round(per * 20_000_000 / 1024**2), \"MB\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "per = (2 + len(\"Mumbai\")) + 4 + 8",
+  "print(per, \"bytes per record,\", round(per * 20_000_000 / 1024**2), \"MB\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Fixed costs",
+   "note": "The 2-byte length prefix is paid on every record. <code>per<\/code> is created: 20.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "per",
+       "20"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "per"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "per",
+       "20"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "20 bytes per record, 381 MB\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Design · encoding</span></div>
+    <h4>Pick an encoding for a phone-number key</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A telecom job keys records by a 10-digit mobile number. Compare storing it as Text, as <code>writeLong</code>, and as a VLong.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>9876543210</pre></div><div><small>Expected output</small><pre>Text 11 · long 8 · VLong 6 bytes</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Text: VInt length + 10 characters.</li><li>writeLong: always 8 bytes.</li><li>VLong: marker + the bytes the number needs.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The difference per record is small; over a billion call records it is several GB of shuffle.",
+   "code": "n = 9876543210\ntext = 1 + len(str(n))\nfixed = 8\nvlong = 1 + (n.bit_length() + 7) // 8\nprint(f\"Text {text} · long {fixed} · VLong {vlong} bytes\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "n = 9876543210",
+  "text = 1 + len(str(n))",
+  "fixed = 8",
+  "vlong = 1 + (n.bit_length() + 7) // 8",
+  "print(f\"Text {text} · long {fixed} · VLong {vlong} bytes\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>n<\/code> is created: 9876543210.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n",
+       "9876543210"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>text<\/code> is created: 11.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n",
+       "9876543210"
+      ],
+      [
+       "text",
+       "11"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "text"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>fixed<\/code> is created: 8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n",
+       "9876543210"
+      ],
+      [
+       "text",
+       "11"
+      ],
+      [
+       "fixed",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "fixed"
+  },
+  {
+   "line": 4,
+   "phase": "VLong",
+   "note": "34 bits need 5 bytes plus the marker. <code>vlong<\/code> is created: 6.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n",
+       "9876543210"
+      ],
+      [
+       "text",
+       "11"
+      ],
+      [
+       "fixed",
+       "8"
+      ],
+      [
+       "vlong",
+       "6"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "vlong"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n",
+       "9876543210"
+      ],
+      [
+       "text",
+       "11"
+      ],
+      [
+       "fixed",
+       "8"
+      ],
+      [
+       "vlong",
+       "6"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "Text 11 · long 8 · VLong 6 bytes\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Correctness · partitioning</span></div>
+    <h4>A key whose hashCode breaks the job</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A developer writes a composite key but forgets to override <code>hashCode()</code>, so Java's default (based on the object's identity) is used. Equal keys from two map tasks get different hash codes. What happens to the reducers' output?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>key (S0001, 2026-09-01) from two maps</pre></div><div><small>Expected output</small><pre>map 0 sends (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;) to reducer 3
+map 1 sends (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;) to reducer 2
+hash from the fields -&gt; reducer 2 for both maps</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>HashPartitioner uses hashCode() % reducers.</li><li>Identity hash codes differ between objects and JVMs.</li><li>Simulate two maps sending the same key.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The result: one student-day split across two reducers, two output rows for one key, and totals that look half as big.",
+   "code": "import random, zlib\nreducers = 4\nsame_key = (\"S0001\", \"2026-09-01\")\nfor map_task in [\"map 0\", \"map 1\"]:\n    identity_hash = random.Random(map_task).getrandbits(31)    # different per object/JVM\n    print(map_task, \"sends\", same_key, \"to reducer\", identity_hash % reducers)\ncontent_hash = zlib.crc32(\"|\".join(same_key).encode())                 # same fields, same number\nprint(\"hash from the fields -> reducer\", content_hash % reducers, \"for both maps\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import random, zlib",
+  "reducers = 4",
+  "same_key = (\"S0001\", \"2026-09-01\")",
+  "for map_task in [\"map 0\", \"map 1\"]:",
+  "    identity_hash = random.Random(map_task).getrandbits(31)    # different per object/JVM",
+  "    print(map_task, \"sends\", same_key, \"to reducer\", identity_hash % reducers)",
+  "content_hash = zlib.crc32(\"|\".join(same_key).encode())                 # same fields, same number",
+  "print(\"hash from the fields -> reducer\", content_hash % reducers, \"for both maps\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>reducers<\/code> is created: 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "reducers",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "reducers"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>same_key<\/code> is created: → tuple #1. A new tuple object (#1) is created: (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "reducers",
+       "4"
+      ],
+      [
+       "same_key",
+       "→ tuple #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;)"
+   ],
+   "newVar": "same_key"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>map_task<\/code> is created: &#x27;map 0&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "reducers",
+       "4"
+      ],
+      [
+       "same_key",
+       "→ tuple #1"
+      ],
+      [
+       "map_task",
+       "'map 0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;)"
+   ],
+   "newVar": "map_task"
+  },
+  {
+   "line": 5,
+   "phase": "Identity hash",
+   "note": "Not based on the fields, so equal keys can land on different reducers. <code>identity_hash<\/code> is created: 986568331.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "reducers",
+       "4"
+      ],
+      [
+       "same_key",
+       "→ tuple #1"
+      ],
+      [
+       "map_task",
+       "'map 0'"
+      ],
+      [
+       "identity_hash",
+       "986568331"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;)"
+   ],
+   "newVar": "identity_hash"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "reducers",
+       "4"
+      ],
+      [
+       "same_key",
+       "→ tuple #1"
+      ],
+      [
+       "map_task",
+       "'map 0'"
+      ],
+      [
+       "identity_hash",
+       "986568331"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;)"
+   ],
+   "out": "map 0 sends ('S0001', '2026-09-01') to reducer 3\n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>map_task<\/code> changes to &#x27;map 1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "reducers",
+       "4"
+      ],
+      [
+       "same_key",
+       "→ tuple #1"
+      ],
+      [
+       "map_task",
+       "'map 1'"
+      ],
+      [
+       "identity_hash",
+       "986568331"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;)"
+   ],
+   "newVar": "map_task"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>identity_hash<\/code> changes to 1624261382.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "reducers",
+       "4"
+      ],
+      [
+       "same_key",
+       "→ tuple #1"
+      ],
+      [
+       "map_task",
+       "'map 1'"
+      ],
+      [
+       "identity_hash",
+       "1624261382"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;)"
+   ],
+   "newVar": "identity_hash"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "reducers",
+       "4"
+      ],
+      [
+       "same_key",
+       "→ tuple #1"
+      ],
+      [
+       "map_task",
+       "'map 1'"
+      ],
+      [
+       "identity_hash",
+       "1624261382"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;)"
+   ],
+   "out": "map 1 sends ('S0001', '2026-09-01') to reducer 2\n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "reducers",
+       "4"
+      ],
+      [
+       "same_key",
+       "→ tuple #1"
+      ],
+      [
+       "map_task",
+       "'map 1'"
+      ],
+      [
+       "identity_hash",
+       "1624261382"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>content_hash<\/code> is created: 1908877654.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "reducers",
+       "4"
+      ],
+      [
+       "same_key",
+       "→ tuple #1"
+      ],
+      [
+       "map_task",
+       "'map 1'"
+      ],
+      [
+       "identity_hash",
+       "1624261382"
+      ],
+      [
+       "content_hash",
+       "1908877654"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;)"
+   ],
+   "newVar": "content_hash"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "reducers",
+       "4"
+      ],
+      [
+       "same_key",
+       "→ tuple #1"
+      ],
+      [
+       "map_task",
+       "'map 1'"
+      ],
+      [
+       "identity_hash",
+       "1624261382"
+      ],
+      [
+       "content_hash",
+       "1908877654"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;2026-09-01&#x27;)"
+   ],
+   "out": "hash from the fields -> reducer 2 for both maps\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Which two methods does every Writable implement?",
+  "options": [
+   "serialize() and deserialize()",
+   "toBytes() and fromBytes()",
+   "write(DataOutput) and readFields(DataInput)",
+   "map() and reduce()"
+  ],
+  "answer": 2,
+  "why": "They write the fields and read them back, in the same order."
+ },
+ {
+  "q": "What must a map output KEY type implement?",
+  "options": [
+   "Writable only",
+   "WritableComparable, because keys are sorted in the shuffle",
+   "Serializable",
+   "Comparable only"
+  ],
+  "answer": 1,
+  "why": "compareTo() defines the sort order of keys."
+ },
+ {
+  "q": "Which method decides which reducer a key goes to with the default partitioner?",
+  "options": [
+   "hashCode()",
+   "compareTo()",
+   "toString()",
+   "readFields()"
+  ],
+  "answer": 0,
+  "why": "HashPartitioner: (hashCode() & Integer.MAX_VALUE) % reducers."
+ },
+ {
+  "q": "What happened when the key had no public no-argument constructor?",
+  "options": [
+   "It did not compile",
+   "Hadoop used the other constructor",
+   "Output keys were null",
+   "NoSuchMethodException at runtime and the job failed"
+  ],
+  "answer": 3,
+  "why": "Hadoop creates instances by reflection with new Key()."
+ },
+ {
+  "q": "Why was the first custom Writable bigger than the Text version?",
+  "options": [
+   "Writables are always bigger",
+   "It used compression",
+   "writeUTF adds 2 bytes per string and writeInt/writeLong use 4/8 bytes even for small numbers",
+   "The combiner did not run"
+  ],
+  "answer": 2,
+  "why": "35 bytes vs 25 bytes per record in our lab."
+ },
+ {
+  "q": "How many bytes does a VInt use for the number 100?",
+  "options": [
+   "4",
+   "1",
+   "2",
+   "5"
+  ],
+  "answer": 1,
+  "why": "Values from -112 to 127 fit in a single byte."
+ },
+ {
+  "q": "Why must readFields() set every field?",
+  "options": [
+   "Hadoop reuses the same object, so an unset field keeps the previous record's value",
+   "For speed only",
+   "To avoid compile errors",
+   "Because toString() needs it"
+  ],
+  "answer": 0,
+  "why": "One object is refilled for every record."
+ },
+ {
+  "q": "What does a RawComparator do?",
+  "options": [
+   "Compresses keys",
+   "Partitions keys",
+   "Sorts reducer output files",
+   "Compares keys as bytes without deserializing them"
+  ],
+  "answer": 3,
+  "why": "It makes the sort faster; Text and IntWritable have one."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 9.3 in one screen</h3>
+    <ul><li><b>Writable</b>: <code>write(DataOutput)</code> + <code>readFields(DataInput)</code>, same fields, same order.</li><li>Keys: <b>WritableComparable</b> (<code>compareTo</code> = sort order) and a consistent <code>hashCode</code>/<code>equals</code> (partitioning).</li><li>Public <b>no-arg constructor</b> required (reflection); <code>readFields</code> must overwrite every field (objects are reused).</li><li>Sizes: writeUTF 2 + bytes; int 4; long 8; VInt 1–5, VLong 1–9; Text = VInt length + bytes; NullWritable 0.</li><li>Lab: 35 B (writeUTF + fixed numbers) vs 25 B (Text) vs ≈8 B (VInt) per record; 17.5 / 12.5 / 4.1 MB for 5 lakh records; same 59,946 rows.</li><li><code>toString()</code> controls how the type appears in TextOutputFormat output.</li><li>Faster sorting: a RawComparator compares serialized bytes. Avro/Parquet for data files shared with other tools.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What is a Writable in Hadoop?</summary><p>Writable is Hadoop's serialization interface. A class implements write(DataOutput) to write its fields as bytes and readFields(DataInput) to read them back. Hadoop uses Writables for all MapReduce keys and values and in SequenceFiles. Common built-in Writables are Text, IntWritable, LongWritable, DoubleWritable and NullWritable.</p></details>
+    <details><summary>What is the difference between Writable and WritableComparable?</summary><p>Writable only serializes and deserializes. WritableComparable also implements Comparable, so objects can be sorted. MapReduce sorts map output by key, so every key type must be WritableComparable; value types only need Writable.</p></details>
+    <details><summary>Why does Hadoop not use Java serialization?</summary><p>Java serialization writes class information and object metadata with every object and creates a new object when reading, which is slow and large for billions of small records. Writables write only the field values, can be reused for every record, and many can be compared directly in serialized form with a RawComparator.</p></details>
+    <details><summary>How do you create a custom key in MapReduce?</summary><p>Write a class that implements WritableComparable&lt;YourKey&gt;, with a public no-argument constructor, write() and readFields() handling the same fields in the same order, compareTo() defining the sort order, and hashCode() and equals() based on the same fields so the partitioner sends equal keys to the same reducer. Override toString() for readable text output.</p></details>
+    <details><summary>Why does my custom Writable job fail with NoSuchMethodException &lt;init&gt;()?</summary><p>Hadoop creates key and value objects by reflection with the no-argument constructor. If your class only has a constructor with parameters, Java does not generate the default one, and tasks fail at runtime with NoSuchMethodException: YourClass.&lt;init&gt;(). Add a public no-argument constructor (and make nested classes static).</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Writable exercises using the sizes and counters measured in the lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Bytes per record</h4></div>
+      <p>Compute bytes per record for the three jobs from Map output bytes and Map output records.</p>
+      <div class="prob__io"><div><small>Input</small><pre>17,500,000 · 12,500,000 · 4,068,724 / 500,000</pre></div><div><small>Expected output</small><pre>UTF 35.0
+Text 25.0
+VInt 8.14</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for name, b in [(&quot;UTF&quot;, 17_500_000), (&quot;Text&quot;, 12_500_000), (&quot;VInt&quot;, 4_068_724)]:
+    print(name, round(b / 500_000, 2))</code></pre><div class="output">UTF 35.0
+Text 25.0
+VInt 8.14</div></div>
+        <p><b>How it works:</b> 35, 25 and 8.14 bytes.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>How much smaller?</h4></div>
+      <p>How many times smaller is the compact Writable than the first Writable, and than Text?</p>
+      <div class="prob__io"><div><small>Input</small><pre>three byte counts</pre></div><div><small>Expected output</small><pre>4.3 3.1</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(17_500_000 / 4_068_724, 1), round(12_500_000 / 4_068_724, 1))</code></pre><div class="output">4.3 3.1</div></div>
+        <p><b>How it works:</b> 4.3× smaller than the naive Writable and 3.1× smaller than Text.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>writeUTF cost</h4></div>
+      <p>How many bytes does writeUTF use for "S0001" and for "2026-09-01"?</p>
+      <div class="prob__io"><div><small>Input</small><pre>two strings</pre></div><div><small>Expected output</small><pre>S0001 7
+2026-09-01 12</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for s in [&quot;S0001&quot;, &quot;2026-09-01&quot;]:
+    print(s, 2 + len(s.encode()))</code></pre><div class="output">S0001 7
+2026-09-01 12</div></div>
+        <p><b>How it works:</b> 7 and 12: 19 bytes of key in the naive version.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Materialized vs raw</h4></div>
+      <p>Map output materialized bytes are what is actually written to disk for the shuffle (with partition framing and checksums). Compute the ratio materialized / raw for each job. Which shrinks most?</p>
+      <div class="prob__io"><div><small>Input</small><pre>materialized and raw bytes</pre></div><div><small>Expected output</small><pre>UTF 0.32
+Text 0.33
+VInt 0.39</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>jobs = {&quot;UTF&quot;: (5_604_593, 17_500_000), &quot;Text&quot;: (4_132_541, 12_500_000), &quot;VInt&quot;: (1_601_326, 4_068_724)}
+for k, (m, r) in jobs.items():
+    print(k, round(m / r, 2))</code></pre><div class="output">UTF 0.32
+Text 0.33
+VInt 0.39</div></div>
+        <p><b>How it works:</b> About 0.32, 0.33 and 0.39: the combiner shrank all three record counts from 500,000 to 151,475 before writing; the compact records had less redundancy to begin with.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>VInt encoder</h4></div>
+      <p>Write Hadoop's VInt encoding for non-negative numbers and print the hex for 45, 253, 1413 and 2000.</p>
+      <div class="prob__io"><div><small>Input</small><pre>4 numbers</pre></div><div><small>Expected output</small><pre>45 2d
+253 8f fd
+1413 8e 05 85
+2000 8e 07 d0</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>def vint(i):
+    if i &lt;= 127:
+        return bytes([i])
+    data = i.to_bytes((i.bit_length() + 7) // 8, &quot;big&quot;)
+    return bytes([(-112 - len(data)) &amp; 0xFF]) + data
+for n in [45, 253, 1413, 2000]:
+    print(n, vint(n).hex(&quot; &quot;))</code></pre><div class="output">45 2d
+253 8f fd
+1413 8e 05 85
+2000 8e 07 d0</div></div>
+        <p><b>How it works:</b> 2d · 8f fd · 8e 05 85 · 8e 07 d0. The marker byte 8f means one data byte follows, 8e means two.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Composite key order</h4></div>
+      <p>Sort these (student, day) keys the way compareTo does, and say which reducer call comes first.</p>
+      <div class="prob__io"><div><small>Input</small><pre>4 keys</pre></div><div><small>Expected output</small><pre>[(&#x27;S0002&#x27;, &#x27;2026-09-01&#x27;), (&#x27;S0002&#x27;, &#x27;2026-09-30&#x27;), (&#x27;S0010&#x27;, &#x27;2026-09-01&#x27;), (&#x27;S0100&#x27;, &#x27;2026-09-05&#x27;)]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>keys = [(&quot;S0010&quot;, &quot;2026-09-01&quot;), (&quot;S0002&quot;, &quot;2026-09-30&quot;), (&quot;S0002&quot;, &quot;2026-09-01&quot;), (&quot;S0100&quot;, &quot;2026-09-05&quot;)]
+print(sorted(keys))</code></pre><div class="output">[(&#x27;S0002&#x27;, &#x27;2026-09-01&#x27;), (&#x27;S0002&#x27;, &#x27;2026-09-30&#x27;), (&#x27;S0010&#x27;, &#x27;2026-09-01&#x27;), (&#x27;S0100&#x27;, &#x27;2026-09-05&#x27;)]</div></div>
+        <p><b>How it works:</b> S0002 first (both days in order), then S0010, then S0100: string order works because the IDs are zero-padded.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Shuffle savings per year</h4></div>
+      <p>A nightly job shuffles 800 GB with Text records. A compact Writable would cut the bytes by 3×. The network and disk cost is ₹2 per GB shuffled (illustrative). What is saved in a year?</p>
+      <div class="prob__io"><div><small>Input</small><pre>800 GB/night · 3× smaller · ₹2/GB</pre></div><div><small>Expected output</small><pre>Rs 389,333 per year</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>saved_gb = 800 - 800 / 3
+print(f&quot;Rs {saved_gb * 2 * 365:,.0f} per year&quot;)</code></pre><div class="output">Rs 389,333 per year</div></div>
+        <p><b>How it works:</b> About ₹3.9 lakh a year, plus faster jobs. Worth a day of a developer's time; not worth it for a 1 GB job.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>Zero-padding pitfall</h4></div>
+      <p>If student IDs were not zero-padded (S1, S2, S10), a String compareTo sorts them as text. Show the order, then fix it by comparing the numbers.</p>
+      <div class="prob__io"><div><small>Input</small><pre>S1, S2, S10, S9</pre></div><div><small>Expected output</small><pre>as text:   [&#x27;S1&#x27;, &#x27;S10&#x27;, &#x27;S2&#x27;, &#x27;S9&#x27;]
+as number: [&#x27;S1&#x27;, &#x27;S2&#x27;, &#x27;S9&#x27;, &#x27;S10&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>ids = [&quot;S1&quot;, &quot;S2&quot;, &quot;S10&quot;, &quot;S9&quot;]
+print(&quot;as text:  &quot;, sorted(ids))
+print(&quot;as number:&quot;, sorted(ids, key=lambda s: int(s[1:])))</code></pre><div class="output">as text:   [&#x27;S1&#x27;, &#x27;S10&#x27;, &#x27;S2&#x27;, &#x27;S9&#x27;]
+as number: [&#x27;S1&#x27;, &#x27;S2&#x27;, &#x27;S9&#x27;, &#x27;S10&#x27;]</div></div>
+        <p><b>How it works:</b> Text order gives S1, S10, S2, S9. Storing the number (as the compact key does) sorts correctly and is smaller.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Writable questions test whether you understand what really travels between map and reduce.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Concepts · basics</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“Why does Hadoop have its own IntWritable instead of using Integer?”</h4>
+      <p class="scn__situation">A common opener in Hadoop interviews.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> serialization basics.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Keys and values are sent between JVMs and written to disk, so they must be serialized.</li>
+          <li>Writable writes only the field bytes (4 for an int), with no class metadata, and objects are reused for every record.</li>
+          <li>Keys are WritableComparable so they can be sorted, often byte by byte with a RawComparator.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Debugging · runtime</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>The job runs in your IDE tests but fails on the cluster with NoSuchMethodException</h4>
+      <p class="scn__situation">The message ends with MyKey.&lt;init&gt;().</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> reflection and constructors.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Hadoop instantiates keys and values by reflection with a no-argument constructor.</li>
+          <li>Adding a constructor with parameters removed Java's default one; add a public no-arg constructor.</li>
+          <li>For nested classes, make them static, or reflection cannot create them either.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Performance · shuffle</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>A job with a custom Writable shuffles more data than the old Text version</h4>
+      <p class="scn__situation">The team expected the opposite.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> encoding choices.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Compare Map output bytes / Map output records for both versions to get bytes per record.</li>
+          <li>Look at write(): writeUTF adds 2 bytes per string, writeInt/writeLong use 4/8 bytes even for tiny numbers.</li>
+          <li>Encode IDs and dates as numbers, use VInt/VLong, drop fields the reducer doesn't need; in our lab 35 → 8 bytes per record.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Correctness · keys</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>Output has duplicate keys across part files</h4>
+      <p class="scn__situation">The same (customer, day) appears in part-r-00001 and part-r-00003 with different totals.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> hashCode and equals contracts.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>The key's hashCode() is not based on its fields (or is inconsistent with equals/compareTo), so equal keys go to different reducers.</li>
+          <li>Implement hashCode() from the same fields compareTo() uses; avoid Object.hashCode() and anything JVM-specific.</li>
+          <li>Rerun the job: each key then appears exactly once.</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

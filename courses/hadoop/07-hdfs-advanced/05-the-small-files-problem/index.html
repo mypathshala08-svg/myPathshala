@@ -1,0 +1,1805 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The small files problem | MyPhatshala</title>
+<meta name="description" content="The HDFS small files problem measured on a real Hadoop 3.5.0 cluster: the same 338,894 bytes as 10,000 files vs 1 file. Upload 281 s vs 2.1 s, read 15.2 s vs 1.9 s, NameNode FilesTotal 41 → 10,043 and BlocksTotal 31 → 10,031, fsck average block size 33 B. Then the fix: a Hadoop Archive (HAR) packs them into 4 files, readable by name through har://. NameNode memory sizing, one task per file, compaction, SequenceFiles, CombineFileInputFormat. Python simulations, quiz and interview scenarios.">
+<meta name="mp:minutes" content="26">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/07-hdfs-advanced/05-the-small-files-problem/">
+<meta property="og:title" content="The small files problem · MyPhatshala">
+<meta property="og:description" content="10,000 tiny files took 281 seconds to upload; the same bytes as one file took 2. Measure the small files problem, then fix it.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "The small files problem", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="07-hdfs-advanced/05-the-small-files-problem" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 7.5</b></nav>
+    <h1>The small files problem</h1>
+    <p class="lead">HDFS is built for big files. Store the same data as thousands of tiny files and the NameNode's memory, every client call and every job pay for it. This lesson measures the cost on a real cluster with 10,000 files against one, explains where the time and memory go, and fixes it with a Hadoop Archive and better writing habits.</p>
+    <div class="lesson-meta"><span>Module 7 · HDFS advanced</span><span>⏱ 26 min</span><span>Intermediate</span><span>281 s vs 2 s, measured</span><span>HAR fix on a real cluster</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Ten thousand files, three hundred kilobytes</h2>
+  <div class="story">
+    <p class="narration">The canteen billing app was changed to write <b>one CSV file per order</b> into HDFS. It looked tidy: <code>o_1.csv</code>, <code>o_2.csv</code>, … After one busy morning there are 10,000 files with only 339 KB of data between them. Uploading them took almost five minutes, reading them back took 15 seconds, and the cluster admin calls Riya: the NameNode just gained 20,000 new objects to keep in memory. The same data as one file uploads in 2 seconds and costs the NameNode 2 objects.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 190" role="img" aria-label="The same 339 KB of data as 10,000 small files costs 10,000 files and 10,000 blocks in NameNode memory, and many RPCs; as one file it costs one file and one block.">
+        <g font-size="10">
+          <text x="160" y="22" text-anchor="middle" font-weight="700" class="s-ink">10,000 small files</text>
+          <g style="fill:var(--track);opacity:.75">
+            <rect x="40" y="34" width="10" height="12" rx="1"/><rect x="54" y="34" width="10" height="12" rx="1"/><rect x="68" y="34" width="10" height="12" rx="1"/><rect x="82" y="34" width="10" height="12" rx="1"/><rect x="96" y="34" width="10" height="12" rx="1"/><rect x="110" y="34" width="10" height="12" rx="1"/><rect x="124" y="34" width="10" height="12" rx="1"/><rect x="138" y="34" width="10" height="12" rx="1"/><rect x="152" y="34" width="10" height="12" rx="1"/><rect x="166" y="34" width="10" height="12" rx="1"/><rect x="180" y="34" width="10" height="12" rx="1"/><rect x="194" y="34" width="10" height="12" rx="1"/><rect x="208" y="34" width="10" height="12" rx="1"/><rect x="222" y="34" width="10" height="12" rx="1"/><rect x="236" y="34" width="10" height="12" rx="1"/><rect x="250" y="34" width="10" height="12" rx="1"/><rect x="264" y="34" width="10" height="12" rx="1"/>
+            <rect x="40" y="50" width="10" height="12" rx="1"/><rect x="54" y="50" width="10" height="12" rx="1"/><rect x="68" y="50" width="10" height="12" rx="1"/><rect x="82" y="50" width="10" height="12" rx="1"/><rect x="96" y="50" width="10" height="12" rx="1"/><rect x="110" y="50" width="10" height="12" rx="1"/><rect x="124" y="50" width="10" height="12" rx="1"/><rect x="138" y="50" width="10" height="12" rx="1"/><rect x="152" y="50" width="10" height="12" rx="1"/><rect x="166" y="50" width="10" height="12" rx="1"/><rect x="180" y="50" width="10" height="12" rx="1"/><rect x="194" y="50" width="10" height="12" rx="1"/><rect x="208" y="50" width="10" height="12" rx="1"/><rect x="222" y="50" width="10" height="12" rx="1"/><rect x="236" y="50" width="10" height="12" rx="1"/><rect x="250" y="50" width="10" height="12" rx="1"/><rect x="264" y="50" width="10" height="12" rx="1"/>
+          </g>
+          <text x="160" y="80" text-anchor="middle" font-size="8.6" class="s-ink2">… 10,000 × ~33 bytes</text>
+          <rect x="40" y="92" width="240" height="56" rx="8" class="s-board"/>
+          <text x="160" y="112" text-anchor="middle" font-size="9" style="fill:#F5C77E">NameNode: +10,000 files, +10,000 blocks</text>
+          <text x="160" y="128" text-anchor="middle" font-size="9" style="fill:#9FD3B8">upload 281 s · read 15.2 s</text>
+
+          <text x="480" y="22" text-anchor="middle" font-weight="700" class="s-ink">1 file, same data</text>
+          <rect x="430" y="34" width="100" height="28" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="480" y="52" text-anchor="middle" font-size="9" class="s-green">big.csv 339 KB</text>
+          <rect x="360" y="92" width="240" height="56" rx="8" class="s-board"/>
+          <text x="480" y="112" text-anchor="middle" font-size="9" style="fill:#F5C77E">NameNode: +1 file, +1 block</text>
+          <text x="480" y="128" text-anchor="middle" font-size="9" style="fill:#9FD3B8">upload 2.1 s · read 1.9 s</text>
+        </g>
+        <text x="320" y="174" text-anchor="middle" font-size="9.6" class="s-ink2">Real lab numbers. HDFS cost grows with the NUMBER of objects, not with bytes.</text>
+        <text x="632" y="186" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>This is the famous <b>small files problem</b>. HDFS was designed for a few million large files. Every file, folder and block is an object in the NameNode's memory, and every file needs its own calls to the NameNode and its own pipeline to DataNodes. A 33-byte file costs the NameNode about as much as a 128 MB one.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Then the data size doesn't matter at all?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>For the NameNode, hardly. For jobs, small files also mean one map task per file, so 10,000 tiny tasks that spend more time starting than working. Today we measure all of it, and then fix it: pack the files into a Hadoop Archive, and see why the real fix is to never write them in the first place.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>The small files problem</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>The <b>small files problem</b> refers to the degradation of HDFS and processing performance when data is stored as a large number of files significantly smaller than the HDFS block size. Because the NameNode keeps every file, directory and block as an object in memory (commonly estimated at roughly 150 bytes each), the number of files rather than the volume of data determines NameNode heap use, RPC load and the time for listings, block reports and restarts. Each small file also requires separate metadata operations and a separate block write and read, and frameworks typically create at least one input split (and task) per file, so job overhead grows with file count. Mitigations include writing larger files at the source, periodic <b>compaction</b>, container formats (SequenceFile, Avro, Parquet), <b>Hadoop Archives (HAR)</b>, and input formats that combine files (CombineFileInputFormat).</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>HDFS keeps a catalogue card for every file and block. Millions of tiny files mean millions of cards, endless trips to the catalogue, and thousands of tiny jobs, even if all the files together are small. Store fewer, bigger files.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Small file</b><span>A file much smaller than the block size (128 MB), e.g. KBs.</span></div>
+    <div class="term"><b>Namespace object</b><span>A file, folder or block held in NameNode memory.</span></div>
+    <div class="term"><b>RPC</b><span>A call to the NameNode (create, addBlock, complete, getBlockLocations…).</span></div>
+    <div class="term"><b>Compaction</b><span>Rewriting many small files into a few large ones.</span></div>
+    <div class="term"><b>HAR</b><span>Hadoop Archive: many files packed into a few, read via <code>har://</code>.</span></div>
+    <div class="term"><b>SequenceFile</b><span>A Hadoop container file of key-value records, e.g. filename → content.</span></div>
+    <div class="term"><b>CombineFileInputFormat</b><span>Groups many small files into one split for a single map task.</span></div>
+    <div class="term"><b>Target file size</b><span>Typical goal for compaction: 128 MB to 1 GB per file.</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, same 338,894 bytes)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>NameNode objects</th><td>FilesTotal 41 → 10,043 and BlocksTotal 31 → 10,031 after the small files; fsck: 10,000 blocks, average 33 B</td></tr>
+    <tr><th>Upload</th><td>10,000 files: 281,026 ms (one <code>-put</code> command) · 1 file: 2,133 ms</td></tr>
+    <tr><th>Read everything</th><td>10,000 files: 15,168 ms · 1 file: 1,892 ms</td></tr>
+    <tr><th>Local disk</th><td><code>du -sh</code> of the 10,000 local files: 40 M for 339 KB of data (4 KB blocks)</td></tr>
+    <tr><th>After HAR + delete</th><td>4 files in <code>orders.har</code>; NameNode back to FilesTotal 49, BlocksTotal 35</td></tr>
+  </table>
+
+  <h3 id="levels">Small files at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A library that registers every page</h4>
+      <ul>
+        <li>Imagine a library that makes a catalogue card for every <b>book</b>. Fine. Now someone donates 10,000 single-page leaflets: 10,000 cards, 10,000 shelf slots.</li>
+        <li>The librarian's card box (NameNode memory) fills up, and finding anything takes longer, even though the leaflets together are thinner than one book.</li>
+        <li>Binding the leaflets into one volume (compaction or an archive) needs one card.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> Where the cost comes from</h4>
+      <ul>
+        <li><b>NameNode memory:</b> each file + block ≈ 2 objects. Our 10,000 files added 20,000 objects; the big file added 2.</li>
+        <li><b>RPCs:</b> each file needs create, addBlock, complete, plus a DataNode pipeline. That is why the upload took 281 s instead of 2 s, even in one JVM.</li>
+        <li><b>Reading:</b> one <code>getBlockLocations</code> and one DataNode connection per file: 15.2 s vs 1.9 s.</li>
+        <li><b>Jobs:</b> MapReduce and Spark create about one split per file. 10,000 files → about 10,000 tasks, each lasting milliseconds after seconds of start-up.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> How teams fix it</h4>
+      <ul>
+        <li><b>At the source:</b> buffer and write larger files (e.g. a file per hour per partition, not per event); streaming sinks with sensible flush intervals.</li>
+        <li><b>Compaction jobs:</b> Spark <code>coalesce</code>/<code>repartition</code>, Hive merge settings, or table-format commands (Delta <code>OPTIMIZE</code>, Iceberg rewrite_data_files) on a schedule.</li>
+        <li><b>Containers:</b> SequenceFile or Avro with filename as key; Parquet tables instead of per-record files.</li>
+        <li><b>HAR:</b> for archives that must keep file names but are rarely read. HAR files are immutable and add an index lookup on read.</li>
+        <li><b>Guardrails:</b> name quotas (Lesson 7.4) on landing folders, monitoring of average file size per folder, and federation for unavoidable churn (Lesson 7.2).</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “What is the small files problem in Hadoop and how do you solve it?”, give the two costs (NameNode memory, roughly 150 bytes per object; one map task per file), one number (e.g. 10,000 files vs 1 file), and three solutions: HAR, SequenceFile/combining, CombineFileInputFormat, plus “write bigger files at source”.</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Solutions compared</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Solution</th><th>Reduces NameNode objects</th><th>Keeps file names</th><th>Readable by jobs</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><b>Write bigger files at source</b></td><td>Yes, best</td><td>n/a</td><td>Yes</td><td>The real fix; needs app change</td></tr>
+      <tr><td><b>Compaction (Spark, Hive, table formats)</b></td><td>Yes</td><td>No (records merged)</td><td>Yes</td><td>Schedule regularly</td></tr>
+      <tr><td><b>HAR (hadoop archive)</b></td><td>Yes</td><td>Yes (<code>har://</code>)</td><td>Yes, via har://</td><td>Immutable; extra index lookups</td></tr>
+      <tr><td><b>SequenceFile / Avro container</b></td><td>Yes</td><td>As keys</td><td>Yes</td><td>Needs a pack job and readers that understand it</td></tr>
+      <tr><td><b>CombineFileInputFormat</b></td><td>No</td><td>Yes</td><td>Fewer tasks</td><td>Fixes job overhead only</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Where small files come from</h3>
+  <div class="cards">
+    <div class="card"><h4>Per-event writers</h4><p>Apps writing one file per order, click or sensor reading.</p><span class="tag">design</span></div>
+    <div class="card"><h4>Streaming micro-batches</h4><p>A file every few seconds per partition (Lesson 2.2 of Big Data Fundamentals).</p><span class="tag">streaming</span></div>
+    <div class="card"><h4>Over-partitioning</h4><p>Partitioning by date AND hour AND city AND item gives tiny folders with tiny files.</p><span class="tag">tables</span></div>
+    <div class="card"><h4>Too many reducers</h4><p>A job with 2,000 reducers writing 2,000 files of 50 KB each.</p><span class="tag">jobs</span></div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>A quick health metric: <b>average file size</b> = <code>CONTENT_SIZE / FILE_COUNT</code> from <code>hdfs dfs -count</code>. Our <code>/small</code> folder averaged 34 bytes. Anything far below the block size in a big folder deserves a compaction plan.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Measuring and fixing small files</h2>
+  <p>Run on the Module 5 lab cluster with <code>small_files_lab.sh</code> (in “Run it on your PC”).</p>
+  <ol class="stepper">
+    <li><h4>Create the same data two ways</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>seq 1 10000 | while read i; do printf 'order_id,item,amount\n%d,chai,20\n' $i &gt; o_$i.csv; done
+cat /tmp/small/*.csv &gt; /tmp/big.csv</code></pre><div class="output">10000
+40M	/tmp/small
+338894 bytes in big.csv</div></div>
+      <span class="behind">Even the local disk wastes space: 339 KB of data occupy 40 MB because each tiny file takes a 4 KB block (Big Data Fundamentals, Lesson 2.3).</span></li>
+    <li><h4>Upload both and watch the NameNode</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs dfs -put /tmp/small/*.csv /small/
+hdfs dfs -put /tmp/big.csv /big/
+curl -s 'http://localhost:9870/jmx?qry=Hadoop:service=NameNode,name=FSNamesystem'   # FilesTotal, BlocksTotal</code></pre><div class="output">NameNode before : FilesTotal 41  BlocksTotal 31
+put 10000 files: 281026 ms
+NameNode after small files: FilesTotal 10043  BlocksTotal 10031
+put 1 file: 2133 ms</div></div>
+      <span class="behind">4 minutes 41 seconds vs 2 seconds for the same bytes. The NameNode gained 10,002 files (10,000 + two folders) and 10,000 blocks. (Its JMX counters refresh with a delay, so they didn't show the single big file's +1 within our 6 s wait; fsck below confirms it.)</span></li>
+    <li><h4>Same bytes, very different object counts</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs dfs -count -v /small /big
+hdfs dfs -du -s /small /big
+hdfs fsck /small ; hdfs fsck /big</code></pre><div class="output">   DIR_COUNT   FILE_COUNT       CONTENT_SIZE PATHNAME
+           1        10000             338894 /small
+           1            1             338894 /big
+338894  1016682  /small
+338894  1016682  /big
+ Total blocks (validated):	10000 (avg. block size 33 B)
+ Total blocks (validated):	1 (avg. block size 338894 B)</div></div>
+      <span class="behind">Identical bytes on DataNode disks (HDFS blocks are only as big as their data, so no disk is wasted there). The difference is entirely in the NameNode: 10,000 blocks averaging 33 bytes.</span></li>
+    <li><h4>Read everything back</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs dfs -cat '/small/*.csv' | wc -l
+hdfs dfs -cat /big/big.csv | wc -l</code></pre><div class="output">20000
+read 10000 files: 15168 ms
+20000
+read 1 file: 1892 ms</div></div>
+      <span class="behind">Same 20,000 lines. The small files needed 10,000 location lookups and 10,000 DataNode connections: 8 times slower, and that's with one client and no job framework.</span></li>
+    <li><h4>Fix: pack them into a Hadoop Archive</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hadoop archive -archiveName orders.har -p /small /archives
+hdfs dfs -ls /archives/orders.har
+hdfs dfs -count -v har:///archives/orders.har ; hdfs dfs -cat har:///archives/orders.har/o_42.csv</code></pre><div class="output">archive job took 24 s
+-rw-r--r--   3 hadoop supergroup          0 2026-10-21 16:39 /archives/orders.har/_SUCCESS
+-rw-r--r--   3 hadoop supergroup     834555 2026-10-21 16:39 /archives/orders.har/_index
+-rw-r--r--   3 hadoop supergroup        388 2026-10-21 16:39 /archives/orders.har/_masterindex
+-rw-r--r--   3 hadoop supergroup     338894 2026-10-21 16:39 /archives/orders.har/part-0
+           1        10000             338894 har:///archives/orders.har
+order_id,item,amount
+42,chai,20</div></div>
+      <span class="behind">The archive job (a MapReduce job, here in local mode) packed all data into one <code>part-0</code> file plus an index. Through <code>har://</code> the 10,000 names still exist and can be read individually.</span></li>
+    <li><h4>Delete the originals and check the NameNode</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs dfs -rm -r -skipTrash /small</code></pre><div class="output">removed /small
+NameNode after HAR, without /small: FilesTotal 49  BlocksTotal 35</div></div>
+      <span class="behind">From over 10,000 files and blocks back to 49 and 35: the archive costs the NameNode 4 files. The trade-off: archives are immutable, and each read first consults the index.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>A compaction or archive job must finish and be verified <b>before</b> deleting the originals, and readers must be switched to the new location. Delete first and a failed job means lost data.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>What the NameNode does for each tiny file</h2>
+  <p>Six steps comparing one small-file upload with one big-file upload, then the archive fix.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Objects and RPCs <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Timings and counts">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@namenode : ~</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#7F8C86">$ hdfs dfs -put o_1.csv … o_10000.csv</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#9FD3B8">o_1.csv … o_2.csv … o_3.csv …</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#F5C77E">put 10000 files: 281026 ms</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#9FD3B8">FilesTotal 41 → 10043</text><text x="26" y="90" font-size="8.4" class="mono" style="fill:#9FD3B8">BlocksTotal 31 → 10031</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#7F8C86">$ hdfs dfs -put big.csv /big/</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#F5C77E">put 1 file: 2133 ms</text><text x="26" y="90" font-size="8.4" class="mono" style="fill:#9FD3B8">1 file, 1 block</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#7F8C86">$ hdfs dfs -cat '/small/*.csv'</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#F5C77E">15168 ms</text><text x="26" y="92" font-size="8.4" class="mono" style="fill:#7F8C86">$ hdfs dfs -cat /big/big.csv</text><text x="26" y="110" font-size="8.4" class="mono" style="fill:#9FD3B8">1892 ms</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#7F8C86">$ hadoop archive -archiveName orders.har …</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#9FD3B8">_index  _masterindex  part-0  _SUCCESS</text><text x="26" y="92" font-size="8.4" class="mono" style="fill:#9FD3B8">har://…/o_42.csv → 42,chai,20</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#7F8C86">$ hdfs dfs -rm -r /small</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#9FD3B8">FilesTotal 49  BlocksTotal 35</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>10,000 tiny files start uploading in one command.</li>
+          <li>It takes 281 s, and the NameNode now tracks about 10,000 more files and blocks.</li>
+          <li>The same bytes as one file: 2.1 s, one file, one block.</li>
+          <li>Reading all small files takes 15.2 s; the big file 1.9 s.</li>
+          <li>A Hadoop Archive packs the small files into a few files, still readable by name.</li>
+          <li>With the originals removed, the NameNode is back to a few dozen objects.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Client, NameNode and DataNode interactions per file">
+          <rect x="14" y="20" width="70" height="40" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="49" y="44" text-anchor="middle" font-size="8.6" font-weight="700" class="s-acc">client</text>
+          <rect x="150" y="20" width="100" height="40" rx="6" class="s-board"/><text x="200" y="44" text-anchor="middle" font-size="8.6" font-weight="700" class="s-chalk">NameNode</text>
+          <rect x="290" y="20" width="56" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="318" y="44" text-anchor="middle" font-size="8" class="s-green">DNs</text>
+          <rect x="150" y="80" width="100" height="70" rx="6" class="s-card2"/><text x="200" y="96" text-anchor="middle" font-size="8" class="s-ink2">heap: objects</text>
+          <g data-on="1"><g font-size="7.6" class="mono s-ink"><text x="20" y="84">create o_1.csv</text><text x="20" y="98">addBlock</text><text x="20" y="112">write 33 B → pipeline</text><text x="20" y="126">complete</text></g><path d="M84 40h66M250 40h40" style="fill:none;stroke:var(--track);stroke-width:2"/><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink2">per file: 3 NameNode calls + a 3-DataNode pipeline</text></g>
+          <g data-on="2"><g fill-opacity=".85">
+            <rect x="158" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="168" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="178" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="188" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="198" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="208" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="218" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="228" y="102" width="8" height="8" style="fill:var(--track)"/>
+            <rect x="158" y="114" width="8" height="8" style="fill:var(--blue)"/><rect x="168" y="114" width="8" height="8" style="fill:var(--blue)"/><rect x="178" y="114" width="8" height="8" style="fill:var(--blue)"/><rect x="188" y="114" width="8" height="8" style="fill:var(--blue)"/><rect x="198" y="114" width="8" height="8" style="fill:var(--blue)"/><rect x="208" y="114" width="8" height="8" style="fill:var(--blue)"/><rect x="218" y="114" width="8" height="8" style="fill:var(--blue)"/><rect x="228" y="114" width="8" height="8" style="fill:var(--blue)"/>
+            <rect x="158" y="126" width="8" height="8" style="fill:var(--track)"/><rect x="168" y="126" width="8" height="8" style="fill:var(--track)"/><rect x="178" y="126" width="8" height="8" style="fill:var(--track)"/><rect x="188" y="126" width="8" height="8" style="fill:var(--track)"/><rect x="198" y="126" width="8" height="8" style="fill:var(--blue)"/><rect x="208" y="126" width="8" height="8" style="fill:var(--blue)"/><rect x="218" y="126" width="8" height="8" style="fill:var(--blue)"/><rect x="228" y="126" width="8" height="8" style="fill:var(--blue)"/></g>
+            <text x="180" y="200" text-anchor="middle" font-size="8.6" class="s-ink2">× 10,000: 30,000 NameNode calls,</text><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink2">20,000 objects (orange files, blue blocks)</text></g>
+          <g data-on="3"><rect x="158" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="170" y="102" width="8" height="8" style="fill:var(--blue)"/><path d="M84 40h66M250 40h40" style="fill:none;stroke:var(--green);stroke-width:3"/><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink2">one file: 3 calls, 2 objects, one stream of bytes</text></g>
+          <g data-on="4"><path d="M84 46h66" style="fill:none;stroke:var(--track);stroke-width:2;stroke-dasharray:3 3"/><path d="M290 54H84" style="fill:none;stroke:var(--blue);stroke-width:2;stroke-dasharray:3 3"/><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink2">reading: a location lookup + a DataNode connection per file</text></g>
+          <g data-on="5"><g font-size="7.6" class="mono s-ink"><text x="160" y="112">_index</text><text x="160" y="124">_masterindex</text><text x="160" y="136">part-0 (all data)</text></g><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink2">HAR: the names live inside _index, not in the NameNode</text></g>
+          <g data-on="6"><rect x="158" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="170" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="182" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="194" y="102" width="8" height="8" style="fill:var(--track)"/><rect x="206" y="102" width="8" height="8" style="fill:var(--blue)"/><rect x="218" y="102" width="8" height="8" style="fill:var(--blue)"/><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink2">after deleting /small: only the archive's few objects remain</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Every small file needs create, addBlock and complete calls to the NameNode and its own write pipeline.</li>
+          <li>Repeated 10,000 times: about 30,000 NameNode calls and 20,000 objects in its memory.</li>
+          <li>One big file: the same three calls and two objects, then one efficient stream of bytes.</li>
+          <li>Reading costs one location lookup and one DataNode connection per file.</li>
+          <li>A HAR stores the file names in its own index file, so the NameNode only sees a few files.</li>
+          <li>Removing the originals returns the NameNode to a small object count. (Squares are symbolic.)</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Small files at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="20" y="24" width="80" height="42" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="44" text-anchor="middle" font-size="8.6" class="s-green">nightly compaction</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">→ 256 MB files</text></svg></div>
+    <div><h4>1. Nightly compaction of streaming data</h4>
+      <p>Streaming jobs write small files all day for freshness; a nightly Spark or table-format job rewrites yesterday's partitions into files of a few hundred MB.</p>
+      <div class="uc-flow"><span>Stream: many small files</span><i>→</i><span class="java">Compaction job</span><i>→</i><span>Few large files</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="24" y="22" width="72" height="46" rx="6" class="s-card2"/><text x="60" y="44" text-anchor="middle" font-size="8.6" class="s-ink">avg file size</text><text x="60" y="58" text-anchor="middle" font-size="8.6" class="s-red">34 B ⚠</text></svg></div>
+    <div><h4>2. Monitoring average file size</h4>
+      <p>Platform teams scan the namespace (from fsimage with the Offline Image Viewer, Lesson 5.4) to rank folders by file count and average size, and ask the owners of the worst offenders to fix their writers.</p>
+      <div class="uc-flow"><span>fsimage → oiv</span><i>→</i><span class="java">Files per folder</span><i>→</i><span>Owners fix writers</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="30" y="22" width="60" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="50" text-anchor="middle" font-size="9" class="s-acc">.har</text></svg></div>
+    <div><h4>3. Archiving old logs and documents</h4>
+      <p>Years of small log or document files that must stay individually retrievable are packed into HAR archives (or containers) so they stop costing NameNode memory.</p>
+      <div class="uc-flow"><span>Old small files</span><i>→</i><span class="java">hadoop archive</span><i>→</i><span>har:// access</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><path d="M20 60l20-30 20 20 20-25 20 15" style="fill:none;stroke:var(--blue);stroke-width:2.5"/></svg></div>
+    <div><h4>4. IoT and per-event uploads redesigned</h4>
+      <p>Systems that once wrote one file per sensor reading switch to a message queue (Kafka) and write hourly files per device group, cutting file counts by orders of magnitude.</p>
+      <div class="uc-flow"><span>Per-event files</span><i>→</i><span class="java">Kafka + batching</span><i>→</i><span>Hourly files</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Count the NameNode's work for small and big files</h2>
+  <p>This model counts NameNode objects (files + blocks), NameNode calls and map tasks for the same data stored as many small files or a few big ones. The cost per object comes from the common rule of thumb of about 150 bytes of heap.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+BLOCK = 128 * 1024 * 1024
+HEAP_PER_OBJECT = 150                       # bytes, rule of thumb
+
+def cost(total_bytes, n_files):
+    size = total_bytes / n_files
+    blocks_per_file = max(1, math.ceil(size / BLOCK))
+    objects = n_files * (1 + blocks_per_file)
+    calls = n_files * (2 + blocks_per_file)   # create + complete + addBlock per block
+    tasks = n_files * blocks_per_file         # about one split per block (one per small file)
+    return objects, calls, tasks, objects * HEAP_PER_OBJECT
+
+data = 338_894
+for n in [10_000, 1]:
+    o, c, t, heap = cost(data, n)
+    print(f&quot;{n:&gt;6} files: {o:&gt;6} objects, {c:&gt;6} NameNode calls, {t:&gt;6} map tasks, ~{heap / 1024:.0f} KB heap&quot;)</code></pre><div class="output"> 10000 files:  20000 objects,  30000 NameNode calls,  10000 map tasks, ~2930 KB heap
+     1 files:      2 objects,      3 NameNode calls,      1 map tasks, ~0 KB heap</div></div>
+  <ul class="anno"><li><code>    objects = n_files * (1 + blocks_per_file)</code><span>Each file is at least two objects: the file and its block. Our lab: +10,000 files and +10,000 blocks.</span></li><li><code>    calls = n_files * (2 + blocks_per_file)   # create + complete + addBlock per block</code><span>Each file needs its own create, addBlock and complete calls, the reason 10,000 uploads took 281 s.</span></li><li><code>    tasks = n_files * blocks_per_file         # about one split per block (one per small file)</code><span>Frameworks create about one split per file: 10,000 tiny tasks, mostly start-up overhead.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Small vs big",
+   "hint": "Press <b>Run<\/b>. Then try the same data as 100 files. Where is the sweet spot?",
+   "code": "import math\nBLOCK = 128 * 1024 * 1024\nHEAP_PER_OBJECT = 150                       # bytes, rule of thumb\n\ndef cost(total_bytes, n_files):\n    size = total_bytes / n_files\n    blocks_per_file = max(1, math.ceil(size / BLOCK))\n    objects = n_files * (1 + blocks_per_file)\n    calls = n_files * (2 + blocks_per_file)   # create + complete + addBlock per block\n    tasks = n_files * blocks_per_file         # about one split per block (one per small file)\n    return objects, calls, tasks, objects * HEAP_PER_OBJECT\n\ndata = 338_894\nfor n in [10_000, 1]:\n    o, c, t, heap = cost(data, n)\n    print(f\"{n:>6} files: {o:>6} objects, {c:>6} NameNode calls, {t:>6} map tasks, ~{heap / 1024:.0f} KB heap\")\n"
+  },
+  {
+   "label": "2 · Scale it up",
+   "hint": "<b>Predict first:<\/b> 10 crore small files of 50 KB vs the same data in 1 GB files. How much NameNode heap does each need?",
+   "code": "n_small, size_small = 100_000_000, 50 * 1024\ntotal = n_small * size_small\nfor name, n, blocks in [(\"small files\", n_small, 1), (\"1 GB files\", total // 1024**3, 8)]:\n    objects = n * (1 + blocks)\n    print(f\"{name:11} {n:>12,} files -> {objects * 150 / 1024**3:.1f} GB heap\")\n"
+  },
+  {
+   "label": "3 · Average file size",
+   "hint": "Compute average file size per folder from <code>-count<\/code> output and flag folders with many files (over 100) averaging below 1 MB. One small file is fine; thousands are the problem.",
+   "code": "rows = [(\"/small\", 10000, 338894), (\"/big\", 1, 338894), (\"/warehouse/sales\", 1200, 160_000_000_000)]\nfor path, files, size in rows:\n    avg = size / files\n    print(f\"{path:18} avg {avg:>14,.0f} B\", \"<- small files!\" if files > 100 and avg < 1024**2 else \"\")\n"
+  },
+  {
+   "label": "4 · Compaction plan",
+   "hint": "How many output files should a compaction job write for 45 GB of data with a target of 256 MB per file?",
+   "code": "import math\ndata_gb, target_mb = 45, 256\nprint(math.ceil(data_gb * 1024 / target_mb), \"files\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This compaction code divides by the number of output files, which is zero for an empty partition. Guard against it.",
+   "code": "data_mb, target_mb = 0, 256\nfiles = data_mb // target_mb\nprint(\"bytes per file:\", data_mb / files)\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: 10,000 files vs 1, then archive them</h3>
+  <p>Run this against the Module 5 lab cluster. It creates 10,000 tiny CSV files and one file with the same bytes inside the namenode container, uploads both, reads NameNode counters from <code>/jmx</code>, compares reads, then packs the small files into a Hadoop Archive. It takes about 6 minutes, most of it the small-file upload.</p>
+  <div class="pcrun"><h4>Small files lab</h4>
+  <div class="code" data-lang="bash" data-file="small_files_lab.sh"><pre><code>#!/usr/bin/env bash
+# small_files_lab.sh: the same 10 MB of orders as 10,000 tiny files vs 1 file, and what the NameNode pays.
+NN=&quot;docker exec lab5-namenode-1&quot;
+jmx() { sleep 6; $NN bash -c &quot;curl -s &#x27;http://localhost:9870/jmx?qry=Hadoop:service=NameNode,name=FSNamesystem&#x27;&quot; | python3 -c &quot;import sys,json; b=json.load(sys.stdin)[&#x27;beans&#x27;][0]; print(&#x27;FilesTotal&#x27;, b[&#x27;FilesTotal&#x27;], &#x27; BlocksTotal&#x27;, b[&#x27;BlocksTotal&#x27;])&quot;; }
+run() { echo &quot;\$ $1&quot;; $NN bash -c &quot;$1&quot; 2&gt;&amp;1 | grep -v -E &quot;^\s*$|WARN|INFO&quot;; echo; }
+run &quot;hdfs dfs -rm -r -f -skipTrash /small /big /archives &gt; /dev/null; rm -rf /tmp/small &amp;&amp; mkdir -p /tmp/small &amp;&amp; cd /tmp/small &amp;&amp; seq 1 10000 | while read i; do printf &#x27;order_id,item,amount\n%d,chai,20\n&#x27; \$i &gt; o_\$i.csv; done; ls | wc -l; du -sh /tmp/small; cat /tmp/small/*.csv &gt; /tmp/big.csv; ls -l /tmp/big.csv | awk &#x27;{print \$5, \&quot;bytes in big.csv\&quot;}&#x27;&quot;
+echo &quot;NameNode before : $(jmx)&quot;; echo
+run &quot;hdfs dfs -mkdir -p /small /big; s=\$(date +%s%N); hdfs dfs -put /tmp/small/*.csv /small/; echo put 10000 files: \$(( (\$(date +%s%N)-s)/1000000 )) ms&quot;
+echo &quot;NameNode after small files: $(jmx)&quot;; echo
+run &quot;s=\$(date +%s%N); hdfs dfs -put /tmp/big.csv /big/; echo put 1 file: \$(( (\$(date +%s%N)-s)/1000000 )) ms&quot;
+echo &quot;NameNode after big file   : $(jmx)&quot;; echo
+run &quot;hdfs dfs -count -v /small /big&quot;
+run &quot;hdfs dfs -du -s /small /big&quot;
+run &quot;s=\$(date +%s%N); hdfs dfs -cat &#x27;/small/*.csv&#x27; | wc -l; echo read 10000 files: \$(( (\$(date +%s%N)-s)/1000000 )) ms&quot;
+run &quot;s=\$(date +%s%N); hdfs dfs -cat /big/big.csv | wc -l; echo read 1 file: \$(( (\$(date +%s%N)-s)/1000000 )) ms&quot;
+run &quot;hdfs fsck /small | grep -E &#x27;Total files|Total blocks|Average block size&#x27;; hdfs fsck /big | grep -E &#x27;Total files|Total blocks|Average block size&#x27;&quot;
+echo &quot;=== FIX 1: pack the small files into a Hadoop Archive (HAR)&quot;
+run &quot;s=\$(date +%s); hadoop archive -archiveName orders.har -p /small /archives &gt; /dev/null 2&gt;&amp;1; echo archive job took \$(( \$(date +%s)-s )) s; hdfs dfs -ls /archives/orders.har&quot;
+run &quot;hdfs dfs -count -v har:///archives/orders.har; hdfs dfs -cat har:///archives/orders.har/o_42.csv&quot;
+run &quot;hdfs dfs -rm -r -skipTrash /small &gt; /dev/null &amp;&amp; echo removed /small&quot;
+echo &quot;NameNode after HAR, without /small: $(jmx)&quot;
+
+# Run:  bash small_files_lab.sh</code></pre><div class="output">$ hdfs dfs -rm -r -f -skipTrash /small /big /archives &gt; /dev/null; rm -rf /tmp/small &amp;&amp; mkdir -p /tmp/small &amp;&amp; cd /tmp/small &amp;&amp; seq 1 10000 | while read i; do printf &#x27;order_id,item,amount\n%d,chai,20\n&#x27; $i &gt; o_$i.csv; done; ls | wc -l; du -sh /tmp/small; cat /tmp/small/*.csv &gt; /tmp/big.csv; ls -l /tmp/big.csv | awk &#x27;{print $5, &quot;bytes in big.csv&quot;}&#x27;
+10000
+40M	/tmp/small
+338894 bytes in big.csv
+
+NameNode before : FilesTotal 41  BlocksTotal 31
+
+$ hdfs dfs -mkdir -p /small /big; s=$(date +%s%N); hdfs dfs -put /tmp/small/*.csv /small/; echo put 10000 files: $(( ($(date +%s%N)-s)/1000000 )) ms
+put 10000 files: 281026 ms
+
+NameNode after small files: FilesTotal 10043  BlocksTotal 10031
+
+$ s=$(date +%s%N); hdfs dfs -put /tmp/big.csv /big/; echo put 1 file: $(( ($(date +%s%N)-s)/1000000 )) ms
+put 1 file: 2133 ms
+
+NameNode after big file   : FilesTotal 10043  BlocksTotal 10031
+
+$ hdfs dfs -count -v /small /big
+   DIR_COUNT   FILE_COUNT       CONTENT_SIZE PATHNAME
+           1        10000             338894 /small
+           1            1             338894 /big
+
+$ hdfs dfs -du -s /small /big
+338894  1016682  /small
+338894  1016682  /big
+
+$ s=$(date +%s%N); hdfs dfs -cat &#x27;/small/*.csv&#x27; | wc -l; echo read 10000 files: $(( ($(date +%s%N)-s)/1000000 )) ms
+20000
+read 10000 files: 15168 ms
+
+$ s=$(date +%s%N); hdfs dfs -cat /big/big.csv | wc -l; echo read 1 file: $(( ($(date +%s%N)-s)/1000000 )) ms
+20000
+read 1 file: 1892 ms
+
+$ hdfs fsck /small | grep -E &#x27;Total files|Total blocks|Average block size&#x27;; hdfs fsck /big | grep -E &#x27;Total files|Total blocks|Average block size&#x27;
+Connecting to namenode via http://namenode:9870/fsck?ugi=hadoop&amp;path=%2Fsmall
+ Total files:	10000
+ Total blocks (validated):	10000 (avg. block size 33 B)
+ Total files:	0
+Connecting to namenode via http://namenode:9870/fsck?ugi=hadoop&amp;path=%2Fbig
+ Total files:	1
+ Total blocks (validated):	1 (avg. block size 338894 B)
+ Total files:	0
+
+=== FIX 1: pack the small files into a Hadoop Archive (HAR)
+$ s=$(date +%s); hadoop archive -archiveName orders.har -p /small /archives &gt; /dev/null 2&gt;&amp;1; echo archive job took $(( $(date +%s)-s )) s; hdfs dfs -ls /archives/orders.har
+archive job took 24 s
+Found 4 items
+-rw-r--r--   3 hadoop supergroup          0 2026-10-21 16:39 /archives/orders.har/_SUCCESS
+-rw-r--r--   3 hadoop supergroup     834555 2026-10-21 16:39 /archives/orders.har/_index
+-rw-r--r--   3 hadoop supergroup        388 2026-10-21 16:39 /archives/orders.har/_masterindex
+-rw-r--r--   3 hadoop supergroup     338894 2026-10-21 16:39 /archives/orders.har/part-0
+
+$ hdfs dfs -count -v har:///archives/orders.har; hdfs dfs -cat har:///archives/orders.har/o_42.csv
+   DIR_COUNT   FILE_COUNT       CONTENT_SIZE PATHNAME
+           1        10000             338894 har:///archives/orders.har
+order_id,item,amount
+42,chai,20
+
+$ hdfs dfs -rm -r -skipTrash /small &gt; /dev/null &amp;&amp; echo removed /small
+removed /small
+
+NameNode after HAR, without /small: FilesTotal 49  BlocksTotal 35</div></div>
+  <p class="muted">Real output. Timings vary; the ratio stays dramatic. The JMX counters refresh with a delay, which is why the line after the big file still shows the earlier values; fsck shows its 1 file and 1 block.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Packing small files into one container</h2>
+  <p>A container (like a SequenceFile or a HAR) stores many small files inside one big file and keeps an index of where each one starts. Follow three files being packed and one being read back.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "files = {\"o_1.csv\": b\"1,chai,20\\n\", \"o_2.csv\": b\"2,poha,30\\n\", \"o_3.csv\": b\"3,dosa,40\\n\"}",
+  "container = b\"\"",
+  "index = {}",
+  "for name, data in files.items():",
+  "    index[name] = (len(container), len(data))",
+  "    container += data",
+  "start, length = index[\"o_2.csv\"]",
+  "print(index)",
+  "print(container[start:start + length])"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>files<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}"
+   ],
+   "newVar": "files"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>container<\/code> is created: b&#x27;&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b''"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}"
+   ],
+   "newVar": "container"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>index<\/code> is created: → dict #2. A new dict object (#2) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b''"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "index"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>name<\/code> is created: &#x27;o_1.csv&#x27;. <code>data<\/code> is created: b&#x27;1,chai,20\\n&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b''"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_1.csv'"
+      ],
+      [
+       "data",
+       "b'1,chai,20\\n'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "data"
+  },
+  {
+   "line": 5,
+   "phase": "Index",
+   "note": "Like HAR's _index file: name → (offset, length) inside part-0. Object #2 dict now holds {&#x27;o_1.csv&#x27;: → tuple #3} A new tuple object (#3) is created: (0, 10)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b''"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_1.csv'"
+      ],
+      [
+       "data",
+       "b'1,chai,20\\n'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (1)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3}",
+    "<b>#3 tuple (2)<\/b> (0, 10)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>container<\/code> changes to b&#x27;1,chai,20\\n&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b'1,chai,20\\n'"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_1.csv'"
+      ],
+      [
+       "data",
+       "b'1,chai,20\\n'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (1)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3}",
+    "<b>#3 tuple (2)<\/b> (0, 10)"
+   ],
+   "newVar": "container"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;o_2.csv&#x27;. <code>data<\/code> changes to b&#x27;2,poha,30\\n&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b'1,chai,20\\n'"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_2.csv'"
+      ],
+      [
+       "data",
+       "b'2,poha,30\\n'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (1)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3}",
+    "<b>#3 tuple (2)<\/b> (0, 10)"
+   ],
+   "newVar": "data"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;o_1.csv&#x27;: → tuple #3, &#x27;o_2.csv&#x27;: → tuple #4} A new tuple object (#4) is created: (10, 10)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b'1,chai,20\\n'"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_2.csv'"
+      ],
+      [
+       "data",
+       "b'2,poha,30\\n'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (2)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3, &#x27;o_2.csv&#x27;: → tuple #4}",
+    "<b>#3 tuple (2)<\/b> (0, 10)",
+    "<b>#4 tuple (2)<\/b> (10, 10)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>container<\/code> changes to b&#x27;1,chai,20\\n2,poha,30\\n&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b'1,chai,20\\n2,poha,30\\n'"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_2.csv'"
+      ],
+      [
+       "data",
+       "b'2,poha,30\\n'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (2)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3, &#x27;o_2.csv&#x27;: → tuple #4}",
+    "<b>#3 tuple (2)<\/b> (0, 10)",
+    "<b>#4 tuple (2)<\/b> (10, 10)"
+   ],
+   "newVar": "container"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;o_3.csv&#x27;. <code>data<\/code> changes to b&#x27;3,dosa,40\\n&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b'1,chai,20\\n2,poha,30\\n'"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_3.csv'"
+      ],
+      [
+       "data",
+       "b'3,dosa,40\\n'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (2)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3, &#x27;o_2.csv&#x27;: → tuple #4}",
+    "<b>#3 tuple (2)<\/b> (0, 10)",
+    "<b>#4 tuple (2)<\/b> (10, 10)"
+   ],
+   "newVar": "data"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;o_1.csv&#x27;: → tuple #3, &#x27;o_2.csv&#x27;: → tuple #4, &#x27;o_3.csv&#x27;: → tuple #5} A new tuple object (#5) is created: (20, 10)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b'1,chai,20\\n2,poha,30\\n'"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_3.csv'"
+      ],
+      [
+       "data",
+       "b'3,dosa,40\\n'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (3)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3, &#x27;o_2.csv&#x27;: → tuple #4, &#x27;o_3.csv&#x27;: → tuple #5}",
+    "<b>#3 tuple (2)<\/b> (0, 10)",
+    "<b>#4 tuple (2)<\/b> (10, 10)",
+    "<b>#5 tuple (2)<\/b> (20, 10)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>container<\/code> changes to b&#x27;1,chai,20\\n2,poha,30\\n3,dosa,40\\n&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b'1,chai,20\\n2,poha,30\\n3,dosa,40\\n'"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_3.csv'"
+      ],
+      [
+       "data",
+       "b'3,dosa,40\\n'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (3)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3, &#x27;o_2.csv&#x27;: → tuple #4, &#x27;o_3.csv&#x27;: → tuple #5}",
+    "<b>#3 tuple (2)<\/b> (0, 10)",
+    "<b>#4 tuple (2)<\/b> (10, 10)",
+    "<b>#5 tuple (2)<\/b> (20, 10)"
+   ],
+   "newVar": "container"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b'1,chai,20\\n2,poha,30\\n3,dosa,40\\n'"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_3.csv'"
+      ],
+      [
+       "data",
+       "b'3,dosa,40\\n'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (3)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3, &#x27;o_2.csv&#x27;: → tuple #4, &#x27;o_3.csv&#x27;: → tuple #5}",
+    "<b>#3 tuple (2)<\/b> (0, 10)",
+    "<b>#4 tuple (2)<\/b> (10, 10)",
+    "<b>#5 tuple (2)<\/b> (20, 10)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Read",
+   "note": "One lookup in the index, then one read from the big file. <code>start<\/code> is created: 10. <code>length<\/code> is created: 10.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b'1,chai,20\\n2,poha,30\\n3,dosa,40\\n'"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_3.csv'"
+      ],
+      [
+       "data",
+       "b'3,dosa,40\\n'"
+      ],
+      [
+       "start",
+       "10"
+      ],
+      [
+       "length",
+       "10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (3)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3, &#x27;o_2.csv&#x27;: → tuple #4, &#x27;o_3.csv&#x27;: → tuple #5}",
+    "<b>#3 tuple (2)<\/b> (0, 10)",
+    "<b>#4 tuple (2)<\/b> (10, 10)",
+    "<b>#5 tuple (2)<\/b> (20, 10)"
+   ],
+   "newVar": "length"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b'1,chai,20\\n2,poha,30\\n3,dosa,40\\n'"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_3.csv'"
+      ],
+      [
+       "data",
+       "b'3,dosa,40\\n'"
+      ],
+      [
+       "start",
+       "10"
+      ],
+      [
+       "length",
+       "10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (3)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3, &#x27;o_2.csv&#x27;: → tuple #4, &#x27;o_3.csv&#x27;: → tuple #5}",
+    "<b>#3 tuple (2)<\/b> (0, 10)",
+    "<b>#4 tuple (2)<\/b> (10, 10)",
+    "<b>#5 tuple (2)<\/b> (20, 10)"
+   ],
+   "out": "{'o_1.csv': (0, 10), 'o_2.csv': (10, 10), 'o_3.csv': (20, 10)}\n"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ dict #1"
+      ],
+      [
+       "container",
+       "b'1,chai,20\\n2,poha,30\\n3,dosa,40\\n'"
+      ],
+      [
+       "index",
+       "→ dict #2"
+      ],
+      [
+       "name",
+       "'o_3.csv'"
+      ],
+      [
+       "data",
+       "b'3,dosa,40\\n'"
+      ],
+      [
+       "start",
+       "10"
+      ],
+      [
+       "length",
+       "10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;o_1.csv&#x27;: b&#x27;1,chai,20\\n&#x27;, &#x27;o_2.csv&#x27;: b&#x27;2,poha,30\\n&#x27;, &#x27;o_3.csv&#x27;: b&#x27;3,dosa,40\\n&#x27;}",
+    "<b>#2 dict (3)<\/b> {&#x27;o_1.csv&#x27;: → tuple #3, &#x27;o_2.csv&#x27;: → tuple #4, &#x27;o_3.csv&#x27;: → tuple #5}",
+    "<b>#3 tuple (2)<\/b> (0, 10)",
+    "<b>#4 tuple (2)<\/b> (10, 10)",
+    "<b>#5 tuple (2)<\/b> (20, 10)"
+   ],
+   "out": "b'2,poha,30\\n'\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three small-files calculations: NameNode heap, job overhead, and the payoff of compaction.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Sizing · heap</span></div>
+    <h4>How much NameNode memory do small files cost?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A team writes 20 lakh files a day, each 30 KB (one block each), and keeps them for 180 days. Using about 150 bytes per object, how much NameNode heap do they occupy?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>20,00,000/day · 180 days · 2 objects/file</pre></div><div><small>Expected output</small><pre>360,000,000 files -&gt; 101 GB of NameNode heap</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Files kept = per day × days.</li><li>Objects = files × 2 (file + block).</li><li>Heap = objects × 150 B.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "About 100 GB of heap for roughly 10 TB of data. Written as hourly 1 GB files, the same data would need a few MB.",
+   "code": "files = 2_000_000 * 180\nobjects = files * 2\nprint(f\"{files:,} files -> {objects * 150 / 1024**3:.0f} GB of NameNode heap\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "files = 2_000_000 * 180",
+  "objects = files * 2",
+  "print(f\"{files:,} files -> {objects * 150 / 1024**3:.0f} GB of NameNode heap\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>files<\/code> is created: 360000000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "360000000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "files"
+  },
+  {
+   "line": 2,
+   "phase": "Objects",
+   "note": "Bytes of data don't matter here, only counts. <code>objects<\/code> is created: 720000000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "360000000"
+      ],
+      [
+       "objects",
+       "720000000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "objects"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "360000000"
+      ],
+      [
+       "objects",
+       "720000000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "360,000,000 files -> 101 GB of NameNode heap\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Jobs · overhead</span></div>
+    <h4>How long do 10,000 tiny tasks take?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A job reads 10,000 small files, one map task each. Each task spends 1.5 s starting and 0.05 s working. With 200 task slots, how long does the map phase take, compared with 2 tasks reading 2 big files (1.5 s + 40 s work each)?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>10,000 × (1.5 + 0.05) s / 200 slots vs 2 × 41.5 s</pre></div><div><small>Expected output</small><pre>small files: 77.5 s (4.2 task-hours of pure start-up)
+big files  : 41.5 s</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Waves = tasks / slots.</li><li>Time = waves × task time.</li><li>Compare.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The small-file job is faster in wall time here, but it burns 4.2 hours of cluster time on start-up alone. CombineFileInputFormat packs many files per task to avoid this.",
+   "code": "import math\nsmall = math.ceil(10_000 / 200) * (1.5 + 0.05)\nbig = math.ceil(2 / 200) * (1.5 + 40)\nprint(f\"small files: {small:.1f} s ({10_000 * 1.5 / 3600:.1f} task-hours of pure start-up)\")\nprint(f\"big files  : {big:.1f} s\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import math",
+  "small = math.ceil(10_000 / 200) * (1.5 + 0.05)",
+  "big = math.ceil(2 / 200) * (1.5 + 40)",
+  "print(f\"small files: {small:.1f} s ({10_000 * 1.5 / 3600:.1f} task-hours of pure start-up)\")",
+  "print(f\"big files  : {big:.1f} s\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Waves",
+   "note": "10,000 tasks on 200 slots run in 50 waves. <code>small<\/code> is created: 77.5.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "77.5"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "small"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>big<\/code> is created: 41.5.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "77.5"
+      ],
+      [
+       "big",
+       "41.5"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "big"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "77.5"
+      ],
+      [
+       "big",
+       "41.5"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "small files: 77.5 s (4.2 task-hours of pure start-up)\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "77.5"
+      ],
+      [
+       "big",
+       "41.5"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "big files  : 41.5 s\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Operations · payoff</span></div>
+    <h4>Is a nightly compaction job worth it?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A streaming job creates 2,880 files per partition per day across 50 partitions. Compaction rewrites each day into 2 files per partition, costing 20 minutes of a 40-node cluster (₹600 per node-hour). Each NameNode object costs ₹0.0002 per day in extra heap and GC (illustrative). Compare the yearly cost with and without compaction.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>2,880 × 50 files/day · compaction 20 min × 40 nodes</pre></div><div><small>Expected output</small><pre>heap/GC cost avoided: Rs 3,844,720  compaction cost: Rs 2,920,000</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Objects avoided per day.</li><li>Objects accumulate: day d keeps d days of files.</li><li>Compare with compaction cost.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The bigger win is not money: without compaction, a year adds about 10 crore objects and the NameNode eventually can't restart within its maintenance window.",
+   "code": "files_per_day = 2880 * 50\navoided_per_day = (files_per_day - 2 * 50) * 2           # files + blocks\nheap_cost = sum(avoided_per_day * d for d in range(1, 366)) * 0.0002\ncompaction_cost = 365 * 20 / 60 * 40 * 600\nprint(f\"heap/GC cost avoided: Rs {heap_cost:,.0f}  compaction cost: Rs {compaction_cost:,.0f}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "files_per_day = 2880 * 50",
+  "avoided_per_day = (files_per_day - 2 * 50) * 2           # files + blocks",
+  "heap_cost = sum(avoided_per_day * d for d in range(1, 366)) * 0.0002",
+  "compaction_cost = 365 * 20 / 60 * 40 * 600",
+  "print(f\"heap/GC cost avoided: Rs {heap_cost:,.0f}  compaction cost: Rs {compaction_cost:,.0f}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>files_per_day<\/code> is created: 144000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files_per_day",
+       "144000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "files_per_day"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>avoided_per_day<\/code> is created: 287800.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files_per_day",
+       "144000"
+      ],
+      [
+       "avoided_per_day",
+       "287800"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "avoided_per_day"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>heap_cost<\/code> is created: 3844720.2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files_per_day",
+       "144000"
+      ],
+      [
+       "avoided_per_day",
+       "287800"
+      ],
+      [
+       "heap_cost",
+       "3844720.2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "heap_cost"
+  },
+  {
+   "line": 4,
+   "phase": "Accumulation",
+   "note": "Objects pile up every day the files are kept. <code>compaction_cost<\/code> is created: 2920000.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files_per_day",
+       "144000"
+      ],
+      [
+       "avoided_per_day",
+       "287800"
+      ],
+      [
+       "heap_cost",
+       "3844720.2"
+      ],
+      [
+       "compaction_cost",
+       "2920000.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "compaction_cost"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files_per_day",
+       "144000"
+      ],
+      [
+       "avoided_per_day",
+       "287800"
+      ],
+      [
+       "heap_cost",
+       "3844720.2"
+      ],
+      [
+       "compaction_cost",
+       "2920000.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "heap/GC cost avoided: Rs 3,844,720  compaction cost: Rs 2,920,000\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Why are small files a problem for HDFS?",
+  "options": [
+   "They use more DataNode disk per byte",
+   "HDFS can't store files under 1 MB",
+   "Every file and block is an object in NameNode memory and needs its own calls, regardless of size",
+   "They are slower to compress"
+  ],
+  "answer": 2,
+  "why": "In our lab both folders used 1,016,682 raw bytes; only the object counts differed."
+ },
+ {
+  "q": "How long did uploading 10,000 tiny files take vs one file with the same bytes?",
+  "options": [
+   "About the same",
+   "281 s vs 2.1 s",
+   "15 s vs 2 s",
+   "10 s vs 1 s"
+  ],
+  "answer": 1,
+  "why": "Three NameNode calls and a pipeline per file."
+ },
+ {
+  "q": "What average block size did fsck report for /small?",
+  "options": [
+   "33 B",
+   "128 MB",
+   "4 KB",
+   "338,894 B"
+  ],
+  "answer": 0,
+  "why": "10,000 blocks for 338,894 bytes."
+ },
+ {
+  "q": "What happens in MapReduce/Spark with 10,000 small input files (by default)?",
+  "options": [
+   "One task reads them all",
+   "They are skipped",
+   "They are merged automatically",
+   "About one split and task per file"
+  ],
+  "answer": 3,
+  "why": "CombineFileInputFormat or compaction avoid this."
+ },
+ {
+  "q": "What did the Hadoop Archive contain?",
+  "options": [
+   "10,000 files",
+   "Only an index",
+   "_index, _masterindex, part-0 and _SUCCESS",
+   "A zip file"
+  ],
+  "answer": 2,
+  "why": "Data in part-0, names and offsets in the index."
+ },
+ {
+  "q": "How do you read a file inside a HAR?",
+  "options": [
+   "hdfs dfs -unhar",
+   "Through a har:// path, e.g. har:///archives/orders.har/o_42.csv",
+   "It must be extracted first",
+   "With fsck"
+  ],
+  "answer": 1,
+  "why": "Real: printed “42,chai,20”."
+ },
+ {
+  "q": "Which fix removes the problem at its source?",
+  "options": [
+   "Writing larger files (batching) in the producing application",
+   "Bigger NameNode heap",
+   "More DataNodes",
+   "Lower replication"
+  ],
+  "answer": 0,
+  "why": "Everything else is cleanup after the fact."
+ },
+ {
+  "q": "Which tool reduces task overhead but NOT NameNode objects?",
+  "options": [
+   "HAR",
+   "Compaction",
+   "Writing bigger files",
+   "CombineFileInputFormat"
+  ],
+  "answer": 3,
+  "why": "It groups files into fewer splits; the files still exist."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 7.5 in one screen</h3>
+    <ul><li>Small files cost the <b>NameNode</b> (≈150 B per file/folder/block, rule of thumb), <b>RPCs</b> and <b>tasks</b>, not DataNode disk.</li><li>Lab (338,894 bytes): 10,000 files upload 281 s vs 2.1 s; read 15.2 s vs 1.9 s; +10,000 files and blocks; fsck avg block 33 B.</li><li>DataNode raw bytes were identical (1,016,682): blocks are only as big as their data.</li><li>Fixes: write bigger files at source; scheduled <b>compaction</b> (Spark, Hive, Delta OPTIMIZE, Iceberg rewrite); containers (SequenceFile, Avro, Parquet).</li><li><b>HAR</b>: <code>hadoop archive -archiveName x.har -p /src /dest</code>; read via <code>har://</code>; immutable.</li><li><b>CombineFileInputFormat</b> reduces tasks, not NameNode objects.</li><li>Watch average file size (<code>-count</code>), use name quotas on landing zones.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What is the small files problem in Hadoop?</summary><p>When data is stored as many files much smaller than the block size, the NameNode must keep an object in memory for each file and block, handle separate RPCs for each, and jobs create a task per file. Memory, NameNode load and job overhead grow with the number of files, not the amount of data, which limits scalability and performance.</p></details>
+    <details><summary>How do you solve the small files problem?</summary><p>Prevent it by writing larger files (batching, sensible streaming intervals, fewer reducers). Clean up existing data with compaction jobs that rewrite small files into large ones, Hadoop Archives (HAR) for rarely accessed data, or container formats like SequenceFile/Avro/Parquet. Use CombineFileInputFormat to reduce task counts when reading.</p></details>
+    <details><summary>What is a Hadoop Archive (HAR)?</summary><p>An archive created by the hadoop archive command (a MapReduce job) that packs many files into a few large part files plus index files. The original paths remain readable through the har:// file system, while the NameNode stores only the archive's few files. HAR files are immutable.</p></details>
+    <details><summary>Do small files waste DataNode disk space in HDFS?</summary><p>Not in the way local file systems do: an HDFS block replica only occupies the bytes it contains. In our lab, 10,000 small files and one big file used the same raw bytes. The waste is in NameNode memory, RPC load and job overhead.</p></details>
+    <details><summary>What file size should data in HDFS have?</summary><p>As a guideline, hundreds of MB to a few GB per file: at least around the block size (128 MB) and big enough that jobs have reasonably sized splits, while not so big that a single file limits parallelism (for non-splittable formats).</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Small-files exercises using the real counts and timings from the lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Objects added</h4></div>
+      <p>FilesTotal went 41 → 10,043 and BlocksTotal 31 → 10,031. How many objects did the NameNode gain?</p>
+      <div class="prob__io"><div><small>Input</small><pre>two counters</pre></div><div><small>Expected output</small><pre>20002 objects</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print((10043 - 41) + (10031 - 31), &quot;objects&quot;)</code></pre><div class="output">20002 objects</div></div>
+        <p><b>How it works:</b> 20,002: 10,000 files, 2 folders and 10,000 blocks.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Slowdown factors</h4></div>
+      <p>Compute how many times slower upload and read were for the small files.</p>
+      <div class="prob__io"><div><small>Input</small><pre>281,026 vs 2,133 ms · 15,168 vs 1,892 ms</pre></div><div><small>Expected output</small><pre>upload 132x slower, read 8.0x slower</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;upload {281026 / 2133:.0f}x slower, read {15168 / 1892:.1f}x slower&quot;)</code></pre><div class="output">upload 132x slower, read 8.0x slower</div></div>
+        <p><b>How it works:</b> About 132× slower to upload and 8× slower to read, for identical bytes.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Average file size</h4></div>
+      <p>What is the average size of the 10,000 files?</p>
+      <div class="prob__io"><div><small>Input</small><pre>338,894 bytes / 10,000</pre></div><div><small>Expected output</small><pre>33.8894 bytes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(338894 / 10000, &quot;bytes&quot;)</code></pre><div class="output">33.8894 bytes</div></div>
+        <p><b>How it works:</b> About 34 bytes; fsck reports 33 B (rounded down).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Heap after a year</h4></div>
+      <p>An app creates 5,000 small files per hour, each one block, kept forever. How many objects after one year, and roughly how much heap at 150 B each?</p>
+      <div class="prob__io"><div><small>Input</small><pre>5,000/hour × 8,760 hours</pre></div><div><small>Expected output</small><pre>87,600,000 objects -&gt; 12.2 GB</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>files = 5000 * 8760
+print(f&quot;{files * 2:,} objects -&gt; {files * 2 * 150 / 1024**3:.1f} GB&quot;)</code></pre><div class="output">87,600,000 objects -&gt; 12.2 GB</div></div>
+        <p><b>How it works:</b> 8.76 crore objects, about 12 GB of heap from a single application.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Parse the HAR index idea</h4></div>
+      <p>Given an index of name → (offset, length) and the big file, read o_3.csv.</p>
+      <div class="prob__io"><div><small>Input</small><pre>index + bytes</pre></div><div><small>Expected output</small><pre>b&#x27;3,dosa,40\n&#x27;</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>part0 = b&quot;1,chai,20\n2,poha,30\n3,dosa,40\n&quot;
+index = {&quot;o_1.csv&quot;: (0, 10), &quot;o_2.csv&quot;: (10, 10), &quot;o_3.csv&quot;: (20, 10)}
+o, l = index[&quot;o_3.csv&quot;]
+print(part0[o:o + l])</code></pre><div class="output">b&#x27;3,dosa,40\n&#x27;</div></div>
+        <p><b>How it works:</b> b"3,dosa,40\n": one index lookup and one read from part-0, like har:// does.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Tasks with combining</h4></div>
+      <p>10,000 small files of 34 bytes; CombineFileInputFormat packs files into splits of up to 128 MB. How many tasks?</p>
+      <div class="prob__io"><div><small>Input</small><pre>10,000 × 34 B</pre></div><div><small>Expected output</small><pre>1 task(s)</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+print(max(1, math.ceil(10000 * 34 / (128 * 1024**2))), &quot;task(s)&quot;)</code></pre><div class="output">1 task(s)</div></div>
+        <p><b>How it works:</b> 1 task instead of 10,000, but the NameNode still holds 20,000 objects.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Fix the writer or buy RAM?</h4></div>
+      <p>Option A: a bigger NameNode server with 512 GB RAM for ₹35 lakh. Option B: 3 developer-weeks (₹1.5 lakh each) to batch writes, which removes 90% of new small files. Which is cheaper, and which keeps working next year?</p>
+      <div class="prob__io"><div><small>Input</small><pre>₹35 lakh vs 3 × ₹1.5 lakh</pre></div><div><small>Expected output</small><pre>A: Rs 35 lakh, B: Rs 4.5 lakh</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>a, b = 35, 3 * 1.5
+print(f&quot;A: Rs {a} lakh, B: Rs {b} lakh&quot;)</code></pre><div class="output">A: Rs 35 lakh, B: Rs 4.5 lakh</div></div>
+        <p><b>How it works:</b> B costs ₹4.5 lakh vs ₹35 lakh (illustrative) and stops the growth; A only postpones the problem.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>Compaction planner</h4></div>
+      <p>Given partition sizes (MB) and file counts, plan how many output files each partition needs at a 256 MB target, and how many objects are saved.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 partitions</pre></div><div><small>Expected output</small><pre>dt=2026-10-19: 2880 -&gt; 22 files
+dt=2026-10-20: 2880 -&gt; 24 files
+dt=2026-10-21: 1500 -&gt; 2 files
+objects saved: 14424</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+parts = {&quot;dt=2026-10-19&quot;: (5400, 2880), &quot;dt=2026-10-20&quot;: (6100, 2880), &quot;dt=2026-10-21&quot;: (300, 1500)}
+saved = 0
+for p, (mb, files) in parts.items():
+    out = max(1, math.ceil(mb / 256))
+    saved += (files - out) * 2
+    print(f&quot;{p}: {files} -&gt; {out} files&quot;)
+print(&quot;objects saved:&quot;, saved)</code></pre><div class="output">dt=2026-10-19: 2880 -&gt; 22 files
+dt=2026-10-20: 2880 -&gt; 24 files
+dt=2026-10-21: 1500 -&gt; 2 files
+objects saved: 14424</div></div>
+        <p><b>How it works:</b> 22 + 24 + 2 output files; about 14,424 objects saved. Real compaction jobs also respect sort order and table formats.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">The small files problem is one of the most asked Hadoop interview topics, from freshers to architects.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">HDFS · basics</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“Why is HDFS bad at small files?”</h4>
+      <p class="scn__situation">Almost guaranteed in a Hadoop interview.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> NameNode memory and task overhead.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Every file and block is an object in NameNode RAM (~150 bytes each); millions of tiny files exhaust the heap.</li>
+          <li>Each file means separate NameNode calls and DataNode connections, and one map task per file.</li>
+          <li>Fixes: bigger files at source, compaction, HAR or SequenceFiles, CombineFileInputFormat.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Streaming · design</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>A Spark Streaming job writes 50,000 files an hour</h4>
+      <p class="scn__situation">Analysts' queries on the output table get slower each week; the NameNode heap keeps growing.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> write-side and cleanup-side fixes.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Reduce output partitions per micro-batch (coalesce) and increase the trigger interval if freshness allows.</li>
+          <li>Use a table format (Delta/Iceberg/Hudi) and schedule compaction (OPTIMIZE / rewrite) for closed partitions.</li>
+          <li>Monitor average file size per partition and alert when it drops.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Operations · cleanup</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>Find the folders causing the most NameNode load</h4>
+      <p class="scn__situation">The cluster has 40 crore objects; you must find who owns them without hammering the NameNode.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> offline analysis.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Fetch the latest fsimage (<code>hdfs dfsadmin -fetchImage</code>) and convert it with the Offline Image Viewer to a delimited file.</li>
+          <li>Aggregate by folder: file count, total size, average size; rank by file count with small average size.</li>
+          <li>Work with owners: compaction or HAR for old data, writer fixes for new data, name quotas on landing folders.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Concepts · trade-offs</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“HAR or SequenceFile?”</h4>
+      <p class="scn__situation">A follow-up after you list solutions.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> when each fits.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>HAR keeps the original paths readable through har:// with no code change for readers; good for archives. It is immutable and reading has index overhead.</li>
+          <li>SequenceFile packs files as key-value records (name → bytes); efficient and splittable for MapReduce, but readers must use the container.</li>
+          <li>For tabular data, compaction into Parquet is usually better than both.</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

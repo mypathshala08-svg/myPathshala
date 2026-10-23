@@ -1,0 +1,2302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DistCp and disaster recovery | MyPhatshala</title>
+<meta name="description" content="DistCp and Hadoop disaster recovery on two real Hadoop 3.5.0 clusters: a full copy (170 MB, 5 maps, 25.5 s), the silent skip of a changed file with plain DistCp, -update (size + checksum), -delete, snapshot-diff sync (-diff s1 s2: 1 file, rename replayed), -bandwidth, and a failover drill that shows the RPO. RPO and RTO, active-passive vs active-active, -p preserve flags, checksums, cloud targets, architecture diagram, animations, Python simulation, quiz and interview scenarios.">
+<meta name="mp:minutes" content="32">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/12-multiple-clusters-and-operations/02-distcp-and-disaster-recovery/">
+<meta property="og:title" content="DistCp and disaster recovery · MyPhatshala">
+<meta property="og:description" content="Plain DistCp said &quot;success&quot; and skipped a changed file. Sync two real clusters properly, use snapshot diffs, and run a DR drill.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "DistCp and disaster recovery", "learningResourceType": "Lesson", "educationalLevel": "Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="12-multiple-clusters-and-operations/02-distcp-and-disaster-recovery" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 12.2</b></nav>
+    <h1>DistCp and disaster recovery</h1>
+    <p class="lead">A second cluster only protects you if it holds the right data. This lesson copies a production folder to a real DR cluster with DistCp, catches the classic silent skip, keeps the copy in sync with -update, -delete and snapshot diffs, and runs a failover drill that shows exactly what a disaster would cost.</p>
+    <div class="lesson-meta"><span>Module 12 · Multiple clusters and operations</span><span>⏱ 32 min</span><span>Advanced</span><span>Two real clusters</span><span>Architecture diagram + 2 animations</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>A second cluster, and the menu that didn't arrive</h2>
+  <div class="story">
+    <p class="narration">The college now runs two clusters: <b>prod</b> on campus and a <b>DR</b> (disaster recovery) cluster in another building. Every night Kabir copies <code>/prod/canteen</code> to DR with DistCp. One morning the canteen raises the price of chai from ₹15 to ₹18. The nightly copy finishes "successfully", yet the DR menu still says ₹15. Same file name, same size (143 bytes), so plain DistCp skipped it without a word.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="Prod cluster copies to the DR cluster each night; plain DistCp skipped the changed menu file because it had the same name and size, while distcp -update compared checksums and copied it.">
+        <g font-size="10">
+          <rect x="20" y="20" width="200" height="120" rx="10" class="s-soft-green" style="stroke:var(--green)"/>
+          <text x="120" y="40" text-anchor="middle" font-weight="700" class="s-green">PROD · hdfs://namenode</text>
+          <g font-size="8.6" class="mono s-ink"><text x="36" y="62">canteen_orders.csv</text><text x="36" y="78">menu.csv  chai,18  143 B</text><text x="36" y="94">orders_day31.csv  (new)</text><text x="36" y="110">feedback.txt  (deleted)</text></g>
+          <rect x="420" y="20" width="200" height="120" rx="10" class="s-soft-blue" style="stroke:var(--blue)"/>
+          <text x="520" y="40" text-anchor="middle" font-weight="700" class="s-blue">DR · hdfs://nn-canteen</text>
+          <g font-size="8.6" class="mono s-ink"><text x="436" y="62">canteen_orders.csv</text><text x="436" y="78" class="s-red">menu.csv  chai,15  143 B</text><text x="436" y="94">orders_day31.csv  ✓</text><text x="436" y="110" class="s-red">feedback.txt  still here</text></g>
+          <path d="M220 70h200" style="fill:none;stroke:var(--track);stroke-width:2;stroke-dasharray:5 4"/>
+          <text x="320" y="62" text-anchor="middle" font-size="8.6" class="s-acc">hadoop distcp (no options)</text>
+          <text x="320" y="88" text-anchor="middle" font-size="8.6" class="s-ink2">Files Copied=1 · Files Skipped=4</text>
+          <path d="M220 118h200" style="fill:none;stroke:var(--green);stroke-width:2"/>
+          <text x="320" y="112" text-anchor="middle" font-size="8.6" class="s-green">distcp -update -delete</text>
+          <text x="320" y="134" text-anchor="middle" font-size="8.6" class="s-ink2">size + checksum → menu fixed, file removed</text>
+        </g>
+        <text x="320" y="176" text-anchor="middle" font-size="9.6" class="s-ink2">Real run between two lab clusters. "Success" only means the copy did what you asked.</text>
+        <text x="632" y="194" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, DistCp said it succeeded. How can DR be wrong?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Without options DistCp only asks "does a file with this name already exist there?". If yes, it skips it. It never looked inside menu.csv. With <code>-update</code> it compares size and checksum, and with <code>-delete</code> it also removes what prod deleted.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>And if the campus floods tonight, DR is our only copy. Whatever wasn't synced yet is simply gone.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>That loss window has a name: the <b>RPO</b>. Today we copy between two real clusters, fix the sync, use snapshots so a nightly sync copies only what changed, and run a failover drill to see exactly what DR would miss.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>DistCp and disaster recovery</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>DistCp</b> (distributed copy) is a Hadoop tool that copies large directory trees within or between clusters by running a <b>map-only MapReduce job</b>: the client builds a listing of source files, splits it into chunks, and each map task copies its files directly from source DataNodes to destination DataNodes, verifying checksums. Options control incremental behaviour (<code>-update</code> copies files whose size or checksum differ, <code>-overwrite</code> copies unconditionally, <code>-delete</code> removes target files missing from the source, <code>-diff</code> applies a snapshot difference), what metadata is preserved (<code>-p</code>), parallelism (<code>-m</code>) and bandwidth (<code>-bandwidth</code>). <b>Disaster recovery (DR)</b> is the set of plans, copies and procedures that let a service resume at another site after the primary site is lost. It is measured by the <b>recovery point objective (RPO)</b>, the maximum acceptable data loss expressed as time, and the <b>recovery time objective (RTO)</b>, the maximum acceptable time to restore service.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>DistCp is <code>cp</code> for clusters: many map tasks copy files in parallel. DR means keeping a second copy far away and knowing how to switch to it. RPO = how much data you can lose; RTO = how long you can be down.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>DistCp</b><span>Distributed copy: a map-only MapReduce job that copies files.</span></div>
+    <div class="term"><b>-update</b><span>Copy only files that are missing or differ in size or checksum.</span></div>
+    <div class="term"><b>-delete</b><span>Remove target files that no longer exist at the source.</span></div>
+    <div class="term"><b>-diff s1 s2</b><span>Sync using the difference between two source snapshots.</span></div>
+    <div class="term"><b>DR site</b><span>A second cluster in another place that can take over.</span></div>
+    <div class="term"><b>RPO</b><span>Recovery point objective: how much recent data you may lose.</span></div>
+    <div class="term"><b>RTO</b><span>Recovery time objective: how long until service is back.</span></div>
+    <div class="term"><b>Failover drill</b><span>A planned rehearsal of switching to DR.</span></div>
+  </div>
+
+  <h3 id="architecture">Architecture at a glance</h3>
+  <p>Our lab: two clusters on separate networks. DistCp's map tasks run on prod's YARN and write straight into the DR cluster's DataNodes. Snapshots on both sides make each night's sync small.</p>
+  <div class="scene">
+    <svg viewBox="0 0 640 280" role="img" aria-label="Prod site with NameNode, YARN and three workers running DistCp map tasks; DR site with NameNode nn-canteen and three DataNodes; snapshots s1 and s2 on both; a nightly scheduler; the RPO window between the last sync and a disaster.">
+      <g font-size="9">
+        <rect x="12" y="12" width="300" height="196" rx="10" class="s-soft-green" style="stroke:var(--green)"/>
+        <text x="162" y="30" text-anchor="middle" font-weight="700" class="s-green">PROD site · lab8</text>
+        <rect x="26" y="40" width="130" height="34" rx="6" class="s-board"/><text x="91" y="55" text-anchor="middle" font-size="8.4" class="s-chalk">NameNode</text><text x="91" y="67" text-anchor="middle" font-size="7.6" style="fill:#9FD3B8">/prod/canteen · s1 s2</text>
+        <rect x="168" y="40" width="130" height="34" rx="6" class="s-board"/><text x="233" y="55" text-anchor="middle" font-size="8.4" class="s-chalk">ResourceManager</text><text x="233" y="67" text-anchor="middle" font-size="7.6" style="fill:#F5C77E">runs the DistCp job</text>
+        <rect x="26" y="90" width="84" height="66" rx="6" class="s-card2"/><text x="68" y="104" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink">worker1</text>
+        <rect x="118" y="90" width="84" height="66" rx="6" class="s-card2"/><text x="160" y="104" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink">worker2</text>
+        <rect x="210" y="90" width="84" height="66" rx="6" class="s-card2"/><text x="252" y="104" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink">worker3</text>
+        <g font-size="7.6"><rect x="34" y="112" width="68" height="16" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="68" y="123" text-anchor="middle" class="s-acc">copy map</text>
+        <rect x="126" y="112" width="68" height="16" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="160" y="123" text-anchor="middle" class="s-acc">copy map</text>
+        <rect x="218" y="112" width="68" height="16" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="252" y="123" text-anchor="middle" class="s-acc">copy map</text>
+        <text x="68" y="146" text-anchor="middle" class="s-ink2">DataNode</text><text x="160" y="146" text-anchor="middle" class="s-ink2">DataNode</text><text x="252" y="146" text-anchor="middle" class="s-ink2">DataNode</text></g>
+        <rect x="26" y="168" width="272" height="30" rx="6" class="s-card2"/><text x="162" y="187" text-anchor="middle" font-size="8.2" class="s-ink">scheduler (cron / Oozie / Airflow): every night 01:00</text>
+
+        <rect x="400" y="12" width="228" height="196" rx="10" class="s-soft-blue" style="stroke:var(--blue)"/>
+        <text x="514" y="30" text-anchor="middle" font-weight="700" class="s-blue">DR site · lab72</text>
+        <rect x="414" y="40" width="200" height="34" rx="6" class="s-board"/><text x="514" y="55" text-anchor="middle" font-size="8.4" class="s-chalk">NameNode nn-canteen</text><text x="514" y="67" text-anchor="middle" font-size="7.6" style="fill:#9FD3B8">/dr/canteen · s1 (s2 after sync)</text>
+        <g font-size="8"><rect x="414" y="90" width="60" height="40" rx="6" class="s-card2"/><text x="444" y="114" text-anchor="middle" class="s-ink">DN</text>
+        <rect x="484" y="90" width="60" height="40" rx="6" class="s-card2"/><text x="514" y="114" text-anchor="middle" class="s-ink">DN</text>
+        <rect x="554" y="90" width="60" height="40" rx="6" class="s-card2"/><text x="584" y="114" text-anchor="middle" class="s-ink">DN</text></g>
+        <text x="514" y="150" text-anchor="middle" font-size="8" class="s-ink2">same data, other building</text>
+        <text x="514" y="166" text-anchor="middle" font-size="8" class="s-ink2">can run jobs if prod is lost</text>
+
+        <path d="M298 57C350 57 360 57 414 57" style="fill:none;stroke:var(--blue);stroke-width:1.6;stroke-dasharray:4 3"/>
+        <text x="356" y="50" text-anchor="middle" font-size="7.6" class="s-blue">listing</text>
+        <path d="M294 120C340 120 370 110 414 110" style="fill:none;stroke:var(--track);stroke-width:2.2"/>
+        <text x="356" y="134" text-anchor="middle" font-size="7.6" class="s-acc">blocks</text>
+
+        <path d="M40 240H600" style="fill:none;stroke:var(--line);stroke-width:1.4"/>
+        <circle cx="150" cy="240" r="5" style="fill:var(--green)"/><text x="150" y="258" text-anchor="middle" font-size="8.2" class="s-green">last sync 01:00</text>
+        <circle cx="470" cy="240" r="5" style="fill:#D64545"/><text x="470" y="258" text-anchor="middle" font-size="8.2" class="s-red">disaster 19:00</text>
+        <rect x="150" y="226" width="320" height="10" rx="3" style="fill:#D64545;opacity:.25"/>
+        <text x="310" y="222" text-anchor="middle" font-size="8.2" class="s-red">RPO window: data written here exists only on prod</text>
+      </g>
+      <text x="632" y="274" text-anchor="end" class="s-wm">myphatshala.in</text>
+    </svg>
+  </div>
+
+  <h3>From our lab (two Hadoop 3.5.0 clusters)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>First full copy</th><td>5 files, 169,964,453 bytes, 5 map tasks, 25.5 s</td></tr>
+    <tr><th>Plain re-run</th><td>Files Copied=1, Files Skipped=4: the changed <code>menu.csv</code> (same 143 bytes) was skipped and the deleted file stayed</td></tr>
+    <tr><th><code>-update</code> / <code>-delete</code></th><td>Copied only <code>menu.csv</code> (143 bytes); then removed <code>feedback.txt</code> on DR</td></tr>
+    <tr><th>Snapshot diff</th><td><code>-update -diff s1 s2</code>: 1 file (28,086 bytes), 1 map, 15.1 s; a rename was replayed as a rename</td></tr>
+    <tr><th>Throttle</th><td><code>-bandwidth 1</code> on 19.4 MB: 34.2 s</td></tr>
+    <tr><th>DR drill</th><td>The Lesson 8.1 report ran on DR data with identical results; a file written after the last sync was missing on DR</td></tr>
+  </table>
+
+  <h3 id="levels">DR at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A spare key with a neighbour</h4>
+      <ul>
+        <li>You keep a spare house key with a neighbour in another street. If you lose yours, you can still get in: that is <b>DR</b>.</li>
+        <li>If you changed the lock last week and forgot to give the neighbour the new key, the spare is useless. A stale copy is the risk DistCp <code>-update</code> protects against.</li>
+        <li>How old the spare may be is the <b>RPO</b>; how long it takes to walk over and get it is the <b>RTO</b>.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How DistCp decides what to copy</h4>
+      <ul>
+        <li><b>No option:</b> if a file with the same name exists at the target, it is skipped. Our changed <code>menu.csv</code> was skipped.</li>
+        <li><b><code>-update</code>:</b> copy if the target is missing, or if size or checksum differ. <code>menu.csv</code> was copied (143 bytes).</li>
+        <li><b><code>-overwrite</code>:</b> copy everything again, always.</li>
+        <li><b><code>-delete</code></b> (with <code>-update</code> or <code>-overwrite</code>): delete target files not present at the source.</li>
+        <li><b><code>-diff s1 s2</code>:</b> ask the NameNode what changed between two snapshots, replay renames and deletes, copy only new or modified files.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What production DR adds</h4>
+      <ul>
+        <li><b>Metadata too:</b> Hive/Impala tables need their metastore replicated (schemas, partitions), not just HDFS files.</li>
+        <li><b>Checksums across settings:</b> HDFS file checksums depend on block size and checksum type. Copy with <code>-pb</code> (preserve block size) or use <code>dfs.checksum.combine.mode=COMPOSITE_CRC</code>; <code>-skipcrccheck</code> hides real corruption and is a last resort.</li>
+        <li><b>Across versions and clouds:</b> <code>webhdfs://</code> works between different Hadoop versions; <code>s3a://</code> and <code>abfs://</code> targets copy to cloud storage.</li>
+        <li><b>Drills:</b> a DR plan that was never tested is a guess. Teams run the real jobs on DR a few times a year and measure the actual RTO.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For "What is DistCp and how is it used for DR?", say: a map-only MapReduce job that copies files in parallel between clusters; incremental with <code>-update</code> (size + checksum) and <code>-delete</code>; snapshot-based with <code>-diff</code>; and define RPO and RTO with one example.</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>DistCp options and DR designs</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Option</th><th>What it does</th><th>Our lab</th></tr></thead>
+    <tbody>
+      <tr><td><b>(none)</b></td><td>Copy files whose name doesn't exist at the target</td><td>Skipped the changed menu.csv</td></tr>
+      <tr><td><b>-update</b></td><td>Copy if missing or size/checksum differ</td><td>Copied 143 bytes</td></tr>
+      <tr><td><b>-overwrite</b></td><td>Copy everything, always</td><td>(not used; would copy 162 MB)</td></tr>
+      <tr><td><b>-delete</b></td><td>Remove target files missing at source</td><td>Removed feedback.txt</td></tr>
+      <tr><td><b>-diff s1 s2</b></td><td>Replay a snapshot diff; needs s1 on both sides</td><td>1 file, 1 map, rename kept</td></tr>
+      <tr><td><b>-p[rbugpcaxt]</b></td><td>Preserve replication, block size, user, group, permissions, checksum type, ACLs, xattrs, times</td><td>Use <code>-pb</code> when block sizes differ</td></tr>
+      <tr><td><b>-m N</b> / <b>-strategy dynamic</b></td><td>Number of maps; dynamic lets fast maps take more chunks</td><td>One map per file here</td></tr>
+      <tr><td><b>-bandwidth MB</b></td><td>Limit each map's speed, to protect the network</td><td>1 MB/s: 34.2 s for 19.4 MB</td></tr>
+      <tr><td><b>-i</b> / <b>-atomic</b></td><td>Ignore failures / copy to a temp folder then move in one step</td><td>-</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>DR designs</h3>
+  <div class="cards">
+    <div class="card"><h4>Backup only</h4><p>Copies on cheaper storage (another cluster, cloud). Protects data, but restoring and rebuilding compute takes days: long RTO.</p><span class="tag">cheapest</span></div>
+    <div class="card"><h4>Active–passive</h4><p>A DR cluster kept in sync (nightly or hourly DistCp). Jobs move there on failover. RPO = sync interval.</p><span class="tag">most common</span></div>
+    <div class="card"><h4>Active–active</h4><p>Both sites ingest and serve; data is written to both or replicated continuously. Low RPO/RTO, highest cost and complexity.</p><span class="tag">critical systems</span></div>
+    <div class="card"><h4>Cloud as DR</h4><p>DistCp to <code>s3a://</code> or <code>abfs://</code>; spin up a cloud cluster only during a disaster.</p><span class="tag">pay when used</span></div>
+  </div>
+
+  <h3>Animated example: when Chennai floods</h3>
+  <div class="anim anim--one" data-frames="6" data-delay="4800">
+    <div class="anim__title">An insurer's DR night <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="An insurance company's Chennai data centre floods; it fails over to its Pune DR cluster and loses only the data written since the last sync">
+          <rect x="10" y="10" width="150" height="70" rx="8" class="s-soft-green" style="stroke:var(--green)"/>
+          <text x="85" y="26" text-anchor="middle" font-size="8.6" font-weight="700" class="s-green">Chennai (prod)</text>
+          <rect x="200" y="10" width="150" height="70" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/>
+          <text x="275" y="26" text-anchor="middle" font-size="8.6" font-weight="700" class="s-blue">Pune (DR)</text>
+          <g data-on="1-"><text x="85" y="46" text-anchor="middle" font-size="7.8" class="s-ink">claims, policies</text><text x="85" y="60" text-anchor="middle" font-size="7.8" class="s-ink">40 TB in HDFS</text>
+            <text x="275" y="46" text-anchor="middle" font-size="7.8" class="s-ink">copy as of 01:00</text></g>
+          <g data-on="1"><path d="M160 45h40" style="fill:none;stroke:var(--green);stroke-width:2"/><text x="180" y="112" text-anchor="middle" font-size="9" class="s-ink">01:00 · nightly distcp -update -diff</text><text x="180" y="128" text-anchor="middle" font-size="8.4" class="s-ink2">only the day's changes travel (about 300 GB)</text></g>
+          <g data-on="2"><text x="180" y="112" text-anchor="middle" font-size="9" class="s-ink">09:00–18:00 · a normal day</text><text x="180" y="128" text-anchor="middle" font-size="8.4" class="s-ink2">new claims are written only in Chennai</text></g>
+          <g data-on="3-"><rect x="10" y="10" width="150" height="70" rx="8" style="fill:#2E5AAC;opacity:.35"/><text x="85" y="72" text-anchor="middle" font-size="8.6" font-weight="700" class="s-red">FLOODED 19:00</text></g>
+          <g data-on="3"><text x="180" y="112" text-anchor="middle" font-size="9" class="s-ink">19:00 · power and network lost in Chennai</text><text x="180" y="128" text-anchor="middle" font-size="8.4" class="s-ink2">the on-call team opens the DR runbook</text></g>
+          <g data-on="4-"><path d="M275 80v30" style="fill:none;stroke:var(--blue);stroke-width:2"/><rect x="215" y="110" width="120" height="22" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/><text x="275" y="125" text-anchor="middle" font-size="8.2" class="s-blue">jobs + users → Pune</text></g>
+          <g data-on="4"><text x="110" y="150" text-anchor="middle" font-size="9" class="s-ink">19:40 · DNS and job configs</text><text x="110" y="164" text-anchor="middle" font-size="8.4" class="s-ink2">point to the DR NameNode</text></g>
+          <g data-on="5-"><rect x="10" y="176" width="340" height="22" rx="5" class="s-soft-acc" style="stroke:#D64545"/><text x="180" y="191" text-anchor="middle" font-size="8.4" class="s-red">lost: claims written 01:00–19:00 (RPO = 18 h)</text></g>
+          <g data-on="5"><text x="110" y="150" text-anchor="middle" font-size="9" class="s-ink">20:30 · reports run in Pune</text><text x="110" y="164" text-anchor="middle" font-size="8.4" class="s-ink2">RTO achieved: 1 h 30 min</text></g>
+          <g data-on="6"><text x="110" y="150" text-anchor="middle" font-size="9" class="s-green">next quarter: hourly snapshots + diff sync</text><text x="110" y="164" text-anchor="middle" font-size="8.4" class="s-ink2">RPO drops from 18 h to about 1 h</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li><b>01:00:</b> the nightly snapshot-diff DistCp copies the day's changes from Chennai to the Pune DR cluster.</li>
+          <li><b>Daytime:</b> new claims keep arriving, but only Chennai has them until the next sync.</li>
+          <li><b>19:00:</b> a flood takes the Chennai data centre offline.</li>
+          <li><b>19:40:</b> following the runbook, the team points jobs and users at the Pune NameNode.</li>
+          <li><b>20:30:</b> service is back (RTO 1.5 hours), but claims written since 01:00 are lost (RPO 18 hours).</li>
+          <li><b>Afterwards:</b> hourly snapshots and diff syncs cut the possible loss to about one hour. (Illustrative scenario.)</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>Run DistCp from the cluster with spare YARN capacity and, when versions differ, from the newer one, reading the older cluster over <code>webhdfs://</code>. In our lab the maps ran on prod's workers, the only machines that could reach both clusters.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Two clusters, one nightly sync, one drill</h2>
+  <p>Prod is the Module 8 cluster; DR is the federation cluster from Lesson 7.2 (<code>hdfs://nn-canteen:8020</code>). Commands run on a prod worker, which <code>join_clusters.sh</code> connects to both networks.</p>
+  <ol class="stepper">
+    <li><h4>First full copy</h4>
+      <div class="code" data-lang="bash" data-file="lab8-worker1"><pre><code>hadoop distcp /prod/canteen hdfs://nn-canteen:8020/dr/</code></pre><div class="output">   exit 0, took 25540 ms
+   Bytes Copied=169964453
+   Files Copied=5
+   Launched map tasks=5</div></div>
+      <span class="behind">A map-only job: the client listed 5 files, YARN ran 5 copy maps on prod's workers, and each map streamed blocks from prod DataNodes into DR DataNodes, then compared checksums.</span></li>
+    <li><h4>A day later: plain DistCp again</h4>
+      <div class="code" data-lang="bash" data-file="lab8-worker1"><pre><code>hadoop distcp /prod/canteen hdfs://nn-canteen:8020/dr/</code></pre><div class="output">   Bytes Copied=70147
+   Files Copied=1
+   Files Skipped=4
+    143 /dr/canteen/menu.csv
+    5093962 /dr/canteen/feedback.txt</div></div>
+      <span class="behind">Only the new file was copied. The changed <code>menu.csv</code> (same name, same size) and the deleted <code>feedback.txt</code> were left as they were, and the job still reported success.</span></li>
+    <li><h4><code>-update</code>, then <code>-update -delete</code></h4>
+      <div class="code" data-lang="bash" data-file="lab8-worker1"><pre><code>hadoop distcp -update /prod/canteen hdfs://nn-canteen:8020/dr/canteen
+hadoop distcp -update -delete /prod/canteen hdfs://nn-canteen:8020/dr/canteen
+hdfs dfs -cat hdfs://nn-canteen:8020/dr/canteen/menu.csv | head -1</code></pre><div class="output">   Bytes Copied=143
+   Files Copied=1
+   Files Skipped=4
+   ...
+   Files Skipped=5
+chai,drink,18,A</div></div>
+      <span class="behind">With <code>-update</code>, source and target paths are the folders themselves. Size was equal, but the checksums differed, so <code>menu.csv</code> was copied. <code>-delete</code> then removed <code>feedback.txt</code> from DR.</span></li>
+    <li><h4>Sync only a snapshot difference</h4>
+      <div class="code" data-lang="bash" data-file="lab8-worker1"><pre><code>hdfs dfs -createSnapshot /prod/canteen s1     # and s1 on the DR copy
+hdfs dfs -mv  .../orders_day31.csv .../orders_2026-10-31.csv ; put orders_2026-11-01.csv
+hdfs dfs -createSnapshot /prod/canteen s2
+hdfs snapshotDiff /prod/canteen s1 s2
+hadoop distcp -update -diff s1 s2 /prod/canteen hdfs://nn-canteen:8020/dr/canteen</code></pre><div class="output">   M	.
+   +	./orders_2026-11-01.csv
+   R	./orders_day31.csv -> ./orders_2026-10-31.csv
+   exit 0, took 15085 ms
+   Bytes Copied=28086
+   Files Copied=1
+   Launched map tasks=1</div></div>
+      <span class="behind">DistCp asked the NameNode for the diff instead of comparing every file. The rename was applied as a rename on DR (no bytes copied) and only the new 28 KB file travelled. On millions of files this is the difference between hours of listing and minutes.</span></li>
+    <li><h4>Throttle the copy</h4>
+      <div class="code" data-lang="bash" data-file="lab8-worker1"><pre><code>hadoop distcp -bandwidth 1 /prod/canteen/student_orders.csv hdfs://nn-canteen:8020/dr/throttled.csv</code></pre><div class="output">   exit 0, took 34192 ms
+   Bytes Copied=19418699</div></div>
+      <span class="behind">At 1 MB/s per map, 19.4 MB needs at least 19 s of copying plus job start-up. Throttling protects the link between sites during business hours.</span></li>
+    <li><h4>Disaster drill</h4>
+      <div class="code" data-lang="bash" data-file="lab8-worker1"><pre><code>hadoop jar mr.jar ItemRevenue hdfs://nn-canteen:8020/dr/canteen/canteen_orders.csv hdfs://nn-canteen:8020/dr/report
+hdfs dfs -put day32.csv /prod/canteen/orders_2026-11-02.csv      # written after the last sync</code></pre><div class="output">completed successfully
+chai	50170	752550
+dosa	49948	2247660
+idli	49984	1499520
+   prod files: 7   DR files: 6   missing on DR: orders_2026-11-02.csv</div></div>
+      <span class="behind">The Lesson 8.1 report gives identical numbers from DR data. But anything written after the last sync exists only on prod: if prod were gone now, that file would be lost. That gap is the RPO.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Never point a scheduled sync at the wrong direction or the wrong folder with <code>-delete</code>: it will faithfully delete everything the source doesn't have. Test every new sync command on a scratch folder first, and keep snapshots on the target so a bad run can be undone.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Our sync, run by run</h2>
+  <p>Six steps from the lab: full copy, silent skip, update, delete, snapshot diff, drill.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Prod → DR <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="DistCp output of each run">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@worker1 : ~</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop distcp /prod/canteen dr:/dr/</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">Files Copied=5</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">Bytes Copied=169964453</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#F5C77E">took 25540 ms, 5 maps</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop distcp /prod/canteen dr:/dr/</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">Files Copied=1</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#FF8A80">Files Skipped=4</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#FF8A80">dr menu.csv: chai,drink,15</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop distcp -update ...</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">Files Copied=1</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">Bytes Copied=143</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#F5C77E">dr menu.csv: chai,drink,18</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop distcp -update -delete ...</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">Files Skipped=5</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#F5C77E">feedback.txt removed on DR</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop distcp -update -diff s1 s2 ...</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">R orders_day31 -> orders_2026-10-31</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">Files Copied=1  Bytes Copied=28086</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#F5C77E">took 15085 ms, 1 map</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop jar mr.jar ItemRevenue dr:...</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">completed successfully</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">chai 50170 752550</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#FF8A80">missing on DR: orders_2026-11-02.csv</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The first copy moves all 5 files, 170 MB, with 5 map tasks in 25.5 s.</li>
+          <li>Run again without options: only the new file is copied; the changed menu is skipped.</li>
+          <li>With -update, the menu's checksum mismatch is noticed and 143 bytes are copied.</li>
+          <li>With -delete, DR also loses the file prod deleted.</li>
+          <li>The snapshot diff sync copies one 28 KB file and replays a rename.</li>
+          <li>The drill runs the report on DR; one file written after the sync is missing.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Files on prod and DR for each run">
+          <rect x="10" y="16" width="150" height="150" rx="8" class="s-soft-green" style="stroke:var(--green)"/><text x="85" y="32" text-anchor="middle" font-size="8.6" font-weight="700" class="s-green">PROD</text>
+          <rect x="200" y="16" width="150" height="150" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/><text x="275" y="32" text-anchor="middle" font-size="8.6" font-weight="700" class="s-blue">DR</text>
+          <g data-on="1"><g font-size="7.6" class="mono s-ink"><text x="20" y="52">canteen_orders</text><text x="20" y="66">student_orders</text><text x="20" y="80">orders_x30</text><text x="20" y="94">menu (chai 15)</text><text x="20" y="108">feedback</text><text x="210" y="52">canteen_orders</text><text x="210" y="66">student_orders</text><text x="210" y="80">orders_x30</text><text x="210" y="94">menu (chai 15)</text><text x="210" y="108">feedback</text></g><path d="M160 80h40" style="fill:none;stroke:var(--track);stroke-width:2"/><text x="180" y="200" text-anchor="middle" font-size="8.4" class="s-ink2">5 maps, each copies one file, then checks checksums</text></g>
+          <g data-on="2"><g font-size="7.6" class="mono s-ink"><text x="20" y="52">… 3 big files</text><text x="20" y="66" class="s-acc">menu (chai 18)</text><text x="20" y="80" class="s-acc">orders_day31 (new)</text><text x="20" y="94" style="text-decoration:line-through">feedback</text><text x="210" y="52">… 3 big files</text><text x="210" y="66" class="s-red">menu (chai 15)</text><text x="210" y="80" class="s-green">orders_day31 ✓</text><text x="210" y="94" class="s-red">feedback</text></g><text x="180" y="200" text-anchor="middle" font-size="8.4" class="s-ink2">no option: a name that exists at DR is skipped</text></g>
+          <g data-on="3"><g font-size="7.6" class="mono s-ink"><text x="20" y="66">menu: 143 B, crc A</text><text x="210" y="66">menu: 143 B, crc B</text></g><path d="M160 63h40" style="fill:none;stroke:var(--green);stroke-width:2"/><text x="180" y="200" text-anchor="middle" font-size="8.4" class="s-ink2">-update: same size, different checksum → copy</text></g>
+          <g data-on="4"><g font-size="7.6" class="mono s-ink"><text x="210" y="94" class="s-red" style="text-decoration:line-through">feedback</text></g><text x="180" y="200" text-anchor="middle" font-size="8.4" class="s-ink2">-delete: DR now mirrors prod exactly</text></g>
+          <g data-on="5"><g font-size="7.6" class="mono s-ink"><text x="20" y="52">snapshot s1 → s2</text><text x="20" y="66" class="s-acc">R day31 → 2026-10-31</text><text x="20" y="80" class="s-acc">+ 2026-11-01</text><text x="210" y="66">rename applied</text><text x="210" y="80" class="s-green">2026-11-01 ✓</text></g><path d="M160 74h40" style="fill:none;stroke:var(--green);stroke-width:2"/><text x="180" y="200" text-anchor="middle" font-size="8.4" class="s-ink2">the NameNode's diff replaces a full comparison</text></g>
+          <g data-on="6"><g font-size="7.6" class="mono s-ink"><text x="20" y="66">7 files</text><text x="20" y="80" class="s-red">+ 2026-11-02 (after sync)</text><text x="210" y="66">6 files</text><text x="210" y="80" class="s-green">report ✓ same numbers</text></g><text x="180" y="200" text-anchor="middle" font-size="8.4" class="s-ink2">the unsynced file is the RPO: lost if prod dies now</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>DR becomes an exact copy: each map copies one file and verifies it.</li>
+          <li>Prod changed the menu, added a file and deleted one; plain DistCp only notices the new name.</li>
+          <li>-update compares size and checksum; equal sizes are not enough to skip.</li>
+          <li>-delete removes target files that no longer exist at the source.</li>
+          <li>With snapshots, only the listed changes are applied: a rename and one new file.</li>
+          <li>DR can run the same jobs, but always lags prod by the time since the last sync.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>DistCp and DR at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="10" y="26" width="40" height="38" rx="6" class="s-soft-green" style="stroke:var(--green)"/><rect x="70" y="26" width="40" height="38" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><path d="M50 45h20" style="fill:none;stroke:var(--track);stroke-width:2"/></svg></div>
+    <div><h4>1. Bank: regulator-mandated DR</h4>
+      <p>Banks must show a tested DR plan. Transaction history in HDFS is synced to a second data centre several times a day, and failover drills are run and reported every quarter.</p>
+      <div class="uc-flow"><span>Hourly snapshots</span><i>→</i><span class="java">distcp -diff</span><i>→</i><span>DR site + drill report</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="20" y="24" width="80" height="42" rx="6" class="s-card2"/><text x="60" y="49" text-anchor="middle" font-size="9" class="s-ink">CDH → CDP</text></svg></div>
+    <div><h4>2. Telecom: migrating to a new cluster</h4>
+      <p>When a telecom moves petabytes of call records from an old Hadoop distribution to a new cluster, DistCp over <code>webhdfs://</code> copies data while both run; repeated <code>-update</code> runs shrink the final cut-over window.</p>
+      <div class="uc-flow"><span>Old cluster</span><i>→</i><span class="java">distcp -update (repeat)</span><i>→</i><span>New cluster</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><path d="M30 60c-12 0-12-20 4-20 2-12 22-14 28-2 14-4 22 10 14 22z" class="s-soft-blue" style="stroke:var(--blue)"/></svg></div>
+    <div><h4>3. E-commerce: archive to the cloud</h4>
+      <p>Old order data is copied to object storage (<code>s3a://</code> or <code>abfs://</code>) with DistCp, verified, and then deleted from the on-prem cluster to free disks.</p>
+      <div class="uc-flow"><span>HDFS (cold data)</span><i>→</i><span class="java">distcp → s3a://</span><i>→</i><span>Cheap object storage</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="49" text-anchor="middle" font-size="8.6" class="s-acc">prod → dev</text></svg></div>
+    <div><h4>4. Analytics team: refreshing a test cluster</h4>
+      <p>A masked sample of production data is copied to the development cluster every week so new jobs are tested on realistic data without touching prod.</p>
+      <div class="uc-flow"><span>Prod (masked)</span><i>→</i><span class="java">distcp -update -delete</span><i>→</i><span>Dev cluster</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><circle cx="60" cy="45" r="26" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="49" text-anchor="middle" font-size="8.6" class="s-green">2 regions</text></svg></div>
+    <div><h4>5. Healthcare: two regions, active–active</h4>
+      <p>A hospital chain ingests records in two regions and replicates each region's data to the other, so either site can serve all reports if one goes down.</p>
+      <div class="uc-flow"><span>Region A ⇄ Region B</span><i>→</i><span class="java">scheduled two-way sync</span><i>→</i><span>Either site serves</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Decide like DistCp</h2>
+  <p>This model reproduces our second run. Each file has a size and a checksum. Plain DistCp only checks whether the name exists at the target; <code>-update</code> also compares size and checksum; <code>-delete</code> removes target files the source no longer has.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>prod = {&quot;canteen_orders.csv&quot;: (4692009, &quot;c1&quot;), &quot;menu.csv&quot;: (143, &quot;m2&quot;),
+        &quot;orders_day31.csv&quot;: (70147, &quot;d1&quot;), &quot;orders_x30.csv&quot;: (140759640, &quot;x1&quot;),
+        &quot;student_orders.csv&quot;: (19418699, &quot;s1&quot;)}
+dr = {&quot;canteen_orders.csv&quot;: (4692009, &quot;c1&quot;), &quot;menu.csv&quot;: (143, &quot;m1&quot;),
+      &quot;feedback.txt&quot;: (5093962, &quot;f1&quot;), &quot;orders_x30.csv&quot;: (140759640, &quot;x1&quot;),
+      &quot;student_orders.csv&quot;: (19418699, &quot;s1&quot;)}
+
+def plan(src, dst, update=False, delete=False):
+    copy, skip = [], []
+    for name, (size, crc) in src.items():
+        if name not in dst:
+            copy.append(name)
+        elif update and dst[name] != (size, crc):   # size OR checksum differs
+            copy.append(name)
+        else:
+            skip.append(name)
+    gone = [n for n in dst if n not in src] if delete else []
+    return copy, skip, gone
+
+for opts in [{}, {&quot;update&quot;: True}, {&quot;update&quot;: True, &quot;delete&quot;: True}]:
+    c, s, g = plan(prod, dr, **opts)
+    print(opts or &quot;no options&quot;, &quot;-&gt; copy&quot;, c, &quot;| skipped&quot;, len(s), &quot;| delete&quot;, g)</code></pre><div class="output">no options -&gt; copy [&#x27;orders_day31.csv&#x27;] | skipped 4 | delete []
+{&#x27;update&#x27;: True} -&gt; copy [&#x27;menu.csv&#x27;, &#x27;orders_day31.csv&#x27;] | skipped 3 | delete []
+{&#x27;update&#x27;: True, &#x27;delete&#x27;: True} -&gt; copy [&#x27;menu.csv&#x27;, &#x27;orders_day31.csv&#x27;] | skipped 3 | delete [&#x27;feedback.txt&#x27;]</div></div>
+  <ul class="anno"><li><code>        elif update and dst[name] != (size, crc):   # size OR checksum differs</code><span>Our menu.csv: same 143 bytes, different checksum. Only -update notices.</span></li><li><code>    gone = [n for n in dst if n not in src] if delete else []</code><span>-delete is what removed feedback.txt from the DR copy.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Three ways to sync",
+   "hint": "Press <b>Run<\/b>. Which run leaves DR with the old chai price?",
+   "code": "prod = {\"canteen_orders.csv\": (4692009, \"c1\"), \"menu.csv\": (143, \"m2\"),\n        \"orders_day31.csv\": (70147, \"d1\"), \"orders_x30.csv\": (140759640, \"x1\"),\n        \"student_orders.csv\": (19418699, \"s1\")}\ndr = {\"canteen_orders.csv\": (4692009, \"c1\"), \"menu.csv\": (143, \"m1\"),\n      \"feedback.txt\": (5093962, \"f1\"), \"orders_x30.csv\": (140759640, \"x1\"),\n      \"student_orders.csv\": (19418699, \"s1\")}\n\ndef plan(src, dst, update=False, delete=False):\n    copy, skip = [], []\n    for name, (size, crc) in src.items():\n        if name not in dst:\n            copy.append(name)\n        elif update and dst[name] != (size, crc):   # size OR checksum differs\n            copy.append(name)\n        else:\n            skip.append(name)\n    gone = [n for n in dst if n not in src] if delete else []\n    return copy, skip, gone\n\nfor opts in [{}, {\"update\": True}, {\"update\": True, \"delete\": True}]:\n    c, s, g = plan(prod, dr, **opts)\n    print(opts or \"no options\", \"-> copy\", c, \"| skipped\", len(s), \"| delete\", g)\n"
+  },
+  {
+   "label": "2 · Snapshot diff to plan",
+   "hint": "Turn a snapshotDiff report into actions: + copy, - delete, R rename, M ignore (a modified folder).",
+   "code": "diff = [\"M\\t.\", \"+\\t./orders_2026-11-01.csv\", \"R\\t./orders_day31.csv -> ./orders_2026-10-31.csv\"]\nfor line in diff:\n    kind, path = line.split(\"\\t\")\n    if kind == \"+\":\n        print(\"copy  \", path)\n    elif kind == \"-\":\n        print(\"delete\", path)\n    elif kind == \"R\":\n        old, new = path.split(\" -> \")\n        print(\"rename\", old, \"to\", new, \"(no bytes copied)\")\n"
+  },
+  {
+   "label": "3 · RPO from a schedule",
+   "hint": "<b>Predict first:<\/b> syncs at 01:00 and 13:00; the disaster strikes at 12:40. How many hours of data are lost? What about hourly syncs?",
+   "code": "def lost_hours(sync_hours, disaster):\n    last = max(h for h in sync_hours if h <= disaster)\n    return disaster - last\nprint(\"twice a day:\", round(lost_hours([1, 13], 12 + 40 / 60), 2), \"h\")\nprint(\"hourly     :\", round(lost_hours(list(range(24)), 12 + 40 / 60), 2), \"h\")\n"
+  },
+  {
+   "label": "4 · Will the sync fit?",
+   "hint": "2 TB changes per day; the link between sites gives 400 MB/s, but DistCp may use only half during the night window of 6 h. Does it fit?",
+   "code": "changed_mb = 2 * 1024 * 1024\nrate = 400 / 2\nhours = changed_mb / rate / 3600\nprint(f\"{hours:.1f} h needed, window 6 h ->\", \"fits\" if hours <= 6 else \"does NOT fit\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This plan should copy changed files, but it crashes on a file that exists only at the target. Fix the lookup.",
+   "code": "src = {\"a.csv\": (10, \"x\")}\ndst = {\"a.csv\": (10, \"y\"), \"old.csv\": (5, \"z\")}\nfor name in dst:\n    if src[name] != dst[name]:\n        print(\"copy\", name)\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: two clusters, one sync, one drill</h3>
+  <p>You need the Module 8 lab (prod) and the Lesson 7.2 federation lab (DR) running together; stop the Module 5 lab to save memory. <code>join_clusters.sh</code> connects only prod's three workers to the DR network: both clusters use names like <code>namenode</code>, and when we joined every container to both networks, a client resolved <code>resourcemanager</code> to the wrong network and got "Connection refused". Then run <code>distcp_lab.sh</code> inside <code>lab8-worker1-1</code>. It takes about 4 minutes.</p>
+  <div class="pcrun"><h4>Connect the clusters, then sync and drill</h4>
+  <div class="code" data-lang="bash" data-file="distcp_lab.sh"><pre><code># ---- join_clusters.sh (run on your PC) ----
+# join_clusters.sh: let the lab8 workers (where DistCp&#x27;s map tasks run) reach the second cluster.
+# Only the workers join: the clusters both use names like &quot;namenode&quot;, and a container on two networks
+# can answer to the wrong address. Run on your PC.
+docker compose -p lab72 start                       # the Lesson 7.2 federation cluster = our &quot;DR&quot; site
+for c in worker1 worker2 worker3; do docker network connect lab72_default lab8-$c-1; done
+docker exec lab8-worker1-1 getent hosts namenode resourcemanager nn-canteen
+docker cp lab8-namenode-1:/tmp/mr/mr.jar /tmp/mr.jar &amp;&amp; docker cp /tmp/mr.jar lab8-worker1-1:/tmp/mr.jar
+
+# ---- distcp_lab.sh ----
+# distcp_lab.sh: copy a production folder to a second (DR) cluster, keep it in sync, then fail over.
+# PROD = the Module 8 cluster (hdfs://namenode). DR = the federation cluster of Lesson 7.2 (hdfs://nn-canteen:8020).
+# The lab8 workers are joined to the DR cluster&#x27;s Docker network (join_clusters.sh). Run inside lab8-worker1-1.
+DR=hdfs://nn-canteen:8020
+P=/prod/canteen
+D=$DR/dr/canteen
+run() { local name=$1; shift; local s=$(date +%s%N)
+  hadoop distcp &quot;$@&quot; &gt; /tmp/$name.log 2&gt;&amp;1; echo &quot;   exit $?, took $(( ($(date +%s%N) - s) / 1000 / 1000 )) ms&quot;
+  grep -E &quot;Bytes Copied|Bytes Skipped|Files Copied|Files Skipped|DIR_COPY|Launched map tasks|Deleted|Files Deleted|Bytes Expected&quot; /tmp/$name.log | sed &#x27;s/^\s*/   /&#x27; | sort -u; }
+hdfs dfs -rm -r -f -skipTrash $P $DR/dr &gt; /dev/null 2&gt;&amp;1
+hdfs dfs -mkdir -p $P $DR/dr
+hdfs dfs -cp /user/hadoop/data/{canteen_orders.csv,student_orders.csv,menu.csv,feedback.txt,orders_x30.csv} $P/
+echo &quot;== 0. what we protect (prod)&quot;
+hdfs dfs -count -h $P
+echo &quot;== 1. first full copy to the DR cluster (one map per file here)&quot;
+run d1 $P $DR/dr/
+hdfs dfs -count -h $D
+echo &quot;== 2. a day later: one new file, one changed file, one deleted file&quot;
+hdfs dfs -cat $P/canteen_orders.csv | head -5001 &gt; /tmp/day31.csv; hdfs dfs -put -f /tmp/day31.csv $P/orders_day31.csv
+hdfs dfs -cat $P/menu.csv | sed &#x27;s/^chai,drink,15/chai,drink,18/&#x27; &gt; /tmp/menu.csv; hdfs dfs -put -f /tmp/menu.csv $P/menu.csv
+hdfs dfs -rm -skipTrash $P/feedback.txt &gt; /dev/null
+echo &quot;-- plain distcp again (no -update): the existing files are NOT replaced&quot;
+run d2a $P $DR/dr/
+hdfs dfs -ls $D | awk &#x27;{print &quot;   &quot;, $5, $8}&#x27; | sed &quot;s#$DR##&quot;
+echo &quot;-- distcp -update: copy only what is new or different&quot;
+run d2 -update $P $D
+echo &quot;-- distcp -update -delete: also remove what prod deleted&quot;
+run d3 -update -delete $P $D
+hdfs dfs -ls $D | awk &#x27;{print &quot;   &quot;, $5, $8}&#x27; | sed &quot;s#$DR##&quot;
+echo &quot;-- is the price change there?&quot;; hdfs dfs -cat $D/menu.csv | head -1
+echo &quot;== 3. snapshot-based sync: only the difference between two snapshots&quot;
+hdfs dfsadmin -allowSnapshot $P &gt; /dev/null; hdfs dfsadmin -fs $DR -allowSnapshot /dr/canteen &gt; /dev/null
+hdfs dfs -createSnapshot $P s1 &gt; /dev/null; hdfs dfs -createSnapshot $D s1 &gt; /dev/null
+hdfs dfs -mv $P/orders_day31.csv $P/orders_2026-10-31.csv
+hdfs dfs -cat $P/canteen_orders.csv | head -2001 | tail -2000 &gt; /tmp/day32.csv; hdfs dfs -put /tmp/day32.csv $P/orders_2026-11-01.csv
+hdfs dfs -createSnapshot $P s2 &gt; /dev/null
+hdfs snapshotDiff $P s1 s2 2&gt;/dev/null | sed &#x27;s/^/   /&#x27;
+run d4 -update -diff s1 s2 $P $D
+hdfs dfs -ls $D | awk &#x27;{print &quot;   &quot;, $5, $8}&#x27; | sed &quot;s#$DR##&quot;
+echo &quot;== 4. throttle: -bandwidth 1 (MB/s per map) on the 19 MB student_orders.csv&quot;
+run d5 -bandwidth 1 $P/student_orders.csv $DR/dr/throttled.csv
+echo &quot;== 5. disaster drill: prod is down, run the report on the DR cluster&quot;
+hdfs dfs -rm -r -f -skipTrash $DR/dr/report &gt; /dev/null 2&gt;&amp;1
+hadoop jar /tmp/mr.jar ItemRevenue $D/canteen_orders.csv $DR/dr/report &gt; /tmp/dr_job.log 2&gt;&amp;1
+grep -oE &quot;completed successfully|failed with state [A-Z]+&quot; /tmp/dr_job.log
+hdfs dfs -cat $DR/dr/report/part-r-00000 | head -3
+echo &quot;-- recovery point: what DR has vs prod right now&quot;
+hdfs dfs -put -f /tmp/day32.csv $P/orders_2026-11-02.csv     # written after the last sync
+echo &quot;   prod files: $(hdfs dfs -ls $P | grep -c &#x27;^-&#x27;)   DR files: $(hdfs dfs -ls $D | grep -c &#x27;^-&#x27;)   missing on DR: $(diff &lt;(hdfs dfs -ls $P | grep &#x27;^-&#x27; | awk -F/ &#x27;{print $NF}&#x27;) &lt;(hdfs dfs -ls $D | grep &#x27;^-&#x27; | awk -F/ &#x27;{print $NF}&#x27;) | grep &#x27;^&lt;&#x27; | cut -c3-)&quot;
+
+# Run:  docker cp distcp_lab.sh lab8-worker1-1:/tmp/ &amp;&amp; docker exec lab8-worker1-1 bash /tmp/distcp_lab.sh</code></pre><div class="output">== 0. what we protect (prod)
+           1            5            162.1 M /prod/canteen
+== 1. first full copy to the DR cluster (one map per file here)
+   exit 0, took 25540 ms
+   Bytes Copied=169964453
+   Bytes Expected=169964453
+   DIR_COPY=1
+   Files Copied=5
+   Launched map tasks=5
+           1            5            162.1 M hdfs://nn-canteen:8020/dr/canteen
+== 2. a day later: one new file, one changed file, one deleted file
+-- plain distcp again (no -update): the existing files are NOT replaced
+   exit 0, took 19796 ms
+   Bytes Copied=70147
+   Bytes Expected=70147
+   Bytes Skipped=164870491
+   DIR_COPY=1
+   Files Copied=1
+   Files Skipped=4
+   Launched map tasks=3
+    4692009 /dr/canteen/canteen_orders.csv
+    5093962 /dr/canteen/feedback.txt
+    143 /dr/canteen/menu.csv
+    70147 /dr/canteen/orders_day31.csv
+    140759640 /dr/canteen/orders_x30.csv
+    19418699 /dr/canteen/student_orders.csv
+-- distcp -update: copy only what is new or different
+   exit 0, took 20135 ms
+   Bytes Copied=143
+   Bytes Expected=143
+   Bytes Skipped=164940495
+   Files Copied=1
+   Files Skipped=4
+   Launched map tasks=3
+-- distcp -update -delete: also remove what prod deleted
+   exit 0, took 24772 ms
+   Bytes Skipped=164940638
+   Files Skipped=5
+   Launched map tasks=4
+    4692009 /dr/canteen/canteen_orders.csv
+    143 /dr/canteen/menu.csv
+    70147 /dr/canteen/orders_day31.csv
+    140759640 /dr/canteen/orders_x30.csv
+    19418699 /dr/canteen/student_orders.csv
+-- is the price change there?
+chai,drink,18,A
+== 3. snapshot-based sync: only the difference between two snapshots
+   Difference between snapshot s1 and snapshot s2 under directory /prod/canteen:
+   M	.
+   +	./orders_2026-11-01.csv
+   R	./orders_day31.csv -&gt; ./orders_2026-10-31.csv
+   exit 0, took 15085 ms
+   Bytes Copied=28086
+   Bytes Expected=28086
+   Files Copied=1
+   Launched map tasks=1
+    4692009 /dr/canteen/canteen_orders.csv
+    143 /dr/canteen/menu.csv
+    70147 /dr/canteen/orders_2026-10-31.csv
+    28086 /dr/canteen/orders_2026-11-01.csv
+    140759640 /dr/canteen/orders_x30.csv
+    19418699 /dr/canteen/student_orders.csv
+== 4. throttle: -bandwidth 1 (MB/s per map) on the 19 MB student_orders.csv
+   exit 0, took 34192 ms
+   Bytes Copied=19418699
+   Bytes Expected=19418699
+   Files Copied=1
+   Launched map tasks=1
+== 5. disaster drill: prod is down, run the report on the DR cluster
+completed successfully
+chai	50170	752550
+dosa	49948	2247660
+idli	49984	1499520
+-- recovery point: what DR has vs prod right now
+   prod files: 7   DR files: 6   missing on DR: orders_2026-11-02.csv</div></div>
+  <p class="muted">Real output. Timings vary. Notice step 2: plain DistCp reports success with "Files Skipped=4" while the DR menu still has the old price.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Applying a snapshot diff</h2>
+  <p>Follow a DR folder as the diff is applied: a rename moves a name without copying bytes, and only the new file is copied.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "dr = {\"orders_day31.csv\": 70147, \"menu.csv\": 143}",
+  "diff = [(\"R\", \"orders_day31.csv\", \"orders_2026-10-31.csv\"), (\"+\", \"orders_2026-11-01.csv\", 28086)]",
+  "copied = 0",
+  "for op in diff:",
+  "    if op[0] == \"R\":",
+  "        dr[op[2]] = dr.pop(op[1])",
+  "    elif op[0] == \"+\":",
+  "        dr[op[1]] = op[2]",
+  "        copied += op[2]",
+  "print(sorted(dr), copied)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>dr<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;orders_day31.csv&#x27;: 70147, &#x27;menu.csv&#x27;: 143}"
+   ],
+   "newVar": "dr"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>diff<\/code> is created: → list #2. A new list object (#2) is created: [→ tuple #3, → tuple #4] A new tuple object (#3) is created: (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;) A new tuple object (#4) is created: (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;orders_day31.csv&#x27;: 70147, &#x27;menu.csv&#x27;: 143}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ],
+   "newVar": "diff"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>copied<\/code> is created: 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ],
+      [
+       "copied",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;orders_day31.csv&#x27;: 70147, &#x27;menu.csv&#x27;: 143}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ],
+   "newVar": "copied"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>op<\/code> is created: → tuple #3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ],
+      [
+       "copied",
+       "0"
+      ],
+      [
+       "op",
+       "→ tuple #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;orders_day31.csv&#x27;: 70147, &#x27;menu.csv&#x27;: 143}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ],
+   "newVar": "op"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ],
+      [
+       "copied",
+       "0"
+      ],
+      [
+       "op",
+       "→ tuple #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;orders_day31.csv&#x27;: 70147, &#x27;menu.csv&#x27;: 143}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Rename",
+   "note": "The DR NameNode just renames the file; no data crosses the network. Object #1 dict now holds {&#x27;menu.csv&#x27;: 143, &#x27;orders_2026-10-31.…: 70147}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ],
+      [
+       "copied",
+       "0"
+      ],
+      [
+       "op",
+       "→ tuple #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;menu.csv&#x27;: 143, &#x27;orders_2026-10-31.…: 70147}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>op<\/code> changes to → tuple #4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ],
+      [
+       "copied",
+       "0"
+      ],
+      [
+       "op",
+       "→ tuple #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;menu.csv&#x27;: 143, &#x27;orders_2026-10-31.…: 70147}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ],
+   "newVar": "op"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ],
+      [
+       "copied",
+       "0"
+      ],
+      [
+       "op",
+       "→ tuple #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;menu.csv&#x27;: 143, &#x27;orders_2026-10-31.…: 70147}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ],
+      [
+       "copied",
+       "0"
+      ],
+      [
+       "op",
+       "→ tuple #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;menu.csv&#x27;: 143, &#x27;orders_2026-10-31.…: 70147}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #1 dict now holds {&#x27;menu.csv&#x27;: 143, &#x27;orders_2026-10-31.…: 70147, &#x27;orders_2026-11-01.…: 28086}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ],
+      [
+       "copied",
+       "0"
+      ],
+      [
+       "op",
+       "→ tuple #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;menu.csv&#x27;: 143, &#x27;orders_2026-10-31.…: 70147, &#x27;orders_2026-11-01.…: 28086}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Copy",
+   "note": "Only new or modified files are copied: 28,086 bytes in our lab. <code>copied<\/code> changes to 28086.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ],
+      [
+       "copied",
+       "28086"
+      ],
+      [
+       "op",
+       "→ tuple #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;menu.csv&#x27;: 143, &#x27;orders_2026-10-31.…: 70147, &#x27;orders_2026-11-01.…: 28086}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ],
+   "newVar": "copied"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ],
+      [
+       "copied",
+       "28086"
+      ],
+      [
+       "op",
+       "→ tuple #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;menu.csv&#x27;: 143, &#x27;orders_2026-10-31.…: 70147, &#x27;orders_2026-11-01.…: 28086}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dr",
+       "→ dict #1"
+      ],
+      [
+       "diff",
+       "→ list #2"
+      ],
+      [
+       "copied",
+       "28086"
+      ],
+      [
+       "op",
+       "→ tuple #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;menu.csv&#x27;: 143, &#x27;orders_2026-10-31.…: 70147, &#x27;orders_2026-11-01.…: 28086}",
+    "<b>#2 list (2)<\/b> [→ tuple #3, → tuple #4]",
+    "<b>#3 tuple (3)<\/b> (&#x27;R&#x27;, &#x27;orders_day31.csv&#x27;, &#x27;orders_2026-10-31.csv&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;+&#x27;, &#x27;orders_2026-11-01.csv&#x27;, 28086)"
+   ],
+   "out": "['menu.csv', 'orders_2026-10-31.csv', 'orders_2026-11-01.csv'] 28086\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Four DR calculations from different industries: RPO and RTO, the sync window, snapshot savings and cost.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Banking · RPO/RTO</span></div>
+    <h4>Does the nightly sync meet the regulator?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A bank's policy says RPO ≤ 4 hours and RTO ≤ 2 hours. Today it syncs once a night at 02:00 and failover takes 90 minutes. What is the worst-case RPO, and does it comply?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>sync every 24 h · failover 90 min · limits 4 h / 2 h</pre></div><div><small>Expected output</small><pre>RPO 24 h (limit 4) -&gt; FAIL; RTO 1.5 h (limit 2) -&gt; OK
+syncs needed per day for RPO 4 h: 6</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Worst case: disaster just before the next sync.</li><li>RPO = sync interval; RTO = failover time.</li><li>Compare with the limits.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "RTO passes, RPO fails. Six snapshot-diff syncs a day (every 4 hours) fix it.",
+   "code": "interval_h, failover_min = 24, 90\nrpo, rto = interval_h, failover_min / 60\nprint(f\"RPO {rpo} h (limit 4) -> {'OK' if rpo <= 4 else 'FAIL'}; RTO {rto} h (limit 2) -> {'OK' if rto <= 2 else 'FAIL'}\")\nprint(\"syncs needed per day for RPO 4 h:\", 24 // 4)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "interval_h, failover_min = 24, 90",
+  "rpo, rto = interval_h, failover_min / 60",
+  "print(f\"RPO {rpo} h (limit 4) -> {'OK' if rpo <= 4 else 'FAIL'}; RTO {rto} h (limit 2) -> {'OK' if rto <= 2 else 'FAIL'}\")",
+  "print(\"syncs needed per day for RPO 4 h:\", 24 // 4)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>interval_h<\/code> is created: 24. <code>failover_min<\/code> is created: 90.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "interval_h",
+       "24"
+      ],
+      [
+       "failover_min",
+       "90"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "failover_min"
+  },
+  {
+   "line": 2,
+   "phase": "Worst case",
+   "note": "Data written just after a sync waits a full interval. <code>rpo<\/code> is created: 24. <code>rto<\/code> is created: 1.5.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "interval_h",
+       "24"
+      ],
+      [
+       "failover_min",
+       "90"
+      ],
+      [
+       "rpo",
+       "24"
+      ],
+      [
+       "rto",
+       "1.5"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "rto"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "interval_h",
+       "24"
+      ],
+      [
+       "failover_min",
+       "90"
+      ],
+      [
+       "rpo",
+       "24"
+      ],
+      [
+       "rto",
+       "1.5"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "RPO 24 h (limit 4) -> FAIL; RTO 1.5 h (limit 2) -> OK\n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "interval_h",
+       "24"
+      ],
+      [
+       "failover_min",
+       "90"
+      ],
+      [
+       "rpo",
+       "24"
+      ],
+      [
+       "rto",
+       "1.5"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "syncs needed per day for RPO 4 h: 6\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Telecom · bandwidth</span></div>
+    <h4>How long does the first copy take?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A telecom starts DR for 1.2 PB of call records. The inter-site link is 10 Gbit/s; DistCp may use 60% of it. How many days does the first full copy take?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>1.2 PB · 10 Gbit/s · 60% usable</pre></div><div><small>Expected output</small><pre>20.8 days</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Convert the link to bytes per second.</li><li>Divide data by usable rate.</li><li>Convert to days.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "About 21 days. That is why big first copies are often seeded by shipping disks or done in stages, with -update runs afterwards.",
+   "code": "data_bytes = 1.2 * 1024**5\nrate = 10e9 / 8 * 0.60\ndays = data_bytes / rate / 86400\nprint(f\"{days:.1f} days\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "data_bytes = 1.2 * 1024**5",
+  "rate = 10e9 / 8 * 0.60",
+  "days = data_bytes / rate / 86400",
+  "print(f\"{days:.1f} days\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>data_bytes<\/code> is created: 1351079888211148.8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data_bytes",
+       "1351079888211148.8"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "data_bytes"
+  },
+  {
+   "line": 2,
+   "phase": "Bits vs bytes",
+   "note": "10 Gbit/s is 1.25 GB/s before overheads. <code>rate<\/code> is created: 750000000.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data_bytes",
+       "1351079888211148.8"
+      ],
+      [
+       "rate",
+       "750000000.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "rate"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>days<\/code> is created: 20.85.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data_bytes",
+       "1351079888211148.8"
+      ],
+      [
+       "rate",
+       "750000000.0"
+      ],
+      [
+       "days",
+       "20.85"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "days"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data_bytes",
+       "1351079888211148.8"
+      ],
+      [
+       "rate",
+       "750000000.0"
+      ],
+      [
+       "days",
+       "20.85"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "20.8 days\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">E-commerce · snapshots</span></div>
+    <h4>How much listing does a snapshot diff save?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A folder holds 50 million files; 20,000 change per day. A plain -update run must compare every file (say 2 ms of NameNode work per file on each side); a -diff run asks only for the changes. Compare the comparison time.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>50,000,000 files · 20,000 changes · 2 ms per file</pre></div><div><small>Expected output</small><pre>-update compare: 56 h   -diff: 1.3 min</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>-update: every file is listed and compared on both clusters.</li><li>-diff: the NameNode returns only the changes.</li><li>Compare.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The numbers are a simple model, but the gap is real: in our lab -diff ran 1 map for 1 file. Big clusters schedule hourly diffs that a full comparison could never finish.",
+   "code": "files, changed, ms = 50_000_000, 20_000, 2\nupdate_h = files * ms * 2 / 1000 / 3600\ndiff_min = changed * ms * 2 / 1000 / 60\nprint(f\"-update compare: {update_h:.0f} h   -diff: {diff_min:.1f} min\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "files, changed, ms = 50_000_000, 20_000, 2",
+  "update_h = files * ms * 2 / 1000 / 3600",
+  "diff_min = changed * ms * 2 / 1000 / 60",
+  "print(f\"-update compare: {update_h:.0f} h   -diff: {diff_min:.1f} min\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>files<\/code> is created: 50000000. <code>changed<\/code> is created: 20000. <code>ms<\/code> is created: 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "50000000"
+      ],
+      [
+       "changed",
+       "20000"
+      ],
+      [
+       "ms",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "ms"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>update_h<\/code> is created: 55.5556.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "50000000"
+      ],
+      [
+       "changed",
+       "20000"
+      ],
+      [
+       "ms",
+       "2"
+      ],
+      [
+       "update_h",
+       "55.5556"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "update_h"
+  },
+  {
+   "line": 3,
+   "phase": "Both sides",
+   "note": "Source and target listings are both needed for -update. <code>diff_min<\/code> is created: 1.3333.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "50000000"
+      ],
+      [
+       "changed",
+       "20000"
+      ],
+      [
+       "ms",
+       "2"
+      ],
+      [
+       "update_h",
+       "55.5556"
+      ],
+      [
+       "diff_min",
+       "1.3333"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "diff_min"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "50000000"
+      ],
+      [
+       "changed",
+       "20000"
+      ],
+      [
+       "ms",
+       "2"
+      ],
+      [
+       "update_h",
+       "55.5556"
+      ],
+      [
+       "diff_min",
+       "1.3333"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "-update compare: 56 h   -diff: 1.3 min\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 4</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Insurance · cost</span></div>
+    <h4>Backup, active–passive or active–active?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>An insurer loses about ₹5 lakh of business per hour of downtime and ₹2 lakh per hour of lost data. Option A, cloud backup: ₹40 lakh/yr, RTO 48 h, RPO 24 h. Option B, active–passive DR: ₹1.6 crore/yr, RTO 2 h, RPO 1 h. Option C, active–active: ₹4 crore/yr, RTO 0.1 h, RPO 0.1 h. Expect one disaster every 5 years. Which is cheapest in total?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>3 options · 0.2 disasters per year</pre></div><div><small>Expected output</small><pre>A backup           run   40 lakh + expected loss  57.6 lakh =   97.6 lakh/yr
+B active-passive   run  160 lakh + expected loss   2.4 lakh =  162.4 lakh/yr
+C active-active    run  400 lakh + expected loss   0.1 lakh =  400.1 lakh/yr</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Expected yearly loss = 0.2 × (RTO × downtime cost + RPO × data cost).</li><li>Total = running cost + expected loss.</li><li>Compare.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Numbers are illustrative. Here backup is cheapest on paper, but if a regulator demands RPO ≤ 4 h, only B or C are allowed, and B wins.",
+   "code": "opts = {\"A backup\": (40, 48, 24), \"B active-passive\": (160, 2, 1), \"C active-active\": (400, 0.1, 0.1)}\nfor name, (cost_lakh, rto, rpo) in opts.items():\n    loss = 0.2 * (rto * 5 + rpo * 2)\n    print(f\"{name:18} run {cost_lakh:4} lakh + expected loss {loss:5.1f} lakh = {cost_lakh + loss:6.1f} lakh/yr\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "opts = {\"A backup\": (40, 48, 24), \"B active-passive\": (160, 2, 1), \"C active-active\": (400, 0.1, 0.1)}",
+  "for name, (cost_lakh, rto, rpo) in opts.items():",
+  "    loss = 0.2 * (rto * 5 + rpo * 2)",
+  "    print(f\"{name:18} run {cost_lakh:4} lakh + expected loss {loss:5.1f} lakh = {cost_lakh + loss:6.1f} lakh/yr\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>opts<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "opts",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A backup&#x27;: → tuple #2, &#x27;B active-passive&#x27;: → tuple #3, &#x27;C active-active&#x27;: → tuple #4}",
+    "<b>#2 tuple (3)<\/b> (40, 48, 24)",
+    "<b>#3 tuple (3)<\/b> (160, 2, 1)",
+    "<b>#4 tuple (3)<\/b> (400, 0.1, 0.1)"
+   ],
+   "newVar": "opts"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>name<\/code> is created: &#x27;A backup&#x27;. <code>cost_lakh<\/code> is created: 40. <code>rto<\/code> is created: 48. <code>rpo<\/code> is created: 24.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "opts",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'A backup'"
+      ],
+      [
+       "cost_lakh",
+       "40"
+      ],
+      [
+       "rto",
+       "48"
+      ],
+      [
+       "rpo",
+       "24"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A backup&#x27;: → tuple #2, &#x27;B active-passive&#x27;: → tuple #3, &#x27;C active-active&#x27;: → tuple #4}",
+    "<b>#2 tuple (3)<\/b> (40, 48, 24)",
+    "<b>#3 tuple (3)<\/b> (160, 2, 1)",
+    "<b>#4 tuple (3)<\/b> (400, 0.1, 0.1)"
+   ],
+   "newVar": "rpo"
+  },
+  {
+   "line": 3,
+   "phase": "Expected loss",
+   "note": "Probability times impact; regulators may also set hard limits. <code>loss<\/code> is created: 57.6.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "opts",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'A backup'"
+      ],
+      [
+       "cost_lakh",
+       "40"
+      ],
+      [
+       "rto",
+       "48"
+      ],
+      [
+       "rpo",
+       "24"
+      ],
+      [
+       "loss",
+       "57.6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A backup&#x27;: → tuple #2, &#x27;B active-passive&#x27;: → tuple #3, &#x27;C active-active&#x27;: → tuple #4}",
+    "<b>#2 tuple (3)<\/b> (40, 48, 24)",
+    "<b>#3 tuple (3)<\/b> (160, 2, 1)",
+    "<b>#4 tuple (3)<\/b> (400, 0.1, 0.1)"
+   ],
+   "newVar": "loss"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "opts",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'A backup'"
+      ],
+      [
+       "cost_lakh",
+       "40"
+      ],
+      [
+       "rto",
+       "48"
+      ],
+      [
+       "rpo",
+       "24"
+      ],
+      [
+       "loss",
+       "57.6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A backup&#x27;: → tuple #2, &#x27;B active-passive&#x27;: → tuple #3, &#x27;C active-active&#x27;: → tuple #4}",
+    "<b>#2 tuple (3)<\/b> (40, 48, 24)",
+    "<b>#3 tuple (3)<\/b> (160, 2, 1)",
+    "<b>#4 tuple (3)<\/b> (400, 0.1, 0.1)"
+   ],
+   "out": "A backup           run   40 lakh + expected loss  57.6 lakh =   97.6 lakh/yr\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;B active-passive&#x27;. <code>cost_lakh<\/code> changes to 160. <code>rto<\/code> changes to 2. <code>rpo<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "opts",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'B active-passive'"
+      ],
+      [
+       "cost_lakh",
+       "160"
+      ],
+      [
+       "rto",
+       "2"
+      ],
+      [
+       "rpo",
+       "1"
+      ],
+      [
+       "loss",
+       "57.6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A backup&#x27;: → tuple #2, &#x27;B active-passive&#x27;: → tuple #3, &#x27;C active-active&#x27;: → tuple #4}",
+    "<b>#2 tuple (3)<\/b> (40, 48, 24)",
+    "<b>#3 tuple (3)<\/b> (160, 2, 1)",
+    "<b>#4 tuple (3)<\/b> (400, 0.1, 0.1)"
+   ],
+   "newVar": "rpo"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>loss<\/code> changes to 2.4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "opts",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'B active-passive'"
+      ],
+      [
+       "cost_lakh",
+       "160"
+      ],
+      [
+       "rto",
+       "2"
+      ],
+      [
+       "rpo",
+       "1"
+      ],
+      [
+       "loss",
+       "2.4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A backup&#x27;: → tuple #2, &#x27;B active-passive&#x27;: → tuple #3, &#x27;C active-active&#x27;: → tuple #4}",
+    "<b>#2 tuple (3)<\/b> (40, 48, 24)",
+    "<b>#3 tuple (3)<\/b> (160, 2, 1)",
+    "<b>#4 tuple (3)<\/b> (400, 0.1, 0.1)"
+   ],
+   "newVar": "loss"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "opts",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'B active-passive'"
+      ],
+      [
+       "cost_lakh",
+       "160"
+      ],
+      [
+       "rto",
+       "2"
+      ],
+      [
+       "rpo",
+       "1"
+      ],
+      [
+       "loss",
+       "2.4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A backup&#x27;: → tuple #2, &#x27;B active-passive&#x27;: → tuple #3, &#x27;C active-active&#x27;: → tuple #4}",
+    "<b>#2 tuple (3)<\/b> (40, 48, 24)",
+    "<b>#3 tuple (3)<\/b> (160, 2, 1)",
+    "<b>#4 tuple (3)<\/b> (400, 0.1, 0.1)"
+   ],
+   "out": "B active-passive   run  160 lakh + expected loss   2.4 lakh =  162.4 lakh/yr\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;C active-active&#x27;. <code>cost_lakh<\/code> changes to 400. <code>rto<\/code> changes to 0.1. <code>rpo<\/code> changes to 0.1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "opts",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'C active-active'"
+      ],
+      [
+       "cost_lakh",
+       "400"
+      ],
+      [
+       "rto",
+       "0.1"
+      ],
+      [
+       "rpo",
+       "0.1"
+      ],
+      [
+       "loss",
+       "2.4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A backup&#x27;: → tuple #2, &#x27;B active-passive&#x27;: → tuple #3, &#x27;C active-active&#x27;: → tuple #4}",
+    "<b>#2 tuple (3)<\/b> (40, 48, 24)",
+    "<b>#3 tuple (3)<\/b> (160, 2, 1)",
+    "<b>#4 tuple (3)<\/b> (400, 0.1, 0.1)"
+   ],
+   "newVar": "rpo"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>loss<\/code> changes to 0.14.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "opts",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'C active-active'"
+      ],
+      [
+       "cost_lakh",
+       "400"
+      ],
+      [
+       "rto",
+       "0.1"
+      ],
+      [
+       "rpo",
+       "0.1"
+      ],
+      [
+       "loss",
+       "0.14"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A backup&#x27;: → tuple #2, &#x27;B active-passive&#x27;: → tuple #3, &#x27;C active-active&#x27;: → tuple #4}",
+    "<b>#2 tuple (3)<\/b> (40, 48, 24)",
+    "<b>#3 tuple (3)<\/b> (160, 2, 1)",
+    "<b>#4 tuple (3)<\/b> (400, 0.1, 0.1)"
+   ],
+   "newVar": "loss"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "opts",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'C active-active'"
+      ],
+      [
+       "cost_lakh",
+       "400"
+      ],
+      [
+       "rto",
+       "0.1"
+      ],
+      [
+       "rpo",
+       "0.1"
+      ],
+      [
+       "loss",
+       "0.14"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A backup&#x27;: → tuple #2, &#x27;B active-passive&#x27;: → tuple #3, &#x27;C active-active&#x27;: → tuple #4}",
+    "<b>#2 tuple (3)<\/b> (40, 48, 24)",
+    "<b>#3 tuple (3)<\/b> (160, 2, 1)",
+    "<b>#4 tuple (3)<\/b> (400, 0.1, 0.1)"
+   ],
+   "out": "C active-active    run  400 lakh + expected loss   0.1 lakh =  400.1 lakh/yr\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "opts",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'C active-active'"
+      ],
+      [
+       "cost_lakh",
+       "400"
+      ],
+      [
+       "rto",
+       "0.1"
+      ],
+      [
+       "rpo",
+       "0.1"
+      ],
+      [
+       "loss",
+       "0.14"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A backup&#x27;: → tuple #2, &#x27;B active-passive&#x27;: → tuple #3, &#x27;C active-active&#x27;: → tuple #4}",
+    "<b>#2 tuple (3)<\/b> (40, 48, 24)",
+    "<b>#3 tuple (3)<\/b> (160, 2, 1)",
+    "<b>#4 tuple (3)<\/b> (400, 0.1, 0.1)"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "How does DistCp copy files?",
+  "options": [
+   "With one big client process",
+   "Through the NameNode",
+   "As a map-only MapReduce job: map tasks copy files in parallel",
+   "With rsync over SSH"
+  ],
+  "answer": 2,
+  "why": "Our first copy launched 5 map tasks for 5 files."
+ },
+ {
+  "q": "In our lab, plain DistCp (no options) ran after menu.csv changed but kept its size. What happened?",
+  "options": [
+   "It copied menu.csv",
+   "It skipped menu.csv because the name already existed",
+   "It failed with a checksum error",
+   "It deleted menu.csv on DR"
+  ],
+  "answer": 1,
+  "why": "Files Copied=1 (the new file), Files Skipped=4, and the job still succeeded."
+ },
+ {
+  "q": "What does -update compare?",
+  "options": [
+   "Size and checksum",
+   "Only names",
+   "Modification time only",
+   "Owner and group"
+  ],
+  "answer": 0,
+  "why": "Equal size (143 bytes) but different checksum, so menu.csv was copied."
+ },
+ {
+  "q": "What does -delete do?",
+  "options": [
+   "Deletes the source after copying",
+   "Deletes failed files",
+   "Deletes snapshots",
+   "Removes target files that no longer exist at the source"
+  ],
+  "answer": 3,
+  "why": "feedback.txt, deleted on prod, was removed from DR."
+ },
+ {
+  "q": "What does -diff s1 s2 need?",
+  "options": [
+   "Nothing special",
+   "The same Hadoop version on both clusters",
+   "Snapshot s1 on both sides (the target unchanged since then) and s2 on the source",
+   "Kerberos"
+  ],
+  "answer": 2,
+  "why": "Then DistCp applies only the changes reported by the NameNode."
+ },
+ {
+  "q": "What is the RPO?",
+  "options": [
+   "How long recovery takes",
+   "How much recent data you can afford to lose, measured in time",
+   "The number of replicas",
+   "The DR cluster size"
+  ],
+  "answer": 1,
+  "why": "In our drill, the file written after the last sync was the loss."
+ },
+ {
+  "q": "Two clusters use different block sizes. A copy fails with a checksum mismatch. What is the right first fix?",
+  "options": [
+   "Preserve block size with -pb (or use COMPOSITE_CRC checksums)",
+   "Always use -skipcrccheck",
+   "Lower replication",
+   "Use -m 1"
+  ],
+  "answer": 0,
+  "why": "HDFS file checksums depend on block size; skipping checks hides real corruption."
+ },
+ {
+  "q": "Which DR design usually gives the lowest RPO and RTO?",
+  "options": [
+   "Weekly backup",
+   "Active–passive with nightly sync",
+   "No DR",
+   "Active–active"
+  ],
+  "answer": 3,
+  "why": "Both sites serve and receive data; it is also the most expensive."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 12.2 in one screen</h3>
+    <ul><li><b>DistCp</b> = map-only MapReduce copy; maps copy files and verify checksums.</li><li>No option: existing names are <b>skipped</b> (our changed menu.csv). <code>-update</code>: size + checksum. <code>-overwrite</code>: always. <code>-delete</code>: mirror deletions.</li><li><code>-update -diff s1 s2</code>: apply a snapshot diff (1 file, 1 map, rename replayed in our lab).</li><li><code>-p</code> preserves metadata; <code>-pb</code> keeps block size so checksums match; <code>-bandwidth</code> throttles; <code>-m</code> sets maps.</li><li><b>RPO</b> = data you can lose (time since last sync); <b>RTO</b> = time to recover.</li><li>Designs: backup, active–passive, active–active, cloud as DR. Replicate metadata (Hive metastore) too.</li><li>Test with drills: our report ran on DR with identical results; the unsynced file was missing.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What is DistCp in Hadoop?</summary><p>DistCp (distributed copy) copies large amounts of data within or between clusters. It runs as a map-only MapReduce job: the client lists the source files, and map tasks copy them in parallel from source DataNodes to destination DataNodes, verifying checksums. It supports incremental copies (-update, -delete), snapshot-based syncs (-diff), preserving metadata (-p) and throttling (-bandwidth).</p></details>
+    <details><summary>What is the difference between -update and -overwrite in DistCp?</summary><p>With -update, a file is copied only if it is missing at the target or its size or checksum differs. With -overwrite, every file is copied again even if it is identical. Without either, files whose names already exist at the target are skipped, even if their content changed.</p></details>
+    <details><summary>What are RPO and RTO?</summary><p>The recovery point objective (RPO) is the maximum acceptable amount of data loss, measured as the time since the last good copy. The recovery time objective (RTO) is the maximum acceptable time to restore service after a disaster. Sync frequency drives RPO; automation and drills drive RTO.</p></details>
+    <details><summary>How do you do disaster recovery for HDFS?</summary><p>Keep a second cluster (or cloud storage) at another site, sync data with scheduled DistCp runs (ideally snapshot-based with -diff), replicate metadata such as the Hive metastore, document a failover runbook (DNS, job configs, access) and test it with regular drills. Commercial tools (for example Cloudera Replication Manager) automate the same steps.</p></details>
+    <details><summary>Why does DistCp fail with a checksum mismatch between clusters?</summary><p>HDFS file checksums are computed from block-level checksums, so they depend on block size and checksum type. If source and target use different settings, the checksums differ even for identical data. Preserve block size and checksum type (-pbc) or use the COMPOSITE_CRC combine mode; use -skipcrccheck only when you verify the data another way.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">DR exercises with the real numbers from our two clusters.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Copy speed</h4></div>
+      <p>The first copy moved 169,964,453 bytes in 25,540 ms. What was the effective rate in MB/s?</p>
+      <div class="prob__io"><div><small>Input</small><pre>bytes · ms</pre></div><div><small>Expected output</small><pre>6.3 MB/s</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(169964453 / 2**20 / 25.540, 1), &quot;MB/s&quot;)</code></pre><div class="output">6.3 MB/s</div></div>
+        <p><b>How it works:</b> About 6.3 MB/s, including job start-up; the copy itself was faster.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>What was skipped?</h4></div>
+      <p>Run 2 copied 70,147 bytes and skipped 164,870,491. How many bytes were really changed on prod, and how many of the skipped bytes were stale?</p>
+      <div class="prob__io"><div><small>Input</small><pre>Bytes Copied / Bytes Skipped</pre></div><div><small>Expected output</small><pre>copied 70147 | stale but skipped: menu.csv 143 bytes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;copied&quot;, 70147, &quot;| stale but skipped: menu.csv&quot;, 143, &quot;bytes&quot;)</code></pre><div class="output">copied 70147 | stale but skipped: menu.csv 143 bytes</div></div>
+        <p><b>How it works:</b> Only 143 bytes were stale, but they held the new price. A tiny skip can be a business error.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Throttle check</h4></div>
+      <p>At -bandwidth 1 (MB/s), what is the minimum time to copy 19,418,699 bytes? The run took 34.2 s. Where did the rest go?</p>
+      <div class="prob__io"><div><small>Input</small><pre>19.4 MB · 1 MB/s</pre></div><div><small>Expected output</small><pre>18.5 s minimum</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(19418699 / 2**20, 1), &quot;s minimum&quot;)</code></pre><div class="output">18.5 s minimum</div></div>
+        <p><b>How it works:</b> About 18.5 s of copying; the rest was job submission, container start-up and checksum verification.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>RPO for a schedule</h4></div>
+      <p>Syncs run at 00:00, 06:00, 12:00 and 18:00. A disaster happens at 17:30. How much data is lost, and what is the worst case?</p>
+      <div class="prob__io"><div><small>Input</small><pre>4 syncs a day</pre></div><div><small>Expected output</small><pre>lost: 5.5 h | worst case: 6 h</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>syncs = [0, 6, 12, 18]
+d = 17.5
+print(&quot;lost:&quot;, d - max(s for s in syncs if s &lt;= d), &quot;h | worst case: 6 h&quot;)</code></pre><div class="output">lost: 5.5 h | worst case: 6 h</div></div>
+        <p><b>How it works:</b> 5.5 hours this time; the worst case is a full interval of 6 hours.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Mirror check</h4></div>
+      <p>Write a function that lists files to copy, files to delete and files that are stale-but-skipped for a plain run.</p>
+      <div class="prob__io"><div><small>Input</small><pre>two dicts name → checksum</pre></div><div><small>Expected output</small><pre>copy: [&#x27;c&#x27;]
+stale but skipped: [&#x27;b&#x27;]
+left behind: [&#x27;d&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>src = {&quot;a&quot;: &quot;1&quot;, &quot;b&quot;: &quot;2&quot;, &quot;c&quot;: &quot;3&quot;}
+dst = {&quot;a&quot;: &quot;1&quot;, &quot;b&quot;: &quot;9&quot;, &quot;d&quot;: &quot;4&quot;}
+print(&quot;copy:&quot;, [n for n in src if n not in dst])
+print(&quot;stale but skipped:&quot;, [n for n in src if n in dst and src[n] != dst[n]])
+print(&quot;left behind:&quot;, [n for n in dst if n not in src])</code></pre><div class="output">copy: [&#x27;c&#x27;]
+stale but skipped: [&#x27;b&#x27;]
+left behind: [&#x27;d&#x27;]</div></div>
+        <p><b>How it works:</b> c is copied, b is stale but skipped, d stays behind: the three problems -update and -delete solve.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Maps for a big copy</h4></div>
+      <p>DistCp splits 120,000 files totalling 30 TB over -m 200 maps. Roughly how much does each map copy, and how long at 80 MB/s per map?</p>
+      <div class="prob__io"><div><small>Input</small><pre>30 TB · 200 maps · 80 MB/s</pre></div><div><small>Expected output</small><pre>154 GB per map, about 0.5 h</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>per_map_gb = 30 * 1024 / 200
+print(f&quot;{per_map_gb:.0f} GB per map, about {per_map_gb * 1024 / 80 / 3600:.1f} h&quot;)</code></pre><div class="output">154 GB per map, about 0.5 h</div></div>
+        <p><b>How it works:</b> About 154 GB per map and 0.5 hours, if the network and both clusters can sustain 16 GB/s in total, which they often can't: throttle and schedule.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Is a drill worth it?</h4></div>
+      <p>A failover drill costs one Saturday for 6 engineers (₹15,000 each). Without drills, the team estimates RTO doubles from 2 h to 4 h in a real disaster, at ₹5 lakh per hour. With one disaster every 5 years, is a drill every quarter worth it?</p>
+      <div class="prob__io"><div><small>Input</small><pre>4 drills/yr · ₹15,000 × 6 · 0.2 disasters/yr</pre></div><div><small>Expected output</small><pre>drills Rs 360,000 vs expected saving Rs 200,000 per year</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>drills = 4 * 6 * 15000
+saved = 0.2 * (4 - 2) * 500000
+print(f&quot;drills Rs {drills:,} vs expected saving Rs {saved:,.0f} per year&quot;)</code></pre><div class="output">drills Rs 360,000 vs expected saving Rs 200,000 per year</div></div>
+        <p><b>How it works:</b> ₹3.6 lakh vs ₹2 lakh on these illustrative numbers. Teams usually still drill, because a failed real failover can be far worse than the average, and regulators often require it.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>Build a copy plan from a snapshot diff</h4></div>
+      <p>Given a snapshotDiff report with +, -, M and R lines, produce the list of DR actions and the bytes to copy.</p>
+      <div class="prob__io"><div><small>Input</small><pre>diff lines + sizes</pre></div><div><small>Expected output</small><pre>[(&#x27;copy&#x27;, &#x27;./a.csv&#x27;), (&#x27;delete&#x27;, &#x27;./old.csv&#x27;), (&#x27;rename&#x27;, &#x27;./x.csv&#x27;, &#x27;./y.csv&#x27;), (&#x27;copy&#x27;, &#x27;./menu.csv&#x27;)] 28229 bytes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>diff = [&quot;M\t.&quot;, &quot;+\t./a.csv&quot;, &quot;-\t./old.csv&quot;, &quot;R\t./x.csv -&gt; ./y.csv&quot;, &quot;M\t./menu.csv&quot;]
+size = {&quot;./a.csv&quot;: 28086, &quot;./menu.csv&quot;: 143}
+plan, nbytes = [], 0
+for line in diff:
+    kind, path = line.split(&quot;\t&quot;)
+    if path == &quot;.&quot;:
+        continue
+    if kind in &quot;+M&quot;:
+        plan.append((&quot;copy&quot;, path)); nbytes += size[path]
+    elif kind == &quot;-&quot;:
+        plan.append((&quot;delete&quot;, path))
+    elif kind == &quot;R&quot;:
+        plan.append((&quot;rename&quot;,) + tuple(path.split(&quot; -&gt; &quot;)))
+print(plan, nbytes, &quot;bytes&quot;)</code></pre><div class="output">[(&#x27;copy&#x27;, &#x27;./a.csv&#x27;), (&#x27;delete&#x27;, &#x27;./old.csv&#x27;), (&#x27;rename&#x27;, &#x27;./x.csv&#x27;, &#x27;./y.csv&#x27;), (&#x27;copy&#x27;, &#x27;./menu.csv&#x27;)] 28229 bytes</div></div>
+        <p><b>How it works:</b> Copy a.csv and menu.csv (28,229 bytes), delete old.csv, rename x.csv to y.csv: everything else is untouched.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">DistCp and DR questions come up in data platform and Hadoop admin interviews.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Tools · basics</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>"How do you copy data between two Hadoop clusters?"</h4>
+      <p class="scn__situation">A standard question for any Hadoop role.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> DistCp and its key options.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Use DistCp: a map-only MapReduce job that copies files in parallel and verifies checksums.</li>
+          <li>For repeated syncs use -update (size + checksum) and -delete; for big folders use snapshots with -diff.</li>
+          <li>Throttle with -bandwidth, preserve metadata with -p, use webhdfs:// across Hadoop versions.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Incident · data</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>The DR copy has old data, but every nightly job "succeeded"</h4>
+      <p class="scn__situation">An auditor finds that a reference table on DR is three months out of date.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> DistCp default semantics and verification.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Plain DistCp skips files whose names already exist; a file rewritten with the same name was never copied again.</li>
+          <li>Fix the job: -update (and -delete if DR must mirror deletions), or snapshot-based -diff syncs.</li>
+          <li>Add verification: compare file counts and checksums (hdfs dfs -checksum) for key folders, and alert on differences.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Design · DR</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>Design DR for a 2 PB cluster with RPO 1 hour</h4>
+      <p class="scn__situation">A payments company asks for a plan and its cost drivers.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> RPO/RTO thinking and incremental replication.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Seed DR once (staged DistCp or shipped disks), then hourly snapshots with distcp -update -diff on the changed folders.</li>
+          <li>Replicate the Hive metastore and configs; keep a runbook for DNS, job schedulers and access; run quarterly drills.</li>
+          <li>Size the link for the hourly change rate with headroom; monitor sync lag as a first-class alert.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Concepts · RPO/RTO</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>"What is the difference between backup and disaster recovery?"</h4>
+      <p class="scn__situation">Often asked together with RPO and RTO.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> data protection vs service continuity.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Backup keeps copies of data so it can be restored; restoring and rebuilding compute may take days (long RTO).</li>
+          <li>DR keeps a ready site that can take over the service within the RTO, with data no older than the RPO.</li>
+          <li>Many teams need both: DR for outages, backups or snapshots for mistakes (a bad -delete is replicated to DR too).</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

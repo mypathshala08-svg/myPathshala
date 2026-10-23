@@ -1,0 +1,3162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Erasure coding | MyPhatshala</title>
+<meta name="description" content="HDFS erasure coding on a real Hadoop 3.5.0 cluster: the same 140,760,270-byte file uses 422,280,810 bytes with 3× replication and 235,132,110 with RS-3-2 (1.67×); a block group with five internal blocks; the file still reads correctly (same MD5) after 2 DataNodes die and fails with “3 missing blocks” after the third; a 15-byte file costs 45 bytes either way. Policies, striping, cells, verifyClusterSetup, when to use EC. Real XOR parity in Python, quiz and interview scenarios.">
+<meta name="mp:minutes" content="28">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/07-hdfs-advanced/03-erasure-coding/">
+<meta property="og:title" content="Erasure coding · MyPhatshala">
+<meta property="og:description" content="Same safety as three copies at 1.67× the space, until you ask it to do the wrong job. Erasure coding on a real cluster.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Erasure coding", "learningResourceType": "Lesson", "educationalLevel": "Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="07-hdfs-advanced/03-erasure-coding" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 7.3</b></nav>
+    <h1>Erasure coding</h1>
+    <p class="lead">Three replicas are simple and fast, but they triple the disk bill. Hadoop 3 added erasure coding: split data into pieces, compute parity, and survive the same failures with far less space. This lesson stores one file both ways on a real cluster, kills DataNodes until the data is lost, and explains which data should and should not be erasure-coded.</p>
+    <div class="lesson-meta"><span>Module 7 · HDFS advanced</span><span>⏱ 28 min</span><span>Advanced</span><span>Real EC vs replication on one cluster</span><span>Parity you can compute in the browser</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Paying three times for data nobody reads</h2>
+  <div class="story">
+    <p class="narration">The university's finance office looks at the storage bill. Five years of old exam scans, canteen logs and CCTV exports sit in HDFS, read maybe once a year for audits. Every byte is stored <b>three times</b>. 400 TB of data uses 1.2 PB of disk. “Can't we keep fewer copies of the old stuff?” Riya says replication 2 would be risky. Arjun Sir has a better idea, borrowed from the same mathematics that lets a scratched DVD still play.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 190" role="img" aria-label="Replication stores three full copies; erasure coding RS-3-2 splits data into 3 data cells and computes 2 parity cells, using 1.67 times the space and surviving any 2 losses.">
+        <g font-size="10">
+          <text x="150" y="20" text-anchor="middle" font-weight="700" class="s-ink">Replication 3</text>
+          <g><rect x="40" y="30" width="60" height="40" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="120" y="30" width="60" height="40" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="200" y="30" width="60" height="40" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/></g>
+          <g font-size="9" text-anchor="middle" class="s-blue"><text x="70" y="54">A B C</text><text x="150" y="54">A B C</text><text x="230" y="54">A B C</text></g>
+          <text x="150" y="92" text-anchor="middle" font-size="9" class="s-ink">3 full copies · <tspan font-weight="700">300%</tspan> raw space</text>
+          <text x="150" y="108" text-anchor="middle" font-size="9" class="s-ink2">survives 2 lost nodes</text>
+
+          <text x="470" y="20" text-anchor="middle" font-weight="700" class="s-ink">Erasure coding RS-3-2</text>
+          <g><rect x="335" y="30" width="46" height="40" rx="5" class="s-soft-green" style="stroke:var(--green)"/><rect x="389" y="30" width="46" height="40" rx="5" class="s-soft-green" style="stroke:var(--green)"/><rect x="443" y="30" width="46" height="40" rx="5" class="s-soft-green" style="stroke:var(--green)"/><rect x="505" y="30" width="46" height="40" rx="5" class="s-soft-acc" style="stroke:var(--track)"/><rect x="559" y="30" width="46" height="40" rx="5" class="s-soft-acc" style="stroke:var(--track)"/></g>
+          <g font-size="9" text-anchor="middle"><text x="358" y="54" class="s-green">A</text><text x="412" y="54" class="s-green">B</text><text x="466" y="54" class="s-green">C</text><text x="528" y="54" class="s-acc">P1</text><text x="582" y="54" class="s-acc">P2</text></g>
+          <text x="470" y="92" text-anchor="middle" font-size="9" class="s-ink">3 data + 2 parity · <tspan font-weight="700">167%</tspan> raw space</text>
+          <text x="470" y="108" text-anchor="middle" font-size="9" class="s-ink2">survives ANY 2 lost nodes</text>
+          <rect x="120" y="128" width="400" height="34" rx="8" class="s-card2"/>
+          <text x="320" y="149" text-anchor="middle" font-size="9.4" class="s-ink">Our lab, same 140,760,270-byte file: 422,280,810 bytes on disk vs 235,132,110</text>
+        </g>
+        <text x="632" y="184" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Since Hadoop 3, HDFS supports <b>erasure coding</b>. Instead of copying a block three times, it cuts the data into pieces and computes extra <b>parity</b> pieces with Reed-Solomon mathematics. With the policy <b>RS-3-2</b>, 3 data pieces get 2 parity pieces: any 2 of the 5 can be lost, and the data can still be rebuilt.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Same safety as three copies, but 167% instead of 300%?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>For large, cold files, yes. But nothing is free: reading after a failure means <i>calculating</i> the missing data, a small file gains nothing, and you need enough DataNodes and racks. Today we store the same file both ways on our 5-node cluster, kill DataNodes one by one, and see exactly where erasure coding wins and where it doesn't.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Erasure coding in HDFS</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Erasure coding (EC)</b> is a data protection method that encodes <i>k</i> data units into <i>n = k + m</i> units by adding <i>m</i> <b>parity</b> units, such that the original data can be reconstructed from any <i>k</i> of the <i>n</i> units. HDFS (since Hadoop 3.0) applies EC per directory through an <b>erasure coding policy</b> (e.g. RS-6-3-1024k: Reed-Solomon codec, 6 data and 3 parity units, 1 MB cells). Files under the directory are written in <b>striped</b> layout: data is split into cells distributed round-robin over the <i>k</i> data <b>internal blocks</b> of a <b>block group</b>, and parity cells are computed for each stripe and stored in <i>m</i> parity internal blocks, each internal block on a different DataNode (and rack where possible). Storage overhead is <i>(k + m) / k</i> and up to <i>m</i> simultaneous failures are tolerated; missing units are reconstructed by decoding on read or in the background.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Split the data into 3 parts, compute 2 “recovery” parts, put all 5 on different machines. Any 2 machines can die and the data can be recomputed from the other 3. It costs 1.67× space instead of 3×.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Data / parity unit</b><span>Pieces holding the data / pieces computed to rebuild lost data.</span></div>
+    <div class="term"><b>EC policy</b><span>Codec + data units + parity units + cell size, e.g. RS-3-2-1024k.</span></div>
+    <div class="term"><b>Reed-Solomon (RS)</b><span>The codec HDFS normally uses; XOR is a simpler one with 1 parity.</span></div>
+    <div class="term"><b>Cell</b><span>The striping unit (1 MB in our policies), written round-robin across internal blocks.</span></div>
+    <div class="term"><b>Block group</b><span>The k + m internal blocks that together store a striped range of a file.</span></div>
+    <div class="term"><b>Internal block</b><span>One member of a block group, on one DataNode (IDs are negative, consecutive).</span></div>
+    <div class="term"><b>Decoding / reconstruction</b><span>Computing missing units from the surviving ones.</span></div>
+    <div class="term"><b>Storage overhead</b><span>Raw bytes ÷ data bytes: 3.0 for replication 3, 1.67 for RS-3-2, 1.5 for RS-6-3.</span></div>
+  </div>
+
+  <h3>Built-in policies (Hadoop 3.5.0, from <code>hdfs ec -listPolicies</code>)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>RS-6-3-1024k</th><td>ENABLED by default · needs 9 DataNodes · overhead 1.5× · tolerates 3 failures</td></tr>
+    <tr><th>RS-3-2-1024k</th><td>Disabled by default · needs 5 DataNodes (3 racks for rack tolerance) · 1.67× · tolerates 2</td></tr>
+    <tr><th>RS-10-4-1024k</th><td>Disabled · 14 DataNodes · 1.4× · tolerates 4</td></tr>
+    <tr><th>XOR-2-1-1024k</th><td>Disabled · 3 DataNodes · 1.5× · tolerates 1</td></tr>
+    <tr><th>RS-LEGACY-6-3-1024k</th><td>Disabled · older Reed-Solomon implementation, kept for compatibility</td></tr>
+  </table>
+
+  <h3 id="levels">Erasure coding at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A puzzle with spare clues</h4>
+      <ul>
+        <li>Three friends each keep one page of a secret recipe (data). Two more friends keep clue cards made by mixing the pages (parity).</li>
+        <li>If any two friends lose their paper, the remaining three can work out the full recipe.</li>
+        <li>Photocopying the recipe three times also works, but uses far more paper.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How HDFS stores and reads an EC file</h4>
+      <ul>
+        <li>Set a policy on a directory: <code>hdfs ec -setPolicy -path /ec -policy RS-3-2-1024k</code>. New files below it are erasure-coded; existing files are not converted.</li>
+        <li>The client cuts the file into 1 MB cells, writes them round-robin to 3 data internal blocks, computes 2 parity cells per stripe, and writes all 5 in parallel to 5 DataNodes.</li>
+        <li><code>hdfs dfs -du</code> shows the real cost: 140,760,270 bytes of data use 235,132,110 bytes of disk (1.67×), vs 422,280,810 (3×) with replication.</li>
+        <li>Reading normally fetches the 3 data blocks; if some are missing, the client fetches parity and decodes on the fly.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Trade-offs experienced engineers weigh</h4>
+      <ul>
+        <li><b>Small files:</b> a 15-byte file under RS-3-2 used 45 bytes, the same 3× as replication: one data cell plus two full parity cells. EC only saves space for files spanning several cells.</li>
+        <li><b>Data locality:</b> a striped file's bytes are spread over many nodes, so map tasks can't read a whole split locally. EC suits cold, rarely processed data better than hot data.</li>
+        <li><b>Recovery cost:</b> rebuilding a lost replica copies one block; rebuilding an EC unit reads <i>k</i> units over the network and uses CPU (ISA-L native libraries speed this up).</li>
+        <li><b>Cluster shape:</b> RS-6-3 needs 9 DataNodes, and rack fault tolerance needs enough racks; <code>hdfs ec -verifyClusterSetup</code> checks this. Our 2-rack lab got a warning for RS-3-2.</li>
+        <li><b>Operations:</b> EC files can't be appended to in older releases and some features (e.g. hflush/hsync semantics) differ; check your version's documentation before using EC for active data.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “Explain erasure coding in Hadoop 3”, give: the idea (k data + m parity, survive any m losses), the RS-6-3 example (9 units, 1.5× overhead vs 3×), striped layout with cells and block groups, the command <code>hdfs ec -setPolicy</code>, and two disadvantages (CPU/network cost of reconstruction, poor fit for small files and hot data).</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Replication vs erasure coding</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th></th><th>Replication 3</th><th>RS-3-2</th><th>RS-6-3</th><th>RS-10-4</th></tr></thead>
+    <tbody>
+      <tr><td><b>Raw space</b></td><td>300%</td><td>167%</td><td>150%</td><td>140%</td></tr>
+      <tr><td><b>Failures tolerated</b></td><td>2</td><td>2</td><td>3</td><td>4</td></tr>
+      <tr><td><b>Min DataNodes</b></td><td>3</td><td>5</td><td>9</td><td>14</td></tr>
+      <tr><td><b>Normal read</b></td><td>One local replica</td><td>Striped from 3 nodes</td><td>Striped from 6</td><td>Striped from 10</td></tr>
+      <tr><td><b>Repair</b></td><td>Copy one block</td><td colspan="3">Read k units, decode, write the missing one</td></tr>
+      <tr><td><b>Best for</b></td><td>Hot data, small files</td><td colspan="3">Large, cold or archival files</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Commands you'll use</h3>
+  <div class="cards">
+    <div class="card"><h4>See policies</h4><p><code>hdfs ec -listPolicies</code>, <code>-enablePolicy -policy …</code></p><span class="tag">setup</span></div>
+    <div class="card"><h4>Check the cluster</h4><p><code>hdfs ec -verifyClusterSetup -policy RS-6-3-1024k</code>: enough nodes and racks?</p><span class="tag">safety</span></div>
+    <div class="card"><h4>Apply to a folder</h4><p><code>hdfs ec -setPolicy -path /archive -policy RS-6-3-1024k</code>; <code>-getPolicy</code>; <code>-unsetPolicy</code>.</p><span class="tag">per directory</span></div>
+    <div class="card"><h4>Convert old data</h4><p>Copy existing files into the EC folder (e.g. <code>distcp</code>), verify, then delete the replicated originals.</p><span class="tag">migration</span></div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>Setting a policy changes only <b>new</b> files. Existing files keep their layout until rewritten. That is why our lab copied <code>orders_x30.csv</code> into <code>/ec</code> rather than setting the policy on the original folder.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>The same file, two ways, five DataNodes</h2>
+  <p>Our 5-DataNode, 2-rack cluster from Module 5. All output is from <code>ec_lab.sh</code> (in “Run it on your PC”).</p>
+  <ol class="stepper">
+    <li><h4>Enable a policy and check the cluster</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs ec -enablePolicy -policy RS-3-2-1024k
+hdfs ec -verifyClusterSetup -policy RS-6-3-1024k
+hdfs ec -verifyClusterSetup -policy RS-3-2-1024k</code></pre><div class="output">Erasure coding policy RS-3-2-1024k is enabled
+Warning: The cluster setup does not support EC policy RS-3-2-1024k. Reason: 3 racks are required for the erasure coding policies: RS-3-2-1024k. The number of racks is only 2.
+9 DataNodes are required for the erasure coding policies: RS-6-3-1024k. The number of DataNodes is only 5.
+3 racks are required for the erasure coding policies: RS-3-2-1024k. The number of racks is only 2.</div></div>
+      <span class="behind">RS-6-3 is impossible with 5 DataNodes. RS-3-2 works, but with only 2 racks one rack holds 3 of the 5 units, so losing that whole rack would lose data. We continue for the lab; production needs 3+ racks.</span></li>
+    <li><h4>Write the same file with and without EC</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs ec -setPolicy -path /ec -policy RS-3-2-1024k
+hdfs dfs -cp /user/hadoop/data/orders_x30.csv /rep/
+hdfs dfs -cp /user/hadoop/data/orders_x30.csv /ec/
+echo 'one tiny order' | hdfs dfs -put - /ec/tiny.txt     # and the same into /rep
+hdfs dfs -du /rep /ec</code></pre><div class="output">140760270  422280810  /rep/orders_x30.csv
+15         45         /rep/tiny.txt
+140760270  235132110  /ec/orders_x30.csv
+15         45         /ec/tiny.txt</div></div>
+      <span class="behind">Big file: 422 MB vs 235 MB on disk (3.00× vs 1.67×), a 44% saving. Tiny file: 45 bytes both ways. One cell of data still needs two full parity cells, so EC saves nothing on small files.</span></li>
+    <li><h4>One block group, five internal blocks</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs fsck /ec/orders_x30.csv -files -blocks -locations</code></pre><div class="output">/ec/orders_x30.csv 140760270 bytes, erasure-coded: policy=RS-3-2-1024k, 1 block(s):  OK
+blk_-9223372036854775728 172.19.0.7
+blk_-9223372036854775727 172.19.0.4
+blk_-9223372036854775726 172.19.0.5
+blk_-9223372036854775725 172.19.0.6
+blk_-9223372036854775724 172.19.0.8</div></div>
+      <span class="behind">The whole 134 MB file fits in one block group (3 × 128 MB of data capacity). Its five internal blocks have consecutive negative IDs: indexes 0–2 hold data, 3–4 hold parity, each on a different DataNode. (Our listing is the fsck locations, shortened.)</span></li>
+    <li><h4>Lose two DataNodes</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>docker stop lab5-datanode-4 lab5-datanode-5
+hdfs dfs -get -f /ec/orders_x30.csv /tmp/ec2.csv ; md5sum /tmp/ec2.csv</code></pre><div class="output">md5 before: f07bba61afc730a4e29f03702b25e2fb
+read took 63 s
+f07bba61afc730a4e29f03702b25e2fb  /tmp/ec2.csv</div></div>
+      <span class="behind">Identical bytes, decoded from the surviving units. The 63 s were mostly waiting: right after the stop, the NameNode still listed the two DataNodes as live, so the client spent a 60 s connect timeout before using parity. In another run done a little later, the same read took 2 s.</span></li>
+    <li><h4>Lose a third DataNode</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>docker stop lab5-datanode-3
+hdfs dfs -get -f /ec/orders_x30.csv /tmp/ec3.csv
+hdfs dfs -get -f /rep/orders_x30.csv /tmp/rep3.csv ; md5sum /tmp/rep3.csv</code></pre><div class="output">exit=255
+3 missing blocks, the stripe is: AlignedStripe(Offset=0, length=1048576, fetchedChunksNum=0, missingChunksNum=3)
+get: Fatal internal error
+read took 2 s
+f07bba61afc730a4e29f03702b25e2fb  /tmp/rep3.csv</div></div>
+      <span class="behind">Three of five units missing, more than the 2 parity units: the EC file is unreadable. The replicated copy still read fine, because with only 5 DataNodes some of its replicas survived on the 2 remaining nodes. Equal fault tolerance on paper (2 failures each); in this case replication happened to survive a third.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Never set an EC policy on folders with many small files, or on hot data that jobs read all day. Check <code>verifyClusterSetup</code> first, and keep enough racks: an EC policy without rack diversity can lose data to a single rack failure.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Writing stripes, losing nodes, decoding</h2>
+  <p>Six steps for one stripe of RS-3-2 (three 1 MB data cells, two parity cells).</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">RS-3-2 from write to failure <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Commands and outputs">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@namenode : ~</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#7F8C86">$ hdfs ec -setPolicy -path /ec</text><text x="26" y="70" font-size="8.4" class="mono" style="fill:#7F8C86">    -policy RS-3-2-1024k</text><text x="26" y="88" font-size="8.4" class="mono" style="fill:#9FD3B8">Set RS-3-2-1024k erasure coding policy on /ec</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#7F8C86">$ hdfs dfs -cp …/orders_x30.csv /ec/</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#9FD3B8">(done)</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#7F8C86">$ hdfs dfs -du /rep /ec</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#9FD3B8">140760270  422280810  /rep/…</text><text x="26" y="90" font-size="8.4" class="mono" style="fill:#F5C77E">140760270  235132110  /ec/…</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#F5C77E">datanode-4, datanode-5 stopped</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#7F8C86">$ hdfs dfs -get /ec/orders_x30.csv</text><text x="26" y="92" font-size="8.4" class="mono" style="fill:#9FD3B8">md5 f07bba61… (same as before)</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#F5C77E">datanode-3 stopped too</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#E8A3A3">3 missing blocks, the stripe is:</text><text x="26" y="88" font-size="8.4" class="mono" style="fill:#E8A3A3">AlignedStripe(… missingChunksNum=3)</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.4" class="mono" style="fill:#7F8C86">$ hdfs dfs -du /ec/tiny.txt</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#9FD3B8">15  45  /ec/tiny.txt</text><text x="26" y="96" font-size="8.4" class="mono" style="fill:#F5C77E">same 3x as replication</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The admin sets RS-3-2 on the <code>/ec</code> folder.</li>
+          <li>The file is copied in; new files in the folder are erasure-coded.</li>
+          <li><code>-du</code> shows 1.67× instead of 3× raw space.</li>
+          <li>Two DataNodes stop. The file still reads correctly.</li>
+          <li>A third stops. The EC file can no longer be read.</li>
+          <li>Small files gain nothing: 15 bytes still cost 45.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Five DataNodes holding data and parity cells">
+          <g font-size="7.8" text-anchor="middle" class="s-ink"><text x="44" y="22">dn-A</text><text x="112" y="22">dn-B</text><text x="180" y="22">dn-C</text><text x="248" y="22">dn-D</text><text x="316" y="22">dn-E</text></g>
+          <g><rect x="16" y="28" width="56" height="110" rx="6" class="s-card2"/><rect x="84" y="28" width="56" height="110" rx="6" class="s-card2"/><rect x="152" y="28" width="56" height="110" rx="6" class="s-card2"/><rect x="220" y="28" width="56" height="110" rx="6" class="s-card2"/><rect x="288" y="28" width="56" height="110" rx="6" class="s-card2"/></g>
+          <g data-on="2-"><g font-size="8" text-anchor="middle"><rect x="22" y="36" width="44" height="18" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="44" y="49" class="s-green">cell 1</text><rect x="90" y="36" width="44" height="18" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="112" y="49" class="s-green">cell 2</text><rect x="158" y="36" width="44" height="18" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="180" y="49" class="s-green">cell 3</text><rect x="226" y="36" width="44" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="248" y="49" class="s-acc">P1</text><rect x="294" y="36" width="44" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="316" y="49" class="s-acc">P2</text></g></g>
+          <g data-on="2-"><g font-size="8" text-anchor="middle"><rect x="22" y="58" width="44" height="18" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="44" y="71" class="s-green">cell 4</text><rect x="90" y="58" width="44" height="18" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="112" y="71" class="s-green">cell 5</text><rect x="158" y="58" width="44" height="18" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="180" y="71" class="s-green">cell 6</text><rect x="226" y="58" width="44" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="248" y="71" class="s-acc">P1'</text><rect x="294" y="58" width="44" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="316" y="71" class="s-acc">P2'</text></g></g>
+          <g data-on="1"><text x="180" y="170" text-anchor="middle" font-size="8.6" class="s-ink2">the policy needs 5 DataNodes: one per internal block</text></g>
+          <g data-on="2"><text x="180" y="170" text-anchor="middle" font-size="8.6" class="s-ink2">1 MB cells round-robin over 3 data blocks; 2 parity cells per stripe</text></g>
+          <g data-on="3"><text x="180" y="160" text-anchor="middle" font-size="8.6" class="s-ink">per 3 MB of data: 5 MB on disk = 1.67×</text><text x="180" y="176" text-anchor="middle" font-size="8.6" class="s-ink2">replication 3 would store 9 MB</text></g>
+          <g data-on="4-5"><rect x="220" y="28" width="56" height="110" rx="6" style="fill:var(--red);opacity:.35"/><rect x="288" y="28" width="56" height="110" rx="6" style="fill:var(--red);opacity:.35"/></g>
+          <g data-on="4"><text x="180" y="160" text-anchor="middle" font-size="8.6" class="s-green">2 of 5 units lost: any 3 survivors rebuild each stripe</text><text x="180" y="176" text-anchor="middle" font-size="8.6" class="s-ink2">missing data cells are decoded on the fly while reading</text></g>
+          <g data-on="5"><rect x="152" y="28" width="56" height="110" rx="6" style="fill:var(--red);opacity:.35"/><text x="180" y="160" text-anchor="middle" font-size="8.6" class="s-red">3 of 5 units gone, only 2 left &lt; 3 needed</text><text x="180" y="176" text-anchor="middle" font-size="8.6" class="s-red">the stripe cannot be decoded</text></g>
+          <g data-on="6"><rect x="22" y="94" width="44" height="12" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="226" y="94" width="44" height="12" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><rect x="294" y="94" width="44" height="12" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><text x="180" y="160" text-anchor="middle" font-size="8.6" class="s-ink">tiny file: 1 partial data cell + 2 parity cells of the same size</text><text x="180" y="176" text-anchor="middle" font-size="8.6" class="s-ink2">= 3× its size, like replication</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>RS-3-2 needs five internal blocks on five different DataNodes.</li>
+          <li>The client cuts data into 1 MB cells, writes them round-robin to three data blocks, and computes two parity cells for each stripe.</li>
+          <li>Every 3 MB of data costs 5 MB of disk: 1.67×. Three replicas would cost 9 MB.</li>
+          <li>Two DataNodes are lost. Any 3 of the 5 units are enough to rebuild each stripe.</li>
+          <li>With a third loss only two units remain, fewer than the three needed: the data is lost until nodes return.</li>
+          <li>A tiny file fills only part of one cell, but both parity cells are as big as that cell: no saving.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Erasure coding at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="24" y="30" width="72" height="30" rx="6" class="s-card2"/><text x="60" y="49" text-anchor="middle" font-size="9" class="s-ink">archive</text></svg></div>
+    <div><h4>1. Cold and archival data</h4>
+      <p>Clusters apply RS-6-3 to folders of old partitions, logs and backups that are rarely read, cutting raw storage for that data roughly in half compared with 3× replication.</p>
+      <div class="uc-flow"><span>Data older than N months</span><i>→</i><span class="java">Copy into EC folder</span><i>→</i><span>1.5× instead of 3×</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="20" y="24" width="36" height="42" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="64" y="24" width="36" height="42" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="38" y="49" text-anchor="middle" font-size="8" class="s-blue">hot</text><text x="82" y="49" text-anchor="middle" font-size="8" class="s-green">cold</text></svg></div>
+    <div><h4>2. Hot and cold in one cluster</h4>
+      <p>Today's and this month's partitions stay replicated for fast local reads; a scheduled job moves older partitions into an EC directory and updates the table's location.</p>
+      <div class="uc-flow"><span>Hot: replication</span><i>→</i><span class="java">Monthly move job</span><i>→</i><span>Cold: EC</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><text x="60" y="40" text-anchor="middle" font-size="9" class="s-ink">≥ 9 nodes</text><text x="60" y="58" text-anchor="middle" font-size="9" class="s-ink">≥ 3 racks</text></svg></div>
+    <div><h4>3. Planning racks for EC</h4>
+      <p>Architects size racks so each block group spreads widely: with RS-6-3 across 9 or more racks, a whole rack failure costs at most one unit per group.</p>
+      <div class="uc-flow"><span>Policy</span><i>→</i><span class="java">verifyClusterSetup</span><i>→</i><span>Rack plan</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="22" y="22" width="76" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="50" text-anchor="middle" font-size="9" class="s-acc">object stores</text></svg></div>
+    <div><h4>4. The same idea everywhere</h4>
+      <p>Cloud object stores and many storage systems also use erasure coding internally to achieve high durability without full copies; HDFS brought the technique to Hadoop clusters.</p>
+      <div class="uc-flow"><span>Data</span><i>→</i><span class="java">k data + m parity</span><i>→</i><span>Durable, cheaper</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Parity you can compute: XOR erasure coding</h2>
+  <p>HDFS's simplest policy, XOR-2-1, computes one parity cell as the XOR of two data cells. Lose any one of the three and XOR the other two to get it back. Reed-Solomon does the same idea with more parity. Run it, then lose a different cell.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>d1 = b&quot;order_id,item,amount\n1,chai,20\n&quot;
+d2 = b&quot;2,poha,30\n3,dosa,40\n4,idli,30\n&quot;
+size = max(len(d1), len(d2))
+d1, d2 = d1.ljust(size, b&quot;\0&quot;), d2.ljust(size, b&quot;\0&quot;)     # cells are padded to equal size
+
+parity = bytes(a ^ b for a, b in zip(d1, d2))            # XOR-2-1: one parity cell
+print(&quot;stored cells:&quot;, len(d1), &quot;+&quot;, len(d2), &quot;+&quot;, len(parity), &quot;bytes&quot;)
+
+lost = &quot;d2&quot;                                               # a DataNode dies
+rebuilt = bytes(a ^ p for a, p in zip(d1, parity))        # d1 XOR parity = d2
+print(&quot;rebuilt&quot;, lost, &quot;correct:&quot;, rebuilt == d2)
+print(rebuilt.rstrip(b&quot;\0&quot;).decode())
+print(f&quot;overhead: {(len(d1) + len(d2) + len(parity)) / (2 * size):.2f}x&quot;)</code></pre><div class="output">stored cells: 31 + 31 + 31 bytes
+rebuilt d2 correct: True
+2,poha,30
+3,dosa,40
+4,idli,30
+
+overhead: 1.50x</div></div>
+  <ul class="anno"><li><code>parity = bytes(a ^ b for a, b in zip(d1, d2))            # XOR-2-1: one parity cell</code><span>XOR has a handy property: if p = a ⊕ b, then a = p ⊕ b and b = p ⊕ a. One parity cell protects against one loss.</span></li><li><code>rebuilt = bytes(a ^ p for a, p in zip(d1, parity))        # d1 XOR parity = d2</code><span>Reconstruction is computation, not copying: the reader needs the surviving cells and CPU time.</span></li><li><code>print(f&quot;overhead: {(len(d1) + len(d2) + len(parity)) / (2 * size):.2f}x&quot;)</code><span>3 cells stored for 2 cells of data: 1.5×, versus 3× with replication. RS-6-3 also reaches 1.5× but survives 3 losses.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Rebuild a lost cell",
+   "hint": "Press <b>Run<\/b>. Then lose <code>d1<\/code> instead and rebuild it from <code>d2<\/code> and <code>parity<\/code>.",
+   "code": "d1 = b\"order_id,item,amount\\n1,chai,20\\n\"\nd2 = b\"2,poha,30\\n3,dosa,40\\n4,idli,30\\n\"\nsize = max(len(d1), len(d2))\nd1, d2 = d1.ljust(size, b\"\\0\"), d2.ljust(size, b\"\\0\")     # cells are padded to equal size\n\nparity = bytes(a ^ b for a, b in zip(d1, d2))            # XOR-2-1: one parity cell\nprint(\"stored cells:\", len(d1), \"+\", len(d2), \"+\", len(parity), \"bytes\")\n\nlost = \"d2\"                                               # a DataNode dies\nrebuilt = bytes(a ^ p for a, p in zip(d1, parity))        # d1 XOR parity = d2\nprint(\"rebuilt\", lost, \"correct:\", rebuilt == d2)\nprint(rebuilt.rstrip(b\"\\0\").decode())\nprint(f\"overhead: {(len(d1) + len(d2) + len(parity)) / (2 * size):.2f}x\")\n"
+  },
+  {
+   "label": "2 · Overhead of policies",
+   "hint": "<b>Predict first:<\/b> which policy is cheapest? Compute raw space and failures tolerated for each.",
+   "code": "policies = {\"replication 3\": (1, 2), \"XOR-2-1\": (2, 1), \"RS-3-2\": (3, 2), \"RS-6-3\": (6, 3), \"RS-10-4\": (10, 4)}\nfor name, (k, m) in policies.items():\n    overhead = 3.0 if name.startswith(\"replication\") else (k + m) / k\n    tolerated = 2 if name.startswith(\"replication\") else m\n    print(f\"{name:14} {overhead:.2f}x raw   survives {tolerated} failure(s)\")\n"
+  },
+  {
+   "label": "3 · Our lab numbers",
+   "hint": "Check the real <code>-du<\/code> output: data 140,760,270 bytes; raw 422,280,810 (replicated) and 235,132,110 (RS-3-2).",
+   "code": "data, rep, ec = 140_760_270, 422_280_810, 235_132_110\nprint(f\"replication: {rep / data:.2f}x   EC: {ec / data:.2f}x   saving: {1 - ec / rep:.0%}\")\n"
+  },
+  {
+   "label": "4 · Small files",
+   "hint": "A file smaller than one cell still needs full-size parity cells. Compute raw bytes under RS-3-2 for 15 bytes, 1 MB and 10 MB (cell 1 MB).",
+   "code": "import math\ncell, k, m = 1024 * 1024, 3, 2\nfor size in [15, 1024 * 1024, 10 * 1024 * 1024]:\n    stripes = math.ceil(size / (k * cell))\n    parity = m * (min(size, cell) if stripes == 1 else cell) * stripes   # parity cells are as big as the largest data cell\n    raw = size + parity\n    print(f\"{size:>10} bytes -> raw {raw:>10}  ({raw / size:.2f}x)\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This check thinks a stripe with 3 lost units is still readable under RS-3-2. Fix the rule (need at least k survivors).",
+   "code": "k, m = 3, 2\nlost = 3\nreadable = lost <= k\nprint(\"readable:\", readable)\nassert not readable, \"RS-3-2 survives at most m = 2 losses\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: replication vs RS-3-2 on five DataNodes</h3>
+  <p>Use the 5-DataNode cluster from Module 5 (lab5). The script enables RS-3-2, checks the cluster, copies the same file into a replicated folder and an erasure-coded folder, compares disk usage, then stops DataNodes one by one and reads the files. It restarts the DataNodes at the end. Save as <code>ec_lab.sh</code> in the lab folder and run <code>bash ec_lab.sh</code>.</p>
+  <div class="pcrun"><h4>Erasure coding lab</h4>
+  <div class="code" data-lang="bash" data-file="ec_lab.sh"><pre><code>#!/usr/bin/env bash
+# ec_lab.sh: store the same file with 3x replication and with RS-3-2 erasure coding, then lose DataNodes.
+P=lab5
+NN=&quot;docker exec $P-namenode-1&quot;
+run() { echo &quot;\$ $1&quot;; $NN bash -c &quot;$1&quot; 2&gt;&amp;1 | grep -v -E &quot;^\s*$|WARN|INFO&quot;; echo; }
+run &quot;hdfs ec -enablePolicy -policy RS-3-2-1024k&quot;
+run &quot;hdfs ec -verifyClusterSetup -policy RS-6-3-1024k&quot;
+run &quot;hdfs ec -verifyClusterSetup -policy RS-3-2-1024k&quot;
+run &quot;hdfs dfs -rm -r -f -skipTrash /ec /rep &gt; /dev/null; hdfs dfs -mkdir -p /ec /rep &amp;&amp; hdfs ec -setPolicy -path /ec -policy RS-3-2-1024k&quot;
+run &quot;hdfs ec -getPolicy -path /ec ; hdfs ec -getPolicy -path /rep&quot;
+run &quot;hdfs dfs -cp /user/hadoop/data/orders_x30.csv /rep/ &amp;&amp; hdfs dfs -cp /user/hadoop/data/orders_x30.csv /ec/&quot;
+run &quot;echo &#x27;one tiny order&#x27; | hdfs dfs -put - /ec/tiny.txt; echo &#x27;one tiny order&#x27; | hdfs dfs -put - /rep/tiny.txt&quot;
+run &quot;hdfs dfs -du /rep /ec&quot;
+run &quot;hdfs fsck /ec/orders_x30.csv -files -blocks -locations | grep -E &#x27;bytes|blk_&#x27; | cut -c1-210&quot;
+run &quot;hdfs dfs -get -f /ec/orders_x30.csv /tmp/ec.csv &gt; /dev/null 2&gt;&amp;1; hdfs dfs -get -f /rep/orders_x30.csv /tmp/rep.csv &gt; /dev/null 2&gt;&amp;1; md5sum /tmp/ec.csv /tmp/rep.csv&quot;
+echo &quot;&gt;&gt;&gt; docker stop $P-datanode-4 $P-datanode-5   (2 of 5 DataNodes gone)&quot;; docker stop $P-datanode-4 $P-datanode-5 &gt; /dev/null; echo
+run &quot;s=\$(date +%s); hdfs dfs -get -f /ec/orders_x30.csv /tmp/ec2.csv &gt; /dev/null 2&gt;&amp;1; echo read took \$(( \$(date +%s) - s )) s; md5sum /tmp/ec2.csv&quot;
+echo &quot;&gt;&gt;&gt; docker stop $P-datanode-3   (3 of 5 gone: more than the 2 parity blocks)&quot;; docker stop $P-datanode-3 &gt; /dev/null; echo
+run &quot;hdfs dfs -get -f /ec/orders_x30.csv /tmp/ec3.csv &gt; /tmp/err 2&gt;&amp;1; echo exit=\$?; grep -m1 -oE &#x27;[0-9]+ missing blocks, the stripe is: AlignedStripe[^;]*&#x27; /tmp/err; grep -m1 -oE &#x27;get: .*&#x27; /tmp/err&quot;
+run &quot;s=\$(date +%s); hdfs dfs -get -f /rep/orders_x30.csv /tmp/rep3.csv &gt; /dev/null 2&gt;&amp;1; echo read took \$(( \$(date +%s) - s )) s; md5sum /tmp/rep3.csv&quot;
+docker start $P-datanode-3 $P-datanode-4 $P-datanode-5 &gt; /dev/null
+
+# Run:  bash ec_lab.sh</code></pre><div class="output">$ hdfs ec -enablePolicy -policy RS-3-2-1024k
+Erasure coding policy RS-3-2-1024k is enabled
+Warning: The cluster setup does not support EC policy RS-3-2-1024k. Reason: 3 racks are required for the erasure coding policies: RS-3-2-1024k. The number of racks is only 2.
+
+$ hdfs ec -verifyClusterSetup -policy RS-6-3-1024k
+9 DataNodes are required for the erasure coding policies: RS-6-3-1024k. The number of DataNodes is only 5.
+
+$ hdfs ec -verifyClusterSetup -policy RS-3-2-1024k
+3 racks are required for the erasure coding policies: RS-3-2-1024k. The number of racks is only 2.
+
+$ hdfs dfs -rm -r -f -skipTrash /ec /rep &gt; /dev/null; hdfs dfs -mkdir -p /ec /rep &amp;&amp; hdfs ec -setPolicy -path /ec -policy RS-3-2-1024k
+Set RS-3-2-1024k erasure coding policy on /ec
+
+$ hdfs ec -getPolicy -path /ec ; hdfs ec -getPolicy -path /rep
+RS-3-2-1024k
+The erasure coding policy of /rep is unspecified
+
+$ hdfs dfs -cp /user/hadoop/data/orders_x30.csv /rep/ &amp;&amp; hdfs dfs -cp /user/hadoop/data/orders_x30.csv /ec/
+
+$ echo &#x27;one tiny order&#x27; | hdfs dfs -put - /ec/tiny.txt; echo &#x27;one tiny order&#x27; | hdfs dfs -put - /rep/tiny.txt
+
+$ hdfs dfs -du /rep /ec
+140760270  422280810  /rep/orders_x30.csv
+15         45         /rep/tiny.txt
+140760270  235132110  /ec/orders_x30.csv
+15         45         /ec/tiny.txt
+
+$ hdfs fsck /ec/orders_x30.csv -files -blocks -locations | grep -E &#x27;bytes|blk_&#x27; | cut -c1-210
+Connecting to namenode via http://namenode:9870/fsck?ugi=hadoop&amp;files=1&amp;blocks=1&amp;locations=1&amp;path=%2Fec%2Forders_x30.csv
+/ec/orders_x30.csv 140760270 bytes, erasure-coded: policy=RS-3-2-1024k, 1 block(s):  OK
+0. BP-1507681208-172.19.0.3-1792565333483:blk_-9223372036854775728_1109 len=140760270 Live_repl=5  [blk_-9223372036854775728:DatanodeInfoWithStorage[172.19.0.7:9866,DS-e40699e9-3a0b-4fe5-8521-c39c99d74636,DISK]
+
+$ hdfs dfs -get -f /ec/orders_x30.csv /tmp/ec.csv &gt; /dev/null 2&gt;&amp;1; hdfs dfs -get -f /rep/orders_x30.csv /tmp/rep.csv &gt; /dev/null 2&gt;&amp;1; md5sum /tmp/ec.csv /tmp/rep.csv
+f07bba61afc730a4e29f03702b25e2fb  /tmp/ec.csv
+f07bba61afc730a4e29f03702b25e2fb  /tmp/rep.csv
+
+&gt;&gt;&gt; docker stop lab5-datanode-4 lab5-datanode-5   (2 of 5 DataNodes gone)
+
+$ s=$(date +%s); hdfs dfs -get -f /ec/orders_x30.csv /tmp/ec2.csv &gt; /dev/null 2&gt;&amp;1; echo read took $(( $(date +%s) - s )) s; md5sum /tmp/ec2.csv
+read took 63 s
+f07bba61afc730a4e29f03702b25e2fb  /tmp/ec2.csv
+
+&gt;&gt;&gt; docker stop lab5-datanode-3   (3 of 5 gone: more than the 2 parity blocks)
+
+$ hdfs dfs -get -f /ec/orders_x30.csv /tmp/ec3.csv &gt; /tmp/err 2&gt;&amp;1; echo exit=$?; grep -m1 -oE &#x27;[0-9]+ missing blocks, the stripe is: AlignedStripe[^;]*&#x27; /tmp/err; grep -m1 -oE &#x27;get: .*&#x27; /tmp/err
+exit=255
+3 missing blocks, the stripe is: AlignedStripe(Offset=0, length=1048576, fetchedChunksNum=0, missingChunksNum=3)
+get: Fatal internal error
+
+$ s=$(date +%s); hdfs dfs -get -f /rep/orders_x30.csv /tmp/rep3.csv &gt; /dev/null 2&gt;&amp;1; echo read took $(( $(date +%s) - s )) s; md5sum /tmp/rep3.csv
+read took 2 s
+f07bba61afc730a4e29f03702b25e2fb  /tmp/rep3.csv</div></div>
+  <p class="muted">Real output. The read with 2 DataNodes down took 63 s here because the NameNode still listed them as live and the client waited for a connect timeout; a repeat run took 2 s. Block IDs and IPs will differ on your run.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Striping cells round-robin</h2>
+  <p>Follow how a writer spreads 1 MB cells over three data internal blocks, stripe by stripe, and adds two parity cells per stripe.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "k, m = 3, 2",
+  "cells = [\"c1\", \"c2\", \"c3\", \"c4\", \"c5\", \"c6\", \"c7\"]",
+  "blocks = {i: [] for i in range(k + m)}",
+  "for n, cell in enumerate(cells):",
+  "    blocks[n % k].append(cell)",
+  "stripes = (len(cells) + k - 1) // k",
+  "for s in range(stripes):",
+  "    blocks[3].append(f\"P{s + 1}\")",
+  "    blocks[4].append(f\"Q{s + 1}\")",
+  "print(blocks)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>k<\/code> is created: 3. <code>m<\/code> is created: 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "m"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>cells<\/code> is created: → list #1. A new list object (#1) is created: [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]"
+   ],
+   "newVar": "cells"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>blocks<\/code> is created: → dict #2. A new dict object (#2) is created: {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7} A new list object (#3) is created: [] A new list object (#4) is created: [] A new list object (#5) is created: [] A new list object (#6) is created: [] A new list object (#7) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "blocks"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> is created: 0. <code>cell<\/code> is created: &#x27;c1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "cell",
+       "'c1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "cell"
+  },
+  {
+   "line": 5,
+   "phase": "Round-robin",
+   "note": "Cell n goes to data block n mod 3. Object #3 list now holds [&#x27;c1&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "cell",
+       "'c1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (1)<\/b> [&#x27;c1&#x27;]",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 1. <code>cell<\/code> changes to &#x27;c2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "cell",
+       "'c2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (1)<\/b> [&#x27;c1&#x27;]",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "cell"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #4 list now holds [&#x27;c2&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "cell",
+       "'c2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (1)<\/b> [&#x27;c1&#x27;]",
+    "<b>#4 list (1)<\/b> [&#x27;c2&#x27;]",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 2. <code>cell<\/code> changes to &#x27;c3&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "cell",
+       "'c3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (1)<\/b> [&#x27;c1&#x27;]",
+    "<b>#4 list (1)<\/b> [&#x27;c2&#x27;]",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "cell"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #5 list now holds [&#x27;c3&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "cell",
+       "'c3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (1)<\/b> [&#x27;c1&#x27;]",
+    "<b>#4 list (1)<\/b> [&#x27;c2&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;c3&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 3. <code>cell<\/code> changes to &#x27;c4&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "cell",
+       "'c4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (1)<\/b> [&#x27;c1&#x27;]",
+    "<b>#4 list (1)<\/b> [&#x27;c2&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;c3&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "cell"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #3 list now holds [&#x27;c1&#x27;, &#x27;c4&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "cell",
+       "'c4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (2)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;]",
+    "<b>#4 list (1)<\/b> [&#x27;c2&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;c3&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 4. <code>cell<\/code> changes to &#x27;c5&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "4"
+      ],
+      [
+       "cell",
+       "'c5'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (2)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;]",
+    "<b>#4 list (1)<\/b> [&#x27;c2&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;c3&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "cell"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #4 list now holds [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "4"
+      ],
+      [
+       "cell",
+       "'c5'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (2)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;c3&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 5. <code>cell<\/code> changes to &#x27;c6&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "cell",
+       "'c6'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (2)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;c3&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "cell"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #5 list now holds [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "cell",
+       "'c6'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (2)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 6. <code>cell<\/code> changes to &#x27;c7&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (2)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "cell"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #3 list now holds [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>stripes<\/code> is created: 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "stripes"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>s<\/code> is created: 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ],
+      [
+       "s",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "s"
+  },
+  {
+   "line": 8,
+   "phase": "Parity",
+   "note": "Every stripe (up to 3 cells) gets its own 2 parity cells. Object #6 list now holds [&#x27;P1&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ],
+      [
+       "s",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;P1&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "Object #7 list now holds [&#x27;Q1&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ],
+      [
+       "s",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;P1&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;Q1&#x27;]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>s<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ],
+      [
+       "s",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;P1&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;Q1&#x27;]"
+   ],
+   "newVar": "s"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #6 list now holds [&#x27;P1&#x27;, &#x27;P2&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ],
+      [
+       "s",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;P1&#x27;, &#x27;P2&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;Q1&#x27;]"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "Object #7 list now holds [&#x27;Q1&#x27;, &#x27;Q2&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ],
+      [
+       "s",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;P1&#x27;, &#x27;P2&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;Q1&#x27;, &#x27;Q2&#x27;]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>s<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ],
+      [
+       "s",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;P1&#x27;, &#x27;P2&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;Q1&#x27;, &#x27;Q2&#x27;]"
+   ],
+   "newVar": "s"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #6 list now holds [&#x27;P1&#x27;, &#x27;P2&#x27;, &#x27;P3&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ],
+      [
+       "s",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (3)<\/b> [&#x27;P1&#x27;, &#x27;P2&#x27;, &#x27;P3&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;Q1&#x27;, &#x27;Q2&#x27;]"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "Object #7 list now holds [&#x27;Q1&#x27;, &#x27;Q2&#x27;, &#x27;Q3&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ],
+      [
+       "s",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (3)<\/b> [&#x27;P1&#x27;, &#x27;P2&#x27;, &#x27;P3&#x27;]",
+    "<b>#7 list (3)<\/b> [&#x27;Q1&#x27;, &#x27;Q2&#x27;, &#x27;Q3&#x27;]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ],
+      [
+       "s",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (3)<\/b> [&#x27;P1&#x27;, &#x27;P2&#x27;, &#x27;P3&#x27;]",
+    "<b>#7 list (3)<\/b> [&#x27;Q1&#x27;, &#x27;Q2&#x27;, &#x27;Q3&#x27;]"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ],
+      [
+       "cells",
+       "→ list #1"
+      ],
+      [
+       "blocks",
+       "→ dict #2"
+      ],
+      [
+       "n",
+       "6"
+      ],
+      [
+       "cell",
+       "'c7'"
+      ],
+      [
+       "stripes",
+       "3"
+      ],
+      [
+       "s",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (7)<\/b> [&#x27;c1&#x27;, &#x27;c2&#x27;, &#x27;c3&#x27;, &#x27;c4&#x27;, &#x27;c5&#x27;, &#x27;c6&#x27;, &#x27;c7&#x27;]",
+    "<b>#2 dict (5)<\/b> {0: → list #3, 1: → list #4, 2: → list #5, 3: → list #6, 4: → list #7}",
+    "<b>#3 list (3)<\/b> [&#x27;c1&#x27;, &#x27;c4&#x27;, &#x27;c7&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;c2&#x27;, &#x27;c5&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;c3&#x27;, &#x27;c6&#x27;]",
+    "<b>#6 list (3)<\/b> [&#x27;P1&#x27;, &#x27;P2&#x27;, &#x27;P3&#x27;]",
+    "<b>#7 list (3)<\/b> [&#x27;Q1&#x27;, &#x27;Q2&#x27;, &#x27;Q3&#x27;]"
+   ],
+   "out": "{0: ['c1', 'c4', 'c7'], 1: ['c2', 'c5'], 2: ['c3', 'c6'], 3: ['P1', 'P2', 'P3'], 4: ['Q1', 'Q2', 'Q3']}\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three erasure-coding decisions with numbers: storage saved, how many DataNodes a policy needs, and whether a folder should be erasure-coded at all.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Cost · storage</span></div>
+    <h4>How much disk does EC save on the archive?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>The university's archive holds 400 TB of data, all with replication 3. If it moves to RS-6-3, how much raw disk is freed?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>400 TB · 3× vs 1.5×</pre></div><div><small>Expected output</small><pre>replication 1200 TB, RS-6-3 600 TB, freed 600 TB</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Raw with replication = 400 × 3.</li><li>Raw with RS-6-3 = 400 × 9/6.</li><li>Difference.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "600 TB freed: half the raw space, with 3 tolerated failures instead of 2.",
+   "code": "data = 400\nrep, ec = data * 3, data * 9 / 6\nprint(f\"replication {rep} TB, RS-6-3 {ec:.0f} TB, freed {rep - ec:.0f} TB\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "data = 400",
+  "rep, ec = data * 3, data * 9 / 6",
+  "print(f\"replication {rep} TB, RS-6-3 {ec:.0f} TB, freed {rep - ec:.0f} TB\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>data<\/code> is created: 400.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "400"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "data"
+  },
+  {
+   "line": 2,
+   "phase": "Overhead",
+   "note": "(k + m) / k = 9 / 6 = 1.5. <code>rep<\/code> is created: 1200. <code>ec<\/code> is created: 600.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "400"
+      ],
+      [
+       "rep",
+       "1200"
+      ],
+      [
+       "ec",
+       "600.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "ec"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "400"
+      ],
+      [
+       "rep",
+       "1200"
+      ],
+      [
+       "ec",
+       "600.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "replication 1200 TB, RS-6-3 600 TB, freed 600 TB\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Cluster · requirements</span></div>
+    <h4>Can our cluster use the policy?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>The cluster has 8 DataNodes in 3 racks. Which of RS-3-2, RS-6-3 and RS-10-4 can it run, using the rule “at least k + m DataNodes”?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>8 DataNodes</pre></div><div><small>Expected output</small><pre>RS-3-2   needs  5 DataNodes -&gt; OK
+RS-6-3   needs  9 DataNodes -&gt; not enough
+RS-10-4  needs 14 DataNodes -&gt; not enough</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Units per group = k + m.</li><li>Compare with the DataNode count.</li><li>Report usable policies.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Rack tolerance needs more: hdfs ec -verifyClusterSetup also checks racks, as our 2-rack lab showed for RS-3-2.",
+   "code": "nodes = 8\nfor name, k, m in [(\"RS-3-2\", 3, 2), (\"RS-6-3\", 6, 3), (\"RS-10-4\", 10, 4)]:\n    print(f\"{name:8} needs {k + m:2} DataNodes ->\", \"OK\" if nodes >= k + m else \"not enough\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "nodes = 8",
+  "for name, k, m in [(\"RS-3-2\", 3, 2), (\"RS-6-3\", 6, 3), (\"RS-10-4\", 10, 4)]:",
+  "    print(f\"{name:8} needs {k + m:2} DataNodes ->\", \"OK\" if nodes >= k + m else \"not enough\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>nodes<\/code> is created: 8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "nodes"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>name<\/code> is created: &#x27;RS-3-2&#x27;. <code>k<\/code> is created: 3. <code>m<\/code> is created: 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "8"
+      ],
+      [
+       "name",
+       "'RS-3-2'"
+      ],
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "m"
+  },
+  {
+   "line": 3,
+   "phase": "Units",
+   "note": "Each internal block must be on a different DataNode. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "8"
+      ],
+      [
+       "name",
+       "'RS-3-2'"
+      ],
+      [
+       "k",
+       "3"
+      ],
+      [
+       "m",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "RS-3-2   needs  5 DataNodes -> OK\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;RS-6-3&#x27;. <code>k<\/code> changes to 6. <code>m<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "8"
+      ],
+      [
+       "name",
+       "'RS-6-3'"
+      ],
+      [
+       "k",
+       "6"
+      ],
+      [
+       "m",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "m"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "8"
+      ],
+      [
+       "name",
+       "'RS-6-3'"
+      ],
+      [
+       "k",
+       "6"
+      ],
+      [
+       "m",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "RS-6-3   needs  9 DataNodes -> not enough\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;RS-10-4&#x27;. <code>k<\/code> changes to 10. <code>m<\/code> changes to 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "8"
+      ],
+      [
+       "name",
+       "'RS-10-4'"
+      ],
+      [
+       "k",
+       "10"
+      ],
+      [
+       "m",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "m"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "8"
+      ],
+      [
+       "name",
+       "'RS-10-4'"
+      ],
+      [
+       "k",
+       "10"
+      ],
+      [
+       "m",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "RS-10-4  needs 14 DataNodes -> not enough\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "8"
+      ],
+      [
+       "name",
+       "'RS-10-4'"
+      ],
+      [
+       "k",
+       "10"
+      ],
+      [
+       "m",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Decision · fit</span></div>
+    <h4>Should this folder be erasure-coded?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Three folders: /logs/2021 (400 TB, average file 900 MB, read once a year), /tmp (2 TB, average file 40 KB, read constantly) and /warehouse/today (50 TB, 256 MB files, read by every morning job). Score each for EC.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>3 folders</pre></div><div><small>Expected output</small><pre>/logs/2021         EC
+/tmp               keep replication
+/warehouse/today   keep replication</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>EC needs files much larger than one stripe (k × 1 MB).</li><li>EC suits cold data.</li><li>Recommend.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "/warehouse/today could move to EC once it becomes cold (e.g. after 90 days).",
+   "code": "folders = [(\"/logs/2021\", 900, \"cold\"), (\"/tmp\", 0.04, \"hot\"), (\"/warehouse/today\", 256, \"hot\")]\nfor path, avg_mb, temp in folders:\n    big = avg_mb >= 6 * 10        # well beyond one RS-6-3 stripe of 6 MB\n    print(f\"{path:18} {'EC' if big and temp == 'cold' else 'keep replication'}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "folders = [(\"/logs/2021\", 900, \"cold\"), (\"/tmp\", 0.04, \"hot\"), (\"/warehouse/today\", 256, \"hot\")]",
+  "for path, avg_mb, temp in folders:",
+  "    big = avg_mb >= 6 * 10        # well beyond one RS-6-3 stripe of 6 MB",
+  "    print(f\"{path:18} {'EC' if big and temp == 'cold' else 'keep replication'}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>folders<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;/logs/2021&#x27;, 900, &#x27;cold&#x27;)",
+    "<b>#3 tuple (3)<\/b> (&#x27;/tmp&#x27;, 0.04, &#x27;hot&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;/warehouse/today&#x27;, 256, &#x27;hot&#x27;)"
+   ],
+   "newVar": "folders"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>path<\/code> is created: &#x27;/logs/2021&#x27;. <code>avg_mb<\/code> is created: 900. <code>temp<\/code> is created: &#x27;cold&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "path",
+       "'/logs/2021'"
+      ],
+      [
+       "avg_mb",
+       "900"
+      ],
+      [
+       "temp",
+       "'cold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;/logs/2021&#x27;, 900, &#x27;cold&#x27;)",
+    "<b>#3 tuple (3)<\/b> (&#x27;/tmp&#x27;, 0.04, &#x27;hot&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;/warehouse/today&#x27;, 256, &#x27;hot&#x27;)"
+   ],
+   "newVar": "temp"
+  },
+  {
+   "line": 3,
+   "phase": "Rule",
+   "note": "Big and cold → EC; small or hot → replication. <code>big<\/code> is created: True.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "path",
+       "'/logs/2021'"
+      ],
+      [
+       "avg_mb",
+       "900"
+      ],
+      [
+       "temp",
+       "'cold'"
+      ],
+      [
+       "big",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;/logs/2021&#x27;, 900, &#x27;cold&#x27;)",
+    "<b>#3 tuple (3)<\/b> (&#x27;/tmp&#x27;, 0.04, &#x27;hot&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;/warehouse/today&#x27;, 256, &#x27;hot&#x27;)"
+   ],
+   "newVar": "big"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "path",
+       "'/logs/2021'"
+      ],
+      [
+       "avg_mb",
+       "900"
+      ],
+      [
+       "temp",
+       "'cold'"
+      ],
+      [
+       "big",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;/logs/2021&#x27;, 900, &#x27;cold&#x27;)",
+    "<b>#3 tuple (3)<\/b> (&#x27;/tmp&#x27;, 0.04, &#x27;hot&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;/warehouse/today&#x27;, 256, &#x27;hot&#x27;)"
+   ],
+   "out": "/logs/2021         EC\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>path<\/code> changes to &#x27;/tmp&#x27;. <code>avg_mb<\/code> changes to 0.04. <code>temp<\/code> changes to &#x27;hot&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "path",
+       "'/tmp'"
+      ],
+      [
+       "avg_mb",
+       "0.04"
+      ],
+      [
+       "temp",
+       "'hot'"
+      ],
+      [
+       "big",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;/logs/2021&#x27;, 900, &#x27;cold&#x27;)",
+    "<b>#3 tuple (3)<\/b> (&#x27;/tmp&#x27;, 0.04, &#x27;hot&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;/warehouse/today&#x27;, 256, &#x27;hot&#x27;)"
+   ],
+   "newVar": "temp"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>big<\/code> changes to False.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "path",
+       "'/tmp'"
+      ],
+      [
+       "avg_mb",
+       "0.04"
+      ],
+      [
+       "temp",
+       "'hot'"
+      ],
+      [
+       "big",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;/logs/2021&#x27;, 900, &#x27;cold&#x27;)",
+    "<b>#3 tuple (3)<\/b> (&#x27;/tmp&#x27;, 0.04, &#x27;hot&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;/warehouse/today&#x27;, 256, &#x27;hot&#x27;)"
+   ],
+   "newVar": "big"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "path",
+       "'/tmp'"
+      ],
+      [
+       "avg_mb",
+       "0.04"
+      ],
+      [
+       "temp",
+       "'hot'"
+      ],
+      [
+       "big",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;/logs/2021&#x27;, 900, &#x27;cold&#x27;)",
+    "<b>#3 tuple (3)<\/b> (&#x27;/tmp&#x27;, 0.04, &#x27;hot&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;/warehouse/today&#x27;, 256, &#x27;hot&#x27;)"
+   ],
+   "out": "/tmp               keep replication\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>path<\/code> changes to &#x27;/warehouse/today&#x27;. <code>avg_mb<\/code> changes to 256.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "path",
+       "'/warehouse/today'"
+      ],
+      [
+       "avg_mb",
+       "256"
+      ],
+      [
+       "temp",
+       "'hot'"
+      ],
+      [
+       "big",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;/logs/2021&#x27;, 900, &#x27;cold&#x27;)",
+    "<b>#3 tuple (3)<\/b> (&#x27;/tmp&#x27;, 0.04, &#x27;hot&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;/warehouse/today&#x27;, 256, &#x27;hot&#x27;)"
+   ],
+   "newVar": "avg_mb"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>big<\/code> changes to True.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "path",
+       "'/warehouse/today'"
+      ],
+      [
+       "avg_mb",
+       "256"
+      ],
+      [
+       "temp",
+       "'hot'"
+      ],
+      [
+       "big",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;/logs/2021&#x27;, 900, &#x27;cold&#x27;)",
+    "<b>#3 tuple (3)<\/b> (&#x27;/tmp&#x27;, 0.04, &#x27;hot&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;/warehouse/today&#x27;, 256, &#x27;hot&#x27;)"
+   ],
+   "newVar": "big"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "path",
+       "'/warehouse/today'"
+      ],
+      [
+       "avg_mb",
+       "256"
+      ],
+      [
+       "temp",
+       "'hot'"
+      ],
+      [
+       "big",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;/logs/2021&#x27;, 900, &#x27;cold&#x27;)",
+    "<b>#3 tuple (3)<\/b> (&#x27;/tmp&#x27;, 0.04, &#x27;hot&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;/warehouse/today&#x27;, 256, &#x27;hot&#x27;)"
+   ],
+   "out": "/warehouse/today   keep replication\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "path",
+       "'/warehouse/today'"
+      ],
+      [
+       "avg_mb",
+       "256"
+      ],
+      [
+       "temp",
+       "'hot'"
+      ],
+      [
+       "big",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;/logs/2021&#x27;, 900, &#x27;cold&#x27;)",
+    "<b>#3 tuple (3)<\/b> (&#x27;/tmp&#x27;, 0.04, &#x27;hot&#x27;)",
+    "<b>#4 tuple (3)<\/b> (&#x27;/warehouse/today&#x27;, 256, &#x27;hot&#x27;)"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "With RS-6-3, how many DataNode failures can a block group survive?",
+  "options": [
+   "1",
+   "2",
+   "3",
+   "6"
+  ],
+  "answer": 2,
+  "why": "m = 3 parity units: any 3 of the 9 can be lost."
+ },
+ {
+  "q": "What is the raw storage overhead of RS-6-3?",
+  "options": [
+   "3.0×",
+   "1.5×",
+   "2.0×",
+   "1.0×"
+  ],
+  "answer": 1,
+  "why": "(6 + 3) / 6 = 1.5×."
+ },
+ {
+  "q": "In our lab, how much disk did the 140,760,270-byte file use under RS-3-2?",
+  "options": [
+   "235,132,110",
+   "140,760,270",
+   "422,280,810",
+   "281,520,540"
+  ],
+  "answer": 0,
+  "why": "1.67×; with replication it was 422,280,810 (3×)."
+ },
+ {
+  "q": "Why did the 15-byte file cost 45 bytes under EC?",
+  "options": [
+   "A bug",
+   "EC adds headers",
+   "It was replicated",
+   "One small data cell still needs two parity cells of the same size"
+  ],
+  "answer": 3,
+  "why": "EC saves space only for files spanning several cells."
+ },
+ {
+  "q": "What happened after a third DataNode was stopped?",
+  "options": [
+   "The EC file still read",
+   "The NameNode crashed",
+   "The EC file could not be read: 3 missing blocks in the stripe",
+   "The file was auto-replicated"
+  ],
+  "answer": 2,
+  "why": "Only 2 of 5 units left; 3 are needed."
+ },
+ {
+  "q": "Which command applies EC to new files in a folder?",
+  "options": [
+   "hdfs dfs -setrep -ec",
+   "hdfs ec -setPolicy -path /dir -policy RS-6-3-1024k",
+   "hdfs dfsadmin -ec",
+   "hadoop ec -convert"
+  ],
+  "answer": 1,
+  "why": "Existing files keep their layout until rewritten."
+ },
+ {
+  "q": "Which data is the best fit for erasure coding?",
+  "options": [
+   "Large, rarely read archival files",
+   "Many small hot files",
+   "Files being appended all day",
+   "Temporary job output"
+  ],
+  "answer": 0,
+  "why": "Cold, large files: big savings, rare reconstruction cost."
+ },
+ {
+  "q": "Why did verifyClusterSetup warn about RS-3-2 on our cluster?",
+  "options": [
+   "Too few DataNodes",
+   "Java version",
+   "Disk full",
+   "3 racks are required, but there were only 2"
+  ],
+  "answer": 3,
+  "why": "Without enough racks, one rack failure could take too many units."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 7.3 in one screen</h3>
+    <ul><li>EC: <b>k data + m parity</b> units; survive any <b>m</b> losses; overhead <b>(k+m)/k</b>.</li><li>Policies: RS-6-3 (enabled by default, 9 DNs, 1.5×), RS-3-2 (5 DNs, 1.67×), RS-10-4, XOR-2-1.</li><li>Striped layout: 1 MB <b>cells</b> round-robin; a <b>block group</b> of k+m <b>internal blocks</b> on different DataNodes.</li><li>Lab: 422,280,810 B (rep 3) vs 235,132,110 B (RS-3-2) for the same file; same MD5 after 2 DNs died; “3 missing blocks” after the third.</li><li>Small files: no saving (15 B → 45 B). Hot data: loses locality, costs decode CPU.</li><li>Commands: <code>hdfs ec -listPolicies / -enablePolicy / -verifyClusterSetup / -setPolicy / -getPolicy</code>.</li><li>Policy affects only new files; move existing data with a copy.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What is erasure coding in Hadoop?</summary><p>A storage method introduced in Hadoop 3 in which file data is split into data units and parity units are computed with an algorithm such as Reed-Solomon. The units are stored on different DataNodes, and the original data can be reconstructed from any k of the k + m units. It gives similar or better fault tolerance than 3× replication at around 1.4–1.67× storage.</p></details>
+    <details><summary>What are the disadvantages of erasure coding?</summary><p>Reconstruction needs network reads from several nodes and CPU for decoding; reads lose data locality because data is striped across nodes; small files gain no space; it needs at least k + m DataNodes and enough racks; and some write features behave differently from replicated files. It is best for large, cold data.</p></details>
+    <details><summary>How do you enable erasure coding on a directory?</summary><p>Enable the policy if needed (hdfs ec -enablePolicy -policy RS-6-3-1024k), check the cluster with hdfs ec -verifyClusterSetup, then run hdfs ec -setPolicy -path /dir -policy RS-6-3-1024k. Files created afterwards in that directory are erasure-coded; existing files must be copied to be converted.</p></details>
+    <details><summary>What is a block group?</summary><p>In striped erasure coding, the set of k data and m parity internal blocks that together store a range of a file. Each internal block is stored on a different DataNode and has an ID derived from the group ID.</p></details>
+    <details><summary>Replication or erasure coding: how do you choose?</summary><p>Use replication for hot data, small files and data read with locality by many jobs. Use erasure coding for large files that are rarely read, such as archives, old partitions and backups, where storage savings matter more than read performance.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Erasure-coding exercises using the real sizes, IDs and messages from the lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Overhead formula</h4></div>
+      <p>Print the overhead (k+m)/k for RS-3-2, RS-6-3 and RS-10-4.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 policies</pre></div><div><small>Expected output</small><pre>RS-3-2: 1.67x
+RS-6-3: 1.50x
+RS-10-4: 1.40x</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for k, m in [(3, 2), (6, 3), (10, 4)]:
+    print(f&quot;RS-{k}-{m}: {(k + m) / k:.2f}x&quot;)</code></pre><div class="output">RS-3-2: 1.67x
+RS-6-3: 1.50x
+RS-10-4: 1.40x</div></div>
+        <p><b>How it works:</b> 1.67×, 1.50×, 1.40×.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Saving in the lab</h4></div>
+      <p>How many bytes did RS-3-2 save compared with replication for the lab file?</p>
+      <div class="prob__io"><div><small>Input</small><pre>422,280,810 vs 235,132,110</pre></div><div><small>Expected output</small><pre>187,148,700 bytes saved</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{422_280_810 - 235_132_110:,} bytes saved&quot;)</code></pre><div class="output">187,148,700 bytes saved</div></div>
+        <p><b>How it works:</b> 187,148,700 bytes, about 44% less raw space.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Internal block indexes</h4></div>
+      <p>Internal block IDs are the group ID plus the index. Given the five IDs from fsck, print each index and whether it holds data or parity (k = 3).</p>
+      <div class="prob__io"><div><small>Input</small><pre>-9223372036854775728 … -9223372036854775724</pre></div><div><small>Expected output</small><pre>-9223372036854775728 index 0 data
+-9223372036854775727 index 1 data
+-9223372036854775726 index 2 data
+-9223372036854775725 index 3 parity
+-9223372036854775724 index 4 parity</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>ids = [-9223372036854775728 + i for i in range(5)]
+group = ids[0]
+for b in ids:
+    i = b - group
+    print(b, &quot;index&quot;, i, &quot;data&quot; if i &lt; 3 else &quot;parity&quot;)</code></pre><div class="output">-9223372036854775728 index 0 data
+-9223372036854775727 index 1 data
+-9223372036854775726 index 2 data
+-9223372036854775725 index 3 parity
+-9223372036854775724 index 4 parity</div></div>
+        <p><b>How it works:</b> Indexes 0–2 are data, 3–4 parity: consecutive IDs in one block group.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>XOR recovery</h4></div>
+      <p>Data cells a = b"HDFS", b = b"EC!!"; parity p = a XOR b. Rebuild a from b and p.</p>
+      <div class="prob__io"><div><small>Input</small><pre>two 4-byte cells</pre></div><div><small>Expected output</small><pre>b&#x27;HDFS&#x27;</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>a, b = b&quot;HDFS&quot;, b&quot;EC!!&quot;
+p = bytes(x ^ y for x, y in zip(a, b))
+print(bytes(x ^ y for x, y in zip(b, p)))</code></pre><div class="output">b&#x27;HDFS&#x27;</div></div>
+        <p><b>How it works:</b> b"HDFS": XOR parity is the simplest erasure code.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Readable or not?</h4></div>
+      <p>For RS-6-3, given the number of lost units in a block group, print whether it can be read.</p>
+      <div class="prob__io"><div><small>Input</small><pre>0 to 4 lost</pre></div><div><small>Expected output</small><pre>0 lost -&gt; readable
+1 lost -&gt; readable
+2 lost -&gt; readable
+3 lost -&gt; readable
+4 lost -&gt; LOST</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>k, m = 6, 3
+for lost in range(5):
+    print(lost, &quot;lost -&gt;&quot;, &quot;readable&quot; if lost &lt;= m else &quot;LOST&quot;)</code></pre><div class="output">0 lost -&gt; readable
+1 lost -&gt; readable
+2 lost -&gt; readable
+3 lost -&gt; readable
+4 lost -&gt; LOST</div></div>
+        <p><b>How it works:</b> Up to 3 losses are fine; the fourth makes the group unreadable.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Stripes in a file</h4></div>
+      <p>How many full stripes does a 140,760,270-byte file have under RS-3-2 with 1 MB cells?</p>
+      <div class="prob__io"><div><small>Input</small><pre>140,760,270 bytes</pre></div><div><small>Expected output</small><pre>44 full stripes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>cell, k = 1024 * 1024, 3
+print(140_760_270 // (k * cell), &quot;full stripes&quot;)</code></pre><div class="output">44 full stripes</div></div>
+        <p><b>How it works:</b> 44 full stripes of 3 MB, plus a partial one; each stripe has its own 2 parity cells.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Archive disk budget</h4></div>
+      <p>Disk costs ₹4,000 per TB (with servers and power, illustrative). An archive of 300 TB moves from replication 3 to RS-6-3. What is the saving?</p>
+      <div class="prob__io"><div><small>Input</small><pre>300 TB</pre></div><div><small>Expected output</small><pre>450 TB freed -&gt; Rs 1,800,000</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>freed = 300 * 3 - 300 * 1.5
+print(f&quot;{freed:.0f} TB freed -&gt; Rs {freed * 4000:,.0f}&quot;)</code></pre><div class="output">450 TB freed -&gt; Rs 1,800,000</div></div>
+        <p><b>How it works:</b> 450 TB freed, about ₹18 lakh of disk (illustrative), or room for years of new data.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>Placement check</h4></div>
+      <p>Given rack assignments of the 5 internal blocks, check whether losing any single rack loses more than m = 2 units.</p>
+      <div class="prob__io"><div><small>Input</small><pre>5 units over 2 racks</pre></div><div><small>Expected output</small><pre>worst rack holds 3 units -&gt; a rack failure loses data</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>from collections import Counter
+racks = [&quot;r1&quot;, &quot;r1&quot;, &quot;r2&quot;, &quot;r2&quot;, &quot;r2&quot;]           # rack of each internal block
+worst = max(Counter(racks).values())
+print(&quot;worst rack holds&quot;, worst, &quot;units -&gt;&quot;, &quot;safe&quot; if worst &lt;= 2 else &quot;a rack failure loses data&quot;)</code></pre><div class="output">worst rack holds 3 units -&gt; a rack failure loses data</div></div>
+        <p><b>How it works:</b> With 2 racks, one holds 3 units: exactly why verifyClusterSetup asked for 3 racks for RS-3-2.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Erasure coding questions are common in Hadoop 3 interviews, especially for platform and administrator roles.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Hadoop 3 · features</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What's new in Hadoop 3 for storage?”</h4>
+      <p class="scn__situation">A common Hadoop 2 vs 3 question.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> erasure coding and its trade-offs.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Erasure coding: e.g. RS-6-3 stores 1.5× instead of 3× and tolerates 3 failures.</li>
+          <li>Also: more than two NameNodes for HA, intra-DataNode disk balancer, and other improvements.</li>
+          <li>Mention when not to use EC: small files, hot data needing locality.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Capacity · decision</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>Storage is 85% full; buying disks takes 4 months</h4>
+      <p class="scn__situation">A 2 PB cluster, mostly replicated. 60% of data is older than a year and rarely read.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> practical EC adoption.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Identify cold, large-file folders; check <code>verifyClusterSetup</code> for RS-6-3 (nodes and racks).</li>
+          <li>Create EC folders, copy cold partitions with distcp, verify checksums/row counts, repoint tables, delete originals.</li>
+          <li>Moving 1.2 PB of data from 3× to 1.5× frees roughly 1.8 PB of raw space; do it in batches off-peak.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Performance · troubleshooting</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>Jobs on EC data are slower and network traffic jumped</h4>
+      <p class="scn__situation">After converting a frequently queried table to EC, morning jobs take 40% longer.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> locality and decode costs.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Striped files have no node-local splits: every read pulls cells from several DataNodes over the network.</li>
+          <li>Any failed node forces decoding, which costs CPU (check that native ISA-L acceleration is enabled).</li>
+          <li>Keep hot tables replicated; apply EC only after data cools down.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Concepts · reliability</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“Is EC as safe as replication?”</h4>
+      <p class="scn__situation">A manager's question before approving EC.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> fault tolerance with conditions.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>RS-6-3 tolerates 3 simultaneous losses per block group vs 2 for replication 3, at half the space.</li>
+          <li>Conditions: enough DataNodes and racks so units are spread out, and capacity for reconstruction traffic.</li>
+          <li>Real demo: data survived 2 lost DataNodes with an identical checksum under RS-3-2, and failed only at the third.</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

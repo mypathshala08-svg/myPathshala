@@ -1,0 +1,4035 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Input splits, InputFormat and RecordReader | MyPhatshala</title>
+<meta name="description" content="How Hadoop MapReduce turns a file into map tasks and records, measured on a real Hadoop 3.5.0 cluster: 1 split for 4.7 MB, 5 splits with 1 MB blocks or split.maxsize, 1 split for a 2-block 134 MB file (the 1.1 split slop), 2 splits with split.minsize 256 MB. A line crossing the block boundary at byte 1,048,576 is read whole by one map and skipped by the next: 300,001 records, none lost or doubled. InputFormat, FileSplit, TextInputFormat, KeyValueTextInputFormat, NLineInputFormat, CombineTextInputFormat, splittable vs gzip. Python simulations, quiz and interview scenarios.">
+<meta name="mp:minutes" content="26">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/08-mapreduce-fundamentals/02-input-splits-inputformat-and-recordreader/">
+<meta property="og:title" content="Input splits, InputFormat and RecordReader · MyPhatshala">
+<meta property="og:description" content="HDFS cuts blocks by bytes, not lines. See on a real cluster how the RecordReader keeps every line whole, and why 2 blocks gave 1 map.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Input splits, InputFormat and RecordReader", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="08-mapreduce-fundamentals/02-input-splits-inputformat-and-recordreader" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 8.2</b></nav>
+    <h1>Input splits, InputFormat and RecordReader</h1>
+    <p class="lead">Before a single map task runs, Hadoop has already decided how many there will be and which bytes each one reads. This lesson opens up that decision (the InputFormat and its splits) and the reader inside each map task that turns bytes into records, using a small job that reports exactly what every split saw.</p>
+    <div class="lesson-meta"><span>Module 8 · MapReduce fundamentals</span><span>⏱ 26 min</span><span>Intermediate</span><span>Boundary line caught on a real cluster</span><span>2 blocks → 1 split, explained</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>A line cut in half</h2>
+  <div class="story">
+    <p class="narration">Riya stores the canteen file again, this time with tiny 1 MB blocks, so her job gets five map tasks instead of one. Then a doubt hits her. HDFS cuts blocks at exactly 1,048,576 bytes; it has no idea where a line ends. She looks at the bytes around the cut: the order <code>71484,poha,25</code> starts at byte 1,048,564 and ends at byte 1,048,578. Fourteen bytes, twelve in block 1 and two in block 2. Will map task 1 see <code>71484,poha,2</code> and map task 2 see a lonely <code>5</code>?</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="Block 1 ends in the middle of the line 71484,poha,25. Map task 1 reads past the end of its split to finish the line; map task 2 skips the partial line and starts at the next full line, 71485.">
+        <g font-size="10">
+          <rect x="30" y="40" width="300" height="40" rx="4" class="s-soft-green" style="stroke:var(--green)"/>
+          <text x="180" y="32" text-anchor="middle" font-weight="700" class="s-ink">block 1 / split 0: bytes 0 … 1,048,575</text>
+          <rect x="330" y="40" width="280" height="40" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/>
+          <text x="470" y="32" text-anchor="middle" font-weight="700" class="s-ink">block 2 / split 1: from byte 1,048,576</text>
+          <text x="250" y="65" text-anchor="middle" font-size="9" class="s-ink">… 71483,… | 71484,poha,2</text>
+          <text x="370" y="65" text-anchor="middle" font-size="9" class="s-ink">5 |</text>
+          <text x="480" y="65" text-anchor="middle" font-size="9" class="s-ink">71485,… | 71486,… | …</text>
+          <path d="M330 34v56" style="fill:none;stroke:var(--red);stroke-width:2;stroke-dasharray:4 3"/>
+          <text x="330" y="102" text-anchor="middle" font-size="8.6" class="s-red">HDFS cut: byte 1,048,576</text>
+          <path d="M196 118h190" style="fill:none;stroke:var(--green);stroke-width:2.5"/>
+          <text x="180" y="138" text-anchor="middle" font-size="9" class="s-green">map 0 reads past its end: last record “71484,poha,25”</text>
+          <path d="M400 152h120" style="fill:none;stroke:var(--blue);stroke-width:2.5"/>
+          <text x="470" y="172" text-anchor="middle" font-size="9" class="s-blue">map 1 skips “5” and starts at byte 1,048,578</text>
+        </g>
+        <text x="632" y="194" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Good doubt, and the answer is no. Blocks are cut by bytes; <b>records</b> are not. The piece of code that reads a split, the <b>RecordReader</b>, follows one rule: finish the line you started, even if it means reading a few bytes from the next block, and skip the half line you start in, because the previous reader already took it.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So the split boundary is just a suggestion?</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>It's a byte range. The records are decided by the reader. We checked it on the cluster: map 0's last line was <code>71484,poha,25</code>, complete, and map 1's first record started at byte 1,048,578. Five maps, 300,001 records in total, not one lost or doubled.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Today: who decides how many splits a job gets (the <b>InputFormat</b>), how big they are, why a 2-block file got only 1 map task, and how each record is read.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Input splits, InputFormat and RecordReader</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>An <b>InputFormat</b> describes how a MapReduce job reads its input. It has two responsibilities: <code>getSplits()</code>, run by the client at job submission, divides the input into <b>InputSplits</b>, logical byte ranges (for files, a <code>FileSplit</code> of path, start offset, length and the hosts that store the data), each processed by exactly one map task; and <code>createRecordReader()</code>, run inside each map task, returns a <b>RecordReader</b> that turns the bytes of one split into key-value records for the mapper. For <code>FileInputFormat</code> the split size is <code>max(minSize, min(maxSize, blockSize))</code>, and a final piece of up to 10% extra (the split slop, 1.1) is merged into the previous split. The default <code>TextInputFormat</code> uses a <code>LineRecordReader</code> that yields the byte offset of each line as key (<code>LongWritable</code>) and the line as value (<code>Text</code>); it completes a line that crosses the end of the split and skips the partial first line of a split that does not start at offset 0, so every line is read exactly once.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Before the job starts, Hadoop divides the input into pieces (splits), one per map task, usually one per block. Inside each map task a reader cuts its piece into records, carefully handling lines that cross the edges.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>InputSplit</b><span>A logical chunk of input for one map task. A byte range, not a copy of data.</span></div>
+    <div class="term"><b>FileSplit</b><span>The split for files: path, start, length, hosts.</span></div>
+    <div class="term"><b>InputFormat</b><span>Decides the splits and creates the record reader.</span></div>
+    <div class="term"><b>RecordReader</b><span>Turns a split's bytes into (key, value) records.</span></div>
+    <div class="term"><b>TextInputFormat</b><span>The default: key = byte offset, value = the line.</span></div>
+    <div class="term"><b>Split size</b><span><code>max(minSize, min(maxSize, blockSize))</code>; normally the block size.</span></div>
+    <div class="term"><b>Split slop</b><span>A last piece up to 10% of a split is joined to the one before (1.1 rule).</span></div>
+    <div class="term"><b>Splittable</b><span>A file a reader can start in the middle of. Plain text yes, gzip no.</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, SplitPeek job)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>canteen_orders.csv, 4.7 MB</th><td>1 block → 1 split, 300,001 records</td></tr>
+    <tr><th>Same file, 1 MB blocks</th><td>5 blocks → 5 splits: 70,485 + 67,321 + 65,498 + 65,574 + 31,123 = 300,001 records</td></tr>
+    <tr><th>1 block, split.maxsize = 1 MB</th><td>The same 5 splits and identical record counts: splits are logical</td></tr>
+    <tr><th>orders_x30.csv, 2 blocks</th><td>Blocks of 134,217,728 + 6,541,912 bytes → only <b>1</b> split (the slop rule), 9,000,000 records</td></tr>
+    <tr><th>orders_x90.csv, 422 MB</th><td>4 splits; with split.minsize = 256 MB: 2 splits</td></tr>
+    <tr><th>Boundary line</th><td>Split 0 ends at byte 1,048,576 but its last record starts at 1,048,564 (<code>71484,poha,25</code>); split 1's first record starts at 1,048,578</td></tr>
+  </table>
+
+  <h3 id="levels">Splits and readers at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Cutting a notebook for five friends</h4>
+      <ul>
+        <li>You tear a 100-page register into five bundles by page number: that's the <b>split</b>. You didn't read it, you just counted pages.</li>
+        <li>A sentence can run from page 20 onto page 21. Friend 1 reads on until the sentence ends; friend 2 ignores the half sentence at the top of page 21 and starts at the next full one: that's the <b>RecordReader</b>.</li>
+        <li>Nobody misses a sentence and nobody reads one twice.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> What the client and the task each do</h4>
+      <ul>
+        <li><b>Client, at submit time:</b> <code>InputFormat.getSplits()</code> lists files, asks the NameNode for block locations and builds FileSplits. Our log: “Total input files to process : 1”, “number of splits:5”. The split list is uploaded with the job, and the MRAppMaster requests one container per split, preferring its hosts.</li>
+        <li><b>Map task:</b> <code>createRecordReader()</code> opens the file, seeks to the split's start and calls <code>map()</code> once per record.</li>
+        <li><b>TextInputFormat records:</b> key = byte offset of the line (<code>LongWritable</code>), value = the line without the newline (<code>Text</code>). The offsets in our SplitPeek output are exactly these keys.</li>
+        <li><b>Size:</b> <code>splitSize = max(minSize, min(maxSize, blockSize))</code>. Default minSize 1 byte, maxSize unlimited, so splitSize = block size.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Edge rules that explain odd counts</h4>
+      <ul>
+        <li><b>Slop 1.1:</b> while the remaining bytes are more than 1.1 × splitSize, cut a full split; the rest becomes the last split. 140,759,640 / 134,217,728 = 1.049, so orders_x30's two blocks gave one split, reading 6.2 MB of block 2 remotely or locally wherever the split ran.</li>
+        <li><b>maxsize smaller than a block</b> gives more maps than blocks (more parallelism, more overhead). <b>minsize bigger than a block</b> gives fewer, bigger maps that span blocks and lose some locality.</li>
+        <li><b>LineRecordReader:</b> a split not starting at 0 throws away everything up to the first newline; every reader keeps reading while the line it is about to start begins at or before its end offset. Together this assigns each line to exactly one split.</li>
+        <li><b>Non-splittable input</b> (gzip, or <code>isSplitable()</code> returning false): one split per file, whatever its size. Module 10 compares codecs and splittability.</li>
+        <li>Splits are computed per file: 10,000 small files give at least 10,000 splits (Lesson 7.5), unless you use <code>CombineTextInputFormat</code>.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “Difference between a block and an input split”, write: a block is the physical unit HDFS stores (128 MB, replicated); a split is the logical unit one map task processes, computed by the InputFormat, usually equal to a block but adjustable by min/max split size, and records that cross a block boundary are read whole by the RecordReader of the split where they start.</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>InputFormats you will meet</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>InputFormat</th><th>Key</th><th>Value</th><th>Splits</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td><b>TextInputFormat</b> (default)</td><td>byte offset (LongWritable)</td><td>line (Text)</td><td>per block</td><td>CSV, logs, any text</td></tr>
+      <tr><td><b>KeyValueTextInputFormat</b></td><td>text before the first tab</td><td>rest of the line</td><td>per block</td><td>Output of an earlier job (key TAB value)</td></tr>
+      <tr><td><b>NLineInputFormat</b></td><td>byte offset</td><td>line</td><td>every N lines</td><td>Each line is a heavy task (e.g. a URL to fetch)</td></tr>
+      <tr><td><b>SequenceFileInputFormat</b></td><td>stored key</td><td>stored value</td><td>per block (sync markers)</td><td>Binary key-value files between jobs</td></tr>
+      <tr><td><b>CombineTextInputFormat</b></td><td>offset</td><td>line</td><td>many files per split</td><td>Lots of small files</td></tr>
+      <tr><td><b>DBInputFormat</b></td><td>row number</td><td>a DBWritable row</td><td>row ranges</td><td>Reading a small database table</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>The settings that change the number of maps</h3>
+  <div class="cards">
+    <div class="card"><h4>Block size</h4><p>Decided when the file is written (<code>-D dfs.blocksize=…</code>). Our 1 MB-block copy gave 5 maps.</p><span class="tag">physical</span></div>
+    <div class="card"><h4>split.maxsize</h4><p><code>mapreduce.input.fileinputformat.split.maxsize</code>: cap below the block size for more maps. 1 MB gave the same 5 splits.</p><span class="tag">more maps</span></div>
+    <div class="card"><h4>split.minsize</h4><p><code>mapreduce.input.fileinputformat.split.minsize</code>: raise above the block size for fewer maps. 256 MB turned 4 splits into 2.</p><span class="tag">fewer maps</span></div>
+    <div class="card"><h4>Compression</h4><p>A gzip file can't be entered in the middle: always 1 split per file. bzip2 and container formats can be split.</p><span class="tag">splittable?</span></div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>You cannot set the number of map tasks directly in the new API: it follows the splits. To change it, change the split size or the block size. The number of <i>reduce</i> tasks, on the other hand, is simply <code>mapreduce.job.reduces</code> (Lesson 8.5).</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Watching splits with SplitPeek</h2>
+  <p><code>SplitPeek.java</code> is a map-only job whose mapper counts the records it gets and, in <code>cleanup()</code>, writes one line per split: its start and length, the first and last record offsets, the last line and the host it ran on. Run with <code>splits_lab.sh</code> on the Module 8 lab (in “Run it on your PC”).</p>
+  <ol class="stepper">
+    <li><h4>One small file, one split</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr.jar SplitPeek /user/hadoop/data/canteen_orders.csv /out/peek_a
+hdfs dfs -cat /out/peek_a/part-m-*</code></pre><div class="output">number of splits:1
+split start=0 length=4692009 | records=300001 first_offset=0 last_offset=4691994 last_line=301000,idli,30 | ran_on=worker2</div></div>
+      <span class="behind">4.7 MB is less than one 128 MB block, so one split covers the whole file. The last line starts at byte 4,691,994: <code>301000,idli,30</code> plus the newline is 15 bytes, ending exactly at 4,692,009.</span></li>
+    <li><h4>Same data, 1 MB blocks</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hdfs dfs -D dfs.blocksize=1048576 -put -f canteen_orders.csv /user/hadoop/data/orders_1mb_blocks.csv
+hadoop jar mr.jar SplitPeek /user/hadoop/data/orders_1mb_blocks.csv /out/peek_b</code></pre><div class="output"> Total blocks (validated):	5 (avg. block size 938401 B)
+number of splits:5
+split start=0 length=1048576 | records=70485 first_offset=0 last_offset=1048564 last_line=71484,poha,25 | ran_on=worker2
+split start=1048576 length=1048576 | records=67321 first_offset=1048578 last_offset=2097145 last_line=138805,idli,30 | ran_on=worker3
+split start=2097152 length=1048576 | records=65498 first_offset=2097160 last_offset=3145721 last_line=204303,chai,15 | ran_on=worker1
+split start=3145728 length=1048576 | records=65574 first_offset=3145736 last_offset=4194301 last_line=269877,samosa,18 | ran_on=worker2
+split start=4194304 length=497705 | records=31123 first_offset=4194318 last_offset=4691994 last_line=301000,idli,30 | ran_on=worker1</div></div>
+      <span class="behind">Five blocks, five splits, five maps on all three workers. No split's first record starts exactly at its start: each began by skipping a partial line. The record counts add up to 300,001.</span></li>
+    <li><h4>Read the boundary</h4>
+      <div class="code" data-lang="text" data-file="arithmetic"><pre><code>split 0 ends at        1,048,576
+its last line starts   1,048,564   "71484,poha,25\n" = 14 bytes
+so that line ends at   1,048,578   (2 bytes inside block 2)
+split 1 first record   1,048,578</code></pre></div>
+      <span class="behind">Map 0 read 2 bytes past its split to finish the line; map 1 threw away those 2 bytes (“5” and the newline) and started at the next line. The same happens at every boundary: 2,097,145 + 15 = 2,097,160, the first record of split 2.</span></li>
+    <li><h4>Splits without changing blocks</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr.jar SplitPeek -D mapreduce.input.fileinputformat.split.maxsize=1048576 \
+    /user/hadoop/data/canteen_orders.csv /out/peek_c</code></pre><div class="output">number of splits:5
+split start=0 length=1048576 | records=70485 first_offset=0 last_offset=1048564 last_line=71484,poha,25 | ran_on=worker3
+…
+split start=4194304 length=497705 | records=31123 first_offset=4194318 last_offset=4691994 last_line=301000,idli,30 | ran_on=worker3</div></div>
+      <span class="behind">The file is still one 4.7 MB block, yet the job got the same 5 splits with identical record counts. A split is only a byte range; it does not need to match a block.</span></li>
+    <li><h4>Two blocks, one split</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hdfs fsck /user/hadoop/data/orders_x30.csv -files -blocks
+hadoop jar mr.jar SplitPeek /user/hadoop/data/orders_x30.csv /out/peek_d</code></pre><div class="output">0. …blk_1073741827_1003 len=134217728 Live_repl=3
+1. …blk_1073741828_1004 len=6541912 Live_repl=3
+number of splits:1
+split start=0 length=140759640 | records=9000000 first_offset=0 last_offset=140759625 last_line=301000,idli,30 | ran_on=worker1</div></div>
+      <span class="behind">140,759,640 bytes is only 1.049 times the 128 MB split size, below the 1.1 slop, so FileInputFormat makes one split instead of a 128 MB split plus a 6.2 MB one. A tiny second map task would cost more than it saves.</span></li>
+    <li><h4>Fewer, bigger splits</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr.jar SplitPeek /user/hadoop/data/orders_x90.csv /out/peek_e
+hadoop jar mr.jar SplitPeek -D mapreduce.input.fileinputformat.split.minsize=268435456 \
+    /user/hadoop/data/orders_x90.csv /out/peek_f</code></pre><div class="output">number of splits:4
+number of splits:2</div></div>
+      <span class="behind">With minSize 256 MB, splitSize = max(256 MB, min(∞, 128 MB)) = 256 MB: two map tasks, each reading two blocks. Fewer task start-ups, but part of each split may be read from another node.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Don't “fix” a slow job by setting split.maxsize very low. Our 4.7 MB file in five 1 MB splits started five JVMs for work one map does in seconds. Smaller splits help only when each map does heavy work per record.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>From a file to records</h2>
+  <p>Six steps: the client computes splits, two map tasks read across the boundary at byte 1,048,576.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Splits and the boundary line <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Terminal output of SplitPeek">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@namenode : /tmp/mr</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop jar mr.jar SplitPeek orders_1mb…</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">Total input files to process : 1</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#F5C77E">number of splits:5</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">map 0% reduce 0%</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#7F8C86">(5 map tasks on worker1, 2, 3)</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">split 0: start=0 length=1048576</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">first_offset=0</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#9FD3B8">records=70485</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">split 0:</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">last_offset=1048564</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#F5C77E">last_line=71484,poha,25</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">split 1: start=1048576</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">first_offset=1048578</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#9FD3B8">records=67321</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">70485 + 67321 + 65498</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">+ 65574 + 31123</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#F5C77E">= 300001 records</text><text x="26" y="110" font-size="8.2" class="mono" style="fill:#7F8C86">(the whole file, once)</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The client lists the input and computes 5 splits before anything runs.</li>
+          <li>YARN starts 5 map tasks, one per split.</li>
+          <li>Map 0 starts at byte 0, so its first record is at offset 0.</li>
+          <li>Map 0's last record starts 12 bytes before the end of its split.</li>
+          <li>Map 1 starts 2 bytes after its split's start.</li>
+          <li>Every line was read exactly once: 300,001 records in total.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Bytes around the split boundary">
+          <g font-size="8">
+            <rect x="12" y="16" width="336" height="30" rx="5" class="s-card2"/>
+            <text x="180" y="35" text-anchor="middle" class="s-ink">orders_1mb_blocks.csv · 4,692,009 bytes · 5 blocks</text>
+          </g>
+          <g data-on="1"><g font-size="7.6"><rect x="12" y="60" width="76" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="50" y="75" text-anchor="middle" class="s-green">split 0</text><rect x="88" y="60" width="76" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="126" y="75" text-anchor="middle" class="s-blue">split 1</text><rect x="164" y="60" width="76" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="202" y="75" text-anchor="middle" class="s-green">split 2</text><rect x="240" y="60" width="76" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="278" y="75" text-anchor="middle" class="s-blue">split 3</text><rect x="316" y="60" width="32" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="332" y="75" text-anchor="middle" class="s-green">4</text></g><text x="180" y="120" text-anchor="middle" font-size="8.6" class="s-ink">getSplits(): byte ranges + hosts, on the client</text><text x="180" y="134" text-anchor="middle" font-size="8.6" class="s-ink">no data is read yet</text></g>
+          <g data-on="2"><g font-size="7.6"><rect x="12" y="60" width="76" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="50" y="75" text-anchor="middle" class="s-green">map 0</text><rect x="88" y="60" width="76" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="126" y="75" text-anchor="middle" class="s-blue">map 1</text><rect x="164" y="60" width="76" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="202" y="75" text-anchor="middle" class="s-green">map 2</text><rect x="240" y="60" width="76" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="278" y="75" text-anchor="middle" class="s-blue">map 3</text><rect x="316" y="60" width="32" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="332" y="75" text-anchor="middle" class="s-green">4</text></g><text x="180" y="120" text-anchor="middle" font-size="8.6" class="s-ink">each map: createRecordReader(split)</text><text x="180" y="134" text-anchor="middle" font-size="8.6" class="s-ink">→ LineRecordReader</text></g>
+          <g data-on="3"><rect x="12" y="70" width="210" height="34" rx="4" class="s-soft-green" style="stroke:var(--green)"/><rect x="222" y="70" width="126" height="34" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><path d="M222 62v52" style="fill:none;stroke:var(--red);stroke-width:2;stroke-dasharray:3 3"/><text x="222" y="128" text-anchor="middle" font-size="8" class="s-red">byte 1,048,576</text><text x="60" y="91" text-anchor="middle" font-size="8" class="mono s-ink">1001,samosa,18</text><text x="180" y="160" text-anchor="middle" font-size="8.6" class="s-ink">map 0: key 0 → “order_id,item,amount”, key 21 → …</text></g>
+          <g data-on="4"><rect x="12" y="70" width="210" height="34" rx="4" class="s-soft-green" style="stroke:var(--green)"/><rect x="222" y="70" width="126" height="34" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><path d="M222 62v52" style="fill:none;stroke:var(--red);stroke-width:2;stroke-dasharray:3 3"/><text x="170" y="91" text-anchor="middle" font-size="8" class="mono s-ink">71484,poha,2</text><text x="232" y="91" text-anchor="middle" font-size="8" class="mono s-ink">5</text><path d="M128 110h112" style="fill:none;stroke:var(--green);stroke-width:2.5"/><text x="180" y="140" text-anchor="middle" font-size="8.6" class="s-ink">line starts at 1,048,564 (before the end):</text><text x="180" y="154" text-anchor="middle" font-size="8.6" class="s-ink">map 0 reads on, 2 bytes into block 2</text></g>
+          <g data-on="5"><rect x="12" y="70" width="210" height="34" rx="4" class="s-soft-green" style="stroke:var(--green)"/><rect x="222" y="70" width="126" height="34" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><path d="M222 62v52" style="fill:none;stroke:var(--red);stroke-width:2;stroke-dasharray:3 3"/><text x="232" y="91" text-anchor="middle" font-size="8" class="mono s-ink2" style="text-decoration:line-through">5</text><text x="292" y="91" text-anchor="middle" font-size="8" class="mono s-ink">71485,…</text><text x="232" y="64" text-anchor="middle" font-size="7.6" class="s-red">skipped</text><path d="M246 110h96" style="fill:none;stroke:var(--blue);stroke-width:2.5"/><text x="180" y="140" text-anchor="middle" font-size="8.6" class="s-ink">map 1 skips to the first newline,</text><text x="180" y="154" text-anchor="middle" font-size="8.6" class="s-ink">first key = 1,048,578</text></g>
+          <g data-on="6"><text x="180" y="100" text-anchor="middle" font-size="8.6" class="s-ink">a line belongs to the split</text><text x="180" y="114" text-anchor="middle" font-size="8.6" class="s-ink">in which it STARTS</text><text x="180" y="140" text-anchor="middle" font-size="8.6" class="s-green">no line lost, no line doubled</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>getSplits() turns the file into byte ranges with their hosts. Nothing is read yet.</li>
+          <li>Each map task creates a LineRecordReader for its own split.</li>
+          <li>Map 0 starts at byte 0. Keys are byte offsets: the header at 0, the first order at 21.</li>
+          <li>The line 71484,poha,25 starts inside split 0, so map 0 reads it fully, crossing into block 2.</li>
+          <li>Map 1 discards the partial line before its first newline and starts with 71485.</li>
+          <li>The rule: a line is read by the split in which it starts.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Splits at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="20" y="26" width="80" height="38" rx="6" class="s-soft-acc" style="stroke:var(--red)"/><text x="60" y="49" text-anchor="middle" font-size="8.6" class="s-red">.gz = 1 map</text></svg></div>
+    <div><h4>1. The single giant gzip file</h4>
+      <p>A vendor sends a 40 GB <code>.gz</code> file daily. The job gets one map task that runs for hours while the rest of the cluster sits idle. Teams recompress to a splittable format (bzip2, or Parquet/ORC with block compression) or ask for many smaller files.</p>
+      <div class="uc-flow"><span>40 GB .gz</span><i>→</i><span class="java">1 split</span><i>→</i><span>Recompress</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="22" width="84" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="8.6" class="s-ink">1 line =</text><text x="60" y="56" text-anchor="middle" font-size="8.6" class="s-acc">1 heavy task</text></svg></div>
+    <div><h4>2. NLineInputFormat for heavy rows</h4>
+      <p>A file of 5,000 lines, each naming a large image or a model to score. As one 50 KB split it would be one map; NLineInputFormat with N = 50 gives 100 maps working in parallel.</p>
+      <div class="uc-flow"><span>5,000 lines</span><i>→</i><span class="java">N = 50</span><i>→</i><span>100 maps</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="30" width="14" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="34" y="30" width="14" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="52" y="30" width="14" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><path d="M70 45h12" style="fill:none;stroke:var(--track);stroke-width:2"/><rect x="86" y="24" width="20" height="42" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/></svg></div>
+    <div><h4>3. Combining small files</h4>
+      <p>Daily folders with thousands of small log files are read with CombineTextInputFormat and a max split size of 256 MB, so a job runs a few dozen maps instead of thousands.</p>
+      <div class="uc-flow"><span>8,000 files</span><i>→</i><span class="java">CombineTextInputFormat</span><i>→</i><span>~40 maps</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><path d="M20 62l22-20 18 10 20-24 20 12" style="fill:none;stroke:var(--blue);stroke-width:2.5"/></svg></div>
+    <div><h4>4. Tuning map count for CPU-heavy jobs</h4>
+      <p>A parsing job spends 90% of its time on CPU. Lowering split.maxsize to 64 MB doubles the number of maps and uses every core; for an I/O-bound job the same change only adds overhead.</p>
+      <div class="uc-flow"><span>128 MB splits</span><i>→</i><span class="java">maxsize 64 MB</span><i>→</i><span>2× maps</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Compute splits like FileInputFormat</h2>
+  <p>This is the core of <code>FileInputFormat.getSplits()</code> for one file: the split size formula and the 1.1 slop rule. The file sizes are the real ones from our lab, and the printed counts match the job logs.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>MB = 1024 * 1024
+SLOP = 1.1
+
+def get_splits(length, block=128 * MB, min_size=1, max_size=2**63 - 1):
+    split_size = max(min_size, min(max_size, block))
+    splits, start, remaining = [], 0, length
+    while remaining / split_size &gt; SLOP:
+        splits.append((start, split_size))
+        start += split_size
+        remaining -= split_size
+    if remaining:
+        splits.append((start, remaining))
+    return splits
+
+files = {&quot;canteen_orders.csv&quot;: 4_692_009, &quot;orders_x30.csv&quot;: 140_759_640, &quot;orders_x90.csv&quot;: 422_278_920}
+print(&quot;A&quot;, len(get_splits(files[&quot;canteen_orders.csv&quot;])), &quot;split(s)&quot;)
+print(&quot;B&quot;, get_splits(files[&quot;canteen_orders.csv&quot;], block=1 * MB))
+print(&quot;D&quot;, len(get_splits(files[&quot;orders_x30.csv&quot;])), &quot;split(s)&quot;)
+print(&quot;E&quot;, len(get_splits(files[&quot;orders_x90.csv&quot;])), &quot;split(s)&quot;)
+print(&quot;F&quot;, len(get_splits(files[&quot;orders_x90.csv&quot;], min_size=256 * MB)), &quot;split(s) with minsize 256 MB&quot;)</code></pre><div class="output">A 1 split(s)
+B [(0, 1048576), (1048576, 1048576), (2097152, 1048576), (3145728, 1048576), (4194304, 497705)]
+D 1 split(s)
+E 4 split(s)
+F 2 split(s) with minsize 256 MB</div></div>
+  <ul class="anno"><li><code>    split_size = max(min_size, min(max_size, block))</code><span>The formula from FileInputFormat.computeSplitSize(). With default min and max it is simply the block size.</span></li><li><code>    while remaining / split_size &gt; SLOP:</code><span>Keep cutting full splits only while more than 1.1 splits are left; the rest becomes the last split.</span></li><li><code>print(&quot;D&quot;, len(get_splits(files[&quot;orders_x30.csv&quot;])), &quot;split(s)&quot;)</code><span>140,759,640 / 134,217,728 = 1.049, below 1.1: two blocks, one split, exactly as the job log said.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Count the splits",
+   "hint": "Press <b>Run<\/b>. Compare every line with the lab table: 1, 5, 1, 4 and 2.",
+   "code": "MB = 1024 * 1024\nSLOP = 1.1\n\ndef get_splits(length, block=128 * MB, min_size=1, max_size=2**63 - 1):\n    split_size = max(min_size, min(max_size, block))\n    splits, start, remaining = [], 0, length\n    while remaining / split_size > SLOP:\n        splits.append((start, split_size))\n        start += split_size\n        remaining -= split_size\n    if remaining:\n        splits.append((start, remaining))\n    return splits\n\nfiles = {\"canteen_orders.csv\": 4_692_009, \"orders_x30.csv\": 140_759_640, \"orders_x90.csv\": 422_278_920}\nprint(\"A\", len(get_splits(files[\"canteen_orders.csv\"])), \"split(s)\")\nprint(\"B\", get_splits(files[\"canteen_orders.csv\"], block=1 * MB))\nprint(\"D\", len(get_splits(files[\"orders_x30.csv\"])), \"split(s)\")\nprint(\"E\", len(get_splits(files[\"orders_x90.csv\"])), \"split(s)\")\nprint(\"F\", len(get_splits(files[\"orders_x90.csv\"], min_size=256 * MB)), \"split(s) with minsize 256 MB\")\n"
+  },
+  {
+   "label": "2 · Where does the slop bite?",
+   "hint": "<b>Predict first:<\/b> for which file sizes between 128 MB and 160 MB does the job get only 1 split?",
+   "code": "MB = 1024 * 1024\nfor size_mb in [130, 135, 140, 140.8, 141, 150, 160]:\n    n = 1 if size_mb / 128 <= 1.1 else 2\n    print(f\"{size_mb:6} MB -> {n} split(s)\")\n"
+  },
+  {
+   "label": "3 · Read across a boundary",
+   "hint": "A LineRecordReader in miniature. Split the text at byte 20 and read both halves. Which split gets the line that crosses byte 20?",
+   "code": "data = b\"1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n\"\n\ndef read_split(start, length):\n    end, pos, out = start + length, start, []\n    if start != 0:                                  # skip the partial first line\n        pos = data.index(b\"\\n\", start) + 1\n    while pos <= end and pos < len(data):           # a line STARTING at or before end is ours\n        nl = data.index(b\"\\n\", pos)\n        out.append((pos, data[pos:nl].decode()))\n        pos = nl + 1\n    return out\n\nprint(\"split 0:\", read_split(0, 20))\nprint(\"split 1:\", read_split(20, len(data) - 20))\n"
+  },
+  {
+   "label": "4 · Tune maps for a CPU-heavy job",
+   "hint": "A 1 GB file, 128 MB blocks. Which split.maxsize gives 32 map tasks? Check with the formula.",
+   "code": "MB = 1024 * 1024\nlength = 1024 * MB\nfor max_mb in [128, 64, 32, 16]:\n    size = max(1, min(max_mb * MB, 128 * MB))\n    n = 0\n    remaining = length\n    while remaining / size > 1.1:\n        remaining -= size; n += 1\n    print(f\"maxsize {max_mb:3} MB -> {n + (1 if remaining else 0)} splits\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This reader forgets to skip the partial first line when its split does not start at 0. Run it: the boundary line is read in two broken pieces. Fix it with the rule from task 3.",
+   "code": "data = b\"1001,chai,15\\n1002,dosa,45\\n\"\nstart = 20                                          # inside \"1002,dosa,45\"\nfirst = data[start:data.index(b\"\\n\", start)].decode()\noid, item, amount = first.split(\",\")\nprint(\"record:\", oid, item, amount)\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: peek inside every split</h3>
+  <p>Use the Module 8 lab from Lesson 8.1 (<code>lab8</code>). <code>SplitPeek.java</code> is a map-only job that writes one line per split. <code>splits_lab.sh</code> runs it six ways. It takes about 3 minutes.</p>
+  <div class="pcrun"><h4>A job that reports its own split</h4>
+  <div class="code" data-lang="bash" data-file="SplitPeek.java"><pre><code>// SplitPeek.java: a map-only job that reports, for every input split, where it starts,
+// how long it is, which hosts hold it, the first and last record offsets, and the record count.
+import java.io.IOException;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.FileSplit;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+
+public class SplitPeek {
+  public static class PeekMapper extends Mapper&lt;LongWritable, Text, NullWritable, Text&gt; {
+    private long first = -1, last = -1, records = 0;
+    private String lastLine = &quot;&quot;;
+
+    @Override
+    protected void map(LongWritable offset, Text line, Context ctx) {
+      if (first &lt; 0) first = offset.get();
+      last = offset.get();
+      lastLine = line.toString();
+      records++;
+    }
+
+    @Override
+    protected void cleanup(Context ctx) throws IOException, InterruptedException {
+      FileSplit s = (FileSplit) ctx.getInputSplit();
+      String host = java.net.InetAddress.getLocalHost().getHostName();
+      ctx.write(NullWritable.get(), new Text(String.format(
+          &quot;split start=%d length=%d | records=%d first_offset=%d last_offset=%d last_line=%s | ran_on=%s&quot;,
+          s.getStart(), s.getLength(), records, first, last, lastLine, host)));
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] rest = new GenericOptionsParser(conf, args).getRemainingArgs();
+    Job job = Job.getInstance(conf, &quot;split peek&quot;);
+    job.setJarByClass(SplitPeek.class);
+    job.setMapperClass(PeekMapper.class);
+    job.setNumReduceTasks(0);                     // map-only: one output file per map task
+    job.setOutputKeyClass(NullWritable.class);
+    job.setOutputValueClass(Text.class);
+    FileInputFormat.addInputPath(job, new Path(rest[0]));
+    FileOutputFormat.setOutputPath(job, new Path(rest[1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+
+// In the mr-lab folder:
+//   docker cp SplitPeek.java lab8-namenode-1:/tmp/mr/
+//   docker exec -it lab8-namenode-1 bash
+// Inside the container (canteen_orders.csv and orders_x30/x90 from Lesson 8.1 are already in HDFS):
+//   cd /tmp/mr
+//   mkdir -p classes &amp;&amp; javac -cp $(hadoop classpath) -d classes *.java &amp;&amp; jar cf mr.jar -C classes .
+//   hadoop jar mr.jar SplitPeek /user/hadoop/data/canteen_orders.csv /out/peek_a
+//   hdfs dfs -cat /out/peek_a/part-m-*</code></pre><div class="output">== A: canteen_orders.csv (4.7 MB, 1 block)
+number of splits:1
+split start=0 length=4692009 | records=300001 first_offset=0 last_offset=4691994 last_line=301000,idli,30 | ran_on=worker2</div></div>
+  <p class="muted">Real output. The key the mapper receives is the byte offset of each line, so first_offset and last_offset are simply the first and last keys it saw.</p></div>
+  <div class="pcrun"><h4>Six ways to split the same data</h4>
+  <div class="code" data-lang="bash" data-file="splits_lab.sh"><pre><code># splits_lab.sh: how many input splits (map tasks) does Hadoop make, and where do records start?
+cd /tmp/mr
+run() {  # run SplitPeek with extra options, print split count and one line per split
+  out=/out/peek_$1; shift
+  hdfs dfs -rm -r -f -skipTrash $out &gt; /dev/null 2&gt;&amp;1
+  hadoop jar mr.jar SplitPeek &quot;$@&quot; $out 2&gt;&amp;1 | grep -o &quot;number of splits:[0-9]*&quot;
+  hdfs dfs -cat $out/part-m-* 2&gt;/dev/null
+}
+echo &quot;== A: canteen_orders.csv (4.7 MB, 1 block)&quot;
+run a /user/hadoop/data/canteen_orders.csv
+echo &quot;== B: same data stored with 1 MB blocks&quot;
+hdfs dfs -D dfs.blocksize=1048576 -put -f canteen_orders.csv /user/hadoop/data/orders_1mb_blocks.csv
+hdfs fsck /user/hadoop/data/orders_1mb_blocks.csv -blocks 2&gt;/dev/null | grep &quot;Total blocks&quot;
+run b /user/hadoop/data/orders_1mb_blocks.csv
+echo &quot;== C: 1 block, but split.maxsize = 1 MB&quot;
+run c -D mapreduce.input.fileinputformat.split.maxsize=1048576 /user/hadoop/data/canteen_orders.csv
+echo &quot;== D: orders_x30.csv (2 blocks: 128 MB + 6.2 MB)&quot;
+run d /user/hadoop/data/orders_x30.csv
+echo &quot;== E: orders_x90.csv (4 blocks), then split.minsize = 256 MB&quot;
+run e /user/hadoop/data/orders_x90.csv | head -1
+run f -D mapreduce.input.fileinputformat.split.minsize=268435456 /user/hadoop/data/orders_x90.csv | head -1
+
+# Inside the namenode container:
+#   bash /tmp/mr/splits_lab.sh</code></pre><div class="output">== A: canteen_orders.csv (4.7 MB, 1 block)
+number of splits:1
+split start=0 length=4692009 | records=300001 first_offset=0 last_offset=4691994 last_line=301000,idli,30 | ran_on=worker2
+== B: same data stored with 1 MB blocks
+ Total blocks (validated):	5 (avg. block size 938401 B)
+number of splits:5
+split start=0 length=1048576 | records=70485 first_offset=0 last_offset=1048564 last_line=71484,poha,25 | ran_on=worker2
+split start=1048576 length=1048576 | records=67321 first_offset=1048578 last_offset=2097145 last_line=138805,idli,30 | ran_on=worker3
+split start=2097152 length=1048576 | records=65498 first_offset=2097160 last_offset=3145721 last_line=204303,chai,15 | ran_on=worker1
+split start=3145728 length=1048576 | records=65574 first_offset=3145736 last_offset=4194301 last_line=269877,samosa,18 | ran_on=worker2
+split start=4194304 length=497705 | records=31123 first_offset=4194318 last_offset=4691994 last_line=301000,idli,30 | ran_on=worker1
+== C: 1 block, but split.maxsize = 1 MB
+number of splits:5
+split start=0 length=1048576 | records=70485 first_offset=0 last_offset=1048564 last_line=71484,poha,25 | ran_on=worker3
+split start=1048576 length=1048576 | records=67321 first_offset=1048578 last_offset=2097145 last_line=138805,idli,30 | ran_on=worker1
+split start=2097152 length=1048576 | records=65498 first_offset=2097160 last_offset=3145721 last_line=204303,chai,15 | ran_on=worker2
+split start=3145728 length=1048576 | records=65574 first_offset=3145736 last_offset=4194301 last_line=269877,samosa,18 | ran_on=worker3
+split start=4194304 length=497705 | records=31123 first_offset=4194318 last_offset=4691994 last_line=301000,idli,30 | ran_on=worker3
+== D: orders_x30.csv (2 blocks: 128 MB + 6.2 MB)
+number of splits:1
+split start=0 length=140759640 | records=9000000 first_offset=0 last_offset=140759625 last_line=301000,idli,30 | ran_on=worker1
+== E: orders_x90.csv (4 blocks), then split.minsize = 256 MB
+number of splits:4
+number of splits:2</div></div>
+  <p class="muted">Real output. Which worker ran each split will differ on your machine; split boundaries, offsets and record counts will be identical because the data is generated with a fixed seed.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Who reads the line that crosses the boundary?</h2>
+  <p>Two readers share 39 bytes, cut at byte 20. Follow <code>pos</code> in each: the second reader jumps past the first newline, the first reads past its end.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "data = \"1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n\"",
+  "for start, end in [(0, 20), (20, 39)]:",
+  "    pos = start",
+  "    if start != 0:",
+  "        pos = data.index(\"\\n\", start) + 1",
+  "    lines = []",
+  "    while pos <= end and pos < len(data):",
+  "        nl = data.index(\"\\n\", pos)",
+  "        lines.append(data[pos:nl])",
+  "        pos = nl + 1",
+  "    print(start, end, lines)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>data<\/code> is created: &#x27;1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "data"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>start<\/code> is created: 0. <code>end<\/code> is created: 20.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "end"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>pos<\/code> is created: 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "pos"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>lines<\/code> is created: → list #1. A new list object (#1) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "0"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (0)<\/b> []"
+   ],
+   "newVar": "lines"
+  },
+  {
+   "line": 7,
+   "phase": "Read on",
+   "note": "Split 0 starts “1002,dosa,45” at byte 13, before its end (20), so it reads the whole line. The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "0"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>nl<\/code> is created: 12.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "0"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "12"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (0)<\/b> []"
+   ],
+   "newVar": "nl"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "Object #1 list now holds [&#x27;1001,chai,15&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "0"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "12"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [&#x27;1001,chai,15&#x27;]"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "<code>pos<\/code> changes to 13.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "13"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "12"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [&#x27;1001,chai,15&#x27;]"
+   ],
+   "newVar": "pos"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "13"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "12"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [&#x27;1001,chai,15&#x27;]"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>nl<\/code> changes to 25.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "13"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "25"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [&#x27;1001,chai,15&#x27;]"
+   ],
+   "newVar": "nl"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "Object #1 list now holds [&#x27;1001,chai,15&#x27;, &#x27;1002,dosa,45&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "13"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "25"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;1001,chai,15&#x27;, &#x27;1002,dosa,45&#x27;]"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "<code>pos<\/code> changes to 26.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "26"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "25"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;1001,chai,15&#x27;, &#x27;1002,dosa,45&#x27;]"
+   ],
+   "newVar": "pos"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "26"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "25"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;1001,chai,15&#x27;, &#x27;1002,dosa,45&#x27;]"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Result",
+   "note": "Each line printed exactly once. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "0"
+      ],
+      [
+       "end",
+       "20"
+      ],
+      [
+       "pos",
+       "26"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "25"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;1001,chai,15&#x27;, &#x27;1002,dosa,45&#x27;]"
+   ],
+   "out": "0 20 ['1001,chai,15', '1002,dosa,45']\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>start<\/code> changes to 20. <code>end<\/code> changes to 39.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "26"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "25"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;1001,chai,15&#x27;, &#x27;1002,dosa,45&#x27;]"
+   ],
+   "newVar": "end"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>pos<\/code> changes to 20.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "20"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "25"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;1001,chai,15&#x27;, &#x27;1002,dosa,45&#x27;]"
+   ],
+   "newVar": "pos"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "20"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "25"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;1001,chai,15&#x27;, &#x27;1002,dosa,45&#x27;]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Skip",
+   "note": "Split 1 starts inside “1002,dosa,45”, so it throws away bytes up to the newline. <code>pos<\/code> changes to 26.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "26"
+      ],
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "nl",
+       "25"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;1001,chai,15&#x27;, &#x27;1002,dosa,45&#x27;]"
+   ],
+   "newVar": "pos"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>lines<\/code> changes to → list #2. A new list object (#2) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "26"
+      ],
+      [
+       "lines",
+       "→ list #2"
+      ],
+      [
+       "nl",
+       "25"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "lines"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "26"
+      ],
+      [
+       "lines",
+       "→ list #2"
+      ],
+      [
+       "nl",
+       "25"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>nl<\/code> changes to 38.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "26"
+      ],
+      [
+       "lines",
+       "→ list #2"
+      ],
+      [
+       "nl",
+       "38"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "nl"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "Object #2 list now holds [&#x27;1003,poha,25&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "26"
+      ],
+      [
+       "lines",
+       "→ list #2"
+      ],
+      [
+       "nl",
+       "38"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#2 list (1)<\/b> [&#x27;1003,poha,25&#x27;]"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "<code>pos<\/code> changes to 39.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "39"
+      ],
+      [
+       "lines",
+       "→ list #2"
+      ],
+      [
+       "nl",
+       "38"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#2 list (1)<\/b> [&#x27;1003,poha,25&#x27;]"
+   ],
+   "newVar": "pos"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "39"
+      ],
+      [
+       "lines",
+       "→ list #2"
+      ],
+      [
+       "nl",
+       "38"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#2 list (1)<\/b> [&#x27;1003,poha,25&#x27;]"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "39"
+      ],
+      [
+       "lines",
+       "→ list #2"
+      ],
+      [
+       "nl",
+       "38"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#2 list (1)<\/b> [&#x27;1003,poha,25&#x27;]"
+   ],
+   "out": "20 39 ['1003,poha,25']\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data",
+       "'1001,chai,15\\n1002,dosa,45\\n1003,poha,25\\n'"
+      ],
+      [
+       "start",
+       "20"
+      ],
+      [
+       "end",
+       "39"
+      ],
+      [
+       "pos",
+       "39"
+      ],
+      [
+       "lines",
+       "→ list #2"
+      ],
+      [
+       "nl",
+       "38"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#2 list (1)<\/b> [&#x27;1003,poha,25&#x27;]"
+   ]
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three split calculations: from block layout to map count, a boundary check, and choosing a split size.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Splits · count</span></div>
+    <h4>How many map tasks will this job get?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A folder holds three files: 300 MB, 130 MB and 20 MB, with 128 MB blocks and default split settings. How many map tasks run?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>300 MB · 130 MB · 20 MB</pre></div><div><small>Expected output</small><pre>[3, 1, 1] -&gt; 5 map tasks</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Splits are computed per file.</li><li>Apply the 1.1 slop rule to each file.</li><li>Add them up.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "130 MB is only 1.016 splits, so 1 map. The 20 MB file still costs a whole map task of its own.",
+   "code": "def n_splits(mb, size=128):\n    n, rem = 0, mb\n    while rem / size > 1.1:\n        rem -= size; n += 1\n    return n + (1 if rem else 0)\nfiles = [300, 130, 20]\nprint([n_splits(f) for f in files], \"->\", sum(n_splits(f) for f in files), \"map tasks\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "def n_splits(mb, size=128):",
+  "    n, rem = 0, mb",
+  "    while rem / size > 1.1:",
+  "        rem -= size; n += 1",
+  "    return n + (1 if rem else 0)",
+  "files = [300, 130, 20]",
+  "print([n_splits(f) for f in files], \"->\", sum(n_splits(f) for f in files), \"map tasks\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>n_splits<\/code> is created: function n_splits().",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "n_splits"
+  },
+  {
+   "line": 6,
+   "phase": "Per file",
+   "note": "300 MB → 128 + 172 (1.34 > 1.1) → 128 + 128 + 44: 3 splits. <code>files<\/code> is created: → list #1. A new list object (#1) is created: [300, 130, 20]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "files"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>n_splits()<\/code> is called: a new frame is pushed with <code>mb<\/code> = 300, <code>size<\/code> = 128.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "size"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>n<\/code> is created: 0. <code>rem<\/code> is created: 300.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "300"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "rem"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "300"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 1. <code>rem<\/code> changes to 172.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "rem",
+       "172"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "rem"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "rem",
+       "172"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 2. <code>rem<\/code> changes to 44.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "rem",
+       "44"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "rem"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "rem",
+       "44"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "rem",
+       "44"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Return",
+   "note": "<code>n_splits()<\/code> returns <b>3<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>n_splits()<\/code> is called: a new frame is pushed with <code>mb<\/code> = 130, <code>size<\/code> = 128.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "130"
+      ],
+      [
+       "size",
+       "128"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "size"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>n<\/code> is created: 0. <code>rem<\/code> is created: 130.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "130"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "130"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "rem"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "130"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "130"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "130"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "130"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Return",
+   "note": "<code>n_splits()<\/code> returns <b>1<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>n_splits()<\/code> is called: a new frame is pushed with <code>mb<\/code> = 20, <code>size<\/code> = 128.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "20"
+      ],
+      [
+       "size",
+       "128"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "size"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>n<\/code> is created: 0. <code>rem<\/code> is created: 20.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "20"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "20"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "rem"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "20"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "20"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "20"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "20"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Return",
+   "note": "<code>n_splits()<\/code> returns <b>1<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>n_splits()<\/code> is called: a new frame is pushed with <code>mb<\/code> = 300, <code>size<\/code> = 128.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "size"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>n<\/code> is created: 0. <code>rem<\/code> is created: 300.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "300"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "rem"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "300"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 1. <code>rem<\/code> changes to 172.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "rem",
+       "172"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "rem"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "rem",
+       "172"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 2. <code>rem<\/code> changes to 44.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "rem",
+       "44"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "rem"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "rem",
+       "44"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "300"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "rem",
+       "44"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Return",
+   "note": "<code>n_splits()<\/code> returns <b>3<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "130"
+      ],
+      [
+       "size",
+       "128"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>n<\/code> is created: 0. <code>rem<\/code> is created: 130.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "130"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "130"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "rem"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "130"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "130"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "130"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "130"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Return",
+   "note": "<code>n_splits()<\/code> returns <b>1<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "20"
+      ],
+      [
+       "size",
+       "128"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>n<\/code> is created: 0. <code>rem<\/code> is created: 20.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "20"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "20"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "newVar": "rem"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "20"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "20"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    },
+    {
+     "frame": "n_splits()",
+     "vars": [
+      [
+       "mb",
+       "20"
+      ],
+      [
+       "size",
+       "128"
+      ],
+      [
+       "n",
+       "0"
+      ],
+      [
+       "rem",
+       "20"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Return",
+   "note": "<code>n_splits()<\/code> returns <b>1<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "n_splits",
+       "function n_splits()"
+      ],
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 130, 20]"
+   ],
+   "out": "[3, 1, 1] -> 5 map tasks\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Records · boundary</span></div>
+    <h4>Check a boundary from the job output</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>SplitPeek reported for split 1: <code>last_offset=2097145 last_line=138805,idli,30</code>, and split 2 started at byte 2,097,152 with <code>first_offset=2097160</code>. Show that no line was lost between them.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>2,097,145 · &quot;138805,idli,30&quot; · 2,097,160</pre></div><div><small>Expected output</small><pre>line ends at 2097160 | split 2 first record 2097160 | match: True
+bytes read past the split end: 8</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>The last line of split 1 ends at its offset + its length + 1 (newline).</li><li>That must be exactly where split 2's first record starts.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Do the same for split 0 → 1: 1,048,564 + len(\"71484,poha,25\") + 1.",
+   "code": "last_offset, last_line = 2097145, \"138805,idli,30\"\nends_at = last_offset + len(last_line) + 1\nprint(\"line ends at\", ends_at, \"| split 2 first record\", 2097160, \"| match:\", ends_at == 2097160)\nprint(\"bytes read past the split end:\", ends_at - 2097152)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "last_offset, last_line = 2097145, \"138805,idli,30\"",
+  "ends_at = last_offset + len(last_line) + 1",
+  "print(\"line ends at\", ends_at, \"| split 2 first record\", 2097160, \"| match:\", ends_at == 2097160)",
+  "print(\"bytes read past the split end:\", ends_at - 2097152)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>last_offset<\/code> is created: 2097145. <code>last_line<\/code> is created: &#x27;138805,idli,30&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "last_offset",
+       "2097145"
+      ],
+      [
+       "last_line",
+       "'138805,idli,30'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_line"
+  },
+  {
+   "line": 2,
+   "phase": "End",
+   "note": "14 characters plus the newline. <code>ends_at<\/code> is created: 2097160.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "last_offset",
+       "2097145"
+      ],
+      [
+       "last_line",
+       "'138805,idli,30'"
+      ],
+      [
+       "ends_at",
+       "2097160"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "ends_at"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "last_offset",
+       "2097145"
+      ],
+      [
+       "last_line",
+       "'138805,idli,30'"
+      ],
+      [
+       "ends_at",
+       "2097160"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "line ends at 2097160 | split 2 first record 2097160 | match: True\n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "last_offset",
+       "2097145"
+      ],
+      [
+       "last_line",
+       "'138805,idli,30'"
+      ],
+      [
+       "ends_at",
+       "2097160"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "bytes read past the split end: 8\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Tuning · size</span></div>
+    <h4>Pick a split size for a 10 GB job</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A 10 GB text file, 128 MB blocks, on a cluster with 40 free map containers. Each map has a fixed 6 s start-up and processes 50 MB/s. Compare 128 MB splits, 256 MB splits (split.minsize) and 64 MB splits (split.maxsize).</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>10 GB · 40 containers · 6 s start · 50 MB/s</pre></div><div><small>Expected output</small><pre> 64 MB: 160 maps, 4 waves, ~29 s
+128 MB:  80 maps, 2 waves, ~17 s
+256 MB:  40 maps, 1 waves, ~11 s</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Maps = size / split size; waves = maps / 40.</li><li>Time per map = 6 s + split / 50 MB/s.</li><li>Total ≈ waves × time per map.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Here 256 MB wins on paper, but bigger splits read more data across nodes and recover more slowly if a map fails. 128 MB is the usual default for good reason.",
+   "code": "import math\nfor split in [64, 128, 256]:\n    maps = math.ceil(10 * 1024 / split)\n    waves = math.ceil(maps / 40)\n    t = waves * (6 + split / 50)\n    print(f\"{split:3} MB: {maps:3} maps, {waves} waves, ~{t:.0f} s\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import math",
+  "for split in [64, 128, 256]:",
+  "    maps = math.ceil(10 * 1024 / split)",
+  "    waves = math.ceil(maps / 40)",
+  "    t = waves * (6 + split / 50)",
+  "    print(f\"{split:3} MB: {maps:3} maps, {waves} waves, ~{t:.0f} s\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>split<\/code> is created: 64.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "64"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "split"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>maps<\/code> is created: 160.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "64"
+      ],
+      [
+       "maps",
+       "160"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "maps"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>waves<\/code> is created: 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "64"
+      ],
+      [
+       "maps",
+       "160"
+      ],
+      [
+       "waves",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "waves"
+  },
+  {
+   "line": 5,
+   "phase": "Waves",
+   "note": "Fewer, bigger maps mean fewer start-ups but coarser balancing. <code>t<\/code> is created: 29.12.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "64"
+      ],
+      [
+       "maps",
+       "160"
+      ],
+      [
+       "waves",
+       "4"
+      ],
+      [
+       "t",
+       "29.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "t"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "64"
+      ],
+      [
+       "maps",
+       "160"
+      ],
+      [
+       "waves",
+       "4"
+      ],
+      [
+       "t",
+       "29.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": " 64 MB: 160 maps, 4 waves, ~29 s\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>split<\/code> changes to 128.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "128"
+      ],
+      [
+       "maps",
+       "160"
+      ],
+      [
+       "waves",
+       "4"
+      ],
+      [
+       "t",
+       "29.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "split"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>maps<\/code> changes to 80.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "128"
+      ],
+      [
+       "maps",
+       "80"
+      ],
+      [
+       "waves",
+       "4"
+      ],
+      [
+       "t",
+       "29.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "maps"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>waves<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "128"
+      ],
+      [
+       "maps",
+       "80"
+      ],
+      [
+       "waves",
+       "2"
+      ],
+      [
+       "t",
+       "29.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "waves"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>t<\/code> changes to 17.12.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "128"
+      ],
+      [
+       "maps",
+       "80"
+      ],
+      [
+       "waves",
+       "2"
+      ],
+      [
+       "t",
+       "17.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "t"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "128"
+      ],
+      [
+       "maps",
+       "80"
+      ],
+      [
+       "waves",
+       "2"
+      ],
+      [
+       "t",
+       "17.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "128 MB:  80 maps, 2 waves, ~17 s\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>split<\/code> changes to 256.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "256"
+      ],
+      [
+       "maps",
+       "80"
+      ],
+      [
+       "waves",
+       "2"
+      ],
+      [
+       "t",
+       "17.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "split"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>maps<\/code> changes to 40.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "256"
+      ],
+      [
+       "maps",
+       "40"
+      ],
+      [
+       "waves",
+       "2"
+      ],
+      [
+       "t",
+       "17.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "maps"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>waves<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "256"
+      ],
+      [
+       "maps",
+       "40"
+      ],
+      [
+       "waves",
+       "1"
+      ],
+      [
+       "t",
+       "17.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "waves"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>t<\/code> changes to 11.12.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "256"
+      ],
+      [
+       "maps",
+       "40"
+      ],
+      [
+       "waves",
+       "1"
+      ],
+      [
+       "t",
+       "11.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "t"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "256"
+      ],
+      [
+       "maps",
+       "40"
+      ],
+      [
+       "waves",
+       "1"
+      ],
+      [
+       "t",
+       "11.12"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "256 MB:  40 maps, 1 waves, ~11 s\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "split",
+       "256"
+      ],
+      [
+       "maps",
+       "40"
+      ],
+      [
+       "waves",
+       "1"
+      ],
+      [
+       "t",
+       "11.12"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Who computes the input splits, and when?",
+  "options": [
+   "Each map task, when it starts",
+   "The NameNode, when the file is written",
+   "The client, at job submission (InputFormat.getSplits())",
+   "The reducer"
+  ],
+  "answer": 2,
+  "why": "Our client log printed “number of splits:5” before any task ran."
+ },
+ {
+  "q": "What does TextInputFormat give the mapper as the key?",
+  "options": [
+   "The line number",
+   "The byte offset of the line in the file",
+   "The first field of the CSV",
+   "Nothing (NullWritable)"
+  ],
+  "answer": 1,
+  "why": "LongWritable offsets like 1048578."
+ },
+ {
+  "q": "A line starts in split 0 and ends in split 1. Who reads it?",
+  "options": [
+   "Split 0's reader reads it whole; split 1's reader skips it",
+   "Both, each its own part",
+   "Split 1 only",
+   "Nobody; it is dropped"
+  ],
+  "answer": 0,
+  "why": "Lab: split 0 ended with 71484,poha,25; split 1 started at 1048578."
+ },
+ {
+  "q": "Why did orders_x30.csv (2 blocks: 128 MB + 6.2 MB) get only 1 split?",
+  "options": [
+   "The file is compressed",
+   "The second block was missing",
+   "Maps can't start on block 2",
+   "The remaining size was below 1.1 × split size (split slop)"
+  ],
+  "answer": 3,
+  "why": "140,759,640 / 134,217,728 = 1.049."
+ },
+ {
+  "q": "What is the split size with default settings?",
+  "options": [
+   "64 MB always",
+   "The file size",
+   "max(minSize, min(maxSize, blockSize)), i.e. the block size",
+   "mapreduce.job.maps"
+  ],
+  "answer": 2,
+  "why": "Defaults: minSize 1, maxSize unlimited."
+ },
+ {
+  "q": "split.maxsize = 1 MB on a 4.7 MB file stored as one block gave how many splits?",
+  "options": [
+   "1",
+   "5",
+   "4",
+   "47"
+  ],
+  "answer": 1,
+  "why": "Splits are logical byte ranges and need not match blocks."
+ },
+ {
+  "q": "Why does a 10 GB .gz file get only one map task?",
+  "options": [
+   "gzip is not splittable: a reader can't start in the middle",
+   "gzip files are always small",
+   "HDFS stores it in one block",
+   "The InputFormat rejects it"
+  ],
+  "answer": 0,
+  "why": "Module 10 compares splittable codecs."
+ },
+ {
+  "q": "Which InputFormat helps when a job reads 10,000 small files?",
+  "options": [
+   "NLineInputFormat",
+   "KeyValueTextInputFormat",
+   "SequenceFileOutputFormat",
+   "CombineTextInputFormat"
+  ],
+  "answer": 3,
+  "why": "It packs many files into one split."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 8.2 in one screen</h3>
+    <ul><li><b>InputFormat</b>: <code>getSplits()</code> on the client, <code>createRecordReader()</code> in each map task.</li><li>One map task per <b>split</b>; a split is a byte range (FileSplit: path, start, length, hosts), not a copy of data.</li><li><code>splitSize = max(minSize, min(maxSize, blockSize))</code>; last piece up to 1.1 × is merged (slop).</li><li>Lab: 4.7 MB → 1 split; 1 MB blocks or maxsize 1 MB → 5; 134 MB in 2 blocks → 1; 422 MB → 4, minsize 256 MB → 2.</li><li>TextInputFormat: key = byte offset (LongWritable), value = line (Text).</li><li>LineRecordReader: skip the partial first line (unless start = 0), read past the end to finish the last line; each line read once.</li><li>Non-splittable files (gzip) → 1 split per file; many small files → use CombineTextInputFormat.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What is the difference between an HDFS block and an input split?</summary><p>A block is the physical unit HDFS stores and replicates (128 MB by default). An input split is a logical byte range computed by the job's InputFormat; one map task processes one split. By default a split equals a block, but split.minsize and split.maxsize change that, and the RecordReader reads records that cross block boundaries whole, so a split's records may extend slightly into the next block.</p></details>
+    <details><summary>How is the number of mappers decided in Hadoop?</summary><p>By the number of input splits that the InputFormat computes. For FileInputFormat it depends on the file sizes, block size, mapreduce.input.fileinputformat.split.minsize and split.maxsize, the 1.1 split slop, and whether files are splittable. You cannot set the number of map tasks directly in the new API.</p></details>
+    <details><summary>How does Hadoop handle records that cross block boundaries?</summary><p>The LineRecordReader of a split that does not start at byte 0 skips everything up to the first newline, because that partial line belongs to the previous split. Every reader keeps reading while the next line starts at or before the end of its split, so it finishes a line that crosses the boundary by reading a few bytes of the next block. Each line is therefore processed exactly once.</p></details>
+    <details><summary>What does TextInputFormat pass to the mapper?</summary><p>For each line, a LongWritable key holding the byte offset where the line starts in the file, and a Text value holding the line without its line terminator. The offset is often ignored by the mapper.</p></details>
+    <details><summary>Why does my job have only one mapper for a large file?</summary><p>Usually because the file is compressed with a non-splittable codec such as gzip, the InputFormat marks it as not splittable, or split.minsize is set larger than the file. A file just slightly bigger than one block (up to 10% more) also gets a single split because of the split slop.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Split and record-reader exercises using the real offsets and sizes from our lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Records add up</h4></div>
+      <p>Add the record counts of the five splits and compare with the single-split run.</p>
+      <div class="prob__io"><div><small>Input</small><pre>70,485 · 67,321 · 65,498 · 65,574 · 31,123</pre></div><div><small>Expected output</small><pre>300001 True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>parts = [70485, 67321, 65498, 65574, 31123]
+print(sum(parts), sum(parts) == 300001)</code></pre><div class="output">300001 True</div></div>
+        <p><b>How it works:</b> 300,001 in both runs: the boundary rule loses and duplicates nothing.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Last split length</h4></div>
+      <p>The file is 4,692,009 bytes and splits are 1 MB. What is the length of the last split?</p>
+      <div class="prob__io"><div><small>Input</small><pre>4,692,009 · 1,048,576</pre></div><div><small>Expected output</small><pre>497705</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(4692009 - 4 * 1048576)</code></pre><div class="output">497705</div></div>
+        <p><b>How it works:</b> 497,705 bytes, exactly what SplitPeek printed.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Slop ratio</h4></div>
+      <p>Compute the ratio that decided orders_x30.csv's single split.</p>
+      <div class="prob__io"><div><small>Input</small><pre>140,759,640 / 134,217,728</pre></div><div><small>Expected output</small><pre>1.049 &lt;= 1.1 -&gt; one split</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(140759640 / 134217728, 3), &quot;&lt;= 1.1 -&gt; one split&quot;)</code></pre><div class="output">1.049 &lt;= 1.1 -&gt; one split</div></div>
+        <p><b>How it works:</b> 1.049: below 1.1, so no separate split for the 6.2 MB tail.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Boundary at split 3</h4></div>
+      <p>Split 3 ended at byte 4,194,304; its last line started at 4,194,301 (269877,samosa,18). Where does split 4 start reading?</p>
+      <div class="prob__io"><div><small>Input</small><pre>4,194,301 + line + newline</pre></div><div><small>Expected output</small><pre>4194318</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(4194301 + len(&quot;269877,samosa,18&quot;) + 1)</code></pre><div class="output">4194318</div></div>
+        <p><b>How it works:</b> 4,194,318, the first_offset of split 4. Map 3 read 14 bytes past its end.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>KeyValueTextInputFormat</h4></div>
+      <p>Parse output lines of Lesson 8.1 the way KeyValueTextInputFormat does: key before the first tab, value after.</p>
+      <div class="prob__io"><div><small>Input</small><pre>part-r-00000 lines</pre></div><div><small>Expected output</small><pre>&#x27;chai&#x27; -&gt; &#x27;50170\t752550&#x27;
+&#x27;vada pav&#x27; -&gt; &#x27;49986\t999720&#x27;</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>lines = [&quot;chai\t50170\t752550&quot;, &quot;vada pav\t49986\t999720&quot;]
+for l in lines:
+    key, value = l.split(&quot;\t&quot;, 1)
+    print(repr(key), &quot;-&gt;&quot;, repr(value))</code></pre><div class="output">&#x27;chai&#x27; -&gt; &#x27;50170\t752550&#x27;
+&#x27;vada pav&#x27; -&gt; &#x27;49986\t999720&#x27;</div></div>
+        <p><b>How it works:</b> Only the first tab separates; the value keeps the rest. Useful for chaining jobs.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>NLineInputFormat</h4></div>
+      <p>5,000 lines, N = 50 lines per split. How many maps, and which lines does map 7 get?</p>
+      <div class="prob__io"><div><small>Input</small><pre>5,000 lines · N = 50</pre></div><div><small>Expected output</small><pre>100 maps; map 7 gets lines 351 to 400</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>n = 50
+print(5000 // n, &quot;maps; map 7 gets lines&quot;, 7 * n + 1, &quot;to&quot;, 8 * n)</code></pre><div class="output">100 maps; map 7 gets lines 351 to 400</div></div>
+        <p><b>How it works:</b> 100 maps; map 7 (counting from 0) gets lines 351–400.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>The gzip bottleneck</h4></div>
+      <p>A daily 60 GB gzip file takes one map 2 hours. Recompressed to splittable 128 MB pieces on a cluster with 100 free containers, each piece takes 45 s plus 5 s start-up. Estimate the new map time.</p>
+      <div class="prob__io"><div><small>Input</small><pre>60 GB · 100 containers · 50 s per map</pre></div><div><small>Expected output</small><pre>480 maps, 5 waves, about 4 minutes instead of 120</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+maps = math.ceil(60 * 1024 / 128)
+waves = math.ceil(maps / 100)
+print(maps, &quot;maps,&quot;, waves, &quot;waves, about&quot;, round(waves * 50 / 60), &quot;minutes instead of 120&quot;)</code></pre><div class="output">480 maps, 5 waves, about 4 minutes instead of 120</div></div>
+        <p><b>How it works:</b> 480 maps in 5 waves: about 4 minutes instead of 2 hours (illustrative numbers).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>A full LineRecordReader check</h4></div>
+      <p>Generate 1,000 order lines, cut them into 7 equal byte ranges, read each with the boundary rule, and verify that every line is read exactly once.</p>
+      <div class="prob__io"><div><small>Input</small><pre>1,000 lines · 7 splits</pre></div><div><small>Expected output</small><pre>1000 lines read; True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import random
+random.seed(1)
+items = [&quot;chai&quot;, &quot;dosa&quot;, &quot;poha&quot;, &quot;idli&quot;]
+data = &quot;&quot;.join(f&quot;{1000 + i},{random.choice(items)},{random.randint(10, 50)}\n&quot; for i in range(1000))
+size = len(data) // 7 + 1
+seen = []
+for start in range(0, len(data), size):
+    end = start + size
+    pos = 0 if start == 0 else data.index(&quot;\n&quot;, start) + 1
+    while pos &lt;= end and pos &lt; len(data):
+        nl = data.index(&quot;\n&quot;, pos)
+        seen.append(data[pos:nl]); pos = nl + 1
+print(len(seen), &quot;lines read;&quot;, len(set(seen)) == 1000 and len(seen) == 1000)</code></pre><div class="output">1000 lines read; True</div></div>
+        <p><b>How it works:</b> 1000 lines read exactly once, whatever the cut points. Try other split counts.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Splits come up whenever an interviewer asks how many mappers a job will have, or why a job is slow.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Concepts · basics</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“Block vs input split?”</h4>
+      <p class="scn__situation">A classic Hadoop interview question.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> physical vs logical.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Block: physical storage unit of HDFS, fixed size, replicated, cut by bytes.</li>
+          <li>Split: logical unit of work for one map task, computed by the InputFormat at submission; usually one block.</li>
+          <li>Records crossing a block edge are read whole by the split they start in; min/max split size can make splits differ from blocks.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Internals · records</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“A line is split across two blocks. Does the mapper get half a line?”</h4>
+      <p class="scn__situation">Follow-up to the first question.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> the LineRecordReader rule.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>No. The reader of the first split reads past its end to finish the line (a remote read of a few bytes if needed).</li>
+          <li>The reader of the next split skips its partial first line, because it belongs to the previous split.</li>
+          <li>So each line is processed exactly once; only the split starting at byte 0 doesn't skip.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Performance · tuning</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>A job on one 50 GB file runs with a single mapper for 3 hours</h4>
+      <p class="scn__situation">The cluster is mostly idle while it runs.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> splittability diagnosis.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Check “number of splits” in the client log; one split for 50 GB almost always means a non-splittable codec (gzip) or a custom isSplitable() returning false.</li>
+          <li>Fix upstream: write splittable files (bzip2, or Parquet/ORC/Avro with block compression) or many smaller gzip files.</li>
+          <li>Short term: decompress once into HDFS as plain text, or repartition with a one-off job.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Tuning · map count</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>“How do you increase or decrease the number of mappers?”</h4>
+      <p class="scn__situation">Often asked right after “how is the number of mappers decided”.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> knowing which knob does what.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>More maps: lower mapreduce.input.fileinputformat.split.maxsize (or write with a smaller block size).</li>
+          <li>Fewer maps: raise split.minsize, or use CombineTextInputFormat for many small files.</li>
+          <li>Mention the trade-off: more maps add start-up overhead; fewer, bigger maps lose locality and parallelism.</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

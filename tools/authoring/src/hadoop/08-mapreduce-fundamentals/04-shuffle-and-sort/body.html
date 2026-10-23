@@ -1,0 +1,277 @@
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>The sorting room between two teams</h2>
+  <div class="story">
+    <p class="narration">Riya runs the same item-revenue job three times on the 140 MB orders file. Same input, same code, same answer each time. Only one setting changes: the size of the map task's sort buffer. With 16 MB the map task writes its output to disk 18 times and then has to merge those 18 files in two passes. With 200 MB it writes twice. Kabir asks the obvious question: why does a map task write anything to disk at all, if the answer is just six lines?</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="Map side: an in-memory buffer fills, spills sorted files to local disk, which are merged into one sorted file per map. Reduce side: the reducer fetches its partition from every map and merges them before calling reduce.">
+        <g font-size="10">
+          <text x="150" y="20" text-anchor="middle" font-weight="700" class="s-ink">MAP SIDE (worker that ran the map)</text>
+          <rect x="20" y="34" width="100" height="40" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="70" y="51" text-anchor="middle" font-size="8.6" class="s-acc">sort buffer</text><text x="70" y="65" text-anchor="middle" font-size="8.2" class="s-ink">io.sort.mb = 16</text>
+          <path d="M120 54h22" style="fill:none;stroke:var(--track);stroke-width:1.6"/>
+          <g class="s-ink"><rect x="146" y="30" width="34" height="12" rx="2" class="s-card2"/><rect x="146" y="46" width="34" height="12" rx="2" class="s-card2"/><rect x="146" y="62" width="34" height="12" rx="2" class="s-card2"/></g>
+          <text x="163" y="88" text-anchor="middle" font-size="8.2" class="s-ink2">18 spill files</text>
+          <path d="M182 54h22" style="fill:none;stroke:var(--track);stroke-width:1.6"/>
+          <rect x="206" y="34" width="84" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="248" y="51" text-anchor="middle" font-size="8.6" class="s-green">merged file.out</text><text x="248" y="65" text-anchor="middle" font-size="8.2" class="s-ink">sorted, 1 per map</text>
+
+          <text x="490" y="20" text-anchor="middle" font-weight="700" class="s-ink">REDUCE SIDE</text>
+          <path d="M290 54C330 54 340 54 370 54" style="fill:none;stroke:var(--blue);stroke-width:1.8;stroke-dasharray:4 3"/>
+          <text x="330" y="46" text-anchor="middle" font-size="8" class="s-blue">HTTP fetch</text>
+          <rect x="372" y="34" width="100" height="40" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="422" y="51" text-anchor="middle" font-size="8.6" class="s-blue">fetch + merge</text><text x="422" y="65" text-anchor="middle" font-size="8.2" class="s-ink">from every map</text>
+          <path d="M472 54h20" style="fill:none;stroke:var(--blue);stroke-width:1.6"/>
+          <rect x="494" y="30" width="126" height="48" rx="8" class="s-board"/>
+          <text x="557" y="50" text-anchor="middle" font-size="9" style="fill:#F5C77E">reduce(chai, [15, 15 …])</text>
+          <text x="557" y="66" text-anchor="middle" font-size="8.6" style="fill:#9FD3B8">keys arrive sorted</text>
+
+          <rect x="20" y="112" width="600" height="46" rx="8" class="s-card2"/>
+          <text x="320" y="130" text-anchor="middle" font-size="9" class="s-ink">io.sort.mb 16 → 18 spills, Spilled Records 31,354,091 · 64 → 5 spills, 27,000,000 · 200 → 2 spills, 27,000,000</text>
+          <text x="320" y="148" text-anchor="middle" font-size="9" class="s-ink2">9,000,000 map output records · 108 MB shuffled to the reducer · same 6 output lines every time</text>
+        </g>
+        <text x="320" y="184" text-anchor="middle" font-size="9.6" class="s-ink2">Real lab runs. The shuffle is everything between map() writing a pair and reduce() receiving it.</text>
+        <text x="632" y="196" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+A> In Lesson 8.1 we said “Hadoop groups by key for you”. Today we open that box. It is called the <b>shuffle and sort</b>, and it is usually the most expensive part of a job: the map output is sorted, written to the worker's local disk, copied over the network to the reducers, and merged again.
+R> So the map writes to disk because the buffer is too small to hold everything?
+A> Partly. Even with a huge buffer the output must land on disk, because the reducers run later, maybe on other machines, and the map task's JVM exits when it is done. The NodeManager keeps serving that file to whichever reducer asks for it.
+K> And if the buffer is small, the map writes many little sorted files and has to merge them. That's our 18 spills and the extra 4.35 million records in “Spilled Records”.
+A> Exactly. Let's follow one pair, <code>(“chai”, 15)</code>, from <code>context.write()</code> to <code>reduce()</code>.
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Shuffle and sort</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>The <b>shuffle and sort</b> is the phase of a MapReduce job, carried out by the framework, that moves intermediate key-value pairs from map tasks to reduce tasks so that each reducer receives all values of its keys, sorted by key. On the <b>map side</b>, output pairs are assigned a partition by the <b>Partitioner</b> (by default <code>HashPartitioner</code>: <code>(key.hashCode() &amp; Integer.MAX_VALUE) % numReduceTasks</code>), collected in an in-memory circular buffer (<code>mapreduce.task.io.sort.mb</code>), sorted by partition and key, optionally passed through a <b>combiner</b>, and <b>spilled</b> to local disk whenever the buffer reaches <code>mapreduce.map.sort.spill.percent</code> (0.80); spill files are merged (<code>mapreduce.task.io.sort.factor</code> streams at a time) into one partitioned, sorted output file per map task. On the <b>reduce side</b>, fetcher threads copy the reducer's partition from every map over HTTP from the NodeManager's ShuffleHandler, merge the segments in memory and on disk, and present each key with an iterator over its values to the <code>reduce()</code> method.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Each map sorts its output into labelled piles, one pile per reducer, and leaves them on its worker's disk. Each reducer collects its pile from every map, merges them into one sorted stream, and then calls your reduce once per key.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Partition</b><span>Which reducer a key goes to; decided by the Partitioner.</span></div>
+    <div class="term"><b>Sort buffer</b><span>Circular in-memory buffer for map output, <code>io.sort.mb</code> (100 MB by default).</span></div>
+    <div class="term"><b>Spill</b><span>Writing the sorted buffer contents to a file on local disk.</span></div>
+    <div class="term"><b>Merge factor</b><span><code>io.sort.factor</code>: how many sorted files are merged in one pass (10).</span></div>
+    <div class="term"><b>ShuffleHandler</b><span>The NodeManager service (<code>mapreduce_shuffle</code>, port 13562) that serves map output.</span></div>
+    <div class="term"><b>Fetcher</b><span>A reducer thread that copies map output; 5 in parallel by default.</span></div>
+    <div class="term"><b>Slowstart</b><span>Reducers start copying after 5% of maps finish (<code>reduce.slowstart.completedmaps</code>).</span></div>
+    <div class="term"><b>Spilled Records</b><span>Counter: how many records were written to local disk, map and reduce side together.</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, ItemRevenue on the 140 MB orders file)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>Map output</th><td>9,000,000 records; 107,999,586 materialized bytes = 107,999,586 Reduce shuffle bytes (everything the map wrote, the reducer fetched)</td></tr>
+    <tr><th>io.sort.mb = 16</th><td>“soft limit at 13421773” (80% of 16 MB) · 18 spills · “Merging 18 sorted segments” → “Merging 9 intermediate segments out of a total of 18” → “Down to the last merge-pass, with 10 segments left” · Spilled Records 31,354,091 · map 18.6 s</td></tr>
+    <tr><th>io.sort.mb = 64 / 200</th><td>5 spills / 2 spills · Spilled Records 27,000,000 both · map 16.3 s / 16.4 s</td></tr>
+    <tr><th>3 reducers</th><td>HashPartitioner sent chai, dosa, samosa, vada pav to part 1 and idli, poha to part 2; <code>part-r-00000</code> stayed empty (0 bytes)</td></tr>
+    <tr><th>422 MB job (Lesson 8.1)</th><td>Shuffled Maps=4, Merged Map outputs=4, 323,998,764 bytes shuffled; the reduce attempt started while maps were still running (slowstart)</td></tr>
+  </table>
+
+LEVELS> Shuffle and sort at three levels
+L1> The post office sorting room
+      <ul>
+        <li>Every map is a post office collecting letters. It doesn't send them one by one: it drops them into bags, <b>one bag per destination city</b> (a partition per reducer), sorted by street (key).</li>
+        <li>When the counter table is full, the clerk ties up a bundle and puts it in the back room (a <b>spill</b>). At closing time all bundles for a city are combined into one sorted bag (the <b>merge</b>).</li>
+        <li>Each city's van (a <b>reducer</b>) visits every post office and picks up only its own bag (the <b>fetch</b>), then merges the bags so the postman walks each street once (<b>reduce</b>).</li>
+      </ul>
+L2> The steps and the settings
+      <ul>
+        <li><b>Partition:</b> every <code>context.write(k, v)</code> gets a partition number from the Partitioner, immediately.</li>
+        <li><b>Buffer:</b> pairs go into the <code>io.sort.mb</code> buffer. At 80% full a background thread sorts it by (partition, key), runs the combiner if any, and spills one file. The map keeps writing into the remaining 20% meanwhile.</li>
+        <li><b>Merge:</b> at the end the spills are merged, at most <code>io.sort.factor</code> (10) at a time, into <code>file.out</code> plus an index of where each partition starts. 18 spills needed an extra pass; 5 or 2 did not.</li>
+        <li><b>Fetch:</b> after 5% of maps finish, reducers start; 5 fetchers per reducer download their partition from each finished map over HTTP (port 13562).</li>
+        <li><b>Merge and reduce:</b> fetched segments are merged (in memory first, spilling to disk when needed); the final merge feeds <code>reduce()</code> directly, one key at a time.</li>
+      </ul>
+L3> Reading the counters like an engineer
+      <ul>
+        <li><b>Spilled Records</b> counts records written to local disk anywhere in the job. Ideal is 2 × map output (map writes once, reducer once): 18,000,000 here, only possible when the map spills exactly once.</li>
+        <li>With 2–10 spills the map writes each record twice (spill + final merge) and the reducer once: 3 × 9,000,000 = <b>27,000,000</b>, our 64 MB and 200 MB runs.</li>
+        <li>With 18 spills the merge needed an intermediate pass that rewrote 9 of the 18 segments: 31,354,091 − 27,000,000 = <b>4,354,091</b> extra records, about half the data written a third time.</li>
+        <li>Materialized bytes (108 MB) exceed raw map output bytes (90 MB for this file) because each record carries key and value lengths in the intermediate file format.</li>
+        <li>Fixes in order of effect: emit less (filter, combiner, compact types), compress map output (<code>mapreduce.map.output.compress</code>, Module 10), then tune <code>io.sort.mb</code> so a map spills once or twice.</li>
+      </ul>
+/LEVELS
+EXAM> For “Explain shuffle and sort in MapReduce”, draw two boxes: map side (partition → buffer → sort → spill → merge, local disk) and reduce side (fetch over HTTP → merge → reduce, keys in sorted order). Name three settings: <code>io.sort.mb</code>, <code>sort.spill.percent</code> 0.80, <code>io.sort.factor</code> 10.
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>The settings that shape the shuffle</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Setting</th><th>Default</th><th>Side</th><th>What it changes</th></tr></thead>
+    <tbody>
+      <tr><td><code>mapreduce.task.io.sort.mb</code></td><td>100 MB (our lab: 64)</td><td>map</td><td>Sort buffer size; bigger means fewer spills. Must fit in the map's heap.</td></tr>
+      <tr><td><code>mapreduce.map.sort.spill.percent</code></td><td>0.80</td><td>map</td><td>When a spill starts; “soft limit at 13421773” for 16 MB</td></tr>
+      <tr><td><code>mapreduce.task.io.sort.factor</code></td><td>10</td><td>both</td><td>Files merged per pass; 18 spills needed two passes</td></tr>
+      <tr><td><code>mapreduce.map.output.compress</code></td><td>false</td><td>map</td><td>Compress spills and shuffle traffic (e.g. Snappy, LZ4)</td></tr>
+      <tr><td><code>mapreduce.reduce.shuffle.parallelcopies</code></td><td>5</td><td>reduce</td><td>Fetcher threads per reducer</td></tr>
+      <tr><td><code>mapreduce.job.reduce.slowstart.completedmaps</code></td><td>0.05</td><td>reduce</td><td>Fraction of maps finished before reducers launch</td></tr>
+      <tr><td><code>mapreduce.reduce.shuffle.input.buffer.percent</code></td><td>0.70</td><td>reduce</td><td>Share of reducer heap used to hold fetched map output</td></tr>
+      <tr><td><code>mapreduce.job.reduces</code></td><td>1</td><td>job</td><td>Number of partitions = number of reducers = output files</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>The hooks you can plug into the shuffle</h3>
+  <div class="cards">
+    <div class="card"><h4>Partitioner</h4><p>Decides which reducer gets a key. Default: hash of the key modulo reducers. Custom ones in Lesson 9.2.</p><span class="tag">which reducer</span></div>
+    <div class="card"><h4>Sort comparator</h4><p>Decides the order of keys. Default: the key type's natural order (Text compares bytes).</p><span class="tag">which order</span></div>
+    <div class="card"><h4>Combiner</h4><p>A mini-reduce run on each spill on the map side, to shrink the data before it travels. Lesson 9.1.</p><span class="tag">less data</span></div>
+    <div class="card"><h4>Grouping comparator</h4><p>Decides which consecutive keys share one <code>reduce()</code> call. Used for secondary sort, Lesson 9.7.</p><span class="tag">which group</span></div>
+  </div>
+TIP> The shuffle is all-to-all: with M maps and R reducers there are M × R pieces to copy. 1,000 maps and 200 reducers mean 2 lakh small HTTP fetches. That is why the number of reducers and the size of map output matter so much for big jobs.
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Watching the shuffle on a real cluster</h2>
+  <p>Run on the Module 8 lab with <code>shuffle_lab.sh</code> (in “Run it on your PC”). It runs ItemRevenue (Lesson 8.1) three times on <code>orders_x30.csv</code> (140 MB, one split) with different sort buffers and reads the task logs with <code>yarn logs</code>.</p>
+  <ol class="stepper">
+    <li><h4>Run the same job with three buffer sizes</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>for mb in 16 64 200; do
+  hadoop jar mr.jar ItemRevenue -D mapreduce.task.io.sort.mb=$mb \
+      /user/hadoop/data/orders_x30.csv /out/shuf_$mb
+done</code></pre><div class="output">== io.sort.mb=16   job took 39 s
+== io.sort.mb=64   job took 37 s
+== io.sort.mb=200  job took 36 s</div></div>
+      <span class="behind"><code>-D</code> sets a property for this job only (the driver uses GenericOptionsParser). Each map task now gets a different buffer.</span></li>
+    <li><h4>The buffer fills and spills</h4>
+      <div class="code" data-lang="bash" data-file="map task log, io.sort.mb=16"><pre><code>yarn logs -applicationId &lt;app&gt; -log_files syslog | grep MapTask</code></pre><div class="output">MapTask: mapreduce.task.io.sort.mb: 16
+MapTask: soft limit at 13421773
+MapTask: Spilling map output
+MapTask: Finished spill 0</div></div>
+      <span class="behind">13,421,773 bytes is 80% of 16 MB (16,777,216 × 0.8). At that point a SpillThread sorts the buffer by partition and key and writes it to the worker's local disk, while the map keeps filling the rest.</span></li>
+    <li><h4>Many spills, merged in passes</h4>
+      <div class="code" data-lang="text" data-file="map task log, io.sort.mb=16"><pre><code>MapTask: Finished spill 17
+Merger: Merging 18 sorted segments
+Merger: Merging 9 intermediate segments out of a total of 18
+Merger: Down to the last merge-pass, with 10 segments left of total size: 107999642 bytes</code></pre></div>
+      <span class="behind">18 spill files (0 to 17), but only 10 may be merged at once. So Hadoop first merges 9 of them into one file, leaving 9 + 1 = 10, then does the final pass into one sorted <code>file.out</code>.</span></li>
+    <li><h4>Compare the counters</h4>
+      <div class="code" data-lang="text" data-file="counters"><pre><code>io.sort.mb  spills  Spilled Records  map time
+16          18      31,354,091       18.6 s
+64           5      27,000,000       16.3 s
+200          2      27,000,000       16.4 s
+(Map output records = 9,000,000 and Reduce shuffle bytes = 107,999,586 in all three)</code></pre></div>
+      <span class="behind">Map output and shuffle size never change: the data is the same. What changes is how many times it is written to local disk. 27,000,000 = 3 × 9,000,000 (spill, merge, reducer); the 16 MB run wrote 4,354,091 records a third time in the extra pass.</span></li>
+    <li><h4>Where each key goes</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hadoop jar mr.jar ItemRevenue -D mapreduce.job.reduces=3 canteen_orders.csv /out/red_3</code></pre><div class="output">part-r-00000 (0 bytes):
+part-r-00001 (79 bytes): chai dosa samosa vada pav
+part-r-00002 (38 bytes): idli poha</div></div>
+      <span class="behind">HashPartitioner: <code>(hash("chai") &amp; MAX) % 3 = 1</code>. With only 6 keys, hashing happened to give nothing to reducer 0 and four items to reducer 1. The Python runner below reproduces these numbers.</span></li>
+    <li><h4>The reducer sees sorted keys</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs dfs -cat /out/shuf_16/part-r-00000</code></pre><div class="output">chai	1505100	22576500
+dosa	1498440	67429800
+idli	1499520	44985600
+poha	1496730	37418250
+samosa	1500630	27011340
+vada pav	1499580	29991600</div></div>
+      <span class="behind">The input was in random item order; the output is alphabetical because the reducer reads one merged stream sorted by key and calls <code>reduce()</code> each time the key changes. Keys are sorted <i>within</i> each reducer, not across reducers.</span></li>
+  </ol>
+WARN> A bigger <code>io.sort.mb</code> is not free: the buffer lives inside the map task's heap. Our maps had <code>-Xmx300m</code>; setting io.sort.mb close to or above that makes the task die with an OutOfMemoryError (values above 2047 MB are rejected outright as invalid). Raise the container memory and the heap together.
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>From context.write() to reduce()</h2>
+  <p>Six steps of the shuffle for the 16 MB run: fill, spill, merge, serve, fetch, reduce.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Shuffle and sort <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Task log lines and counters">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">yarn logs … map task syslog</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">mapreduce.task.io.sort.mb: 16</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">soft limit at 13421773</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#F5C77E">Spilling map output</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">Finished spill 0</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#7F8C86">…</text><text x="26" y="110" font-size="8.2" class="mono" style="fill:#9FD3B8">Finished spill 17</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#F5C77E">Merging 18 sorted segments</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">Merging 9 intermediate segments</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#F5C77E">  out of a total of 18</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#9FD3B8">Down to the last merge-pass,</text><text x="26" y="120" font-size="8.2" class="mono" style="fill:#9FD3B8">  with 10 segments left</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">map task done</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">Map output materialized bytes=</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#9FD3B8">  107999586</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">map 100% reduce 0%</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">Shuffled Maps =1</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#9FD3B8">Reduce shuffle bytes=107999586</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">map 100% reduce 100%</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">Spilled Records=31354091</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#9FD3B8">chai  1505100  22576500</text><text x="26" y="108" font-size="8.2" class="mono" style="fill:#9FD3B8">dosa  1498440  67429800 …</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The map task starts with a 16 MB buffer; a spill starts at 80% full.</li>
+          <li>The buffer fills and spills 18 times during the map.</li>
+          <li>18 spill files are too many for one 10-way merge: one extra pass first.</li>
+          <li>The map finishes with one sorted output file of 108 MB on its local disk.</li>
+          <li>The reducer fetches exactly those bytes.</li>
+          <li>The reducer writes six lines; Spilled Records shows the cost of the extra merge pass.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Sort buffer, spill files, merged output, fetch, reducer merge">
+          <text x="90" y="20" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">map task (worker)</text>
+          <text x="280" y="20" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">reduce task</text>
+          <rect x="16" y="28" width="148" height="34" rx="6" class="s-card2"/>
+          <text x="90" y="74" text-anchor="middle" font-size="7.8" class="s-ink2">sort buffer, 16 MB</text>
+          <rect x="206" y="28" width="140" height="186" rx="8" class="s-card2" style="fill-opacity:.4"/>
+          <g data-on="1"><rect x="20" y="32" width="112" height="26" rx="4" style="fill:var(--track);opacity:.55"/><path d="M134 28v34" style="fill:none;stroke:var(--red);stroke-width:1.6;stroke-dasharray:3 2"/><text x="90" y="100" text-anchor="middle" font-size="8.4" class="s-ink">(chai,15) (dosa,45) (chai,15) …</text><text x="90" y="114" text-anchor="middle" font-size="8.4" class="s-ink">each tagged with its partition</text><text x="90" y="128" text-anchor="middle" font-size="8.4" class="s-red">80% line = soft limit</text></g>
+          <g data-on="2"><rect x="20" y="32" width="40" height="26" rx="4" style="fill:var(--track);opacity:.55"/><g class="s-acc"><rect x="20" y="90" width="22" height="14" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><rect x="46" y="90" width="22" height="14" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><rect x="72" y="90" width="22" height="14" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><rect x="98" y="90" width="22" height="14" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><rect x="124" y="90" width="22" height="14" rx="2" class="s-soft-acc" style="stroke:var(--track)"/></g><text x="90" y="124" text-anchor="middle" font-size="8.4" class="s-ink">sorted spill files on local disk</text><text x="90" y="138" text-anchor="middle" font-size="8.4" class="s-ink">spill0 … spill17</text></g>
+          <g data-on="3"><g><rect x="20" y="90" width="22" height="14" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><rect x="46" y="90" width="22" height="14" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><rect x="72" y="90" width="22" height="14" rx="2" class="s-soft-acc" style="stroke:var(--track)"/></g><path d="M31 104l30 26M57 104l8 26M83 104l-14 26" style="fill:none;stroke:var(--track);stroke-width:1.4"/><rect x="40" y="130" width="56" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="68" y="141" text-anchor="middle" font-size="7.6" class="s-green">9 → 1</text><text x="90" y="166" text-anchor="middle" font-size="8.4" class="s-ink">pass 1: 9 segments merged</text><text x="90" y="180" text-anchor="middle" font-size="8.4" class="s-ink">pass 2: the last 10 → file.out</text></g>
+          <g data-on="4"><rect x="20" y="90" width="140" height="44" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="90" y="104" text-anchor="middle" font-size="8" class="s-green">file.out (+ index)</text><text x="54" y="124" text-anchor="middle" font-size="7.8" class="s-ink">part 0</text><path d="M90 112v18" style="fill:none;stroke:var(--green)"/><text x="126" y="124" text-anchor="middle" font-size="7.8" class="s-ink">part 1 …</text><text x="90" y="160" text-anchor="middle" font-size="8.4" class="s-ink">served by the NodeManager's</text><text x="90" y="174" text-anchor="middle" font-size="8.4" class="s-ink">ShuffleHandler, port 13562</text></g>
+          <g data-on="5"><rect x="20" y="90" width="140" height="44" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="90" y="116" text-anchor="middle" font-size="8" class="s-green">file.out</text><path d="M160 112C185 112 190 70 214 70" style="fill:none;stroke:var(--blue);stroke-width:2;stroke-dasharray:4 3"/><rect x="214" y="56" width="124" height="28" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/><text x="276" y="74" text-anchor="middle" font-size="8.2" class="s-blue">fetchers (5) over HTTP</text><text x="276" y="104" text-anchor="middle" font-size="8.2" class="s-ink">only this reducer's</text><text x="276" y="118" text-anchor="middle" font-size="8.2" class="s-ink">partition, from every map</text></g>
+          <g data-on="6"><rect x="214" y="56" width="124" height="28" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/><text x="276" y="74" text-anchor="middle" font-size="8.2" class="s-blue">merge (sorted)</text><path d="M276 84v22" style="fill:none;stroke:var(--blue);stroke-width:1.6"/><rect x="214" y="106" width="124" height="60" rx="6" class="s-board"/><text x="276" y="124" text-anchor="middle" font-size="7.8" style="fill:#F5C77E">reduce(chai, [15, 15 …])</text><text x="276" y="140" text-anchor="middle" font-size="7.8" style="fill:#F5C77E">reduce(dosa, [45, 45 …])</text><text x="276" y="156" text-anchor="middle" font-size="7.8" style="fill:#9FD3B8">… in key order</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Every context.write() goes into the circular buffer with its partition number.</li>
+          <li>At 80% a background thread sorts the buffer by partition and key and writes a spill file to local disk.</li>
+          <li>The merger combines at most 10 files per pass: first 9 into 1, then the final 10.</li>
+          <li>The result is one file per map, sorted, with an index of where each reducer's partition starts.</li>
+          <li>The reducer's fetchers download their partition from each map's NodeManager.</li>
+          <li>The fetched pieces are merged into one sorted stream; reduce() is called once per key.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>The shuffle at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="20" y="24" width="80" height="42" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="44" text-anchor="middle" font-size="8.6" class="s-acc">Spilled Records</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">÷ map output</text></svg></div>
+    <div><h4>1. Tuning slow nightly jobs</h4>
+      <p>Platform teams compare Spilled Records with map output records. A ratio well above 3 means extra merge passes; raising the sort buffer (with container memory) or compressing map output often cuts minutes from big jobs.</p>
+      <div class="uc-flow"><span>Counters</span><i>→</i><span class="java">io.sort.mb, compression</span><i>→</i><span>Fewer disk writes</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="56" width="18" height="14" class="s-soft-blue"/><rect x="38" y="20" width="18" height="50" style="fill:var(--red);opacity:.5"/><rect x="60" y="52" width="18" height="18" class="s-soft-blue"/><rect x="82" y="54" width="18" height="16" class="s-soft-blue"/></svg></div>
+    <div><h4>2. Diagnosing skew</h4>
+      <p>One reducer runs for hours while the others finish in minutes: one key (a popular product, a null customer ID) got most of the shuffle. Our 3-reducer run showed the small version: 4 items to one reducer, none to another.</p>
+      <div class="uc-flow"><span>Hot key</span><i>→</i><span class="java">one huge partition</span><i>→</i><span>Salting / custom partitioner</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="22" y="24" width="76" height="42" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="48" text-anchor="middle" font-size="8.6" class="s-green">TeraSort</text></svg></div>
+    <div><h4>3. Sorting benchmarks</h4>
+      <p>TeraSort, the classic Hadoop benchmark, is almost pure shuffle: map reads, the framework sorts and shuffles terabytes, reduce writes. Clusters are tuned and compared on it.</p>
+      <div class="uc-flow"><span>teragen</span><i>→</i><span class="java">terasort (shuffle)</span><i>→</i><span>teravalidate</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="24" width="38" height="42" rx="6" class="s-card2"/><text x="37" y="49" text-anchor="middle" font-size="8.6" class="s-ink">Spark</text><path d="M58 45h12" style="fill:none;stroke:var(--track);stroke-width:2"/><rect x="72" y="24" width="32" height="42" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="88" y="49" text-anchor="middle" font-size="8" class="s-acc">ESS</text></svg></div>
+    <div><h4>4. The same shuffle in Spark</h4>
+      <p>Spark's <code>groupBy</code> and <code>join</code> also write sorted, partitioned shuffle files to local disk, and on YARN they can be served by an external shuffle service in the NodeManager, just like <code>mapreduce_shuffle</code>.</p>
+      <div class="uc-flow"><span>Stage 1 tasks</span><i>→</i><span class="java">shuffle files</span><i>→</i><span>Stage 2 tasks</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>

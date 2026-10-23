@@ -1,0 +1,2205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HDFS federation | MyPhatshala</title>
+<meta name="description" content="HDFS federation on a real Hadoop 3.5.0 cluster: two independent NameNodes (canteen and hostel) sharing three DataNodes, one cluster ID, two block pools visible on the DataNode disk, a ViewFS mount table giving clients one tree, “Renames across Mount points not supported”, and one namespace surviving while the other NameNode is down. Federation vs HA, ViewFS vs Router-Based Federation, NameNode memory sizing, Python simulations, quiz and interview scenarios.">
+<meta name="mp:minutes" content="26">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/07-hdfs-advanced/02-hdfs-federation/">
+<meta property="og:title" content="HDFS federation · MyPhatshala">
+<meta property="og:description" content="When one NameNode&#x27;s memory is not enough: split the namespace, share the DataNodes. A real two-NameNode cluster.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "HDFS federation", "learningResourceType": "Lesson", "educationalLevel": "Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="07-hdfs-advanced/02-hdfs-federation" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 7.2</b></nav>
+    <h1>HDFS federation</h1>
+    <p class="lead">HA protects the NameNode from failure, but not from its own limits: every file and block lives in one NameNode's memory. Federation runs several independent NameNodes, each owning part of the folder tree, on the same DataNodes. This lesson builds a two-NameNode cluster, looks at the block pools on a DataNode's disk, and shows what works and what doesn't across namespaces.</p>
+    <div class="lesson-meta"><span>Module 7 · HDFS advanced</span><span>⏱ 26 min</span><span>Advanced</span><span>Real two-NameNode cluster</span><span>Block pools on disk</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>When one NameNode's memory is not enough</h2>
+  <div class="story">
+    <p class="narration">The university cluster is a success. The canteen project, the hostel system, exam results and research labs all store data in it. Now there are hundreds of millions of files. The NameNode keeps every file and block in RAM, its heap is already huge, garbage-collection pauses are getting longer, and every team's jobs queue up behind the same NameNode. Adding DataNodes adds disk, but not a single extra byte of NameNode memory. HA (Lesson 7.1) gave the NameNode a spare, but the spare has exactly the same limits.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 190" role="img" aria-label="Federation: two independent NameNodes, each with its own namespace and block pool, sharing the same DataNodes; a client sees one tree through a mount table.">
+        <g font-size="10">
+          <rect x="230" y="10" width="180" height="40" rx="8" class="s-soft-violet" style="stroke:var(--violet)"/><text x="320" y="28" text-anchor="middle" font-weight="700" class="s-violet">Client view (ViewFS / Router)</text><text x="320" y="42" text-anchor="middle" font-size="8.6" class="s-ink">/canteen → NN-1 · /hostel → NN-2</text>
+          <rect x="40" y="62" width="200" height="50" rx="8" class="s-board"/><text x="140" y="82" text-anchor="middle" font-weight="700" class="s-chalk">NameNode 1: canteen</text><text x="140" y="98" text-anchor="middle" font-size="8.6" style="fill:#9FD3B8">namespace /canteen · block pool BP-1</text>
+          <rect x="400" y="62" width="200" height="50" rx="8" class="s-board"/><text x="500" y="82" text-anchor="middle" font-weight="700" class="s-chalk">NameNode 2: hostel</text><text x="500" y="98" text-anchor="middle" font-size="8.6" style="fill:#9FD3B8">namespace /hostel · block pool BP-2</text>
+          <path d="M280 50L190 62M360 50L450 62" style="fill:none;stroke:var(--violet);stroke-width:1.6"/>
+          <g><rect x="120" y="134" width="120" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><rect x="260" y="134" width="120" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><rect x="400" y="134" width="120" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/></g>
+          <g font-size="8.4" class="s-ink"><text x="128" y="150">DataNode 1</text><text x="268" y="150">DataNode 2</text><text x="408" y="150">DataNode 3</text></g>
+          <g font-size="8"><rect x="128" y="156" width="46" height="12" rx="2" style="fill:var(--blue);opacity:.5"/><rect x="178" y="156" width="46" height="12" rx="2" style="fill:var(--track);opacity:.6"/><rect x="268" y="156" width="46" height="12" rx="2" style="fill:var(--blue);opacity:.5"/><rect x="318" y="156" width="46" height="12" rx="2" style="fill:var(--track);opacity:.6"/><rect x="408" y="156" width="46" height="12" rx="2" style="fill:var(--blue);opacity:.5"/><rect x="458" y="156" width="46" height="12" rx="2" style="fill:var(--track);opacity:.6"/></g>
+          <path d="M140 112L180 134M140 112L320 134M140 112L460 134" style="fill:none;stroke:var(--blue);stroke-width:1.2"/>
+          <path d="M500 112L200 134M500 112L340 134M500 112L480 134" style="fill:none;stroke:var(--track);stroke-width:1.2;stroke-dasharray:4 3"/>
+        </g>
+        <text x="320" y="186" text-anchor="middle" font-size="9.4" class="s-ink2">Every DataNode stores blocks for both NameNodes, in separate block pools (blue = canteen, orange = hostel).</text>
+        <text x="632" y="186" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>The answer is <b>HDFS federation</b>. Instead of one NameNode for everything, we run several independent NameNodes, each owning part of the namespace: one for <code>/canteen</code>, one for <code>/hostel</code>. They don't talk to each other at all.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Then each one needs its own DataNodes?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>No, that's the clever part. The same DataNodes serve all of them. Each NameNode gets its own <b>block pool</b> on every DataNode, so storage is shared and grows for everyone. Clients see one tree through a <b>mount table</b>. Today we start two NameNodes on the same three DataNodes, look inside a DataNode's disk, try to move a file between them, and switch one NameNode off.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>HDFS federation</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>HDFS federation</b> scales the namespace layer horizontally by running multiple <b>independent NameNodes</b>, each managing its own <b>namespace volume</b>: a namespace (directory tree and file metadata) plus a <b>block pool</b> (the set of blocks belonging to that namespace). NameNodes do not coordinate with each other. All NameNodes share one <b>cluster ID</b> and the same set of DataNodes; each DataNode registers with every NameNode, stores blocks of each pool in a separate directory (<code>current/BP-…</code>), and sends heartbeats and block reports per pool. Clients obtain a unified view through a client-side mount table (<b>ViewFS</b>, <code>viewfs://</code>) or through <b>Router-Based Federation</b> (RBF), where stateless routers forward requests according to a shared mount table. Each nameservice may itself be highly available.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Several NameNodes split the folder tree between them, like several librarians each responsible for different sections, while all the bookshelves (DataNodes) are shared. A map tells clients which librarian to ask for which folder.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Namespace volume</b><span>One NameNode's namespace plus its block pool.</span></div>
+    <div class="term"><b>Block pool (BP)</b><span>The blocks of one namespace; a <code>BP-…</code> folder on every DataNode.</span></div>
+    <div class="term"><b>Cluster ID</b><span>Shared by all federated NameNodes; set with <code>-clusterId</code> at format.</span></div>
+    <div class="term"><b>Nameservice</b><span>The ID of one namespace (and its HA NameNodes), e.g. <code>nsc</code>, <code>nsh</code>.</span></div>
+    <div class="term"><b>ViewFS</b><span>Client-side mount table: <code>viewfs://campus/canteen</code> → <code>hdfs://nn-canteen/canteen</code>.</span></div>
+    <div class="term"><b>RBF</b><span>Router-Based Federation: routers hold the mount table centrally.</span></div>
+    <div class="term"><b>Mount point</b><span>A path in the unified view that maps to a folder in one namespace.</span></div>
+    <div class="term"><b>Namespace limit</b><span>One NameNode's heap and RPC capacity: what federation spreads out.</span></div>
+  </div>
+
+  <h3>What we saw in the lab (Hadoop 3.5.0)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>Block pools on a DataNode</th><td>Two folders: <code>BP-1200013783-…</code> (canteen, 2.5 M) and <code>BP-343349822-…</code> (hostel, 572 K)</td></tr>
+    <tr><th>Cluster ID</th><td><code>campus-cluster</code> on both NameNodes; different block pool IDs</td></tr>
+    <tr><th>Live DataNodes</th><td>Both NameNodes report <b>3</b>: the same machines</td></tr>
+    <tr><th>Move across mounts</th><td><code>mv: Renames across Mount points not supported</code></td></tr>
+    <tr><th>One NameNode down</th><td><code>/hostel</code> still listed; <code>/canteen</code> fails</td></tr>
+  </table>
+
+  <h3 id="levels">Federation at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A library with several librarians</h4>
+      <ul>
+        <li>One librarian can only remember so many books. So the library hires a second: one for <b>science</b>, one for <b>arts</b>.</li>
+        <li>Both use the same <b>shelves</b>. Each shelf has a science corner and an arts corner (block pools).</li>
+        <li>A <b>signboard</b> at the entrance says which librarian to ask for which section (mount table). If the arts librarian is on leave, science books can still be borrowed.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How it is set up and used</h4>
+      <ul>
+        <li>Format each NameNode with the <b>same cluster ID</b> (<code>hdfs namenode -format -clusterId campus-cluster</code>); list all nameservices in <code>dfs.nameservices</code> so DataNodes register with every NameNode.</li>
+        <li>Each NameNode only knows its own files: <code>hdfs dfs -ls -R hdfs://nn-canteen:8020/</code> showed only <code>/canteen</code>.</li>
+        <li>With a ViewFS mount table, <code>hdfs dfs -ls /</code> shows <code>/canteen</code>, <code>/hostel</code>, <code>/tmp</code> as one tree.</li>
+        <li>Moving a file between namespaces is a copy (<code>distcp</code> or <code>cp</code>) plus delete, not a rename.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What architects weigh</h4>
+      <ul>
+        <li><b>Why:</b> NameNode heap grows with objects (files, folders, blocks); a common rule of thumb is roughly 150 bytes per object, so hundreds of millions of objects need very large heaps. RPC load also concentrates on one process. Federation splits both.</li>
+        <li><b>ViewFS vs RBF:</b> ViewFS puts the mount table in every client's configuration (changes must reach every client); RBF keeps it in a shared state store behind routers, so clients use one address and admins can move mount points centrally.</li>
+        <li><b>Federation + HA:</b> independent. A large cluster may have 4 nameservices, each with an active and standby NameNode.</li>
+        <li><b>Costs:</b> more NameNodes to run and monitor, uneven growth between namespaces, and no atomic rename across them. Choosing the split (by team, by data domain) matters.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “Explain HDFS federation”, draw two NameNodes with separate namespaces and block pools, shared DataNodes with one folder per block pool, and a mount table on top. Contrast with HA: HA = <b>availability</b> of one namespace; federation = <b>scalability</b> of the namespace.</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>HA vs federation, and two ways to unify the view</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th></th><th>HA</th><th>Federation</th></tr></thead>
+    <tbody>
+      <tr><td><b>Solves</b></td><td>NameNode failure (availability)</td><td>NameNode limits (scalability, isolation)</td></tr>
+      <tr><td><b>NameNodes</b></td><td>Active + standby with the SAME namespace</td><td>Independent, DIFFERENT namespaces</td></tr>
+      <tr><td><b>Shared</b></td><td>Edit log (JournalNodes)</td><td>DataNodes and cluster ID</td></tr>
+      <tr><td><b>Block pools</b></td><td>One</td><td>One per namespace</td></tr>
+      <tr><td><b>Client address</b></td><td><code>hdfs://nameservice</code></td><td><code>viewfs://…</code> or router address</td></tr>
+      <tr><td><b>Combine?</b></td><td colspan="2">Yes: each federated nameservice can be an HA pair.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Unifying the namespaces</h3>
+  <div class="cards">
+    <div class="card"><h4>ViewFS</h4><p>Mount table in the client's <code>core-site.xml</code> (<code>fs.viewfs.mounttable.*</code>). Simple, no extra servers; every client needs the same config.</p><span class="tag">client-side</span></div>
+    <div class="card"><h4>Router-Based Federation</h4><p><code>hdfs dfsrouter</code> processes with a shared state store; <code>hdfs dfsrouteradmin -add /canteen nsc /canteen</code>. Clients talk to routers.</p><span class="tag">server-side</span></div>
+    <div class="card"><h4>Direct URIs</h4><p><code>hdfs://nn-hostel:8020/hostel</code>: works, but hard-codes which namespace holds the data.</p><span class="tag">avoid</span></div>
+    <div class="card"><h4>Split by</h4><p>Team, business domain or data type (e.g. <code>/user</code> vs <code>/warehouse</code> vs <code>/tmp</code>), so each namespace grows predictably.</p><span class="tag">design</span></div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>Putting <code>/tmp</code> and other small-file-heavy, high-churn folders on their own namespace is a classic use of federation: their constant creates and deletes no longer slow down the NameNode that serves production data.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Two NameNodes, three shared DataNodes</h2>
+  <p>Our lab: NameNodes <code>nn-canteen</code> (nameservice <code>nsc</code>) and <code>nn-hostel</code> (<code>nsh</code>), and 3 DataNodes, all <code>apache/hadoop:3.5.0</code>. Commands run on datanode-1; full script in “Run it on your PC”.</p>
+  <ol class="stepper">
+    <li><h4>Configure two nameservices, format with one cluster ID</h4>
+      <div class="code" data-lang="properties" data-file="config (part)"><pre><code>HDFS-SITE.XML_dfs.nameservices=nsc,nsh
+HDFS-SITE.XML_dfs.namenode.rpc-address.nsc=nn-canteen:8020
+HDFS-SITE.XML_dfs.namenode.rpc-address.nsh=nn-hostel:8020
+# on each NameNode, once:
+hdfs namenode -format -nonInteractive -clusterId campus-cluster</code></pre><div class="output">nn-canteen: blockpoolID=BP-1200013783-172.21.0.3-1792598083981 clusterID=campus-cluster
+nn-hostel: blockpoolID=BP-343349822-172.21.0.2-1792598083339 clusterID=campus-cluster</div></div>
+      <span class="behind">Same cluster ID, different block pool IDs. A DataNode accepts NameNodes only from its own cluster ID, so getting this right at format time is essential.</span></li>
+    <li><h4>One tree for the client</h4>
+      <div class="code" data-lang="xml" data-file="client core-site.xml"><pre><code>&lt;name&gt;fs.defaultFS&lt;/name&gt;&lt;value&gt;viewfs://campus&lt;/value&gt;
+&lt;name&gt;fs.viewfs.mounttable.campus.link./canteen&lt;/name&gt;&lt;value&gt;hdfs://nn-canteen:8020/canteen&lt;/value&gt;
+&lt;name&gt;fs.viewfs.mounttable.campus.link./hostel&lt;/name&gt;&lt;value&gt;hdfs://nn-hostel:8020/hostel&lt;/value&gt;</code></pre><div class="output">$ hdfs dfs -ls /
+Found 3 items
+-r-xr-xr-x   - hadoop users          0 2026-10-21 15:58 /canteen
+-r-xr-xr-x   - hadoop users          0 2026-10-21 15:58 /hostel
+-r-xr-xr-x   - hadoop users          0 2026-10-21 15:58 /tmp
+$ hdfs dfs -ls /canteen /hostel
+-rw-r--r--   3 hadoop supergroup    2488895 2026-10-21 15:58 /canteen/orders.csv
+-rw-r--r--   3 hadoop supergroup     538894 2026-10-21 15:58 /hostel/rooms.csv</div></div>
+      <span class="behind">The root <code>/</code> is not stored anywhere: ViewFS builds it from the mount table (hence the read-only <code>r-x</code> entries). Each mount point leads to a different NameNode.</span></li>
+    <li><h4>Each NameNode knows only its own files</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs dfs -ls -R hdfs://nn-canteen:8020/ ; echo ---; hdfs dfs -ls -R hdfs://nn-hostel:8020/</code></pre><div class="output">drwxr-xr-x   - hadoop supergroup          0 2026-10-21 15:58 hdfs://nn-canteen:8020/canteen
+-rw-r--r--   3 hadoop supergroup    2488895 2026-10-21 15:58 hdfs://nn-canteen:8020/canteen/orders.csv
+---
+drwxr-xr-x   - hadoop supergroup          0 2026-10-21 15:58 hdfs://nn-hostel:8020/hostel
+-rw-r--r--   3 hadoop supergroup     538894 2026-10-21 15:58 hdfs://nn-hostel:8020/hostel/rooms.csv
+drwxr-xr-x   - hadoop supergroup          0 2026-10-21 15:55 hdfs://nn-hostel:8020/tmp</div></div>
+      <span class="behind">Two completely separate directory trees, each in its own NameNode's memory.</span></li>
+    <li><h4>Inside a DataNode: one folder per block pool</h4>
+      <div class="code" data-lang="bash" data-file="datanode-1"><pre><code>ls /tmp/hadoop-hadoop/dfs/data/current/ ; du -sh /tmp/hadoop-hadoop/dfs/data/current/BP-*
+for nn in nn-canteen nn-hostel; do hdfs dfsadmin -fs hdfs://$nn:8020 -report | grep -m1 'Live datanodes'; done</code></pre><div class="output">BP-1200013783-172.21.0.3-1792598083981
+BP-343349822-172.21.0.2-1792598083339
+VERSION
+2.5M	/tmp/hadoop-hadoop/dfs/data/current/BP-1200013783-172.21.0.3-1792598083981
+572K	/tmp/hadoop-hadoop/dfs/data/current/BP-343349822-172.21.0.2-1792598083339
+nn-canteen: Live datanodes (3):
+nn-hostel: Live datanodes (3):</div></div>
+      <span class="behind">The same disk holds both pools: 2.5 MB of canteen orders, 572 KB of hostel rooms. Both NameNodes see all three DataNodes, which heartbeat to each separately.</span></li>
+    <li><h4>No rename across namespaces</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs dfs -mv /canteen/orders.csv /hostel/orders.csv</code></pre><div class="output">mv: Renames across Mount points not supported</div></div>
+      <span class="behind">A rename is a metadata change inside one NameNode. Two NameNodes can't do it atomically together, so you must copy and delete. Plan the namespace split so that jobs don't need to move data across it.</span></li>
+    <li><h4>Switch one NameNode off</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>docker stop lab72-nn-canteen-1
+hdfs dfs -ls /hostel
+hdfs dfs -ls /canteen</code></pre><div class="output">-rw-r--r--   3 hadoop supergroup     538894 2026-10-21 15:58 /hostel/rooms.csv
+-ls: java.net.UnknownHostException: nn-canteen</div></div>
+      <span class="behind">Failure isolation: the hostel namespace keeps working. The canteen namespace is unavailable (in our Docker lab the stopped container's name no longer resolves). In production, each nameservice would also be HA.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Federation does not make one namespace bigger or faster: a single folder tree still lives in one NameNode. If one team's namespace outgrows its NameNode, you must split that tree further (or reduce small files, Lesson 7.5).</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>One client, two NameNodes, shared DataNodes</h2>
+  <p>Six steps from our lab: writing to two mount points, looking at the DataNode, and losing one NameNode.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Federation in action <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Client commands in a federated cluster">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@datanode-1 : ~</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#7F8C86">$ hdfs dfs -put orders.csv /canteen/</text><text x="26" y="80" font-size="8.6" class="mono" style="fill:#9FD3B8">(done)</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#7F8C86">$ hdfs dfs -put rooms.csv /hostel/</text><text x="26" y="80" font-size="8.6" class="mono" style="fill:#9FD3B8">(done)</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#7F8C86">$ hdfs dfs -ls /</text><text x="26" y="74" font-size="8.6" class="mono" style="fill:#9FD3B8">/canteen</text><text x="26" y="90" font-size="8.6" class="mono" style="fill:#9FD3B8">/hostel</text><text x="26" y="106" font-size="8.6" class="mono" style="fill:#9FD3B8">/tmp</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#7F8C86">$ ls …/dfs/data/current/</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">BP-1200013783-…  2.5M</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">BP-343349822-…   572K</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#7F8C86">$ hdfs dfs -mv /canteen/orders.csv /hostel/</text><text x="26" y="74" font-size="8.4" class="mono" style="fill:#E8A3A3">mv: Renames across Mount points</text><text x="26" y="88" font-size="8.4" class="mono" style="fill:#E8A3A3">not supported</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#F5C77E">(nn-canteen stopped)</text><text x="26" y="74" font-size="8.6" class="mono" style="fill:#7F8C86">$ hdfs dfs -ls /hostel</text><text x="26" y="90" font-size="8.6" class="mono" style="fill:#9FD3B8">/hostel/rooms.csv</text><text x="26" y="108" font-size="8.6" class="mono" style="fill:#7F8C86">$ hdfs dfs -ls /canteen</text><text x="26" y="124" font-size="8.4" class="mono" style="fill:#E8A3A3">-ls: UnknownHostException: nn-canteen</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The client writes the orders file to <code>/canteen</code>.</li>
+          <li>It writes the rooms file to <code>/hostel</code>, with the same command style.</li>
+          <li>Listing <code>/</code> shows one tree with three mount points.</li>
+          <li>On a DataNode's disk, there are two block pool folders, one per NameNode.</li>
+          <li>Moving a file from <code>/canteen</code> to <code>/hostel</code> is refused.</li>
+          <li>With the canteen NameNode stopped, <code>/hostel</code> still works and <code>/canteen</code> fails.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Mount table routing to two NameNodes and shared DataNodes">
+          <rect x="110" y="12" width="140" height="32" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180" y="27" text-anchor="middle" font-size="8.6" font-weight="700" class="s-violet">client mount table</text><text x="180" y="39" text-anchor="middle" font-size="7.6" class="s-ink">/canteen→nsc  /hostel→nsh</text>
+          <rect x="14" y="70" width="120" height="44" rx="6" class="s-board"/><text x="74" y="88" text-anchor="middle" font-size="8.6" font-weight="700" class="s-chalk">nn-canteen</text><text x="74" y="104" text-anchor="middle" font-size="7.6" style="fill:#9FD3B8">nsc · BP-1200013783</text>
+          <rect x="226" y="70" width="120" height="44" rx="6" class="s-board"/><text x="286" y="88" text-anchor="middle" font-size="8.6" font-weight="700" class="s-chalk">nn-hostel</text><text x="286" y="104" text-anchor="middle" font-size="7.6" style="fill:#9FD3B8">nsh · BP-343349822</text>
+          <g><rect x="30" y="150" width="90" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><rect x="135" y="150" width="90" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><rect x="240" y="150" width="90" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/></g>
+          <g font-size="7.6" class="s-green"><text x="36" y="162">datanode-1</text><text x="141" y="162">datanode-2</text><text x="246" y="162">datanode-3</text></g>
+          <g data-on="1-"><rect x="36" y="168" width="36" height="22" rx="3" style="fill:var(--blue);opacity:.5"/><rect x="141" y="168" width="36" height="22" rx="3" style="fill:var(--blue);opacity:.5"/><rect x="246" y="168" width="36" height="22" rx="3" style="fill:var(--blue);opacity:.5"/></g>
+          <g data-on="2-"><rect x="78" y="168" width="36" height="22" rx="3" style="fill:var(--track);opacity:.6"/><rect x="183" y="168" width="36" height="22" rx="3" style="fill:var(--track);opacity:.6"/><rect x="288" y="168" width="36" height="22" rx="3" style="fill:var(--track);opacity:.6"/></g>
+          <g data-on="1"><path d="M150 44L74 70" style="fill:none;stroke:var(--blue);stroke-width:2.4"/><path d="M74 114L54 168M74 114L159 168M74 114L264 168" style="fill:none;stroke:var(--blue);stroke-width:1.4"/><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-ink2">/canteen → nn-canteen; blocks into pool BP-1200013783</text></g>
+          <g data-on="2"><path d="M210 44L286 70" style="fill:none;stroke:var(--track);stroke-width:2.4"/><path d="M286 114L96 168M286 114L201 168M286 114L306 168" style="fill:none;stroke:var(--track);stroke-width:1.4"/><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-ink2">/hostel → nn-hostel; same DataNodes, other pool</text></g>
+          <g data-on="3"><path d="M150 44L74 70M210 44L286 70" style="fill:none;stroke:var(--violet);stroke-width:2"/><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-ink2">“/” exists only in the mount table</text></g>
+          <g data-on="4"><rect x="30" y="150" width="90" height="46" rx="6" style="fill:none;stroke:var(--green);stroke-width:3"/><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-ink2">each DataNode: one folder per block pool, reports to both NNs</text></g>
+          <g data-on="5"><path d="M74 92H226" style="fill:none;stroke:var(--red);stroke-width:2;stroke-dasharray:4 3"/><text x="150" y="86" text-anchor="middle" font-size="8.4" class="s-red">✗</text><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-red">no shared metadata: rename across NameNodes impossible</text></g>
+          <g data-on="6"><rect x="14" y="70" width="120" height="44" rx="6" style="fill:var(--red);opacity:.4"/><path d="M210 44L286 70" style="fill:none;stroke:var(--track);stroke-width:2.4"/><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-ink2">canteen down; hostel unaffected</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The mount table routes <code>/canteen</code> to nn-canteen, which places blocks in its pool on the DataNodes.</li>
+          <li><code>/hostel</code> goes to nn-hostel; its blocks go to the other pool on the same DataNodes.</li>
+          <li>The root listing is built by the client from the mount table.</li>
+          <li>Each DataNode stores both pools in separate folders and sends a block report per pool to the right NameNode.</li>
+          <li>The NameNodes share nothing but DataNodes and the cluster ID, so a cross-namespace rename can't be done.</li>
+          <li>One NameNode stopping affects only its own namespace.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Federation at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="24" width="42" height="40" rx="6" class="s-board"/><rect x="64" y="24" width="42" height="40" rx="6" class="s-board"/><text x="35" y="48" text-anchor="middle" font-size="8" style="fill:#9FD3B8">NN-1</text><text x="85" y="48" text-anchor="middle" font-size="8" style="fill:#9FD3B8">NN-2</text></svg></div>
+    <div><h4>1. Very large clusters</h4>
+      <p>Organisations whose HDFS holds hundreds of millions to billions of files have publicly described running many NameNodes with federation, often behind routers, because no single NameNode heap could hold their namespace.</p>
+      <div class="uc-flow"><span>Billions of files</span><i>→</i><span class="java">Many nameservices</span><i>→</i><span>One view via routers</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><text x="60" y="40" text-anchor="middle" font-size="10" class="mono s-acc">/tmp</text><text x="60" y="58" text-anchor="middle" font-size="8.6" class="s-ink2">own NameNode</text></svg></div>
+    <div><h4>2. Isolating noisy workloads</h4>
+      <p>Scratch and staging folders with millions of short-lived files get their own namespace, so their churn doesn't slow the NameNode that serves production tables.</p>
+      <div class="uc-flow"><span>/tmp, /staging</span><i>→</i><span class="java">Separate NameNode</span><i>→</i><span>Stable prod latency</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="22" y="22" width="76" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="50" text-anchor="middle" font-size="9" class="s-violet">router</text></svg></div>
+    <div><h4>3. Moving data without changing paths</h4>
+      <p>With Router-Based Federation, admins can copy a folder to a less loaded namespace and then repoint its mount entry. Users keep using the same path.</p>
+      <div class="uc-flow"><span>distcp</span><i>→</i><span class="java">Update mount table</span><i>→</i><span>Same path, new NameNode</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="20" y="20" width="36" height="50" rx="4" class="s-card2"/><rect x="64" y="20" width="36" height="50" rx="4" class="s-card2"/><text x="38" y="48" text-anchor="middle" font-size="8" class="s-ink">team A</text><text x="82" y="48" text-anchor="middle" font-size="8" class="s-ink">team B</text></svg></div>
+    <div><h4>4. Multi-tenant platforms</h4>
+      <p>Shared enterprise clusters give big business units their own namespace for isolation and capacity planning, while sharing DataNodes, YARN and operations.</p>
+      <div class="uc-flow"><span>Business units</span><i>→</i><span class="java">One namespace each</span><i>→</i><span>Shared storage</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>A mount table that routes paths to NameNodes</h2>
+  <p>ViewFS is essentially a longest-prefix lookup: the path's mount point decides which NameNode answers. This program routes a few paths and refuses a rename across mount points, like our real cluster did.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>mounts = {&quot;/canteen&quot;: &quot;hdfs://nn-canteen:8020/canteen&quot;,
+          &quot;/hostel&quot;:  &quot;hdfs://nn-hostel:8020/hostel&quot;,
+          &quot;/tmp&quot;:     &quot;hdfs://nn-hostel:8020/tmp&quot;}
+
+def resolve(path):
+    best = max((m for m in mounts if path == m or path.startswith(m + &quot;/&quot;)), key=len, default=None)
+    if best is None:
+        raise FileNotFoundError(path + &quot; is not under any mount point&quot;)
+    return mounts[best] + path[len(best):]
+
+def rename(src, dst):
+    s, d = resolve(src), resolve(dst)
+    if s.split(&quot;/&quot;)[2] != d.split(&quot;/&quot;)[2]:
+        return &quot;mv: Renames across Mount points not supported&quot;
+    return f&quot;renamed inside {s.split(&#x27;/&#x27;)[2]}&quot;
+
+for p in [&quot;/canteen/orders.csv&quot;, &quot;/hostel/rooms.csv&quot;, &quot;/tmp/x&quot;]:
+    print(f&quot;{p:22} -&gt; {resolve(p)}&quot;)
+print(rename(&quot;/canteen/orders.csv&quot;, &quot;/hostel/orders.csv&quot;))
+print(rename(&quot;/hostel/rooms.csv&quot;, &quot;/tmp/rooms.csv&quot;))</code></pre><div class="output">/canteen/orders.csv    -&gt; hdfs://nn-canteen:8020/canteen/orders.csv
+/hostel/rooms.csv      -&gt; hdfs://nn-hostel:8020/hostel/rooms.csv
+/tmp/x                 -&gt; hdfs://nn-hostel:8020/tmp/x
+mv: Renames across Mount points not supported
+renamed inside nn-hostel:8020</div></div>
+  <ul class="anno"><li><code>    best = max((m for m in mounts if path == m or path.startswith(m + &quot;/&quot;)), key=len, default=None)</code><span>The longest matching mount point wins, so nested mounts (e.g. <code>/data</code> and <code>/data/logs</code>) work.</span></li><li><code>    if s.split(&quot;/&quot;)[2] != d.split(&quot;/&quot;)[2]:</code><span>Different NameNodes behind source and target: no single NameNode can rename atomically. Our cluster printed exactly this message.</span></li><li><code>print(rename(&quot;/hostel/rooms.csv&quot;, &quot;/tmp/rooms.csv&quot;))</code><span>Interesting: <code>/hostel</code> and <code>/tmp</code> are on the same NameNode here, so the logic allows it. Real ViewFS is stricter by default and refuses renames between any two different mount points.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Route paths",
+   "hint": "Press <b>Run<\/b>. Add a mount <code>/exams<\/code> on a third NameNode and route <code>/exams/2026/results.csv<\/code>.",
+   "code": "mounts = {\"/canteen\": \"hdfs://nn-canteen:8020/canteen\",\n          \"/hostel\":  \"hdfs://nn-hostel:8020/hostel\",\n          \"/tmp\":     \"hdfs://nn-hostel:8020/tmp\"}\n\ndef resolve(path):\n    best = max((m for m in mounts if path == m or path.startswith(m + \"/\")), key=len, default=None)\n    if best is None:\n        raise FileNotFoundError(path + \" is not under any mount point\")\n    return mounts[best] + path[len(best):]\n\ndef rename(src, dst):\n    s, d = resolve(src), resolve(dst)\n    if s.split(\"/\")[2] != d.split(\"/\")[2]:\n        return \"mv: Renames across Mount points not supported\"\n    return f\"renamed inside {s.split('/')[2]}\"\n\nfor p in [\"/canteen/orders.csv\", \"/hostel/rooms.csv\", \"/tmp/x\"]:\n    print(f\"{p:22} -> {resolve(p)}\")\nprint(rename(\"/canteen/orders.csv\", \"/hostel/orders.csv\"))\nprint(rename(\"/hostel/rooms.csv\", \"/tmp/rooms.csv\"))\n"
+  },
+  {
+   "label": "2 · NameNode memory",
+   "hint": "Rule of thumb: about 150 bytes of NameNode heap per object (file, folder or block). How much heap do 40 crore files with 1.2 blocks each need?",
+   "code": "files = 400_000_000\nobjects = files + files * 1.2            # files + blocks (folders ignored)\nheap_gb = objects * 150 / 1024**3\nprint(f\"{objects:,.0f} objects -> about {heap_gb:.0f} GB of NameNode heap\")\n"
+  },
+  {
+   "label": "3 · Split the namespace",
+   "hint": "Split the folders across 2 NameNodes so object counts are as even as possible (greedy: biggest first to the emptier one).",
+   "code": "folders = {\"/warehouse\": 120_000_000, \"/user\": 60_000_000, \"/tmp\": 90_000_000, \"/logs\": 70_000_000, \"/ml\": 40_000_000}\nnns = {\"nn1\": [], \"nn2\": []}\nload = {\"nn1\": 0, \"nn2\": 0}\nfor f, n in sorted(folders.items(), key=lambda kv: -kv[1]):\n    target = min(load, key=load.get)\n    nns[target].append(f); load[target] += n\nprint(nns)\nprint({k: f\"{v / 1e6:.0f} M objects\" for k, v in load.items()})\n"
+  },
+  {
+   "label": "4 · Block pools on one DataNode",
+   "hint": "A DataNode stores one folder per block pool. Given the sizes per pool, compute each pool’s share of the disk.",
+   "code": "pools = {\"BP-1200013783 (canteen)\": 2.5, \"BP-343349822 (hostel)\": 0.572}   # MB, from du -sh\ntotal = sum(pools.values())\nfor p, mb in pools.items():\n    print(f\"{p:26} {mb:5.2f} MB  {mb / total:.0%}\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This path is not under any mount point, so resolving it raises an error, like ViewFS does. Add a mount for <code>/research<\/code>.",
+   "code": "mounts = {\"/canteen\": \"hdfs://nn-canteen:8020/canteen\"}\npath = \"/research/data.csv\"\nmatch = [m for m in mounts if path.startswith(m + \"/\")]\nprint(mounts[match[0]])\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: two NameNodes, three DataNodes</h3>
+  <p>Create a folder <code>hdfs-fed-lab</code> with <code>config</code>, <code>docker-compose.yaml</code>, <code>nnf.sh</code>, and a subfolder <code>client-conf</code> containing the client <code>core-site.xml</code> (ViewFS mount table) shown below. Run <code>chmod 777 client-conf</code>, start with <code>docker compose -p lab72 up -d --scale datanode=3</code>, wait 45 seconds, then run <code>federation_lab.sh</code>.</p>
+  <div class="pcrun"><h4>Lab files</h4>
+  <div class="code" data-lang="bash" data-file="docker-compose.yaml"><pre><code>x-hadoop: &amp;hadoop
+  image: apache/hadoop:3.5.0
+  env_file: [./config]
+  volumes: [./nnf.sh:/opt/nnf.sh:ro, ./client-conf:/opt/client-conf]
+services:
+  nn-canteen:
+    &lt;&lt;: *hadoop
+    hostname: nn-canteen
+    command: [&quot;bash&quot;, &quot;/opt/nnf.sh&quot;]
+    environment: { HDFS-SITE.XML_dfs.nameservice.id: nsc }
+  nn-hostel:
+    &lt;&lt;: *hadoop
+    hostname: nn-hostel
+    command: [&quot;bash&quot;, &quot;/opt/nnf.sh&quot;]
+    environment: { HDFS-SITE.XML_dfs.nameservice.id: nsh }
+  datanode:
+    &lt;&lt;: *hadoop
+    command: [&quot;hdfs&quot;, &quot;datanode&quot;]
+    depends_on: [nn-canteen, nn-hostel]
+
+# ---- config ----
+CORE-SITE.XML_fs.defaultFS=hdfs://nn-canteen:8020
+HDFS-SITE.XML_dfs.nameservices=nsc,nsh
+HDFS-SITE.XML_dfs.namenode.rpc-address.nsc=nn-canteen:8020
+HDFS-SITE.XML_dfs.namenode.rpc-address.nsh=nn-hostel:8020
+HDFS-SITE.XML_dfs.namenode.http-address.nsc=nn-canteen:9870
+HDFS-SITE.XML_dfs.namenode.http-address.nsh=nn-hostel:9870
+HDFS-SITE.XML_dfs.namenode.name.dir=/tmp/hadoop-hadoop/dfs/name
+HDFS-SITE.XML_dfs.replication=3
+
+# ---- nnf.sh ----
+#!/bin/bash
+# Format this NameNode once with the SHARED cluster ID, then run it.
+NAME=/tmp/hadoop-hadoop/dfs/name
+[ -d $NAME/current ] || hdfs namenode -format -nonInteractive -clusterId campus-cluster
+exec hdfs namenode
+
+# ---- client-conf/core-site.xml ----
+&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!-- Client view of the federated cluster: one tree, two NameNodes behind it (ViewFS mount table). --&gt;
+&lt;configuration&gt;
+  &lt;property&gt;&lt;name&gt;fs.defaultFS&lt;/name&gt;&lt;value&gt;viewfs://campus&lt;/value&gt;&lt;/property&gt;
+  &lt;property&gt;&lt;name&gt;fs.viewfs.mounttable.campus.link./canteen&lt;/name&gt;&lt;value&gt;hdfs://nn-canteen:8020/canteen&lt;/value&gt;&lt;/property&gt;
+  &lt;property&gt;&lt;name&gt;fs.viewfs.mounttable.campus.link./hostel&lt;/name&gt;&lt;value&gt;hdfs://nn-hostel:8020/hostel&lt;/value&gt;&lt;/property&gt;
+  &lt;property&gt;&lt;name&gt;fs.viewfs.mounttable.campus.link./tmp&lt;/name&gt;&lt;value&gt;hdfs://nn-hostel:8020/tmp&lt;/value&gt;&lt;/property&gt;
+&lt;/configuration&gt;</code></pre><div class="output">lab72-datanode-1 Up 45 seconds
+lab72-datanode-2 Up 45 seconds
+lab72-datanode-3 Up 45 seconds
+lab72-nn-canteen-1 Up 45 seconds
+lab72-nn-hostel-1 Up 46 seconds
+$ docker exec lab72-datanode-1 ls /tmp/hadoop-hadoop/dfs/data/current/
+BP-1200013783-172.21.0.3-1792598083981
+BP-343349822-172.21.0.2-1792598083339
+VERSION</div></div>
+  <p class="muted">Real output. ViewFS mount entries contain “/”, which Docker env files don't allow, so the mount table lives in a separate client config folder used with <code>HADOOP_CONF_DIR=/opt/client-conf</code>.</p></div>
+  <div class="pcrun"><h4>The federation experiments</h4>
+  <div class="code" data-lang="bash" data-file="federation_lab.sh"><pre><code>#!/usr/bin/env bash
+# federation_lab.sh: two NameNodes (canteen, hostel) share the same 3 DataNodes.
+P=lab72
+C=&quot;docker exec $P-datanode-1&quot;
+V=&#x27;HADOOP_CONF_DIR=/opt/client-conf&#x27;          # client config with the ViewFS mount table
+run() { echo &quot;\$ $1&quot;; $C bash -c &quot;$1&quot; 2&gt;&amp;1 | grep -v -E &quot;WARN|^\s*$&quot;; echo; }
+$C bash -c &#x27;cp /opt/hadoop/etc/hadoop/hdfs-site.xml /opt/hadoop/etc/hadoop/log4j.properties /opt/client-conf/&#x27;
+run &quot;hdfs dfs -mkdir -p hdfs://nn-canteen:8020/canteen hdfs://nn-hostel:8020/hostel hdfs://nn-hostel:8020/tmp&quot;
+run &quot;seq 1 200000 | sed &#x27;s/^/order,/&#x27; &gt; /tmp/orders.csv; seq 1 50000 | sed &#x27;s/^/room,/&#x27; &gt; /tmp/rooms.csv&quot;
+run &quot;$V hdfs dfs -put -f /tmp/orders.csv /canteen/ &amp;&amp; $V hdfs dfs -put -f /tmp/rooms.csv /hostel/&quot;
+run &quot;$V hdfs dfs -ls /&quot;
+run &quot;$V hdfs dfs -ls /canteen /hostel&quot;
+run &quot;hdfs dfs -ls -R hdfs://nn-canteen:8020/ ; echo ---; hdfs dfs -ls -R hdfs://nn-hostel:8020/&quot;
+for n in canteen hostel; do echo &quot;nn-$n: $(docker exec $P-nn-$n-1 grep -E &#x27;clusterID|blockpoolID&#x27; /tmp/hadoop-hadoop/dfs/name/current/VERSION | tr &#x27;\n&#x27; &#x27; &#x27;)&quot;; done; echo
+run &quot;ls /tmp/hadoop-hadoop/dfs/data/current/ ; du -sh /tmp/hadoop-hadoop/dfs/data/current/BP-*&quot;
+run &quot;for nn in nn-canteen nn-hostel; do echo \$nn: \$(hdfs dfsadmin -fs hdfs://\$nn:8020 -report 2&gt;/dev/null | grep -m1 &#x27;Live datanodes&#x27;); done&quot;
+run &quot;$V hdfs dfs -mv /canteen/orders.csv /hostel/orders.csv&quot;
+echo &quot;&gt;&gt;&gt; docker stop $P-nn-canteen-1&quot;; docker stop $P-nn-canteen-1 &gt; /dev/null; echo
+run &quot;$V hdfs dfs -ls /hostel&quot;
+run &quot;$V timeout 40 hdfs dfs -ls /canteen 2&gt;&amp;1 | grep -m1 -- -ls:&quot;
+docker start $P-nn-canteen-1 &gt; /dev/null
+
+# Run:  bash federation_lab.sh</code></pre><div class="output">$ hdfs dfs -mkdir -p hdfs://nn-canteen:8020/canteen hdfs://nn-hostel:8020/hostel hdfs://nn-hostel:8020/tmp
+
+$ seq 1 200000 | sed &#x27;s/^/order,/&#x27; &gt; /tmp/orders.csv; seq 1 50000 | sed &#x27;s/^/room,/&#x27; &gt; /tmp/rooms.csv
+
+$ HADOOP_CONF_DIR=/opt/client-conf hdfs dfs -put -f /tmp/orders.csv /canteen/ &amp;&amp; HADOOP_CONF_DIR=/opt/client-conf hdfs dfs -put -f /tmp/rooms.csv /hostel/
+
+$ HADOOP_CONF_DIR=/opt/client-conf hdfs dfs -ls /
+Found 3 items
+-r-xr-xr-x   - hadoop users          0 2026-10-21 15:58 /canteen
+-r-xr-xr-x   - hadoop users          0 2026-10-21 15:58 /hostel
+-r-xr-xr-x   - hadoop users          0 2026-10-21 15:58 /tmp
+
+$ HADOOP_CONF_DIR=/opt/client-conf hdfs dfs -ls /canteen /hostel
+Found 1 items
+-rw-r--r--   3 hadoop supergroup    2488895 2026-10-21 15:58 /canteen/orders.csv
+Found 1 items
+-rw-r--r--   3 hadoop supergroup     538894 2026-10-21 15:58 /hostel/rooms.csv
+
+$ hdfs dfs -ls -R hdfs://nn-canteen:8020/ ; echo ---; hdfs dfs -ls -R hdfs://nn-hostel:8020/
+drwxr-xr-x   - hadoop supergroup          0 2026-10-21 15:58 hdfs://nn-canteen:8020/canteen
+-rw-r--r--   3 hadoop supergroup    2488895 2026-10-21 15:58 hdfs://nn-canteen:8020/canteen/orders.csv
+---
+drwxr-xr-x   - hadoop supergroup          0 2026-10-21 15:58 hdfs://nn-hostel:8020/hostel
+-rw-r--r--   3 hadoop supergroup     538894 2026-10-21 15:58 hdfs://nn-hostel:8020/hostel/rooms.csv
+drwxr-xr-x   - hadoop supergroup          0 2026-10-21 15:55 hdfs://nn-hostel:8020/tmp
+
+nn-canteen: blockpoolID=BP-1200013783-172.21.0.3-1792598083981 clusterID=campus-cluster 
+nn-hostel: blockpoolID=BP-343349822-172.21.0.2-1792598083339 clusterID=campus-cluster 
+
+$ ls /tmp/hadoop-hadoop/dfs/data/current/ ; du -sh /tmp/hadoop-hadoop/dfs/data/current/BP-*
+BP-1200013783-172.21.0.3-1792598083981
+BP-343349822-172.21.0.2-1792598083339
+VERSION
+2.5M	/tmp/hadoop-hadoop/dfs/data/current/BP-1200013783-172.21.0.3-1792598083981
+1.1M	/tmp/hadoop-hadoop/dfs/data/current/BP-343349822-172.21.0.2-1792598083339
+
+$ for nn in nn-canteen nn-hostel; do echo $nn: $(hdfs dfsadmin -fs hdfs://$nn:8020 -report 2&gt;/dev/null | grep -m1 &#x27;Live datanodes&#x27;); done
+nn-canteen: Live datanodes (3):
+nn-hostel: Live datanodes (3):
+
+$ HADOOP_CONF_DIR=/opt/client-conf hdfs dfs -mv /canteen/orders.csv /hostel/orders.csv
+mv: Renames across Mount points not supported
+
+&gt;&gt;&gt; docker stop lab72-nn-canteen-1
+
+$ HADOOP_CONF_DIR=/opt/client-conf hdfs dfs -ls /hostel
+Found 1 items
+-rw-r--r--   3 hadoop supergroup     538894 2026-10-21 15:58 /hostel/rooms.csv
+
+$ HADOOP_CONF_DIR=/opt/client-conf timeout 40 hdfs dfs -ls /canteen 2&gt;&amp;1 | grep -m1 -- -ls:
+-ls: java.net.UnknownHostException: nn-canteen</div></div>
+  <p class="muted">Real output. Your block pool IDs and IP addresses will differ.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>A DataNode registering with two NameNodes</h2>
+  <p>At start-up, a DataNode reads every nameservice from its configuration and registers with each, creating one block pool folder per NameNode.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "nameservices = {\"nsc\": \"BP-1200013783\", \"nsh\": \"BP-343349822\"}",
+  "cluster_id = \"campus-cluster\"",
+  "folders = []",
+  "for ns, pool in nameservices.items():",
+  "    nn_cluster = \"campus-cluster\"",
+  "    if nn_cluster == cluster_id:",
+  "        folders.append(pool)",
+  "print(\"block pool folders:\", folders)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>nameservices<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}"
+   ],
+   "newVar": "nameservices"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>cluster_id<\/code> is created: &#x27;campus-cluster&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}"
+   ],
+   "newVar": "cluster_id"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>folders<\/code> is created: → list #2. A new list object (#2) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ],
+      [
+       "folders",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "folders"
+  },
+  {
+   "line": 4,
+   "phase": "One per NameNode",
+   "note": "The DataNode runs a separate service thread for each nameservice. <code>ns<\/code> is created: &#x27;nsc&#x27;. <code>pool<\/code> is created: &#x27;BP-1200013783&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ],
+      [
+       "folders",
+       "→ list #2"
+      ],
+      [
+       "ns",
+       "'nsc'"
+      ],
+      [
+       "pool",
+       "'BP-1200013783'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "pool"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>nn_cluster<\/code> is created: &#x27;campus-cluster&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ],
+      [
+       "folders",
+       "→ list #2"
+      ],
+      [
+       "ns",
+       "'nsc'"
+      ],
+      [
+       "pool",
+       "'BP-1200013783'"
+      ],
+      [
+       "nn_cluster",
+       "'campus-cluster'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "nn_cluster"
+  },
+  {
+   "line": 6,
+   "phase": "Same cluster",
+   "note": "A NameNode with a different cluster ID would be rejected. The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ],
+      [
+       "folders",
+       "→ list #2"
+      ],
+      [
+       "ns",
+       "'nsc'"
+      ],
+      [
+       "pool",
+       "'BP-1200013783'"
+      ],
+      [
+       "nn_cluster",
+       "'campus-cluster'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}",
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #2 list now holds [&#x27;BP-1200013783&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ],
+      [
+       "folders",
+       "→ list #2"
+      ],
+      [
+       "ns",
+       "'nsc'"
+      ],
+      [
+       "pool",
+       "'BP-1200013783'"
+      ],
+      [
+       "nn_cluster",
+       "'campus-cluster'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}",
+    "<b>#2 list (1)<\/b> [&#x27;BP-1200013783&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>ns<\/code> changes to &#x27;nsh&#x27;. <code>pool<\/code> changes to &#x27;BP-343349822&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ],
+      [
+       "folders",
+       "→ list #2"
+      ],
+      [
+       "ns",
+       "'nsh'"
+      ],
+      [
+       "pool",
+       "'BP-343349822'"
+      ],
+      [
+       "nn_cluster",
+       "'campus-cluster'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}",
+    "<b>#2 list (1)<\/b> [&#x27;BP-1200013783&#x27;]"
+   ],
+   "newVar": "pool"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ],
+      [
+       "folders",
+       "→ list #2"
+      ],
+      [
+       "ns",
+       "'nsh'"
+      ],
+      [
+       "pool",
+       "'BP-343349822'"
+      ],
+      [
+       "nn_cluster",
+       "'campus-cluster'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}",
+    "<b>#2 list (1)<\/b> [&#x27;BP-1200013783&#x27;]"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ],
+      [
+       "folders",
+       "→ list #2"
+      ],
+      [
+       "ns",
+       "'nsh'"
+      ],
+      [
+       "pool",
+       "'BP-343349822'"
+      ],
+      [
+       "nn_cluster",
+       "'campus-cluster'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}",
+    "<b>#2 list (1)<\/b> [&#x27;BP-1200013783&#x27;]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #2 list now holds [&#x27;BP-1200013783&#x27;, &#x27;BP-343349822&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ],
+      [
+       "folders",
+       "→ list #2"
+      ],
+      [
+       "ns",
+       "'nsh'"
+      ],
+      [
+       "pool",
+       "'BP-343349822'"
+      ],
+      [
+       "nn_cluster",
+       "'campus-cluster'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}",
+    "<b>#2 list (2)<\/b> [&#x27;BP-1200013783&#x27;, &#x27;BP-343349822&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ],
+      [
+       "folders",
+       "→ list #2"
+      ],
+      [
+       "ns",
+       "'nsh'"
+      ],
+      [
+       "pool",
+       "'BP-343349822'"
+      ],
+      [
+       "nn_cluster",
+       "'campus-cluster'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}",
+    "<b>#2 list (2)<\/b> [&#x27;BP-1200013783&#x27;, &#x27;BP-343349822&#x27;]"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nameservices",
+       "→ dict #1"
+      ],
+      [
+       "cluster_id",
+       "'campus-cluster'"
+      ],
+      [
+       "folders",
+       "→ list #2"
+      ],
+      [
+       "ns",
+       "'nsh'"
+      ],
+      [
+       "pool",
+       "'BP-343349822'"
+      ],
+      [
+       "nn_cluster",
+       "'campus-cluster'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;nsc&#x27;: &#x27;BP-1200013783&#x27;, &#x27;nsh&#x27;: &#x27;BP-343349822&#x27;}",
+    "<b>#2 list (2)<\/b> [&#x27;BP-1200013783&#x27;, &#x27;BP-343349822&#x27;]"
+   ],
+   "out": "block pool folders: ['BP-1200013783', 'BP-343349822']\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three federation calculations: when one NameNode is too small, how to split, and what federation buys in failure isolation. Each runs live and is traced in memory.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Sizing · heap</span></div>
+    <h4>When does one NameNode stop being enough?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A NameNode server can give the NameNode at most 192 GB of heap. Using the rule of thumb of 150 bytes per object, how many objects fit, and how many files is that if, on average, each file brings 0.1 folders and 1.5 blocks with it?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>192 GB · 150 B/object · 2.6 objects per file</pre></div><div><small>Expected output</small><pre>1.37 billion objects -&gt; about 529 million files</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Objects = heap / 150 bytes.</li><li>Each file costs 1 + 0.1 + 1.5 = 2.6 objects.</li><li>Files = objects / 2.6.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Small files make it worse: 1 GB stored as 1,000 files costs about 1,000× the NameNode memory of one 1 GB file (Lesson 7.5).",
+   "code": "heap = 192 * 1024**3\nobjects = heap / 150\nprint(f\"{objects / 1e9:.2f} billion objects -> about {objects / 2.6 / 1e6:.0f} million files\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "heap = 192 * 1024**3",
+  "objects = heap / 150",
+  "print(f\"{objects / 1e9:.2f} billion objects -> about {objects / 2.6 / 1e6:.0f} million files\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>heap<\/code> is created: 206158430208.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "heap",
+       "206158430208"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "heap"
+  },
+  {
+   "line": 2,
+   "phase": "Rule of thumb",
+   "note": "Real per-object memory varies with path lengths, replication and version. <code>objects<\/code> is created: 1374389534.72.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "heap",
+       "206158430208"
+      ],
+      [
+       "objects",
+       "1374389534.72"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "objects"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "heap",
+       "206158430208"
+      ],
+      [
+       "objects",
+       "1374389534.72"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "1.37 billion objects -> about 529 million files\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Design · split</span></div>
+    <h4>Two namespaces from five top-level folders</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Split /warehouse (12 crore objects), /tmp (9 crore), /logs (7 crore), /user (6 crore) and /ml (4 crore) between two NameNodes as evenly as possible, keeping each folder whole.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>5 folders, 38 crore objects</pre></div><div><small>Expected output</small><pre>nn1: [(&#x27;/warehouse&#x27;, 12), (&#x27;/user&#x27;, 6)] 18 crore
+nn2: [(&#x27;/tmp&#x27;, 9), (&#x27;/logs&#x27;, 7), (&#x27;/ml&#x27;, 4)] 20 crore</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Sort folders by size.</li><li>Give each to the NameNode with fewer objects so far.</li><li>Compare totals.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Real splits also consider who uses what: keep folders that jobs rename between in the same namespace.",
+   "code": "folders = [(\"/warehouse\", 12), (\"/tmp\", 9), (\"/logs\", 7), (\"/user\", 6), (\"/ml\", 4)]\na, b = [], []\nfor f, n in folders:\n    (a if sum(x[1] for x in a) <= sum(x[1] for x in b) else b).append((f, n))\nprint(\"nn1:\", a, sum(x[1] for x in a), \"crore\")\nprint(\"nn2:\", b, sum(x[1] for x in b), \"crore\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "folders = [(\"/warehouse\", 12), (\"/tmp\", 9), (\"/logs\", 7), (\"/user\", 6), (\"/ml\", 4)]",
+  "a, b = [], []",
+  "for f, n in folders:",
+  "    (a if sum(x[1] for x in a) <= sum(x[1] for x in b) else b).append((f, n))",
+  "print(\"nn1:\", a, sum(x[1] for x in a), \"crore\")",
+  "print(\"nn2:\", b, sum(x[1] for x in b), \"crore\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>folders<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)"
+   ],
+   "newVar": "folders"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>a<\/code> is created: → list #7. <code>b<\/code> is created: → list #8. A new list object (#7) is created: [] A new list object (#8) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (0)<\/b> []",
+    "<b>#8 list (0)<\/b> []"
+   ],
+   "newVar": "b"
+  },
+  {
+   "line": 3,
+   "phase": "Greedy",
+   "note": "Largest first, into the lighter side. <code>f<\/code> is created: &#x27;/warehouse&#x27;. <code>n<\/code> is created: 12.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/warehouse'"
+      ],
+      [
+       "n",
+       "12"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (0)<\/b> []",
+    "<b>#8 list (0)<\/b> []"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #7 list now holds [→ tuple #9] A new tuple object (#9) is created: (&#x27;/warehouse&#x27;, 12)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/warehouse'"
+      ],
+      [
+       "n",
+       "12"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (1)<\/b> [→ tuple #9]",
+    "<b>#8 list (0)<\/b> []",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>f<\/code> changes to &#x27;/tmp&#x27;. <code>n<\/code> changes to 9.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/tmp'"
+      ],
+      [
+       "n",
+       "9"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (1)<\/b> [→ tuple #9]",
+    "<b>#8 list (0)<\/b> []",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #8 list now holds [→ tuple #10] A new tuple object (#10) is created: (&#x27;/tmp&#x27;, 9)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/tmp'"
+      ],
+      [
+       "n",
+       "9"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (1)<\/b> [→ tuple #9]",
+    "<b>#8 list (1)<\/b> [→ tuple #10]",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#10 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>f<\/code> changes to &#x27;/logs&#x27;. <code>n<\/code> changes to 7.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/logs'"
+      ],
+      [
+       "n",
+       "7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (1)<\/b> [→ tuple #9]",
+    "<b>#8 list (1)<\/b> [→ tuple #10]",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#10 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #8 list now holds [→ tuple #10, → tuple #11] A new tuple object (#11) is created: (&#x27;/logs&#x27;, 7)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/logs'"
+      ],
+      [
+       "n",
+       "7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (1)<\/b> [→ tuple #9]",
+    "<b>#8 list (2)<\/b> [→ tuple #10, → tuple #11]",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#10 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#11 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>f<\/code> changes to &#x27;/user&#x27;. <code>n<\/code> changes to 6.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/user'"
+      ],
+      [
+       "n",
+       "6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (1)<\/b> [→ tuple #9]",
+    "<b>#8 list (2)<\/b> [→ tuple #10, → tuple #11]",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#10 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#11 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #7 list now holds [→ tuple #9, → tuple #12] A new tuple object (#12) is created: (&#x27;/user&#x27;, 6)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/user'"
+      ],
+      [
+       "n",
+       "6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (2)<\/b> [→ tuple #9, → tuple #12]",
+    "<b>#8 list (2)<\/b> [→ tuple #10, → tuple #11]",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#10 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#11 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#12 tuple (2)<\/b> (&#x27;/user&#x27;, 6)"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>f<\/code> changes to &#x27;/ml&#x27;. <code>n<\/code> changes to 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/ml'"
+      ],
+      [
+       "n",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (2)<\/b> [→ tuple #9, → tuple #12]",
+    "<b>#8 list (2)<\/b> [→ tuple #10, → tuple #11]",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#10 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#11 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#12 tuple (2)<\/b> (&#x27;/user&#x27;, 6)"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #8 list now holds [→ tuple #10, → tuple #11, → tuple #13] A new tuple object (#13) is created: (&#x27;/ml&#x27;, 4)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/ml'"
+      ],
+      [
+       "n",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (2)<\/b> [→ tuple #9, → tuple #12]",
+    "<b>#8 list (3)<\/b> [→ tuple #10, → tuple #11, → tuple #13]",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#10 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#11 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#12 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#13 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/ml'"
+      ],
+      [
+       "n",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (2)<\/b> [→ tuple #9, → tuple #12]",
+    "<b>#8 list (3)<\/b> [→ tuple #10, → tuple #11, → tuple #13]",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#10 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#11 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#12 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#13 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/ml'"
+      ],
+      [
+       "n",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (2)<\/b> [→ tuple #9, → tuple #12]",
+    "<b>#8 list (3)<\/b> [→ tuple #10, → tuple #11, → tuple #13]",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#10 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#11 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#12 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#13 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)"
+   ],
+   "out": "nn1: [('/warehouse', 12), ('/user', 6)] 18 crore\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ list #1"
+      ],
+      [
+       "a",
+       "→ list #7"
+      ],
+      [
+       "b",
+       "→ list #8"
+      ],
+      [
+       "f",
+       "'/ml'"
+      ],
+      [
+       "n",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6]",
+    "<b>#2 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#3 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#4 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#5 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#6 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)",
+    "<b>#7 list (2)<\/b> [→ tuple #9, → tuple #12]",
+    "<b>#8 list (3)<\/b> [→ tuple #10, → tuple #11, → tuple #13]",
+    "<b>#9 tuple (2)<\/b> (&#x27;/warehouse&#x27;, 12)",
+    "<b>#10 tuple (2)<\/b> (&#x27;/tmp&#x27;, 9)",
+    "<b>#11 tuple (2)<\/b> (&#x27;/logs&#x27;, 7)",
+    "<b>#12 tuple (2)<\/b> (&#x27;/user&#x27;, 6)",
+    "<b>#13 tuple (2)<\/b> (&#x27;/ml&#x27;, 4)"
+   ],
+   "out": "nn2: [('/tmp', 9), ('/logs', 7), ('/ml', 4)] 20 crore\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Availability · isolation</span></div>
+    <h4>How much keeps working when one NameNode fails?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Jobs touch namespaces in this pattern: 50% only nsA, 30% only nsB, 20% both. If nsA becomes unavailable (and is not HA), what fraction of jobs can still run?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>50% A · 30% B · 20% both</pre></div><div><small>Expected output</small><pre>federated: 30% of jobs keep running; single NameNode: 0%</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Jobs needing A fail.</li><li>Only B-only jobs survive.</li><li>Compare with a single NameNode, where all fail.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Federation limits the blast radius; HA on each nameservice removes most of the risk.",
+   "code": "only_a, only_b, both = 0.5, 0.3, 0.2\nprint(f\"federated: {only_b:.0%} of jobs keep running; single NameNode: 0%\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "only_a, only_b, both = 0.5, 0.3, 0.2",
+  "print(f\"federated: {only_b:.0%} of jobs keep running; single NameNode: 0%\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Dependencies",
+   "note": "Jobs spanning namespaces share the risk of both. <code>only_a<\/code> is created: 0.5. <code>only_b<\/code> is created: 0.3. <code>both<\/code> is created: 0.2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "only_a",
+       "0.5"
+      ],
+      [
+       "only_b",
+       "0.3"
+      ],
+      [
+       "both",
+       "0.2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "both"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "only_a",
+       "0.5"
+      ],
+      [
+       "only_b",
+       "0.3"
+      ],
+      [
+       "both",
+       "0.2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "federated: 30% of jobs keep running; single NameNode: 0%\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "What problem does HDFS federation mainly solve?",
+  "options": [
+   "NameNode failure",
+   "DataNode disk failures",
+   "The limits of a single NameNode (memory and RPC load for one namespace)",
+   "Slow networks"
+  ],
+  "answer": 2,
+  "why": "HA solves failure; federation scales the namespace across NameNodes."
+ },
+ {
+  "q": "In federation, what do the NameNodes share?",
+  "options": [
+   "The namespace",
+   "DataNodes and the cluster ID",
+   "The edit log",
+   "Nothing at all"
+  ],
+  "answer": 1,
+  "why": "Each has its own namespace and block pool; storage is shared."
+ },
+ {
+  "q": "What is a block pool?",
+  "options": [
+   "The set of blocks belonging to one namespace, stored in a BP-… folder on each DataNode",
+   "A cache of hot blocks",
+   "A group of DataNodes",
+   "A replication policy"
+  ],
+  "answer": 0,
+  "why": "Our DataNode had two: BP-1200013783-… and BP-343349822-…."
+ },
+ {
+  "q": "How do clients see one directory tree over several NameNodes?",
+  "options": [
+   "They can't",
+   "By listing each NameNode separately only",
+   "Through the JournalNodes",
+   "ViewFS mount table or Router-Based Federation"
+  ],
+  "answer": 3,
+  "why": "ViewFS is client-side; RBF routers hold the mount table centrally."
+ },
+ {
+  "q": "What happened when we moved /canteen/orders.csv to /hostel/?",
+  "options": [
+   "It moved instantly",
+   "It copied silently",
+   "mv: Renames across Mount points not supported",
+   "The NameNode crashed"
+  ],
+  "answer": 2,
+  "why": "A rename is a single-NameNode metadata operation."
+ },
+ {
+  "q": "With nn-canteen stopped, what still worked?",
+  "options": [
+   "Nothing",
+   "/hostel",
+   "/canteen",
+   "Only the root /"
+  ],
+  "answer": 1,
+  "why": "Each namespace fails independently."
+ },
+ {
+  "q": "Can a federated nameservice also be HA?",
+  "options": [
+   "Yes, each nameservice can have an active and standby NameNode",
+   "No, they are exclusive",
+   "Only in Hadoop 1",
+   "Only with ViewFS"
+  ],
+  "answer": 0,
+  "why": "HA and federation are orthogonal and are often combined."
+ },
+ {
+  "q": "Why must all federated NameNodes be formatted with the same cluster ID?",
+  "options": [
+   "For licensing",
+   "To share the edit log",
+   "It isn't needed",
+   "DataNodes only serve NameNodes of their own cluster"
+  ],
+  "answer": 3,
+  "why": "Our NameNodes were formatted with -clusterId campus-cluster."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 7.2 in one screen</h3>
+    <ul><li>Federation = several <b>independent NameNodes</b>, each with its own namespace and <b>block pool</b>, sharing DataNodes.</li><li>Same <b>cluster ID</b> (<code>-clusterId</code> at format); <code>dfs.nameservices</code> lists all; DataNodes register with each.</li><li>DataNode disk: one <code>current/BP-…</code> folder per namespace (lab: 2.5 M canteen, 572 K hostel).</li><li>Unified view: <b>ViewFS</b> (client mount table) or <b>RBF</b> (routers + state store).</li><li>No rename across namespaces (“Renames across Mount points not supported”); copy + delete instead.</li><li>Failure isolation: one NameNode down affects only its namespace; combine with HA per nameservice.</li><li>Why: NameNode heap ~150 bytes/object (rule of thumb) and RPC load; split busy or small-file-heavy trees.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What is HDFS federation?</summary><p>A way to scale the HDFS namespace by running multiple independent NameNodes. Each manages its own namespace and block pool, while all of them share the same DataNodes, which store blocks for every pool in separate directories. Clients see a unified namespace through ViewFS or Router-Based Federation.</p></details>
+    <details><summary>What is the difference between HDFS HA and federation?</summary><p>HA provides availability for one namespace: an active and standby NameNode hold the same metadata and the standby takes over on failure. Federation provides scalability and isolation: several NameNodes hold different parts of the namespace. They can be combined, with each federated nameservice running as an HA pair.</p></details>
+    <details><summary>What is ViewFS?</summary><p>A client-side file system (viewfs://) that uses a mount table in the client configuration to map paths like /canteen and /hostel to directories in different HDFS namespaces, giving one logical tree.</p></details>
+    <details><summary>What is Router-Based Federation?</summary><p>A server-side approach introduced in Hadoop 2.9/3.0: stateless router processes accept client requests on one address and forward them to the right nameservice using a mount table kept in a shared state store. Mount points can be changed centrally without updating clients.</p></details>
+    <details><summary>Does federation increase the size limit of a single directory tree?</summary><p>No. Each namespace still lives in one NameNode. Federation helps when the overall namespace can be split into separate subtrees across NameNodes.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Federation exercises using the real IDs, sizes and messages from the lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Parse a block pool ID</h4></div>
+      <p>Extract the random part, the NameNode IP and the creation time (ms) from a block pool ID.</p>
+      <div class="prob__io"><div><small>Input</small><pre>BP-1200013783-172.21.0.3-1792598083981</pre></div><div><small>Expected output</small><pre>1200013783 172.21.0.3 1792598083981</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>bp = &quot;BP-1200013783-172.21.0.3-1792598083981&quot;
+_, rnd, ip, ms = bp.split(&quot;-&quot;)
+print(rnd, ip, ms)</code></pre><div class="output">1200013783 172.21.0.3 1792598083981</div></div>
+        <p><b>How it works:</b> 1200013783, 172.21.0.3 (the NameNode that created it), 1792598083981 ms since 1970.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Which NameNode?</h4></div>
+      <p>Using the lab mount table, print which NameNode serves /tmp/x.</p>
+      <div class="prob__io"><div><small>Input</small><pre>/canteen, /hostel, /tmp mounts</pre></div><div><small>Expected output</small><pre>nn-hostel</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>mounts = {&quot;/canteen&quot;: &quot;nn-canteen&quot;, &quot;/hostel&quot;: &quot;nn-hostel&quot;, &quot;/tmp&quot;: &quot;nn-hostel&quot;}
+print(next(nn for m, nn in mounts.items() if &quot;/tmp/x&quot;.startswith(m + &quot;/&quot;)))</code></pre><div class="output">nn-hostel</div></div>
+        <p><b>How it works:</b> nn-hostel: /tmp was mounted on the hostel namespace.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Pool shares</h4></div>
+      <p>From du -sh: 2.5 M and 572 K. What percentage of the DataNode's HDFS data belongs to each pool?</p>
+      <div class="prob__io"><div><small>Input</small><pre>2.5 MB, 0.572 MB</pre></div><div><small>Expected output</small><pre>canteen 81%, hostel 19%</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>a, b = 2.5, 0.572
+print(f&quot;canteen {a / (a + b):.0%}, hostel {b / (a + b):.0%}&quot;)</code></pre><div class="output">canteen 81%, hostel 19%</div></div>
+        <p><b>How it works:</b> About 81% and 19%: one disk, two namespaces.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Heap check</h4></div>
+      <p>A NameNode has 120 GB of heap. Using 150 bytes per object, will 50 crore objects fit?</p>
+      <div class="prob__io"><div><small>Input</small><pre>120 GB · 50 crore</pre></div><div><small>Expected output</small><pre>needs 70 GB -&gt; fits</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>need = 500_000_000 * 150 / 1024**3
+print(f&quot;needs {need:.0f} GB -&gt; {&#x27;fits&#x27; if need &lt;= 120 else &#x27;does not fit: federate or reduce objects&#x27;}&quot;)</code></pre><div class="output">needs 70 GB -&gt; fits</div></div>
+        <p><b>How it works:</b> About 70 GB: fits, with headroom for growth and GC.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Cross-mount moves</h4></div>
+      <p>List which of these moves are renames (same mount) and which need copy + delete.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 moves</pre></div><div><small>Expected output</small><pre>/canteen/a -&gt; /canteen/archive/a : rename
+/canteen/a -&gt; /hostel/a : copy + delete
+/hostel/r -&gt; /hostel/old/r : rename</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>moves = [(&quot;/canteen/a&quot;, &quot;/canteen/archive/a&quot;), (&quot;/canteen/a&quot;, &quot;/hostel/a&quot;), (&quot;/hostel/r&quot;, &quot;/hostel/old/r&quot;)]
+mount = lambda p: &quot;/&quot; + p.split(&quot;/&quot;)[1]
+for s, d in moves:
+    print(s, &quot;-&gt;&quot;, d, &quot;:&quot;, &quot;rename&quot; if mount(s) == mount(d) else &quot;copy + delete&quot;)</code></pre><div class="output">/canteen/a -&gt; /canteen/archive/a : rename
+/canteen/a -&gt; /hostel/a : copy + delete
+/hostel/r -&gt; /hostel/old/r : rename</div></div>
+        <p><b>How it works:</b> Only the canteen→hostel move crosses mount points.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Live DataNodes per NameNode</h4></div>
+      <p>Parse the report lines and check both NameNodes see the same number of DataNodes.</p>
+      <div class="prob__io"><div><small>Input</small><pre>two lines</pre></div><div><small>Expected output</small><pre>[3, 3] same</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>lines = [&quot;nn-canteen: Live datanodes (3):&quot;, &quot;nn-hostel: Live datanodes (3):&quot;]
+counts = [int(l.split(&quot;(&quot;)[1].split(&quot;)&quot;)[0]) for l in lines]
+print(counts, &quot;same&quot; if len(set(counts)) == 1 else &quot;different&quot;)</code></pre><div class="output">[3, 3] same</div></div>
+        <p><b>How it works:</b> 3 and 3: every DataNode serves both namespaces.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Bigger server or federation?</h4></div>
+      <p>Option A: one NameNode server with 512 GB RAM, ₹40 lakh. Option B: two 256 GB servers, ₹14 lakh each, plus ₹3 lakh/year extra operations for 3 years. Which is cheaper over 3 years?</p>
+      <div class="prob__io"><div><small>Input</small><pre>A ₹40 lakh · B 2 × ₹14 lakh + 3 × ₹3 lakh</pre></div><div><small>Expected output</small><pre>A: Rs 40 lakh, B: Rs 37 lakh -&gt; federation cheaper</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>a = 40
+b = 2 * 14 + 3 * 3
+print(f&quot;A: Rs {a} lakh, B: Rs {b} lakh -&gt;&quot;, &quot;federation cheaper&quot; if b &lt; a else &quot;bigger server cheaper&quot;)</code></pre><div class="output">A: Rs 40 lakh, B: Rs 37 lakh -&gt; federation cheaper</div></div>
+        <p><b>How it works:</b> ₹37 lakh vs ₹40 lakh (illustrative), and B also isolates failures and avoids one giant JVM heap with long GC pauses.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>Mount table resolver</h4></div>
+      <p>Implement longest-prefix resolution with nested mounts /data → nn1 and /data/logs → nn2.</p>
+      <div class="prob__io"><div><small>Input</small><pre>2 nested mounts</pre></div><div><small>Expected output</small><pre>/data/sales/x -&gt; nn1
+/data/logs/app.log -&gt; nn2
+/data/logsheet.csv -&gt; nn1</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>mounts = {&quot;/data&quot;: &quot;nn1&quot;, &quot;/data/logs&quot;: &quot;nn2&quot;}
+def ns(path):
+    return mounts[max((m for m in mounts if path == m or path.startswith(m + &quot;/&quot;)), key=len)]
+for p in [&quot;/data/sales/x&quot;, &quot;/data/logs/app.log&quot;, &quot;/data/logsheet.csv&quot;]:
+    print(p, &quot;-&gt;&quot;, ns(p))</code></pre><div class="output">/data/sales/x -&gt; nn1
+/data/logs/app.log -&gt; nn2
+/data/logsheet.csv -&gt; nn1</div></div>
+        <p><b>How it works:</b> /data/logs/app.log goes to nn2; /data/logsheet.csv still goes to nn1 because the match is on whole path components.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Federation questions appear in senior Hadoop administrator and platform architect interviews.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">HDFS · concepts</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“HA and federation: what's the difference?”</h4>
+      <p class="scn__situation">Often asked right after HA.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> availability vs scalability.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>HA: same namespace on an active and standby NameNode; protects against NameNode failure.</li>
+          <li>Federation: different namespaces on independent NameNodes sharing DataNodes; scales metadata and isolates workloads.</li>
+          <li>They combine: each federated nameservice can be an HA pair.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Operations · capacity</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>NameNode heap at 90% and GC pauses growing</h4>
+      <p class="scn__situation">A 600-million-object namespace on one HA pair; RPC queue times are rising during the day.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> options in order of effort.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>First reduce objects: find small-file-heavy folders, compact them, clean /tmp and old data, use HAR or table compaction.</li>
+          <li>Tune heap and GC; consider Observer NameNodes for read-heavy load.</li>
+          <li>If growth continues, federate: move high-churn trees (/tmp, staging, a big tenant) to a new nameservice, behind routers so paths don't change.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Design · ViewFS vs RBF</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>Rolling out federation to 2,000 client machines</h4>
+      <p class="scn__situation">You add a second nameservice. Edge nodes, Spark jobs, Airflow workers and BI tools all access HDFS.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> client configuration management.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>With ViewFS, every client needs the new mount table; any stale config breaks paths. Manageable with strong config management.</li>
+          <li>With Router-Based Federation, clients point to the routers once; mount changes are made centrally with <code>dfsrouteradmin</code>.</li>
+          <li>Run several routers behind a nameservice for availability, and monitor the state store.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Troubleshooting</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>A new NameNode is up, but no DataNode registers with it</h4>
+      <p class="scn__situation">The second NameNode shows 0 live DataNodes; DataNode logs show an incompatible cluster ID.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> cluster ID and block pools.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>The new NameNode was formatted without the existing cluster ID, so DataNodes refuse it.</li>
+          <li>Reformat the empty new NameNode with <code>-clusterId &lt;existing id&gt;</code> (from any DataNode's VERSION file), add it to <code>dfs.nameservices</code>, and refresh DataNodes (<code>dfsadmin -refreshNamenodes</code>).</li>
+          <li>Never reformat a NameNode that already holds data.</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

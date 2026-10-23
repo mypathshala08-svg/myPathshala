@@ -1,0 +1,2015 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NameNode high availability (QJM and ZooKeeper) | MyPhatshala</title>
+<meta name="description" content="HDFS NameNode high availability on a real Hadoop 3.5.0 cluster with 2 NameNodes, 3 JournalNodes and ZooKeeper: kill the active NameNode while a client writes (failover in about 10 s, 12 of 12 writes succeed), freeze it and watch the JournalNodes reject the old active (“IPC&#x27;s epoch 7 is less than the last promised epoch 8”), and lose the JournalNode majority. QJM, ZKFC, fencing, epochs, split-brain, haadmin. Playground, Python simulations, quiz and interview scenarios.">
+<meta name="mp:minutes" content="30">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/07-hdfs-advanced/01-namenode-high-availability/">
+<meta property="og:title" content="NameNode high availability (QJM and ZooKeeper) · MyPhatshala">
+<meta property="og:description" content="Crash the NameNode, freeze it, starve it of JournalNodes: watch HDFS HA keep exactly one boss.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<link rel="stylesheet" href="../../../../assets/css/cluster-sim.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "NameNode high availability (QJM and ZooKeeper)", "learningResourceType": "Lesson", "educationalLevel": "Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="07-hdfs-advanced/01-namenode-high-availability" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 7.1</b></nav>
+    <h1>NameNode high availability (QJM and ZooKeeper)</h1>
+    <p class="lead">One NameNode means one machine whose failure stops the whole file system. HA runs a standby NameNode that follows every change through a quorum of JournalNodes, and ZooKeeper promotes it automatically. This lesson builds a real HA cluster in Docker, breaks it three different ways, and shows from the logs how Hadoop prevents two NameNodes from ever being active at once.</p>
+    <div class="lesson-meta"><span>Module 7 · HDFS advanced</span><span>⏱ 30 min</span><span>Advanced</span><span>Real failover on a 9-container cluster</span><span>Split-brain prevented live</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>The day the NameNode went down</h2>
+  <div class="story">
+    <p class="narration">Exam-result week at the university. The results portal reads marks files from HDFS. At 10:40 the NameNode server's motherboard dies. Every DataNode is healthy, every block is safe on disk, and yet nobody can open a single file: the only machine that knows <i>which blocks make which file</i> is gone. Restarting on new hardware from the last checkpoint takes the admin team almost an hour. Riya, watching the angry messages, asks the obvious question: why was there only one?</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 190" role="img" aria-label="An HA pair: an active and a standby NameNode, three JournalNodes holding the shared edit log, ZooKeeper deciding who is active, and DataNodes reporting to both NameNodes.">
+        <g font-size="10">
+          <rect x="20" y="20" width="130" height="50" rx="8" class="s-board"/><text x="85" y="42" text-anchor="middle" font-weight="700" class="s-chalk">NameNode nn1</text><text x="85" y="58" text-anchor="middle" font-size="9" style="fill:#9FD3B8">ACTIVE</text>
+          <rect x="490" y="20" width="130" height="50" rx="8" class="s-card2"/><text x="555" y="42" text-anchor="middle" font-weight="700" class="s-ink">NameNode nn2</text><text x="555" y="58" text-anchor="middle" font-size="9" class="s-ink2">STANDBY</text>
+          <rect x="220" y="14" width="200" height="34" rx="8" class="s-soft-violet" style="stroke:var(--violet)"/><text x="320" y="35" text-anchor="middle" font-weight="700" class="s-violet">ZooKeeper: who is active?</text>
+          <g><rect x="215" y="74" width="60" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="290" y="74" width="60" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="365" y="74" width="60" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/></g>
+          <g font-size="8.6" text-anchor="middle" class="s-blue"><text x="245" y="95">jn1</text><text x="320" y="95">jn2</text><text x="395" y="95">jn3</text></g>
+          <text x="320" y="124" text-anchor="middle" font-size="8.6" class="s-ink2">JournalNodes: the shared edit log (majority must accept)</text>
+          <path d="M150 50L215 88" style="fill:none;stroke:var(--green);stroke-width:2"/><text x="120" y="104" font-size="8.4" class="s-green">writes edits</text>
+          <path d="M425 88L490 50" style="fill:none;stroke:var(--blue);stroke-width:1.6;stroke-dasharray:4 3"/><text x="440" y="86" font-size="8.4" class="s-blue">reads edits</text>
+          <g><rect x="200" y="140" width="70" height="28" rx="5" class="s-soft-green" style="stroke:var(--green)"/><rect x="285" y="140" width="70" height="28" rx="5" class="s-soft-green" style="stroke:var(--green)"/><rect x="370" y="140" width="70" height="28" rx="5" class="s-soft-green" style="stroke:var(--green)"/></g>
+          <g font-size="8.6" text-anchor="middle" class="s-green"><text x="235" y="158">DataNode</text><text x="320" y="158">DataNode</text><text x="405" y="158">DataNode</text></g>
+          <path d="M85 70V154h115M555 70V154H440" style="fill:none;stroke:var(--ink-3);stroke-width:1.2"/>
+          <text x="320" y="184" text-anchor="middle" font-size="9" class="s-ink2">DataNodes send heartbeats and block reports to BOTH NameNodes, so the standby is always warm.</text>
+        </g>
+        <text x="632" y="186" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>In Hadoop 1 the NameNode was a <b>single point of failure</b>. Since Hadoop 2 you can run two (or more) NameNodes: one <b>active</b>, the others <b>standby</b>. The standby replays every change from a shared edit log kept on <b>JournalNodes</b>, and receives block reports from all DataNodes, so it is ready to take over in seconds.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Who decides when to switch?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p><b>ZooKeeper</b> and a small process next to each NameNode, the <b>ZKFailoverController</b>. And there's a harder question: what if the old active isn't dead, just frozen, and wakes up later? Two active NameNodes writing different histories would corrupt the file system. Today we build a real HA cluster with 2 NameNodes, 3 JournalNodes and ZooKeeper, crash it, freeze it, and starve it, and watch exactly what Hadoop does.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>NameNode high availability</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>HDFS high availability (HA)</b> runs two or more NameNodes for one namespace (a <b>nameservice</b>): exactly one is <b>active</b> and serves clients; the others are <b>standby</b>. With the <b>Quorum Journal Manager (QJM)</b>, the active NameNode writes every namespace edit to a group of <b>JournalNodes</b> (typically 3 or 5) and an edit succeeds only when a majority acknowledges it; standbys tail these edits to keep their namespace current, while DataNodes send heartbeats and block reports to all NameNodes. <b>Automatic failover</b> uses a <b>ZooKeeper</b> ensemble and a <b>ZKFailoverController (ZKFC)</b> beside each NameNode: the ZKFC monitors its NameNode's health and holds an ephemeral lock znode while it is active; when the active's ZooKeeper session expires, another ZKFC takes the lock, <b>fences</b> the old active, and transitions its NameNode to active. JournalNodes additionally enforce a monotonically increasing <b>epoch</b>, rejecting writes from any NameNode with an older epoch, which prevents split-brain.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Two NameNodes, one in charge. The one in charge writes every change to three JournalNodes; the spare reads those changes and stays up to date. ZooKeeper notices when the one in charge disappears and promotes the spare in about ten seconds. A NameNode that was replaced and comes back is refused by the JournalNodes, so there is never more than one boss.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Nameservice</b><span>A logical name for the HA pair, e.g. <code>hdfs://canteen</code>; clients never name a single NameNode.</span></div>
+    <div class="term"><b>Active / standby</b><span>The NameNode serving clients / the warm spare replaying edits.</span></div>
+    <div class="term"><b>JournalNode (JN)</b><span>A small daemon storing the shared edit log; run 3 or 5.</span></div>
+    <div class="term"><b>QJM</b><span>Quorum Journal Manager: writes succeed when a majority of JNs accept.</span></div>
+    <div class="term"><b>ZKFC</b><span>ZKFailoverController: health-checks its NameNode and runs the election in ZooKeeper.</span></div>
+    <div class="term"><b>Fencing</b><span>Making sure the old active can no longer act (e.g. ssh and kill it).</span></div>
+    <div class="term"><b>Epoch</b><span>A number that grows with each new active writer; JNs reject older epochs.</span></div>
+    <div class="term"><b>Split-brain</b><span>Two nodes both believing they are active: the disaster HA must prevent.</span></div>
+  </div>
+
+  <h3>Settings and numbers from our lab (Hadoop 3.5.0)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>ha.zookeeper.session-timeout.ms</th><td>10000: a crashed active is noticed after about 10 s (our run: kill at 15:44:25, new active at 15:44:35)</td></tr>
+    <tr><th>dfs.qjournal.write-txns.timeout.ms</th><td>20000: without a JournalNode majority for 20 s, the NameNode shuts itself down</td></tr>
+    <tr><th>ipc.client.connect.timeout</th><td>20000: a client that tries the dead NameNode first waits up to 20 s (our write took 22 s)</td></tr>
+    <tr><th>dfs.ha.zkfc.port</th><td>8019 (ZKFC RPC port)</td></tr>
+    <tr><th>dfs.ha.tail-edits.period</th><td>We set 5s in the lab so the standby follows quickly (the shipped default is larger)</td></tr>
+  </table>
+
+  <h3 id="levels">HA at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A cricket team captain</h4>
+      <ul>
+        <li>The <b>captain</b> (active NameNode) makes every decision; the <b>vice-captain</b> (standby) watches every ball and knows the match situation.</li>
+        <li>The <b>scorebook</b> is kept by three scorers (JournalNodes). A decision counts only if at least two of them write it down.</li>
+        <li>If the captain is injured, the <b>umpire</b> (ZooKeeper) hands the armband to the vice-captain. If the old captain walks back on, the scorers refuse to record his decisions: the new captain has a newer armband number.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How a failover happens</h4>
+      <ul>
+        <li>The active's ZKFC holds an <b>ephemeral znode</b> (<code>ActiveStandbyElectorLock</code>) in ZooKeeper. It disappears when its session expires (10 s without contact).</li>
+        <li>The standby's ZKFC grabs the lock, <b>fences</b> the old active, and tells its NameNode to become active. Our log: “Checking for any old active” → “Fencing successful” → “Successfully transitioned … to active state” within one second.</li>
+        <li>Clients use a <b>failover proxy provider</b>: they know both addresses and retry the other on errors such as <code>StandbyException</code>.</li>
+        <li>Manual, graceful switch: <code>hdfs haadmin -failover nn2 nn1</code> (2.2 s in our lab).</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Why split-brain can't happen with QJM</h4>
+      <ul>
+        <li>Each new active asks the JournalNodes for a new <b>epoch</b> greater than any they have seen; a majority must promise it. Our epochs went 2 → 3 → 4 → … with every switch.</li>
+        <li>A frozen old active wakes up with epoch 7 and tries to write: every JN answers “IPC's epoch 7 is less than the last promised epoch 8”, and the NameNode exits. Even with a fake fencer (<code>/bin/true</code>), the shared log cannot be corrupted.</li>
+        <li>Fencing is still needed in production (e.g. <code>sshfence</code>): an old active could otherwise answer stale <i>reads</i> to clients for a while.</li>
+        <li>With fewer than a majority of JNs, no NameNode can write, so both shut down: HDFS chooses consistency over availability (the CP side of the CAP theorem).</li>
+        <li>Since Hadoop 3, more than two NameNodes are supported (one active, several standbys), and <b>Observer NameNodes</b> can serve reads.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “Explain NameNode HA with QJM”: draw active + standby NameNodes, 3 JournalNodes, ZooKeeper with two ZKFCs, and DataNodes reporting to both. Then list: shared edits via quorum (majority), standby tails edits, automatic failover via ZooKeeper session + ZKFC, fencing and epochs to prevent split-brain. Mention the Secondary NameNode is <b>not</b> used in HA; the standby does checkpointing.</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Ways to protect the NameNode</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th></th><th>No HA (Secondary NN)</th><th>HA with NFS shared edits</th><th>HA with QJM (standard)</th></tr></thead>
+    <tbody>
+      <tr><td><b>If the NameNode dies</b></td><td>Cluster down until manual restore</td><td>Standby takes over</td><td>Standby takes over in seconds</td></tr>
+      <tr><td><b>Shared edit log</b></td><td>None (only checkpoints)</td><td>One NFS filer</td><td>3 or 5 JournalNodes, majority</td></tr>
+      <tr><td><b>Single point of failure?</b></td><td>Yes, the NameNode</td><td>The NFS filer</td><td>No (tolerates 1 of 3 JN failures)</td></tr>
+      <tr><td><b>Split-brain protection</b></td><td>Not needed</td><td>Fencing only</td><td>Epochs + fencing</td></tr>
+      <tr><td><b>Who checkpoints</b></td><td>Secondary NameNode</td><td>Standby</td><td>Standby</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Failover modes and admin commands</h3>
+  <div class="cards">
+    <div class="card"><h4>Automatic</h4><p><code>dfs.ha.automatic-failover.enabled=true</code> + ZooKeeper + ZKFC. Used in production.</p><span class="tag">ZooKeeper</span></div>
+    <div class="card"><h4>Manual / graceful</h4><p><code>hdfs haadmin -failover nn2 nn1</code> for planned maintenance or patching.</p><span class="tag">haadmin</span></div>
+    <div class="card"><h4>Check state</h4><p><code>hdfs haadmin -getAllServiceState</code>, or <code>tag.HAState</code> in the NameNode's <code>/jmx</code>.</p><span class="tag">monitoring</span></div>
+    <div class="card"><h4>Observer reads</h4><p>Hadoop 3 Observer NameNodes serve read-only requests to take load off the active.</p><span class="tag">scale reads</span></div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>Clients and jobs should always use the nameservice URI (<code>hdfs://canteen/…</code>), never <code>hdfs://nn1:8020/…</code>. A path with a hard-coded NameNode host breaks the moment that host becomes standby.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Building and breaking a real HA cluster</h2>
+  <p>Our lab: ZooKeeper, 3 JournalNodes, NameNodes nn1 and nn2 (each with a ZKFC) and 3 DataNodes, all <code>apache/hadoop:3.5.0</code> containers. The full files are in “Run it on your PC”.</p>
+  <ol class="stepper">
+    <li><h4>The HA configuration</h4>
+      <div class="code" data-lang="properties" data-file="config (part)"><pre><code>CORE-SITE.XML_fs.defaultFS=hdfs://canteen
+CORE-SITE.XML_ha.zookeeper.quorum=zk:2181
+HDFS-SITE.XML_dfs.nameservices=canteen
+HDFS-SITE.XML_dfs.ha.namenodes.canteen=nn1,nn2
+HDFS-SITE.XML_dfs.namenode.rpc-address.canteen.nn1=nn1:8020
+HDFS-SITE.XML_dfs.namenode.shared.edits.dir=qjournal://jn1:8485;jn2:8485;jn3:8485/canteen
+HDFS-SITE.XML_dfs.client.failover.proxy.provider.canteen=org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider
+HDFS-SITE.XML_dfs.ha.automatic-failover.enabled=true
+HDFS-SITE.XML_dfs.ha.fencing.methods=shell(/bin/true)</code></pre></div>
+      <span class="behind">The client sees one name, <code>canteen</code>, with two possible addresses. <code>shell(/bin/true)</code> is a “fencer that always succeeds”, acceptable only in a lab; we'll see why QJM keeps us safe anyway.</span></li>
+    <li><h4>First start: format, bootstrap, elect</h4>
+      <div class="code" data-lang="bash" data-file="nn.sh (part)"><pre><code># on nn1, once:
+hdfs namenode -format -nonInteractive -clusterId canteen-cluster
+hdfs zkfc -formatZK -nonInteractive
+# on nn2, once:
+hdfs namenode -bootstrapStandby -nonInteractive
+# on both:
+hdfs --daemon start zkfc; hdfs namenode
+
+hdfs haadmin -getAllServiceState</code></pre><div class="output">nn1:8020                                           active
+nn2:8020                                           standby</div></div>
+      <span class="behind">nn2 copies nn1's fsimage; both ZKFCs race for the lock znode in ZooKeeper, and nn1 won. ZooKeeper now holds <code>/hadoop-ha/canteen/ActiveStandbyElectorLock</code> and <code>ActiveBreadCrumb</code> (we listed them with the ZooKeeper client).</span></li>
+    <li><h4>Crash the active while a client writes</h4>
+      <div class="code" data-lang="bash" data-file="ha_failover.sh output"><pre><code>docker kill lab7-nn1-1</code></pre><div class="output">15:44:15 before: nn1:8020=active  nn2:8020=standby
+15:44:25 &gt;&gt;&gt; docker kill lab7-nn1-1   (the active NameNode crashes)
+15:44:27 nn2 is standby
+  ...
+15:44:34 nn2 is standby
+15:44:36 nn2 is active
+15:44:24 write 3 ok  (took 3 s)
+15:44:46 write 4 ok  (took 22 s)
+15:44:48 write 5 ok  (took 2 s)
+  ...
+15:45:03 write 12 ok  (took 2 s)
+15:45:04 files written: 12</div></div>
+      <span class="behind">About 10 s to fail over: the ZooKeeper session timeout. The client's write 4 was in progress: it tried nn1 (20 s connect timeout to the dead address), then nn2, and succeeded. <b>12 of 12 writes succeeded</b>; the application only saw one slow write.</span></li>
+    <li><h4>What the standby's ZKFC did</h4>
+      <div class="code" data-lang="text" data-file="ZKFC log on nn2"><pre><code>grep … /var/log/hadoop/hadoop-hadoop-zkfc-nn2.out</code></pre><div class="output">15:44:34 ActiveStandbyElector - Checking for any old active which needs to be fenced...
+15:44:35 NodeFencer - ====== Beginning Service Fencing Process... ======
+15:44:35 NodeFencer - ====== Fencing successful by method ShellCommandFencer(/bin/true) ======
+15:44:35 ZKFailoverController - Trying to make NameNode at nn2/172.20.0.7:8020 active...
+15:44:35 ZKFailoverController - Successfully transitioned NameNode at nn2/172.20.0.7:8020 to active state</div></div>
+      <span class="behind">Lock taken → old active fenced → standby promoted, all within about a second. Before becoming active, nn2 reads any remaining edits from the JournalNodes, so no change is lost.</span></li>
+    <li><h4>Freeze the active (the zombie test)</h4>
+      <div class="code" data-lang="bash" data-file="zombie.sh output"><pre><code>docker pause lab7-nn1-1 ; sleep 25 ; docker unpause lab7-nn1-1</code></pre><div class="output">15:40:49 before : nn1:8020=active  nn2:8020=standby  | epochs: jn1=7 jn2=7 jn3=7
+15:41:16 during : nn2=active | epochs: jn1=8 jn2=8 jn3=8
+15:41:19 client write to the new active: ok
+15:41:19 &gt;&gt;&gt; docker unpause lab7-nn1-1   (the old active wakes up, still thinking it is active)
+172.20.0.5:8485: IPC's epoch 7 is less than the last promised epoch 8 ; journal id: canteen
+172.20.0.4:8485: IPC's epoch 7 is less than the last promised epoch 8 ; journal id: canteen
+172.20.0.2:8485: IPC's epoch 7 is less than the last promised epoch 8 ; journal id: canteen
+Exiting with status 1: Error: flush failed for required journal ...
+SHUTDOWN_MSG: Shutting down NameNode at nn1/172.20.0.6
+15:41:39 after  : nn1:8020=Failed  nn2:8020=active</div></div>
+      <span class="behind">A frozen process (like a long garbage-collection pause) is the dangerous case: it doesn't know it was replaced. When nn1 woke and tried to write with epoch 7, all three JournalNodes refused, and nn1 shut itself down. <b>Split-brain prevented</b>, even with a fencer that does nothing.</span></li>
+    <li><h4>Lose the JournalNode majority</h4>
+      <div class="code" data-lang="bash" data-file="jn_quorum.sh output"><pre><code>docker stop lab7-jn3-1 ; … ; docker stop lab7-jn2-1</code></pre><div class="output">15:45:56 nn1:8020=standby  nn2:8020=active
+15:46:00 write 1: ok
+15:46:00 &gt;&gt;&gt; stop jn3 (2 of 3 JournalNodes left)
+15:46:02 write 2: ok
+15:46:02 &gt;&gt;&gt; stop jn2 (1 of 3 left: no majority)
+15:47:32 write 3: FAILED (no answer)
+15:47:42 nn1:8020=Failed  nn2:8020=Failed
+nn1: java.io.IOException: Timed out waiting 20000ms for a quorum of nodes to respond.
+nn2: java.io.IOException: Timed out waiting 20000ms for a quorum of nodes to respond.</div></div>
+      <span class="behind">With 2 of 3 JournalNodes, everything works. With 1 of 3, the active can't get a majority for 20 s and stops; the standby can't become active either. HDFS stops rather than risk losing edits. Starting the JournalNodes and NameNodes again (<code>restore.sh</code>) brought the cluster back with all files.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Put the three JournalNodes on three different machines (ideally different racks), never all on the NameNode hosts. Losing two JournalNodes stops the whole file system, as step 6 showed.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Crash, takeover, and the zombie that wakes up</h2>
+  <p>Six steps from our lab. Left: what admins and clients see. Right: ZooKeeper, the ZKFCs and the JournalNodes.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Automatic failover with QJM <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Admin terminal output during failover">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">admin@edge : ~</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#7F8C86">$ hdfs haadmin -getAllServiceState</text><text x="26" y="74" font-size="8.6" class="mono" style="fill:#9FD3B8">nn1:8020   active</text><text x="26" y="90" font-size="8.6" class="mono" style="fill:#9FD3B8">nn2:8020   standby</text><text x="26" y="114" font-size="8.6" class="mono" style="fill:#9FD3B8">write 1 ok · write 2 ok · write 3 ok</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#F5C77E">15:44:25 nn1 crashes</text><text x="26" y="74" font-size="8.6" class="mono" style="fill:#9FD3B8">15:44:27 nn2 is standby</text><text x="26" y="90" font-size="8.6" class="mono" style="fill:#9FD3B8">15:44:31 nn2 is standby</text><text x="26" y="114" font-size="8.6" class="mono" style="fill:#7F8C86">write 4 … waiting</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#9FD3B8">15:44:36 nn2 is active</text><text x="26" y="74" font-size="8.6" class="mono" style="fill:#9FD3B8">15:44:46 write 4 ok (took 22 s)</text><text x="26" y="90" font-size="8.6" class="mono" style="fill:#9FD3B8">15:44:48 write 5 ok (took 2 s)</text><text x="26" y="114" font-size="8.6" class="mono" style="fill:#F5C77E">files written: 12 of 12</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#7F8C86">(another day: nn1 active again)</text><text x="26" y="74" font-size="8.6" class="mono" style="fill:#F5C77E">15:40:51 nn1 frozen (pause)</text><text x="26" y="90" font-size="8.6" class="mono" style="fill:#9FD3B8">15:41:16 nn2=active</text><text x="26" y="106" font-size="8.6" class="mono" style="fill:#9FD3B8">epochs 7 → 8</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#F5C77E">15:41:19 nn1 wakes up</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#E8A3A3">IPC's epoch 7 is less than</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#E8A3A3">the last promised epoch 8</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#E8A3A3">(from jn1, jn2 and jn3)</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.6" class="mono" style="fill:#9FD3B8">SHUTDOWN_MSG: Shutting down</text><text x="26" y="72" font-size="8.6" class="mono" style="fill:#9FD3B8">NameNode at nn1</text><text x="26" y="96" font-size="8.6" class="mono" style="fill:#9FD3B8">nn1:8020=Failed  nn2:8020=active</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>nn1 is active, nn2 standby. A client writes a file every 2 seconds.</li>
+          <li>nn1 crashes. For a few seconds nn2 is still standby; one client write is waiting.</li>
+          <li>About 10 s later nn2 is active. The waiting write succeeds (22 s), and all 12 writes complete.</li>
+          <li>A different test: nn1 is frozen, not dead. nn2 takes over and the epoch rises from 7 to 8.</li>
+          <li>nn1 wakes up and tries to write edits with epoch 7. All three JournalNodes refuse.</li>
+          <li>nn1 shuts itself down. There is only ever one active writer.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="ZooKeeper, ZKFCs, NameNodes and JournalNodes">
+          <rect x="120" y="12" width="120" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180" y="28" text-anchor="middle" font-size="8.6" font-weight="700" class="s-violet">ZooKeeper</text><text x="180" y="40" text-anchor="middle" font-size="7.6" class="s-ink">lock znode</text>
+          <rect x="14" y="70" width="100" height="54" rx="6" class="s-board"/><text x="64" y="90" text-anchor="middle" font-size="8.6" font-weight="700" class="s-chalk">nn1 + ZKFC</text>
+          <rect x="246" y="70" width="100" height="54" rx="6" class="s-card2"/><text x="296" y="90" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">nn2 + ZKFC</text>
+          <g><rect x="110" y="160" width="40" height="30" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="160" y="160" width="40" height="30" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="210" y="160" width="40" height="30" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/></g>
+          <g font-size="7.8" text-anchor="middle" class="s-blue"><text x="130" y="179">jn1</text><text x="180" y="179">jn2</text><text x="230" y="179">jn3</text></g>
+          <g data-on="1"><text x="64" y="108" text-anchor="middle" font-size="8" style="fill:#9FD3B8">ACTIVE · epoch 2</text><text x="296" y="108" text-anchor="middle" font-size="8" class="s-ink2">standby, tailing</text><path d="M84 70L150 46" style="fill:none;stroke:var(--violet);stroke-width:2"/><path d="M64 124L150 162" style="fill:none;stroke:var(--green);stroke-width:2"/><path d="M210 175L296 124" style="fill:none;stroke:var(--blue);stroke-width:1.4;stroke-dasharray:3 3"/><text x="180" y="222" text-anchor="middle" font-size="8.6" class="s-ink2">nn1 holds the lock; edits go to all 3 JNs</text></g>
+          <g data-on="2"><rect x="14" y="70" width="100" height="54" rx="6" style="fill:var(--red);opacity:.35"/><text x="64" y="108" text-anchor="middle" font-size="8" class="s-red">crashed</text><text x="180" y="222" text-anchor="middle" font-size="8.6" class="s-ink2">no heartbeats to ZooKeeper; session expires in ~10 s</text></g>
+          <g data-on="3"><rect x="14" y="70" width="100" height="54" rx="6" style="fill:var(--red);opacity:.35"/><text x="296" y="108" text-anchor="middle" font-size="8" class="s-green" font-weight="700">ACTIVE · epoch 3</text><path d="M276 70L210 46" style="fill:none;stroke:var(--violet);stroke-width:2"/><path d="M296 124L210 162" style="fill:none;stroke:var(--green);stroke-width:2"/><text x="180" y="222" text-anchor="middle" font-size="8.6" class="s-ink2">nn2's ZKFC takes the lock, fences, promotes nn2</text></g>
+          <g data-on="4"><rect x="14" y="70" width="100" height="54" rx="6" style="fill:var(--ink-3);opacity:.3"/><text x="64" y="108" text-anchor="middle" font-size="8" style="fill:#F5C77E">frozen · epoch 7</text><text x="296" y="108" text-anchor="middle" font-size="8" class="s-green" font-weight="700">ACTIVE · epoch 8</text><text x="180" y="150" text-anchor="middle" font-size="8" class="s-blue">JNs promise: epoch ≥ 8 only</text><text x="180" y="222" text-anchor="middle" font-size="8.6" class="s-ink2">a new active always gets a higher epoch from a JN majority</text></g>
+          <g data-on="5"><text x="64" y="108" text-anchor="middle" font-size="8" class="s-red">thinks: ACTIVE, epoch 7</text><path d="M64 124L130 160M64 124L180 160M64 124L230 160" style="fill:none;stroke:var(--red);stroke-width:1.6;stroke-dasharray:4 3"/><text x="296" y="108" text-anchor="middle" font-size="8" class="s-green" font-weight="700">ACTIVE · epoch 8</text><text x="180" y="222" text-anchor="middle" font-size="8.6" class="s-red">every JN rejects epoch 7</text></g>
+          <g data-on="6"><rect x="14" y="70" width="100" height="54" rx="6" style="fill:var(--red);opacity:.35"/><text x="64" y="108" text-anchor="middle" font-size="8" class="s-red">shut down</text><text x="296" y="108" text-anchor="middle" font-size="8" class="s-green" font-weight="700">ACTIVE · epoch 8</text><text x="180" y="222" text-anchor="middle" font-size="8.6" class="s-ink2">one writer, one history: no split-brain</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>nn1's ZKFC holds the lock znode; nn1 writes each edit to the JournalNodes; nn2 tails them.</li>
+          <li>nn1 crashes. Its ZooKeeper session stops being renewed.</li>
+          <li>After the 10 s session timeout the lock disappears; nn2's ZKFC takes it, fences nn1 and makes nn2 active with a higher epoch.</li>
+          <li>In the zombie test, nn1 is only frozen. nn2 becomes active with epoch 8, and the JNs promise to ignore anything older.</li>
+          <li>nn1 wakes up and sends edits with epoch 7. The JNs reject them.</li>
+          <li>nn1 exits. The epoch rule guarantees a single writer even if fencing fails.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <h3 id="playground">Try it yourself: failover in the playground</h3>
+  <p>This playground has two NameNodes. Upload a file, stop the active NameNode, and watch the standby take over.</p>
+  <div class="csim"><script type="application/json">{"title": "Two NameNodes, one in charge", "intro": "<p>An HA cluster with an active and a standby NameNode. Upload a file, then stop the active NameNode and watch the standby take over.<\/p>", "racks": 2, "nodes": 3, "features": ["upload", "ha", "fail"], "preload": [{"name": "exam_results.csv", "sizeMB": 300}], "try": [{"text": "Upload a file so the cluster is busy.", "on": "upload-done"}, {"text": "Press <b>Stop active NameNode<\/b>.", "on": "nn-stop"}, {"text": "Watch the Event log: the standby becomes <b>ACTIVE<\/b> a few seconds later.", "on": "nn-failover"}]}</script></div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>HA at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="26" width="40" height="36" rx="6" class="s-board"/><rect x="64" y="26" width="40" height="36" rx="6" class="s-card2"/><text x="36" y="48" text-anchor="middle" font-size="8" style="fill:#9FD3B8">active</text><text x="84" y="48" text-anchor="middle" font-size="8" class="s-ink2">standby</text></svg></div>
+    <div><h4>1. Every production cluster</h4>
+      <p>Enterprise distributions and admin guides treat NameNode HA with QJM as the standard for production clusters; a single NameNode is accepted only for dev and test.</p>
+      <div class="uc-flow"><span>2 NameNodes</span><i>→</i><span class="java">3 or 5 JournalNodes</span><i>→</i><span>ZooKeeper</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><path d="M30 60h60" class="s-line"/><path d="M40 60V36h40v24" style="fill:none;stroke:var(--track);stroke-width:2.4"/><text x="60" y="30" text-anchor="middle" font-size="8.6" class="s-acc">patch</text></svg></div>
+    <div><h4>2. Rolling upgrades and patching</h4>
+      <p>Admins patch the standby, fail over to it with <code>haadmin -failover</code>, then patch the old active. The file system stays online during OS and Hadoop upgrades.</p>
+      <div class="uc-flow"><span>Patch standby</span><i>→</i><span class="java">Graceful failover</span><i>→</i><span>Patch the other</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="22" y="22" width="76" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="50" text-anchor="middle" font-size="9" class="s-blue">GC pause</text></svg></div>
+    <div><h4>3. Long garbage-collection pauses</h4>
+      <p>A NameNode with a very large heap can pause for many seconds. If that exceeds the ZooKeeper timeout, a failover happens and the paused NameNode exits on waking, exactly our zombie test. Admins tune heap and timeouts to avoid needless failovers.</p>
+      <div class="uc-flow"><span>Pause &gt; 10 s</span><i>→</i><span class="java">Failover</span><i>→</i><span>Old NN exits</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="22" y="22" width="76" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="8.6" class="s-ink">alert:</text><text x="60" y="56" text-anchor="middle" font-size="8.6" class="s-red">HAState changed</text></svg></div>
+    <div><h4>4. Monitoring failovers</h4>
+      <p>Monitoring reads <code>tag.HAState</code> from each NameNode's JMX and alerts on changes. A failover is not an outage, but it means something failed and should be investigated.</p>
+      <div class="uc-flow"><span>/jmx</span><i>→</i><span class="java">HAState watch</span><i>→</i><span>On-call alert</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>A quorum journal with epochs, in Python</h2>
+  <p>Three JournalNodes each remember the highest epoch they have promised. A NameNode becomes the writer by getting a majority to promise its new epoch; an edit is accepted only by JNs that have not promised a higher one. Run it to replay our zombie test.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>jns = {&quot;jn1&quot;: 7, &quot;jn2&quot;: 7, &quot;jn3&quot;: 7}          # last promised epoch on each JournalNode
+log = []
+
+def become_active(name):
+    epoch = max(jns.values()) + 1
+    ok = [j for j in jns if jns[j] &lt; epoch]
+    if len(ok) &gt;= 2:                          # majority of 3
+        for j in ok:
+            jns[j] = epoch
+        print(f&quot;{name} is ACTIVE with epoch {epoch}&quot;)
+        return epoch
+    print(f&quot;{name} could not get a majority&quot;)
+
+def write(name, epoch, edit):
+    accepted = [j for j in jns if epoch &gt;= jns[j]]
+    if len(accepted) &gt;= 2:
+        log.append(edit)
+        print(f&quot;{name} wrote {edit!r} (accepted by {len(accepted)} JNs)&quot;)
+    else:
+        print(f&quot;{name} REJECTED: epoch {epoch} is less than promised {max(jns.values())}&quot;)
+
+e1 = 7                                        # nn1 was active with epoch 7, then froze
+e2 = become_active(&quot;nn2&quot;)                     # nn2 takes over
+write(&quot;nn2&quot;, e2, &quot;mkdir /results&quot;)
+write(&quot;nn1&quot;, e1, &quot;delete /results&quot;)           # the zombie wakes up
+print(&quot;edit log:&quot;, log)</code></pre><div class="output">nn2 is ACTIVE with epoch 8
+nn2 wrote &#x27;mkdir /results&#x27; (accepted by 3 JNs)
+nn1 REJECTED: epoch 7 is less than promised 8
+edit log: [&#x27;mkdir /results&#x27;]</div></div>
+  <ul class="anno"><li><code>    epoch = max(jns.values()) + 1</code><span>A new writer always asks for a higher epoch than any JournalNode has seen. Our lab epochs went 7 → 8.</span></li><li><code>    accepted = [j for j in jns if epoch &gt;= jns[j]]</code><span>A JournalNode refuses any write whose epoch is lower than what it promised: “IPC's epoch 7 is less than the last promised epoch 8”.</span></li><li><code>    if len(accepted) &gt;= 2:</code><span>A write needs a majority (2 of 3). That is why losing two JournalNodes stopped the whole cluster.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · The zombie is rejected",
+   "hint": "Press <b>Run<\/b>. Then add a second failover back to nn1 and write again with the new epoch.",
+   "code": "jns = {\"jn1\": 7, \"jn2\": 7, \"jn3\": 7}          # last promised epoch on each JournalNode\nlog = []\n\ndef become_active(name):\n    epoch = max(jns.values()) + 1\n    ok = [j for j in jns if jns[j] < epoch]\n    if len(ok) >= 2:                          # majority of 3\n        for j in ok:\n            jns[j] = epoch\n        print(f\"{name} is ACTIVE with epoch {epoch}\")\n        return epoch\n    print(f\"{name} could not get a majority\")\n\ndef write(name, epoch, edit):\n    accepted = [j for j in jns if epoch >= jns[j]]\n    if len(accepted) >= 2:\n        log.append(edit)\n        print(f\"{name} wrote {edit!r} (accepted by {len(accepted)} JNs)\")\n    else:\n        print(f\"{name} REJECTED: epoch {epoch} is less than promised {max(jns.values())}\")\n\ne1 = 7                                        # nn1 was active with epoch 7, then froze\ne2 = become_active(\"nn2\")                     # nn2 takes over\nwrite(\"nn2\", e2, \"mkdir /results\")\nwrite(\"nn1\", e1, \"delete /results\")           # the zombie wakes up\nprint(\"edit log:\", log)\n"
+  },
+  {
+   "label": "2 · How long is the outage?",
+   "hint": "<b>Predict first:<\/b> failover time ≈ ZooKeeper session timeout + fencing + transition. Our ZKFC log shows 1 s for fence + transition.",
+   "code": "session_timeout_s = 10\nfence_and_transition_s = 1\nprint(\"expected failover ~\", session_timeout_s + fence_and_transition_s, \"s (real lab: kill 15:44:25, active 15:44:36)\")\n"
+  },
+  {
+   "label": "3 · Majority sizes",
+   "hint": "How many JournalNodes can fail for 3, 5 and 7 JNs? Why are even numbers pointless?",
+   "code": "for n in [3, 4, 5, 6, 7]:\n    majority = n // 2 + 1\n    print(f\"{n} JNs: majority {majority}, can lose {n - majority}\")\n"
+  },
+  {
+   "label": "4 · Client failover",
+   "hint": "A client tries nn1, then nn2. A dead address costs the 20 s connect timeout; a standby answers at once with StandbyException. Compute the extra delay for each case.",
+   "code": "connect_timeout = 20\ncases = {\"nn1 crashed (no reply)\": connect_timeout, \"nn1 is standby (fast error)\": 0.05}\nfor case, wasted in cases.items():\n    print(f\"{case:30} extra delay before trying nn2: {wasted} s\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This check says the cluster is safe with 2 of 4 JournalNodes alive. Fix the majority test.",
+   "code": "alive, total = 2, 4\nsafe = alive >= total / 2\nprint(\"can write:\", safe)\nassert not safe, \"2 of 4 is not a majority\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: build and break an HA cluster</h3>
+  <p>Create a folder <code>hdfs-ha-lab</code> with four files from the lesson's lab: <code>config</code> (the HA settings shown in Part 4), <code>docker-compose.yaml</code>, <code>nn.sh</code> and <code>zk.sh</code> (ZooKeeper runs from the jars inside the Hadoop image, so no extra image is needed). Start it with <code>docker compose -p lab7 up -d --scale datanode=3</code>, wait a minute, then run the three experiments. It needs about 4 GB of free RAM.</p>
+  <div class="pcrun"><h4>Lab files: compose, NameNode start script, ZooKeeper</h4>
+  <div class="code" data-lang="bash" data-file="docker-compose.yaml"><pre><code>x-hadoop: &amp;hadoop
+  image: apache/hadoop:3.5.0
+  env_file: [./config]
+  volumes: [./nn.sh:/opt/nn.sh:ro, ./zk.sh:/opt/zk.sh:ro]
+services:
+  zk:  { &lt;&lt;: *hadoop, hostname: zk,  command: [&quot;bash&quot;, &quot;/opt/zk.sh&quot;] }
+  jn1: { &lt;&lt;: *hadoop, hostname: jn1, command: [&quot;hdfs&quot;, &quot;journalnode&quot;] }
+  jn2: { &lt;&lt;: *hadoop, hostname: jn2, command: [&quot;hdfs&quot;, &quot;journalnode&quot;] }
+  jn3: { &lt;&lt;: *hadoop, hostname: jn3, command: [&quot;hdfs&quot;, &quot;journalnode&quot;] }
+  nn1: { &lt;&lt;: *hadoop, hostname: nn1, command: [&quot;bash&quot;, &quot;/opt/nn.sh&quot;], depends_on: [zk, jn1, jn2, jn3] }
+  nn2: { &lt;&lt;: *hadoop, hostname: nn2, command: [&quot;bash&quot;, &quot;/opt/nn.sh&quot;], depends_on: [nn1] }
+  datanode: { &lt;&lt;: *hadoop, command: [&quot;hdfs&quot;, &quot;datanode&quot;], depends_on: [nn1, nn2] }
+
+# ---- nn.sh ----
+#!/bin/bash
+# Start a NameNode plus its ZKFailoverController in one container.
+# nn1 formats the namespace; nn2 copies it from nn1 (bootstrapStandby).
+NAME=/tmp/hadoop-hadoop/dfs/name
+if [ ! -d $NAME/current ]; then
+  if [ &quot;$(hostname)&quot; = &quot;nn1&quot; ]; then
+    hdfs namenode -format -nonInteractive -clusterId canteen-cluster
+    hdfs zkfc -formatZK -nonInteractive
+  else
+    until hdfs namenode -bootstrapStandby -nonInteractive; do sleep 5; done
+  fi
+fi
+hdfs --daemon start zkfc
+exec hdfs namenode
+
+# ---- zk.sh ----
+#!/bin/bash
+# Run a single ZooKeeper server using the ZooKeeper jars shipped inside the Hadoop image.
+mkdir -p /tmp/zk &amp;&amp; printf &#x27;tickTime=2000\ndataDir=/tmp/zk\nclientPort=2181\nadmin.enableServer=false\n4lw.commands.whitelist=*\n&#x27; &gt; /tmp/zk/zoo.cfg
+exec java -cp &quot;/opt/hadoop/share/hadoop/common/lib/*&quot; org.apache.zookeeper.server.quorum.QuorumPeerMain /tmp/zk/zoo.cfg
+
+# Start:  docker compose -p lab7 up -d --scale datanode=3</code></pre><div class="output">lab7-datanode-1 Up About a minute
+lab7-datanode-2 Up About a minute
+lab7-datanode-3 Up About a minute
+lab7-jn1-1 Up About a minute
+lab7-jn2-1 Up About a minute
+lab7-jn3-1 Up About a minute
+lab7-nn1-1 Up About a minute
+lab7-nn2-1 Up About a minute
+lab7-zk-1 Up About a minute
+$ docker exec lab7-nn1-1 hdfs haadmin -getAllServiceState
+nn1:8020                                           active
+nn2:8020                                           standby</div></div>
+  <p class="muted">Real output. The config file with all HA properties is in Part 4, step 1, plus <code>dfs.namenode.http-address</code> for both NameNodes, <code>dfs.journalnode.edits.dir</code>, <code>dfs.namenode.name.dir</code> and <code>dfs.replication=3</code>.</p></div>
+  <div class="pcrun"><h4>Experiment 1: crash the active during writes</h4>
+  <div class="code" data-lang="bash" data-file="ha_failover.sh"><pre><code>#!/usr/bin/env bash
+# ha_failover.sh: crash the active NameNode while a client keeps writing, and watch HDFS fail over.
+# Run from the folder with docker-compose.yaml (project name lab7).
+P=lab7
+state() { docker exec $P-nn2-1 hdfs haadmin -getAllServiceState 2&gt;/dev/null | awk &#x27;/^nn[12]:8020/{printf &quot;%s=%s  &quot;, $1, $2}&#x27;; }
+echo &quot;$(date +%T) before: $(state)&quot;
+
+# a client on datanode-1 writes one small file every loop, and logs success or failure
+docker exec -d $P-datanode-1 bash -c &#x27;for i in $(seq 1 12); do
+  start=$(date +%s)
+  if echo &quot;order $i&quot; | hdfs dfs -put -f - /orders_$i.txt &gt;/tmp/err_$i 2&gt;&amp;1; then r=ok; else r=FAILED; fi
+  echo &quot;$(date +%T) write $i $r  (took $(( $(date +%s) - start )) s)&quot;
+done &gt; /tmp/writer.log 2&gt;&amp;1&#x27;
+sleep 8
+echo &quot;$(date +%T) &gt;&gt;&gt; docker kill $P-nn1-1   (the active NameNode crashes)&quot;
+docker kill $P-nn1-1 &gt; /dev/null
+for t in $(seq 1 30); do
+  s=$(docker exec $P-nn2-1 hdfs haadmin -getServiceState nn2 2&gt;/dev/null)
+  echo &quot;$(date +%T) nn2 is $s&quot;
+  [ &quot;$s&quot; = &quot;active&quot; ] &amp;&amp; break
+done
+until [ &quot;$(docker exec $P-datanode-1 bash -c &#x27;wc -l &lt; /tmp/writer.log&#x27;)&quot; -ge 12 ]; do sleep 2; done
+echo &quot;--- client log (datanode-1)&quot;
+docker exec $P-datanode-1 cat /tmp/writer.log
+echo &quot;--- ZKFC log on nn2&quot;
+docker exec $P-nn2-1 bash -c &#x27;grep -hE &quot;Checking for any old active|Beginning Service Fencing|Fencing successful|Trying to make|Successfully transitioned&quot; /var/log/hadoop/*zkfc*.out | cut -c1-150 | tail -5&#x27;
+echo &quot;$(date +%T) files written: $(docker exec $P-nn2-1 hdfs dfs -ls / 2&gt;/dev/null | grep -c orders_)&quot;
+
+# Run:  bash ha_failover.sh   (then: docker start lab7-nn1-1)</code></pre><div class="output">15:44:15 before: nn1:8020=active  nn2:8020=standby  
+15:44:25 &gt;&gt;&gt; docker kill lab7-nn1-1   (the active NameNode crashes)
+15:44:27 nn2 is standby
+15:44:28 nn2 is standby
+15:44:29 nn2 is standby
+15:44:31 nn2 is standby
+15:44:32 nn2 is standby
+15:44:33 nn2 is standby
+15:44:34 nn2 is standby
+15:44:36 nn2 is active
+--- client log (datanode-1)
+15:44:19 write 1 ok  (took 2 s)
+15:44:21 write 2 ok  (took 2 s)
+15:44:24 write 3 ok  (took 3 s)
+15:44:46 write 4 ok  (took 22 s)
+15:44:48 write 5 ok  (took 2 s)
+15:44:50 write 6 ok  (took 2 s)
+15:44:52 write 7 ok  (took 2 s)
+15:44:55 write 8 ok  (took 3 s)
+15:44:57 write 9 ok  (took 2 s)
+15:44:59 write 10 ok  (took 2 s)
+15:45:01 write 11 ok  (took 2 s)
+15:45:03 write 12 ok  (took 2 s)
+--- ZKFC log on nn2
+2026-10-21 15:44:34 INFO  ActiveStandbyElector:1019 - Checking for any old active which needs to be fenced...
+2026-10-21 15:44:35 INFO  NodeFencer:97 - ====== Beginning Service Fencing Process... ======
+2026-10-21 15:44:35 INFO  NodeFencer:115 - ====== Fencing successful by method org.apache.hadoop.ha.ShellCommandFencer(/bin/true) ======
+2026-10-21 15:44:35 INFO  ZKFailoverController:412 - Trying to make NameNode at nn2/172.20.0.7:8020 active...
+2026-10-21 15:44:35 INFO  ZKFailoverController:419 - Successfully transitioned NameNode at nn2/172.20.0.7:8020 to active state
+15:45:04 files written: 12</div></div>
+  <p class="muted">Real output: about 10 s to fail over, one slow write, 12 of 12 writes succeeded.</p></div>
+  <div class="pcrun"><h4>Experiment 2: freeze the active (zombie)</h4>
+  <div class="code" data-lang="bash" data-file="zombie.sh"><pre><code>#!/usr/bin/env bash
+# zombie.sh: freeze the active NameNode (it is alive but silent), let the other take over,
+# then wake the old one up and watch the JournalNodes refuse its writes.
+P=lab7
+state() { docker exec $P-nn2-1 hdfs haadmin -getAllServiceState 2&gt;/dev/null | awk &#x27;/^nn[12]:8020/{printf &quot;%s=%s  &quot;, $1, $2}&#x27;; }
+epoch() { for j in 1 2 3; do printf &quot;jn$j=%s &quot; &quot;$(docker exec $P-jn$j-1 cat /tmp/hadoop-hadoop/dfs/journal/canteen/current/last-promised-epoch)&quot;; done; }
+echo &quot;$(date +%T) before : $(state)| epochs: $(epoch)&quot;
+echo &quot;$(date +%T) &gt;&gt;&gt; docker pause $P-nn1-1   (active NameNode frozen, e.g. a 60 s GC pause)&quot;
+docker pause $P-nn1-1 &gt; /dev/null
+sleep 25
+echo &quot;$(date +%T) during : nn2=$(docker exec $P-nn2-1 hdfs haadmin -getServiceState nn2 2&gt;/dev/null) | epochs: $(epoch)&quot;
+echo &quot;order after takeover&quot; | docker exec -i $P-datanode-1 hdfs dfs -put -f - /after_takeover.txt 2&gt;/dev/null &amp;&amp; echo &quot;$(date +%T) client write to the new active: ok&quot;
+echo &quot;$(date +%T) &gt;&gt;&gt; docker unpause $P-nn1-1   (the old active wakes up, still thinking it is active)&quot;
+docker unpause $P-nn1-1 &gt; /dev/null
+sleep 20
+echo &quot;--- old active nn1, last log lines&quot;
+docker logs $P-nn1-1 2&gt;&amp;1 | grep -E &quot;epoch|IPC&#x27;s epoch|FATAL|Error: flush|shutting down|SHUTDOWN_MSG|Transitioning to standby|standby&quot; | cut -c1-190 | tail -6
+echo &quot;$(date +%T) after  : $(state)&quot;
+
+# Run:  bash zombie.sh   (then: docker start lab7-nn1-1)</code></pre><div class="output">15:40:49 before : nn1:8020=active  nn2:8020=standby  | epochs: jn1=7 jn2=7 jn3=7 
+15:40:51 &gt;&gt;&gt; docker pause lab7-nn1-1   (active NameNode frozen, e.g. a 60 s GC pause)
+15:41:16 during : nn2=active | epochs: jn1=8 jn2=8 jn3=8 
+15:41:19 client write to the new active: ok
+15:41:19 &gt;&gt;&gt; docker unpause lab7-nn1-1   (the old active wakes up, still thinking it is active)
+--- old active nn1, last log lines
+172.20.0.5:8485: IPC&#x27;s epoch 7 is less than the last promised epoch 8 ; journal id: canteen
+172.20.0.4:8485: IPC&#x27;s epoch 7 is less than the last promised epoch 8 ; journal id: canteen
+172.20.0.2:8485: IPC&#x27;s epoch 7 is less than the last promised epoch 8 ; journal id: canteen
+2026-10-21 15:41:20 INFO  ExitUtil:248 - Exiting with status 1: Error: flush failed for required journal (JournalAndStream(mgr=QJM to [172.20.0.4:8485, 172.20.0.2:8485, 172.20.0.5:8485], str
+2026-10-21 15:41:20 INFO  NameNode:822 - SHUTDOWN_MSG: 
+SHUTDOWN_MSG: Shutting down NameNode at nn1/172.20.0.6
+15:41:39 after  : nn1:8020=Failed  nn2:8020=active</div></div>
+  <p class="muted">Real output: the JournalNodes refuse epoch 7 after promising epoch 8, and the old active shuts down.</p></div>
+  <div class="pcrun"><h4>Experiment 3: lose the JournalNode majority</h4>
+  <div class="code" data-lang="bash" data-file="jn_quorum.sh"><pre><code>#!/usr/bin/env bash
+# jn_quorum.sh: the active NameNode needs a majority (2 of 3) of JournalNodes to write edits.
+P=lab7
+put() { if echo &quot;x&quot; | timeout 90 docker exec -i $P-datanode-1 hdfs dfs -put -f - /q_$1.txt &gt; /dev/null 2&gt;&amp;1; then echo &quot;$(date +%T) write $1: ok&quot;; else echo &quot;$(date +%T) write $1: FAILED (no answer)&quot;; fi; }
+state() { docker exec $P-datanode-1 hdfs haadmin -getAllServiceState 2&gt;/dev/null | awk &#x27;/^nn[12]:8020/{printf &quot;%s=%s  &quot;, $1, $2}&#x27;; }
+echo &quot;$(date +%T) $(state)&quot;
+put 1
+echo &quot;$(date +%T) &gt;&gt;&gt; stop jn3 (2 of 3 JournalNodes left)&quot;; docker stop $P-jn3-1 &gt; /dev/null
+put 2
+echo &quot;$(date +%T) &gt;&gt;&gt; stop jn2 (1 of 3 left: no majority)&quot;; docker stop $P-jn2-1 &gt; /dev/null
+put 3
+sleep 10
+echo &quot;$(date +%T) $(state)&quot;
+for n in nn1 nn2; do docker logs $P-$n-1 2&gt;&amp;1 | grep -E &quot;Timed out waiting|SHUTDOWN_MSG: Shutting&quot; | tail -2 | cut -c1-120 | sed &quot;s/^/$n: /&quot;; done
+
+# Run:  bash jn_quorum.sh   then restore with:  bash restore.sh</code></pre><div class="output">15:45:56 nn1:8020=standby  nn2:8020=active  
+15:46:00 write 1: ok
+15:46:00 &gt;&gt;&gt; stop jn3 (2 of 3 JournalNodes left)
+15:46:02 write 2: ok
+15:46:02 &gt;&gt;&gt; stop jn2 (1 of 3 left: no majority)
+15:47:32 write 3: FAILED (no answer)
+15:47:42 nn1:8020=Failed  nn2:8020=Failed  
+nn1: java.io.IOException: Timed out waiting 20000ms for a quorum of nodes to respond.
+nn1: SHUTDOWN_MSG: Shutting down NameNode at nn1/172.20.0.6
+nn2: java.io.IOException: Timed out waiting 20000ms for a quorum of nodes to respond.
+nn2: SHUTDOWN_MSG: Shutting down NameNode at nn2/172.20.0.7</div></div>
+  <p class="muted">Real output: with 1 of 3 JournalNodes, both NameNodes stop after the 20 s quorum timeout. restore.sh starts JNs, then NameNodes; all files were intact.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>An election in ZooKeeper</h2>
+  <p>Two ZKFCs try to create the same ephemeral lock znode. The first wins; when its session expires the znode vanishes and the other wins.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "znodes = {}",
+  "def try_lock(who):",
+  "    if \"lock\" not in znodes:",
+  "        znodes[\"lock\"] = who",
+  "        return who + \" is ACTIVE\"",
+  "    return who + \" stays standby\"",
+  "",
+  "print(try_lock(\"nn1\"))",
+  "print(try_lock(\"nn2\"))",
+  "del znodes[\"lock\"]                 # nn1's session expired",
+  "print(try_lock(\"nn2\"))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>znodes<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (0)<\/b> {}"
+   ],
+   "newVar": "znodes"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>try_lock<\/code> is created: function try_lock().",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (0)<\/b> {}"
+   ],
+   "newVar": "try_lock"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>try_lock()<\/code> is called: a new frame is pushed with <code>who<\/code> = &#x27;nn1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    },
+    {
+     "frame": "try_lock()",
+     "vars": [
+      [
+       "who",
+       "'nn1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (0)<\/b> {}"
+   ],
+   "newVar": "who"
+  },
+  {
+   "line": 3,
+   "phase": "Ephemeral",
+   "note": "The lock exists only while its owner's session lives. The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    },
+    {
+     "frame": "try_lock()",
+     "vars": [
+      [
+       "who",
+       "'nn1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (0)<\/b> {}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #1 dict now holds {&#x27;lock&#x27;: &#x27;nn1&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    },
+    {
+     "frame": "try_lock()",
+     "vars": [
+      [
+       "who",
+       "'nn1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;lock&#x27;: &#x27;nn1&#x27;}"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    },
+    {
+     "frame": "try_lock()",
+     "vars": [
+      [
+       "who",
+       "'nn1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;lock&#x27;: &#x27;nn1&#x27;}"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Return",
+   "note": "<code>try_lock()<\/code> returns <b>&#x27;nn1 is ACTIVE&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;lock&#x27;: &#x27;nn1&#x27;}"
+   ],
+   "out": "nn1 is ACTIVE\n"
+  },
+  {
+   "line": 9,
+   "phase": "Expiry",
+   "note": "After 10 s without contact, ZooKeeper deletes nn1's lock. <code>try_lock()<\/code> is called: a new frame is pushed with <code>who<\/code> = &#x27;nn2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    },
+    {
+     "frame": "try_lock()",
+     "vars": [
+      [
+       "who",
+       "'nn2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;lock&#x27;: &#x27;nn1&#x27;}"
+   ],
+   "newVar": "who"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    },
+    {
+     "frame": "try_lock()",
+     "vars": [
+      [
+       "who",
+       "'nn2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;lock&#x27;: &#x27;nn1&#x27;}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    },
+    {
+     "frame": "try_lock()",
+     "vars": [
+      [
+       "who",
+       "'nn2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;lock&#x27;: &#x27;nn1&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Return",
+   "note": "<code>try_lock()<\/code> returns <b>&#x27;nn2 stays standby&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;lock&#x27;: &#x27;nn1&#x27;}"
+   ],
+   "out": "nn2 stays standby\n"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "Object #1 dict now holds {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (0)<\/b> {}"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "<code>try_lock()<\/code> is called: a new frame is pushed with <code>who<\/code> = &#x27;nn2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    },
+    {
+     "frame": "try_lock()",
+     "vars": [
+      [
+       "who",
+       "'nn2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (0)<\/b> {}"
+   ],
+   "newVar": "who"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    },
+    {
+     "frame": "try_lock()",
+     "vars": [
+      [
+       "who",
+       "'nn2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (0)<\/b> {}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #1 dict now holds {&#x27;lock&#x27;: &#x27;nn2&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    },
+    {
+     "frame": "try_lock()",
+     "vars": [
+      [
+       "who",
+       "'nn2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;lock&#x27;: &#x27;nn2&#x27;}"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    },
+    {
+     "frame": "try_lock()",
+     "vars": [
+      [
+       "who",
+       "'nn2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;lock&#x27;: &#x27;nn2&#x27;}"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Return",
+   "note": "<code>try_lock()<\/code> returns <b>&#x27;nn2 is ACTIVE&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "znodes",
+       "→ dict #1"
+      ],
+      [
+       "try_lock",
+       "function try_lock()"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;lock&#x27;: &#x27;nn2&#x27;}"
+   ],
+   "out": "nn2 is ACTIVE\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three HA calculations: failover time, JournalNode sizing, and what an hour of NameNode downtime costs. Each runs live and is traced in memory.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Timing · failover</span></div>
+    <h4>How long does a crash failover take?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>From our ZKFC log: crash at 15:44:25, “Checking for any old active” at 15:44:34, “Successfully transitioned” at 15:44:35. Split the outage into detection and takeover.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>15:44:25 · 15:44:34 · 15:44:35</pre></div><div><small>Expected output</small><pre>detection: 9 s   takeover: 1 s   total: 10 s</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Convert times to seconds.</li><li>Detection = check time − crash.</li><li>Takeover = transition − check.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Lowering the session timeout speeds failover but risks false failovers during GC pauses or network blips.",
+   "code": "to_s = lambda t: sum(int(x) * m for x, m in zip(t.split(\":\"), [3600, 60, 1]))\ncrash, check, done = to_s(\"15:44:25\"), to_s(\"15:44:34\"), to_s(\"15:44:35\")\nprint(\"detection:\", check - crash, \"s   takeover:\", done - check, \"s   total:\", done - crash, \"s\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "to_s = lambda t: sum(int(x) * m for x, m in zip(t.split(\":\"), [3600, 60, 1]))",
+  "crash, check, done = to_s(\"15:44:25\"), to_s(\"15:44:34\"), to_s(\"15:44:35\")",
+  "print(\"detection:\", check - crash, \"s   takeover:\", done - check, \"s   total:\", done - crash, \"s\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>to_s<\/code> is created: function &lt;lambda&gt;().",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "to_s",
+       "function <lambda>()"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "to_s"
+  },
+  {
+   "line": 2,
+   "phase": "Detection",
+   "note": "Almost all of it is the ZooKeeper session timeout. <code>crash<\/code> is created: 56665. <code>check<\/code> is created: 56674. <code>done<\/code> is created: 56675.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "to_s",
+       "function <lambda>()"
+      ],
+      [
+       "crash",
+       "56665"
+      ],
+      [
+       "check",
+       "56674"
+      ],
+      [
+       "done",
+       "56675"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "done"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "to_s",
+       "function <lambda>()"
+      ],
+      [
+       "crash",
+       "56665"
+      ],
+      [
+       "check",
+       "56674"
+      ],
+      [
+       "done",
+       "56675"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "detection: 9 s   takeover: 1 s   total: 10 s\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Sizing · JournalNodes</span></div>
+    <h4>3 or 5 JournalNodes?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Each JournalNode is down for maintenance or failure about 1% of the time, independently. Estimate the chance that a majority is unavailable with 3 and with 5 JNs.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>p(down) = 0.01</pre></div><div><small>Expected output</small><pre>3 JNs: majority lost 0.029800% of the time
+5 JNs: majority lost 0.000985% of the time</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Majority lost when more than n/2 JNs are down at once.</li><li>Sum binomial probabilities.</li><li>Compare.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "5 JNs are about 30 times safer here, but each edit must reach more nodes. Most clusters use 3; very large ones use 5.",
+   "code": "from math import comb\np = 0.01\nfor n in [3, 5]:\n    need_down = n // 2 + 1\n    lost = sum(comb(n, k) * p**k * (1 - p)**(n - k) for k in range(need_down, n + 1))\n    print(f\"{n} JNs: majority lost {lost:.6%} of the time\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "from math import comb",
+  "p = 0.01",
+  "for n in [3, 5]:",
+  "    need_down = n // 2 + 1",
+  "    lost = sum(comb(n, k) * p**k * (1 - p)**(n - k) for k in range(need_down, n + 1))",
+  "    print(f\"{n} JNs: majority lost {lost:.6%} of the time\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>comb<\/code> is created: &lt;built-in function comb&gt;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "comb",
+       "<built-in function comb>"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "comb"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>p<\/code> is created: 0.01.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "comb",
+       "<built-in function comb>"
+      ],
+      [
+       "p",
+       "0.01"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "p"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>n<\/code> is created: 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "comb",
+       "<built-in function comb>"
+      ],
+      [
+       "p",
+       "0.01"
+      ],
+      [
+       "n",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Quorum",
+   "note": "2 of 3 or 3 of 5 must be down to stop writes. <code>need_down<\/code> is created: 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "comb",
+       "<built-in function comb>"
+      ],
+      [
+       "p",
+       "0.01"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "need_down",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "need_down"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>lost<\/code> is created: 0.0003.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "comb",
+       "<built-in function comb>"
+      ],
+      [
+       "p",
+       "0.01"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "need_down",
+       "2"
+      ],
+      [
+       "lost",
+       "0.0003"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "lost"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "comb",
+       "<built-in function comb>"
+      ],
+      [
+       "p",
+       "0.01"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "need_down",
+       "2"
+      ],
+      [
+       "lost",
+       "0.0003"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "3 JNs: majority lost 0.029800% of the time\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 5.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "comb",
+       "<built-in function comb>"
+      ],
+      [
+       "p",
+       "0.01"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "need_down",
+       "2"
+      ],
+      [
+       "lost",
+       "0.0003"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>need_down<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "comb",
+       "<built-in function comb>"
+      ],
+      [
+       "p",
+       "0.01"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "need_down",
+       "3"
+      ],
+      [
+       "lost",
+       "0.0003"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "need_down"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>lost<\/code> changes to 0.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "comb",
+       "<built-in function comb>"
+      ],
+      [
+       "p",
+       "0.01"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "need_down",
+       "3"
+      ],
+      [
+       "lost",
+       "0.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "lost"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "comb",
+       "<built-in function comb>"
+      ],
+      [
+       "p",
+       "0.01"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "need_down",
+       "3"
+      ],
+      [
+       "lost",
+       "0.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "5 JNs: majority lost 0.000985% of the time\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "comb",
+       "<built-in function comb>"
+      ],
+      [
+       "p",
+       "0.01"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "need_down",
+       "3"
+      ],
+      [
+       "lost",
+       "0.0"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Cost · downtime</span></div>
+    <h4>What does an hour without the NameNode cost?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Without HA, a NameNode hardware failure took 55 minutes to recover. 300 analysts and 40 production jobs depend on HDFS. Analyst time costs ₹900/hour; each delayed job costs ₹15,000 in penalties. HA hardware (an extra server and 3 JournalNodes) costs ₹6 lakh. How many such failures pay for HA?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>55 min · 300 × ₹900/h · 40 × ₹15,000 · ₹6 lakh</pre></div><div><small>Expected output</small><pre>one outage costs about Rs 847,500
+HA pays for itself after 1 outage(s)</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Cost per outage = people + jobs.</li><li>Divide HA cost by outage cost.</li><li>Round up.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "And HA also allows patching without downtime, which happens far more often than hardware failures.",
+   "code": "import math\noutage = 300 * 900 * 55 / 60 + 40 * 15000\nprint(f\"one outage costs about Rs {outage:,.0f}\")\nprint(\"HA pays for itself after\", math.ceil(600000 / outage), \"outage(s)\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import math",
+  "outage = 300 * 900 * 55 / 60 + 40 * 15000",
+  "print(f\"one outage costs about Rs {outage:,.0f}\")",
+  "print(\"HA pays for itself after\", math.ceil(600000 / outage), \"outage(s)\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Outage cost",
+   "note": "People waiting plus jobs missing deadlines. <code>outage<\/code> is created: 847500.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "outage",
+       "847500.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "outage"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "outage",
+       "847500.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "one outage costs about Rs 847,500\n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "outage",
+       "847500.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "HA pays for itself after 1 outage(s)\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "In an HA pair, how many NameNodes serve client requests at a time?",
+  "options": [
+   "Both, sharing load",
+   "None, JournalNodes do",
+   "Exactly one, the active",
+   "Whichever is closer"
+  ],
+  "answer": 2,
+  "why": "One active; standbys only follow edits (Observers can serve reads in Hadoop 3)."
+ },
+ {
+  "q": "What do JournalNodes store?",
+  "options": [
+   "Data blocks",
+   "The shared edit log of namespace changes",
+   "ZooKeeper locks",
+   "User passwords"
+  ],
+  "answer": 1,
+  "why": "The active writes each edit to them; the standby tails them."
+ },
+ {
+  "q": "With 3 JournalNodes, how many must accept an edit?",
+  "options": [
+   "2",
+   "1",
+   "3",
+   "Any"
+  ],
+  "answer": 0,
+  "why": "A majority. In our lab, 2 of 3 alive was fine; 1 of 3 stopped both NameNodes."
+ },
+ {
+  "q": "What triggered the automatic failover after we killed nn1?",
+  "options": [
+   "A DataNode",
+   "The client",
+   "A cron job",
+   "nn1's ZooKeeper session expiring, so nn2's ZKFC took the lock"
+  ],
+  "answer": 3,
+  "why": "About 10 s, the session timeout, then fence and transition in ~1 s."
+ },
+ {
+  "q": "Why did the frozen-then-woken nn1 shut down?",
+  "options": [
+   "Out of memory",
+   "ZooKeeper deleted its files",
+   "The JournalNodes rejected its writes: its epoch 7 was below the promised epoch 8",
+   "An admin killed it"
+  ],
+  "answer": 2,
+  "why": "Epochs make split-brain impossible on the shared log."
+ },
+ {
+  "q": "Which component is NOT used in a QJM HA cluster?",
+  "options": [
+   "ZKFC",
+   "Secondary NameNode",
+   "JournalNode",
+   "ZooKeeper"
+  ],
+  "answer": 1,
+  "why": "The standby does checkpointing; the Secondary NameNode is not used."
+ },
+ {
+  "q": "Clients should address HDFS as…",
+  "options": [
+   "hdfs://<nameservice>, e.g. hdfs://canteen",
+   "hdfs://nn1:8020",
+   "The ZooKeeper address",
+   "A DataNode address"
+  ],
+  "answer": 0,
+  "why": "The failover proxy provider tries the configured NameNodes behind the nameservice."
+ },
+ {
+  "q": "Which command switches the active role gracefully to nn1?",
+  "options": [
+   "hdfs dfsadmin -failover",
+   "hdfs namenode -switch",
+   "zkfc -restart",
+   "hdfs haadmin -failover nn2 nn1"
+  ],
+  "answer": 3,
+  "why": "Real: “Failover to NameNode at nn1 … successful” in 2.2 s."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 7.1 in one screen</h3>
+    <ul><li>HA = one <b>active</b> + standby NameNode(s) per <b>nameservice</b>; no Secondary NameNode.</li><li><b>QJM</b>: edits to 3 or 5 <b>JournalNodes</b>; a majority must accept. Lose the majority → NameNodes stop (lab: “Timed out waiting 20000ms for a quorum”).</li><li><b>ZKFC</b> + <b>ZooKeeper</b>: ephemeral lock znode; session timeout 10 s → automatic failover (lab: ~10 s).</li><li>Failover steps: lock → fence old active → transition standby to active.</li><li><b>Epochs</b> stop a zombie: “IPC's epoch 7 is less than the last promised epoch 8” → old active exits.</li><li>Clients use the nameservice and a failover proxy provider; a dead address can cost a 20 s connect timeout.</li><li>Commands: <code>hdfs haadmin -getAllServiceState</code>, <code>-failover nn2 nn1</code>, <code>hdfs zkfc -formatZK</code>, <code>namenode -bootstrapStandby</code>.</li><li>Lab: 12/12 writes survived a crash; graceful failover 2.2 s.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>How does NameNode high availability work in Hadoop?</summary><p>Two or more NameNodes serve one namespace: one active, the rest standby. The active writes every edit to a quorum of JournalNodes; standbys read those edits and receive block reports from all DataNodes, so they hold an up-to-date namespace and block map. ZooKeeper and a ZKFailoverController next to each NameNode run an election; when the active fails, a standby is fenced in and promoted automatically.</p></details>
+    <details><summary>What is the role of ZooKeeper in HDFS HA?</summary><p>It provides the lock used for leader election. The active NameNode's ZKFC holds an ephemeral znode while its session is alive. If the NameNode or ZKFC dies or is partitioned, the session expires, the znode disappears, and another ZKFC acquires it and triggers failover. ZooKeeper does not store HDFS metadata.</p></details>
+    <details><summary>What is fencing and why is it needed?</summary><p>Fencing ensures that a previously active NameNode can no longer act as active, for example by killing it over SSH. With QJM, epochs already prevent the old active from writing edits, but fencing also prevents it from serving stale reads to clients that still contact it.</p></details>
+    <details><summary>What is the difference between the Secondary NameNode and the Standby NameNode?</summary><p>The Secondary NameNode only merges the edit log into a new fsimage (checkpointing) and cannot replace the NameNode. The Standby NameNode keeps a live, up-to-date copy of the namespace, performs checkpointing, and can become active within seconds.</p></details>
+    <details><summary>Why use an odd number of JournalNodes?</summary><p>Writes need a majority. With 3 JNs one may fail; with 4 still only one may fail (majority 3), so the fourth adds cost without tolerance. 5 JNs tolerate two failures.</p></details>
+    <details><summary>What happens to clients during a failover?</summary><p>Clients using the nameservice retry on the other NameNode. In-flight calls may be delayed by timeouts (in our lab one write took 22 s), but they complete once the new active is up; applications normally see only a pause.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">HA exercises using the real timestamps, epochs and logs from the lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Failure tolerance</h4></div>
+      <p>For 3 and 5 JournalNodes, print how many may fail while edits can still be written.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3, 5</pre></div><div><small>Expected output</small><pre>3 JNs tolerate 1 failure
+5 JNs tolerate 2 failures</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for n in [3, 5]:
+    t = n - (n // 2 + 1)
+    print(n, &quot;JNs tolerate&quot;, t, &quot;failure&quot; if t == 1 else &quot;failures&quot;)</code></pre><div class="output">3 JNs tolerate 1 failure
+5 JNs tolerate 2 failures</div></div>
+        <p><b>How it works:</b> 3 JNs tolerate 1 failure; 5 tolerate 2.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Parse haadmin output</h4></div>
+      <p>Find the active NameNode from <code>hdfs haadmin -getAllServiceState</code> output.</p>
+      <div class="prob__io"><div><small>Input</small><pre>two lines</pre></div><div><small>Expected output</small><pre>[&#x27;nn2:8020&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>out = &quot;&quot;&quot;nn1:8020                                           standby
+nn2:8020                                           active&quot;&quot;&quot;
+print([l.split()[0] for l in out.splitlines() if l.split()[1] == &quot;active&quot;])</code></pre><div class="output">[&#x27;nn2:8020&#x27;]</div></div>
+        <p><b>How it works:</b> nn2:8020. Monitoring scripts parse exactly this.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Epoch sequence</h4></div>
+      <p>The lab showed epochs 2, 3, 4 and 7, 8 across failovers. How many active-role changes happened between epoch 2 and epoch 8?</p>
+      <div class="prob__io"><div><small>Input</small><pre>2 → 8</pre></div><div><small>Expected output</small><pre>6 new active writers</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(8 - 2, &quot;new active writers&quot;)</code></pre><div class="output">6 new active writers</div></div>
+        <p><b>How it works:</b> 6: every transition to active (automatic or manual) takes a new epoch.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Slowest write</h4></div>
+      <p>From the client log, find the slowest write and its duration.</p>
+      <div class="prob__io"><div><small>Input</small><pre>write lines</pre></div><div><small>Expected output</small><pre>15:44:46 write 4 ok  (took 22 s)</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>log = [&quot;15:44:19 write 1 ok  (took 2 s)&quot;, &quot;15:44:24 write 3 ok  (took 3 s)&quot;, &quot;15:44:46 write 4 ok  (took 22 s)&quot;, &quot;15:44:48 write 5 ok  (took 2 s)&quot;]
+slow = max(log, key=lambda l: int(l.split(&quot;took &quot;)[1].split()[0]))
+print(slow)</code></pre><div class="output">15:44:46 write 4 ok  (took 22 s)</div></div>
+        <p><b>How it works:</b> Write 4, 22 s: the client's 20 s connect timeout to the dead nn1 address plus the retry on nn2.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Detect a failover in JMX samples</h4></div>
+      <p>Given HAState samples every 5 s from nn2, print when it became active.</p>
+      <div class="prob__io"><div><small>Input</small><pre>timestamps and states</pre></div><div><small>Expected output</small><pre>state change at 15:44:40 standby -&gt; active</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>samples = [(&quot;15:44:25&quot;, &quot;standby&quot;), (&quot;15:44:30&quot;, &quot;standby&quot;), (&quot;15:44:35&quot;, &quot;standby&quot;), (&quot;15:44:40&quot;, &quot;active&quot;)]
+prev = None
+for t, s in samples:
+    if prev and s != prev:
+        print(&quot;state change at&quot;, t, prev, &quot;-&gt;&quot;, s)
+    prev = s</code></pre><div class="output">state change at 15:44:40 standby -&gt; active</div></div>
+        <p><b>How it works:</b> A simple change detector is how failover alerts are built from /jmx.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Quorum check</h4></div>
+      <p>Write a function that says whether the active can write, given which of 3 JNs are up.</p>
+      <div class="prob__io"><div><small>Input</small><pre>[True, False, True]</pre></div><div><small>Expected output</small><pre>True False</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>def can_write(up):
+    return sum(up) &gt; len(up) // 2
+print(can_write([True, False, True]), can_write([True, False, False]))</code></pre><div class="output">True False</div></div>
+        <p><b>How it works:</b> True with 2 of 3, False with 1 of 3, matching the lab.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Patching without downtime</h4></div>
+      <p>Monthly OS patching restarts the NameNode for 20 minutes. Without HA, 300 analysts wait (₹900/hour each). What does HA save per year on patching alone?</p>
+      <div class="prob__io"><div><small>Input</small><pre>12 × 20 min × 300 × ₹900/h</pre></div><div><small>Expected output</small><pre>Rs 1,080,000 per year</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;Rs {12 * 20 / 60 * 300 * 900:,.0f} per year&quot;)</code></pre><div class="output">Rs 1,080,000 per year</div></div>
+        <p><b>How it works:</b> ₹10.8 lakh a year (illustrative) from rolling patches with haadmin -failover.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>Majority from votes</h4></div>
+      <p>Simulate the epoch protocol: JNs promise a new epoch only if it is higher than their current one. Run two competing candidates with epochs 5 and 5 and show only one can win.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 JNs at epoch 4</pre></div><div><small>Expected output</small><pre>nn1: 3 promises -&gt; ACTIVE
+nn2: 0 promises -&gt; refused</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>jns = [4, 4, 4]
+def propose(name, epoch):
+    yes = 0
+    for i, e in enumerate(jns):
+        if epoch &gt; e:
+            jns[i] = epoch; yes += 1
+    return f&quot;{name}: {yes} promises -&gt; {&#x27;ACTIVE&#x27; if yes &gt;= 2 else &#x27;refused&#x27;}&quot;
+print(propose(&quot;nn1&quot;, 5))
+print(propose(&quot;nn2&quot;, 5))</code></pre><div class="output">nn1: 3 promises -&gt; ACTIVE
+nn2: 0 promises -&gt; refused</div></div>
+        <p><b>How it works:</b> nn1 gets 3 promises; nn2 with the same epoch gets 0 and is refused. Real QJM uses the same rule: a strictly higher epoch from a majority.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">HA is a favourite topic for Hadoop administrator and senior data engineer interviews.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">HDFS · architecture</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“Is the NameNode a single point of failure?”</h4>
+      <p class="scn__situation">The classic question.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> Hadoop 1 vs Hadoop 2+ HA.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>In Hadoop 1, yes. Since Hadoop 2, HA runs an active and standby NameNode sharing edits through JournalNodes (QJM).</li>
+          <li>ZooKeeper + ZKFC fail over automatically in seconds; epochs and fencing prevent split-brain.</li>
+          <li>The Secondary NameNode was never a backup; it only checkpoints.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Operations · incident</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>Failovers happen every few days at peak hours</h4>
+      <p class="scn__situation">No hardware is failing, but the active NameNode keeps losing its role around 2 pm.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> GC pauses vs ZooKeeper timeouts.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Check NameNode GC logs: a pause longer than the ZooKeeper session timeout (10 s default) makes ZKFC lose the lock, and the woken NameNode exits.</li>
+          <li>Fix the cause: heap sizing, GC tuning, fewer objects (small files), RPC load from a misbehaving job.</li>
+          <li>Only then consider a slightly longer session timeout; it also slows real failovers.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Design · placement</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>Where do you put JournalNodes and ZooKeeper?</h4>
+      <p class="scn__situation">Designing a new 60-node cluster with 2 racks of masters.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> failure domains.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>3 JNs and 3 ZooKeeper servers on separate machines across racks, so one rack failure leaves a majority (ideally 3 racks for masters).</li>
+          <li>The two NameNodes on different racks and power feeds; JN disks dedicated and fast (edits are synchronous).</li>
+          <li>Use real fencing (sshfence or a power fencer) and monitor HAState.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Concepts · split-brain</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>“What if fencing fails? Can two NameNodes both be active?”</h4>
+      <p class="scn__situation">A follow-up to test depth.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> QJM epochs.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>With QJM, a new active gets a higher epoch from a majority of JournalNodes; they reject writes from older epochs, so the old active cannot change the namespace and exits on its first write.</li>
+          <li>It could briefly serve stale reads, which is why fencing is still configured.</li>
+          <li>Real lab log: “IPC's epoch 7 is less than the last promised epoch 8”, then “Shutting down NameNode”.</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/cluster-sim.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

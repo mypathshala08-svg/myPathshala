@@ -1,0 +1,3096 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reduce-side join | MyPhatshala</title>
+<meta name="description" content="The reduce-side (repartition) join in Hadoop MapReduce, run on a real Hadoop 3.5.0 cluster: 5 lakh canteen orders joined with a menu file through MultipleInputs, tagged values and the item as join key. Real counters show 24.4 MB shuffled, the menu row arriving first in only 3 of 7 groups (so the reducer must buffer), 459,636 orders joined and 40,364 dropped by the inner join. Inner, left, right, full outer and anti joins, skew, memory and when to use it. Python simulation, quiz and interview scenarios.">
+<meta name="mp:minutes" content="26">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/09-mapreduce-in-depth/05-reduce-side-join/">
+<meta property="og:title" content="Reduce-side join · MyPhatshala">
+<meta property="og:description" content="Join 5 lakh orders with a menu in MapReduce, and catch the menu row arriving last in 4 of 7 groups.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Reduce-side join", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="09-mapreduce-in-depth/05-reduce-side-join" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 9.5</b></nav>
+    <h1>Reduce-side join</h1>
+    <p class="lead">MapReduce has no JOIN keyword, but it has something just as good: the shuffle. Map both data sets to the same key, tag where each record came from, and the reducer receives every matching record together. This lesson joins 5 lakh real orders with the menu and reads the counters that show why the reducer must be careful.</p>
+    <div class="lesson-meta"><span>Module 9 · MapReduce in depth</span><span>⏱ 26 min</span><span>Intermediate</span><span>Real join on 5 lakh orders</span><span>Menu-row order measured</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Orders know the item, the menu knows the category</h2>
+  <div class="story">
+    <p class="narration">The canteen manager wants revenue per <b>category</b>: drinks, snacks, breakfast, meals. The 5 lakh orders in <code>student_orders.csv</code> only say <code>dosa</code> or <code>chai</code>; the category lives in a second file, <code>menu.csv</code>. In SQL this is one <code>JOIN</code>. In MapReduce there is no JOIN keyword, and the two files are read by different map tasks on different workers. Riya has to find a way to bring every order and its menu row to the same place.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="Orders and menu rows are both mapped to the item as key, tagged with their source; the shuffle brings each item's orders and its menu row to one reducer, which joins them.">
+        <g font-size="10">
+          <text x="110" y="20" text-anchor="middle" font-weight="700" class="s-ink">MAP: tag each record</text>
+          <rect x="20" y="32" width="180" height="56" rx="6" class="s-soft-acc" style="stroke:var(--track)"/>
+          <text x="110" y="48" text-anchor="middle" font-size="8.6" class="s-acc">orders (5 lakh lines)</text>
+          <text x="110" y="64" text-anchor="middle" font-size="8.2" class="s-ink">1,S1413,…,dosa,45</text>
+          <text x="110" y="79" text-anchor="middle" font-size="8.2" class="s-ink">→ (dosa, O|1,S1413,…,dosa,45)</text>
+          <rect x="20" y="100" width="180" height="48" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/>
+          <text x="110" y="116" text-anchor="middle" font-size="8.6" class="s-blue">menu (7 lines)</text>
+          <text x="110" y="132" text-anchor="middle" font-size="8.2" class="s-ink">dosa,meal,45,D → (dosa, M|meal)</text>
+
+          <text x="320" y="20" text-anchor="middle" font-weight="700" class="s-ink">SHUFFLE by item</text>
+          <path d="M200 70C240 70 250 80 270 80M200 124C240 124 250 86 270 86" style="fill:none;stroke:var(--track);stroke-width:1.6"/>
+          <rect x="270" y="60" width="110" height="46" rx="6" class="s-card2"/>
+          <text x="325" y="78" text-anchor="middle" font-size="8.6" class="s-ink">dosa:</text>
+          <text x="325" y="94" text-anchor="middle" font-size="8.2" class="s-ink">O, O, M, O, O …</text>
+          <text x="325" y="124" text-anchor="middle" font-size="8.4" class="s-ink2">menu row may come anywhere</text>
+
+          <text x="530" y="20" text-anchor="middle" font-weight="700" class="s-ink">REDUCE: join per item</text>
+          <path d="M380 83h50" style="fill:none;stroke:var(--blue);stroke-width:1.6"/>
+          <rect x="430" y="40" width="190" height="90" rx="8" class="s-board"/>
+          <text x="525" y="62" text-anchor="middle" font-size="8.6" style="fill:#F5C77E">1,S1413,…,dosa,45,meal</text>
+          <text x="525" y="80" text-anchor="middle" font-size="8.6" style="fill:#9FD3B8">459,636 orders joined</text>
+          <text x="525" y="98" text-anchor="middle" font-size="8.6" style="fill:#F5C77E">40,364 coffee orders: no menu row</text>
+          <text x="525" y="116" text-anchor="middle" font-size="8.4" style="fill:#9FD3B8">24.4 MB shuffled · 24.8 s</text>
+        </g>
+        <text x="320" y="180" text-anchor="middle" font-size="9.6" class="s-ink2">Make the join key the map output key: the shuffle does the matching, the reducer does the combining.</text>
+        <text x="632" y="194" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, MapReduce only groups by one key. How do I combine two different files?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Make the item the key for <b>both</b> files. The shuffle doesn't care which file a pair came from: every pair with key <code>dosa</code> goes to the same reduce call. You only have to <b>tag</b> each value so the reducer knows which side it came from.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>And I removed coffee from the menu on purpose. Let's see what a join does with orders that have no menu row.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Good. We will also catch something that surprises most people: the menu row does not always arrive first. Our counters will prove it.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Reduce-side join</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A <b>reduce-side join</b> (also called a repartition join) combines two or more data sets on a common key inside the reduce phase. Each input is read by its own mapper (configured with <code>MultipleInputs</code>), which emits the <b>join key</b> as the map output key and the record, <b>tagged</b> with its source, as the value. The shuffle partitions and groups all pairs by the join key, so a single reduce call receives every record of every data set that shares that key. The reducer separates the values by tag, typically buffers one side in memory, and emits the combined records according to the join type (inner, left outer, right outer or full outer). It works for inputs of any size and needs no pre-sorting or co-partitioning, at the cost of shuffling all records of all inputs across the network.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Both files are mapped to (join key, labelled record). Hadoop's shuffle brings everything with the same key to one reducer, and the reducer glues the matching records together.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Join key</b><span>The column both data sets share, here <code>item</code>.</span></div>
+    <div class="term"><b>Tag</b><span>A marker on each value saying where it came from: <code>O|</code> order, <code>M|</code> menu.</span></div>
+    <div class="term"><b>MultipleInputs</b><span>Lets one job read several paths, each with its own InputFormat and Mapper.</span></div>
+    <div class="term"><b>Inner join</b><span>Only keys present on both sides are output.</span></div>
+    <div class="term"><b>Left outer join</b><span>All records of the left side, with blanks where the right side is missing.</span></div>
+    <div class="term"><b>Repartition join</b><span>Another name for a reduce-side join: the data is repartitioned by the join key.</span></div>
+    <div class="term"><b>Buffering</b><span>Keeping one side's records in a list until the other side has been seen.</span></div>
+    <div class="term"><b>Join skew</b><span>One key with far more records than others: one reducer does most of the work.</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, 3 workers, 5 lakh orders + 7-line menu)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>Inputs</th><td><code>student_orders.csv</code> (3 splits) + <code>menu_nocoffee.csv</code> (1 split) = 4 map tasks, 500,007 map input records</td></tr>
+    <tr><th>Shuffle</th><td>500,007 records, 24,448,645 bytes, 8 reduce groups (one per item, coffee included)</td></tr>
+    <tr><th>Menu row position</th><td><code>MENU_FIRST=3</code>, <code>MENU_NOT_FIRST=4</code>: for 4 of 7 items the menu row arrived after some orders</td></tr>
+    <tr><th>Result</th><td><code>ORDERS_JOINED=459,636</code>, <code>ORDERS_WITHOUT_MENU=40,364</code> (every coffee order); 20,851,062 bytes written; 24.8 s</td></tr>
+  </table>
+
+  <h3 id="levels">Joins at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Matching name tags</h4>
+      <ul>
+        <li>Two lists: the bill book (who ordered what) and the price board (which item is which category).</li>
+        <li>Every slip from both lists gets a coloured sticker (the tag) and is dropped into a box labelled with the item name (the key).</li>
+        <li>One person opens the <code>dosa</code> box, finds the one price-board slip and writes “meal” on every order slip in that box.</li>
+        <li>A box with order slips but no price-board slip (coffee) is the interesting case: throw them away (inner join) or keep them with a blank (outer join).</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How the job is wired</h4>
+      <ul>
+        <li><code>MultipleInputs.addInputPath(job, orders, TextInputFormat.class, OrderMapper.class)</code> and the same for the menu with <code>MenuMapper</code>. No <code>setMapperClass</code>.</li>
+        <li>Both mappers must emit the <b>same</b> key and value types: <code>(Text item, Text tagged)</code>.</li>
+        <li>The reducer loops over the values once: menu values set <code>category</code>, order values go into a list. After the loop it writes each order with the category.</li>
+        <li>Values arrive in <b>no guaranteed order</b>. In our run the menu row came first for only 3 of 7 items, so the order list is not optional.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Costs and refinements</h4>
+      <ul>
+        <li><b>Everything is shuffled:</b> all 5 lakh orders crossed the network just to meet 7 menu rows. That is the price of a reduce-side join.</li>
+        <li><b>Memory:</b> the reducer buffers one side. Buffer the smaller side per key; here that would be the menu, but you can only do that if the menu arrives first.</li>
+        <li><b>Secondary sort fixes the order:</b> put the tag in a composite key (item, tag), sort the menu tag before the order tag, and partition and group by item only. Then the menu row is always first and orders can be streamed without a list (Lesson 9.7).</li>
+        <li><b>Skew:</b> chai has 149,669 orders, thali 30,292. One reducer gets the chai group whatever you do; salting the key or a map-side join (Lesson 9.6) avoids that.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “Explain reduce-side join”, write: both mappers emit <code>(join key, tagged record)</code>; the shuffle groups by join key; the reducer separates by tag, buffers one side and emits combinations. Add one drawback (all data is shuffled; buffering can run out of memory) and when to use it (both data sets are large).</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Join types in the reducer</h2>
+  <p>The map side is the same for every join type. Only the last few lines of the reducer change.</p>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Join type</th><th>Reducer emits</th><th>Coffee (orders, no menu row)</th><th>Menu item never ordered</th></tr></thead>
+    <tbody>
+      <tr><td><b>Inner</b></td><td>orders × menu, only when both exist</td><td>dropped (our job: 40,364)</td><td>dropped</td></tr>
+      <tr><td><b>Left outer</b> (orders left)</td><td>every order, category or blank</td><td>kept, category empty</td><td>dropped</td></tr>
+      <tr><td><b>Right outer</b> (menu right)</td><td>every menu row, with its orders or blanks</td><td>dropped</td><td>kept with no order</td></tr>
+      <tr><td><b>Full outer</b></td><td>everything from both sides</td><td>kept</td><td>kept</td></tr>
+      <tr><td><b>Anti join</b></td><td>orders whose key has no menu row</td><td>the only output</td><td>dropped</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>The three ways to join in MapReduce</h3>
+  <div class="cards">
+    <div class="card"><h4>Reduce-side join</h4><p>Any sizes, any layout. Shuffles everything. This lesson.</p><span class="tag">general</span></div>
+    <div class="card"><h4>Map-side join (broadcast)</h4><p>One side is small enough for every mapper's memory; ship it with the distributed cache. No shuffle at all.</p><span class="tag">Lesson 9.6</span></div>
+    <div class="card"><h4>Sorted, partitioned join</h4><p>Both inputs already sorted and split the same way by the key (CompositeInputFormat); mappers merge them directly.</p><span class="tag">special case</span></div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>Hive and Spark pick between the same strategies: a “shuffle join” (Spark's sort-merge join) is a reduce-side join, a “broadcast join” or Hive “map join” is the map-side join of Lesson 9.6.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Joining 5 lakh orders with the menu</h2>
+  <p>Run on the Module 8 lab cluster with <code>join_lab.sh</code> (in “Run it on your PC”). The data comes from <code>make_student_orders.py</code>.</p>
+  <ol class="stepper">
+    <li><h4>Prepare a menu with a missing item</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>grep -v coffee menu.csv &gt; menu_nocoffee.csv
+hdfs dfs -put -f menu_nocoffee.csv /user/hadoop/data/</code></pre><div class="output">chai,drink,15,A
+samosa,snack,18,B
+vada pav,snack,20,B
+poha,breakfast,25,C
+idli,breakfast,30,C
+dosa,meal,45,D
+thali,meal,80,D</div></div>
+      <span class="behind">Real menus go out of date. Removing coffee lets us see what an inner join silently does with orders that have no match.</span></li>
+    <li><h4>Two mappers, one key</h4>
+      <div class="code" data-lang="java" data-file="JoinReduceSide.java (mappers)"><pre><code>// orders: (item, "O|whole line")
+item.set(line.toString().split(",")[3]);
+val.set("O|" + line);
+// menu:   (item, "M|category")
+item.set(f[0]); val.set("M|" + f[1]);
+
+MultipleInputs.addInputPath(job, orders, TextInputFormat.class, OrderMapper.class);
+MultipleInputs.addInputPath(job, menu,   TextInputFormat.class, MenuMapper.class);</code></pre></div>
+      <span class="behind">Each input path gets its own mapper class. The tag is just a prefix on a Text value; production code often uses a small custom Writable (Lesson 9.3) instead.</span></li>
+    <li><h4>Run the job</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr9.jar JoinReduceSide /user/hadoop/data/student_orders.csv \
+    /user/hadoop/data/menu_nocoffee.csv /out/JoinReduceSide</code></pre><div class="output">JobSubmitter:203 - number of splits:4
+Launched map tasks=4
+Launched reduce tasks=1
+Map input records=500007
+Map output records=500007
+Reduce input groups=8
+Reduce shuffle bytes=24448645</div></div>
+      <span class="behind">Three splits of orders plus one split of menu: 4 map tasks. Every record was emitted and shuffled, 24.4 MB of it, to bring 7 menu rows next to 5 lakh orders. 8 groups: 7 menu items plus coffee.</span></li>
+    <li><h4>Proof that the reducer must buffer</h4>
+      <div class="code" data-lang="text" data-file="custom counters"><pre><code>MENU_FIRST=3
+MENU_NOT_FIRST=4</code></pre></div>
+      <span class="behind">The reducer counted whether the menu row was the first value of its group. For 4 of 7 items it was not, because values from 4 map tasks are merged in no particular order. Code that assumed “menu comes first” would have lost thousands of orders without any error.</span></li>
+    <li><h4>Matched and unmatched</h4>
+      <div class="code" data-lang="text" data-file="custom counters"><pre><code>ORDERS_JOINED=459636
+ORDERS_WITHOUT_MENU=40364
+Bytes Written=20851062</code></pre></div>
+      <span class="behind">459,636 + 40,364 = 500,000. The 40,364 are exactly the coffee orders: an inner join dropped them, and only the counter tells you. Always count unmatched records.</span></li>
+    <li><h4>The joined rows</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs dfs -cat /out/JoinReduceSide/part-r-00000 | head -2</code></pre><div class="output">1,S1413,2026-09-14 15:30,dosa,45,meal
+2,S0973,2026-09-26 20:11,samosa,18,snack</div></div>
+      <span class="behind">Each order now carries its category. The next lesson produces exactly the same 459,636 rows with a map-side join in 18.9 s and no shuffle at all.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>If a single key has millions of records on both sides (for example a NULL or default join key like “unknown”), the reducer's list can exhaust the task's heap and the job fails with an OutOfMemoryError. Filter such keys out, buffer only the small side, or use secondary sort to stream.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>One item's journey through the join</h2>
+  <p>Six steps for the item <code>dosa</code>, and what happens to coffee.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Tag, shuffle, buffer, join <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Job output and counters">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@namenode : /tmp/mr9</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop jar mr9.jar JoinReduceSide …</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">number of splits:4</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#7F8C86">(3 order splits + 1 menu split)</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">Map input records=500007</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">Map output records=500007</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#F5C77E">Reduce shuffle bytes=24448645</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">Reduce input groups=8</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#F5C77E">MENU_FIRST=3</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">MENU_NOT_FIRST=4</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">ORDERS_JOINED=459636</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">ORDERS_WITHOUT_MENU=40364</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hdfs dfs -cat …/part-r-00000 | head -2</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">1,S1413,2026-09-14 15:30,dosa,45,meal</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">2,S0973,2026-09-26 20:11,samosa,18,snack</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The job reads two inputs: 3 splits of orders and 1 split of menu.</li>
+          <li>Every record, from both files, becomes one map output pair.</li>
+          <li>All 24.4 MB are shuffled; the reducer sees 8 item groups.</li>
+          <li>The menu row was first in only 3 of 7 groups.</li>
+          <li>459,636 orders joined; 40,364 coffee orders had no menu row.</li>
+          <li>Each output row is an order with its category appended.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Order and menu mappers, shuffle group for dosa, reducer buffer">
+          <g font-size="8">
+            <rect x="12" y="16" width="100" height="40" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="62" y="34" text-anchor="middle" font-weight="700" class="s-acc">OrderMapper ×3</text><text x="62" y="48" text-anchor="middle" class="s-ink2">orders</text>
+            <rect x="12" y="64" width="100" height="40" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="62" y="82" text-anchor="middle" font-weight="700" class="s-blue">MenuMapper ×1</text><text x="62" y="96" text-anchor="middle" class="s-ink2">menu</text>
+            <rect x="200" y="16" width="148" height="88" rx="6" class="s-card2"/><text x="274" y="30" text-anchor="middle" font-weight="700" class="s-ink">reduce("dosa", values)</text>
+          </g>
+          <g data-on="1"><text x="180" y="150" text-anchor="middle" font-size="8.6" class="s-ink">MultipleInputs: each path gets its own mapper class</text></g>
+          <g data-on="2"><text x="118" y="34" font-size="7.6" class="mono s-acc">(dosa, O|1,…)</text><text x="118" y="84" font-size="7.6" class="mono s-blue">(dosa, M|meal)</text><text x="180" y="150" text-anchor="middle" font-size="8.6" class="s-ink">same key type, tagged values</text></g>
+          <g data-on="3"><path d="M112 36C150 36 160 60 200 60M112 84C150 84 160 64 200 64" style="fill:none;stroke:var(--track);stroke-width:1.6"/><g font-size="7.8" class="mono"><text x="210" y="50" class="s-acc">O O O O …</text><text x="210" y="64" class="s-blue">M</text><text x="222" y="64" class="s-acc">O O …</text></g><text x="180" y="150" text-anchor="middle" font-size="8.6" class="s-ink">shuffle: all dosa pairs, from 4 map tasks, in one group</text></g>
+          <g data-on="4"><g font-size="7.8" class="mono"><text x="210" y="50" class="s-acc">O O O O …</text><text x="210" y="64" class="s-blue">M ← not first!</text></g><rect x="200" y="112" width="148" height="30" rx="5" class="s-soft-acc" style="stroke:var(--track)"/><text x="274" y="131" text-anchor="middle" font-size="8" class="s-acc">orders buffered in a list</text><text x="180" y="170" text-anchor="middle" font-size="8.6" class="s-ink">the reducer can't write until it has seen the menu row</text></g>
+          <g data-on="5"><rect x="200" y="112" width="148" height="30" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="274" y="131" text-anchor="middle" font-size="8" class="s-green">dosa → meal: 49,927 rows out</text><rect x="12" y="160" width="160" height="28" rx="5" class="s-soft-acc" style="stroke:var(--red)"/><text x="92" y="178" text-anchor="middle" font-size="8" class="s-red">coffee: no M row → 40,364 dropped</text></g>
+          <g data-on="6"><rect x="12" y="200" width="336" height="26" rx="6" class="s-board"/><text x="180" y="217" text-anchor="middle" font-size="8.4" class="s-chalk">part-r-00000 · 459,636 joined rows · 20.9 MB</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Each input has its own mapper: three order map tasks and one menu map task.</li>
+          <li>Both emit the item as key and a tagged value: O| for orders, M| for menu.</li>
+          <li>The shuffle merges pairs from all four map tasks into one group per item.</li>
+          <li>The menu row can be anywhere in the group, so the orders are kept in a list until it shows up.</li>
+          <li>Once the category is known, every buffered order is written with it. Coffee has no menu row and is dropped.</li>
+          <li>The output is one file of joined rows, one per order with a matching menu row.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Reduce-side joins at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="26" width="40" height="38" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><rect x="66" y="26" width="40" height="38" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="34" y="49" text-anchor="middle" font-size="8.6" class="s-acc">txns</text><text x="86" y="49" text-anchor="middle" font-size="8.6" class="s-blue">accts</text></svg></div>
+    <div><h4>1. Transactions with customer accounts</h4>
+      <p>A bank joins a day's card transactions (hundreds of millions) with the accounts table (crores of rows) on account number. Both sides are too large for memory, so the join is shuffled.</p>
+      <div class="uc-flow"><span>Transactions + accounts</span><i>→</i><span class="java">key = account no.</span><i>→</i><span>Enriched transactions</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><path d="M20 60l20-24 20 14 20-22 20 18" style="fill:none;stroke:var(--green);stroke-width:2.5"/></svg></div>
+    <div><h4>2. Clickstream with user profiles</h4>
+      <p>E-commerce sites join page-view logs with user profiles to attribute views to segments (city, device, plan). Hive's default “common join” for two big tables is exactly this pattern.</p>
+      <div class="uc-flow"><span>Logs + users</span><i>→</i><span class="java">key = user_id</span><i>→</i><span>Views per segment</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="24" y="22" width="72" height="46" rx="6" class="s-card2"/><text x="60" y="44" text-anchor="middle" font-size="8.6" class="s-ink">unmatched</text><text x="60" y="58" text-anchor="middle" font-size="8.6" class="s-red">40,364</text></svg></div>
+    <div><h4>3. Data quality checks</h4>
+      <p>An anti join (records with no match) finds orphans: orders for items missing from the master list, payments for closed accounts. The unmatched count is reported every night.</p>
+      <div class="uc-flow"><span>Facts + master data</span><i>→</i><span class="java">anti join</span><i>→</i><span>Orphan report</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="24" width="38" height="42" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="37" y="49" text-anchor="middle" font-size="8.6" class="s-acc">SQL</text><path d="M58 45h12" style="fill:none;stroke:var(--track);stroke-width:2"/><rect x="72" y="24" width="32" height="42" rx="6" class="s-card2"/><text x="88" y="49" text-anchor="middle" font-size="8" class="s-ink">shuffle</text></svg></div>
+    <div><h4>4. Inside SQL engines</h4>
+      <p>A <code>JOIN</code> between two large tables in Hive or Spark SQL becomes a shuffle join: both sides repartitioned by the join key, then joined per partition. Reading “Exchange hashpartitioning” in a Spark plan means this lesson.</p>
+      <div class="uc-flow"><span>JOIN … ON</span><i>→</i><span class="java">shuffle both sides</span><i>→</i><span>Joined table</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Simulate a reduce-side join</h2>
+  <p>Two small inputs, tagged map output, a shuffle that mixes the order of values (as Hadoop does), and a reducer that joins. Change <code>JOIN</code> to <code>"left"</code> to keep orders without a menu row.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>import random
+random.seed(4)
+orders = [&quot;1,S1413,dosa,45&quot;, &quot;2,S0973,samosa,18&quot;, &quot;3,S0007,coffee,20&quot;, &quot;4,S0001,dosa,45&quot;, &quot;5,S0002,chai,15&quot;]
+menu = [&quot;chai,drink&quot;, &quot;samosa,snack&quot;, &quot;dosa,meal&quot;, &quot;thali,meal&quot;]
+JOIN = &quot;inner&quot;
+
+pairs = [(o.split(&quot;,&quot;)[2], &quot;O|&quot; + o) for o in orders]          # OrderMapper
+pairs += [(m.split(&quot;,&quot;)[0], &quot;M|&quot; + m.split(&quot;,&quot;)[1]) for m in menu]  # MenuMapper
+
+groups = {}
+for k, v in pairs:                                             # shuffle: group by item
+    groups.setdefault(k, []).append(v)
+for k in groups:
+    random.shuffle(groups[k])                                  # values arrive in no fixed order
+
+for item in sorted(groups):                                    # reducer
+    category, buffered = None, []
+    for v in groups[item]:
+        if v.startswith(&quot;M|&quot;):
+            category = v[2:]
+        else:
+            buffered.append(v[2:])
+    for o in buffered:
+        if category is not None:
+            print(o + &quot;,&quot; + category)
+        elif JOIN == &quot;left&quot;:
+            print(o + &quot;,&quot;)                                     # no menu row: empty category</code></pre><div class="output">5,S0002,chai,15,drink
+4,S0001,dosa,45,meal
+1,S1413,dosa,45,meal
+2,S0973,samosa,18,snack</div></div>
+  <ul class="anno"><li><code>pairs = [(o.split(&quot;,&quot;)[2], &quot;O|&quot; + o) for o in orders]          # OrderMapper</code><span>The join key (item) becomes the map output key; the tag O| says “this came from orders”.</span></li><li><code>    random.shuffle(groups[k])                                  # values arrive in no fixed order</code><span>Hadoop merges values from several map tasks; in our lab the menu row was first in only 3 of 7 groups.</span></li><li><code>            buffered.append(v[2:])</code><span>Orders wait in a list until the category is known. This list is the memory risk of reduce-side joins.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Inner join",
+   "hint": "Press <b>Run<\/b>. Which order disappeared, and which menu item never appears?",
+   "code": "import random\nrandom.seed(4)\norders = [\"1,S1413,dosa,45\", \"2,S0973,samosa,18\", \"3,S0007,coffee,20\", \"4,S0001,dosa,45\", \"5,S0002,chai,15\"]\nmenu = [\"chai,drink\", \"samosa,snack\", \"dosa,meal\", \"thali,meal\"]\nJOIN = \"inner\"\n\npairs = [(o.split(\",\")[2], \"O|\" + o) for o in orders]          # OrderMapper\npairs += [(m.split(\",\")[0], \"M|\" + m.split(\",\")[1]) for m in menu]  # MenuMapper\n\ngroups = {}\nfor k, v in pairs:                                             # shuffle: group by item\n    groups.setdefault(k, []).append(v)\nfor k in groups:\n    random.shuffle(groups[k])                                  # values arrive in no fixed order\n\nfor item in sorted(groups):                                    # reducer\n    category, buffered = None, []\n    for v in groups[item]:\n        if v.startswith(\"M|\"):\n            category = v[2:]\n        else:\n            buffered.append(v[2:])\n    for o in buffered:\n        if category is not None:\n            print(o + \",\" + category)\n        elif JOIN == \"left\":\n            print(o + \",\")                                     # no menu row: empty category\n"
+  },
+  {
+   "label": "2 · Left outer join",
+   "hint": "<b>Predict first:<\/b> set <code>JOIN = \"left\"<\/code>. How many rows now?",
+   "code": "groups = {\"coffee\": [\"O|3,S0007,coffee,20\"], \"dosa\": [\"O|1,S1413,dosa,45\", \"M|meal\"], \"thali\": [\"M|meal\"]}\nfor item in sorted(groups):\n    cat = next((v[2:] for v in groups[item] if v.startswith(\"M|\")), None)\n    for v in groups[item]:\n        if v.startswith(\"O|\"):\n            print(v[2:] + \",\" + (cat if cat else \"\"))\n"
+  },
+  {
+   "label": "3 · Anti join",
+   "hint": "Print only the orders that have NO menu row (the data-quality report).",
+   "code": "groups = {\"coffee\": [\"O|3,S0007,coffee,20\", \"O|9,S0011,coffee,20\"], \"dosa\": [\"O|1,S1413,dosa,45\", \"M|meal\"]}\nfor item, vals in sorted(groups.items()):\n    if not any(v.startswith(\"M|\") for v in vals):\n        for v in vals:\n            print(\"orphan:\", v[2:])\n"
+  },
+  {
+   "label": "4 · Count the shuffle",
+   "hint": "Our job shuffled 500,007 records to join 7 menu rows. What fraction of the shuffled records were menu rows?",
+   "code": "orders, menu_rows = 500_000, 7\nprint(f\"menu rows are {menu_rows / (orders + menu_rows) * 100:.4f}% of the shuffle\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This reducer assumes the menu row comes first and writes orders immediately. Here the menu row arrives second. Fix it by buffering.",
+   "code": "values = [\"O|1,S1413,dosa,45\", \"M|meal\", \"O|4,S0001,dosa,45\"]\ncategory = None\nfor v in values:\n    if v.startswith(\"M|\"):\n        category = v[2:]\n    else:\n        print(v[2:] + \",\" + category)\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: join orders with the menu</h3>
+  <p>Use the Module 8 lab cluster (Lesson 8.1). Create the data with <code>make_student_orders.py</code> (it writes <code>student_orders.csv</code> and <code>menu.csv</code>), copy the files and <code>JoinReduceSide.java</code> into <code>/tmp/mr9</code> in the namenode container, compile into <code>mr9.jar</code> and run <code>join_lab.sh</code>. The script also runs the map-side join of Lesson 9.6 for comparison.</p>
+  <div class="pcrun"><h4>Reduce-side join</h4>
+  <div class="code" data-lang="bash" data-file="JoinReduceSide.java"><pre><code>// JoinReduceSide.java: reduce-side join of orders with the menu.
+// Both inputs are mapped to (item, tagged record); the reducer meets them per item and writes
+// every order with its category added.
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.MultipleInputs;
+import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+
+public class JoinReduceSide {
+  enum Join { ORDERS_JOINED, ORDERS_WITHOUT_MENU, MENU_FIRST, MENU_NOT_FIRST }
+
+  // orders: order_id,student_id,time,item,amount   -&gt;  (item, &quot;O|whole line&quot;)
+  public static class OrderMapper extends Mapper&lt;LongWritable, Text, Text, Text&gt; {
+    private final Text item = new Text(), val = new Text();
+    @Override
+    protected void map(LongWritable k, Text line, Context ctx) throws IOException, InterruptedException {
+      item.set(line.toString().split(&quot;,&quot;)[3]);
+      val.set(&quot;O|&quot; + line);
+      ctx.write(item, val);
+    }
+  }
+
+  // menu: item,category,price,counter   -&gt;  (item, &quot;M|category&quot;)
+  public static class MenuMapper extends Mapper&lt;LongWritable, Text, Text, Text&gt; {
+    private final Text item = new Text(), val = new Text();
+    @Override
+    protected void map(LongWritable k, Text line, Context ctx) throws IOException, InterruptedException {
+      String[] f = line.toString().split(&quot;,&quot;);
+      item.set(f[0]); val.set(&quot;M|&quot; + f[1]);
+      ctx.write(item, val);
+    }
+  }
+
+  // For one item: one menu record and thousands of order records, in NO particular order
+  public static class JoinReducer extends Reducer&lt;Text, Text, Text, NullWritable&gt; {
+    private final Text out = new Text();
+    @Override
+    protected void reduce(Text item, Iterable&lt;Text&gt; vals, Context ctx) throws IOException, InterruptedException {
+      String category = null;
+      List&lt;String&gt; orders = new ArrayList&lt;&gt;();         // must buffer: the menu record may arrive last
+      boolean first = true;
+      for (Text v : vals) {
+        String s = v.toString();
+        if (s.startsWith(&quot;M|&quot;)) {
+          category = s.substring(2);
+          ctx.getCounter(first ? Join.MENU_FIRST : Join.MENU_NOT_FIRST).increment(1);
+        } else orders.add(s.substring(2));
+        first = false;
+      }
+      if (category == null) { ctx.getCounter(Join.ORDERS_WITHOUT_MENU).increment(orders.size()); return; }
+      for (String o : orders) { out.set(o + &quot;,&quot; + category); ctx.write(out, NullWritable.get()); }
+      ctx.getCounter(Join.ORDERS_JOINED).increment(orders.size());
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] rest = new GenericOptionsParser(conf, args).getRemainingArgs();   // orders menu out
+    Job job = Job.getInstance(conf, &quot;reduce-side join&quot;);
+    job.setJarByClass(JoinReduceSide.class);
+    MultipleInputs.addInputPath(job, new Path(rest[0]), TextInputFormat.class, OrderMapper.class);
+    MultipleInputs.addInputPath(job, new Path(rest[1]), TextInputFormat.class, MenuMapper.class);
+    job.setReducerClass(JoinReducer.class);
+    job.setMapOutputKeyClass(Text.class);
+    job.setMapOutputValueClass(Text.class);
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(NullWritable.class);
+    FileOutputFormat.setOutputPath(job, new Path(rest[2]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+
+// In the mr-lab folder:
+//   python3 make_student_orders.py
+//   docker exec lab8-namenode-1 mkdir -p /tmp/mr9
+//   docker cp JoinReduceSide.java lab8-namenode-1:/tmp/mr9/
+//   docker cp student_orders.csv lab8-namenode-1:/tmp/mr9/
+//   docker cp menu.csv lab8-namenode-1:/tmp/mr9/
+// Inside the container, in /tmp/mr9:
+//   hdfs dfs -D dfs.blocksize=8388608 -put -f student_orders.csv /user/hadoop/data/
+//   mkdir -p classes &amp;&amp; javac -cp $(hadoop classpath) -d classes *.java &amp;&amp; jar cf mr9.jar -C classes .</code></pre><div class="output">(compiles to mr9.jar; run it with join_lab.sh below)</div></div>
+  <p class="muted">The 8 MB block size gives 3 splits for the orders, so you can see values from several map tasks being merged.</p></div>
+  <div class="pcrun"><h4>Join lab: reduce-side vs map-side</h4>
+  <div class="code" data-lang="bash" data-file="join_lab.sh"><pre><code># join_lab.sh: join 5 lakh orders with the 8-line menu, reduce-side and map-side, and compare
+cd /tmp/mr9
+O=/user/hadoop/data/student_orders.csv; MENU=/user/hadoop/data/menu.csv
+hdfs dfs -put -f menu.csv $MENU
+echo &quot;== menu.csv (minus &#x27;coffee&#x27;, to show an order without a menu row)&quot;
+grep -v coffee menu.csv &gt; menu_nocoffee.csv; hdfs dfs -put -f menu_nocoffee.csv /user/hadoop/data/
+cat menu_nocoffee.csv
+for j in JoinReduceSide JoinMapSide; do
+  hdfs dfs -rm -r -f -skipTrash /out/$j &gt; /dev/null 2&gt;&amp;1
+  start=$(date +%s%N)
+  hadoop jar mr9.jar $j $O /user/hadoop/data/menu_nocoffee.csv /out/$j &gt; /tmp/$j.log 2&gt;&amp;1
+  echo &quot;== $j   $(( ($(date +%s%N) - start) / 1000000 )) ms&quot;
+  grep -E &quot;number of splits|Launched (map|reduce) tasks|Map input records|Map output records|Reduce shuffle bytes|Reduce input groups|ORDERS_JOINED|ORDERS_WITHOUT_MENU|MENU_(NOT_)?FIRST|Bytes Written&quot; /tmp/$j.log | sed -E &#x27;s/^[0-9-]+ [0-9:]+ INFO  //; s/^\s*/  /&#x27;
+  hdfs dfs -ls /out/$j | grep part | awk &#x27;{print &quot;  &quot; $5, $8}&#x27;
+done
+echo &quot;== a joined row&quot;
+hdfs dfs -cat /out/JoinMapSide/part-m-00000 2&gt;/dev/null | head -2
+echo &quot;== same rows from both joins?&quot;
+diff &lt;(hdfs dfs -cat /out/JoinReduceSide/part-* | sort) &lt;(hdfs dfs -cat /out/JoinMapSide/part-* | sort) &gt; /dev/null &amp;&amp; echo &quot;identical (459,636 rows each, compared after sorting)&quot;
+echo &quot;== map task log of JoinMapSide: the cached menu&quot;
+app=$(grep -o &quot;application_[0-9_]*&quot; /tmp/JoinMapSide.log | head -1); sleep 5
+yarn logs -applicationId $app -log_files stderr 2&gt;/dev/null | grep -E &quot;cache files|menu loaded&quot; | head -2 | cut -c1-200
+
+# Inside the namenode container:  bash /tmp/mr9/join_lab.sh</code></pre><div class="output">== menu.csv (minus &#x27;coffee&#x27;, to show an order without a menu row)
+chai,drink,15,A
+samosa,snack,18,B
+vada pav,snack,20,B
+poha,breakfast,25,C
+idli,breakfast,30,C
+dosa,meal,45,D
+thali,meal,80,D
+== JoinReduceSide   24828 ms
+  JobSubmitter:203 - number of splits:4
+  Launched map tasks=4
+  Launched reduce tasks=1
+  Map input records=500007
+  Map output records=500007
+  Reduce input groups=8
+  Reduce shuffle bytes=24448645
+  MENU_FIRST=3
+  MENU_NOT_FIRST=4
+  ORDERS_JOINED=459636
+  ORDERS_WITHOUT_MENU=40364
+  Bytes Written=20851062
+  20851062 /out/JoinReduceSide/part-r-00000
+== JoinMapSide   18943 ms
+  JobSubmitter:203 - number of splits:3
+  Launched map tasks=3
+  Map input records=500000
+  Map output records=459636
+  ORDERS_JOINED=459636
+  ORDERS_WITHOUT_MENU=40364
+  Bytes Written=20851062
+  9020852 /out/JoinMapSide/part-m-00000
+  8993924 /out/JoinMapSide/part-m-00001
+  2836286 /out/JoinMapSide/part-m-00002
+== a joined row
+1,S1413,2026-09-14 15:30,dosa,45,meal
+2,S0973,2026-09-26 20:11,samosa,18,snack
+== same rows from both joins?
+identical (459,636 rows each, compared after sorting)
+== map task log of JoinMapSide: the cached menu
+cache files: [/user/hadoop/data/menu_nocoffee.csv#menu]
+menu loaded in setup(): 7 items, working dir = /tmp/hadoop-hadoop/nm-local-dir/usercache/hadoop/appcache/application_1792643020992_0040/container_1792643020992_0040_01_000003/.</div></div>
+  <p class="muted">Real output. MENU_FIRST/MENU_NOT_FIRST will differ between runs because the merge order depends on which map task finishes first; the joined rows never do. The JoinMapSide part is explained in Lesson 9.6.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>The reducer for one item</h2>
+  <p>The values for <code>dosa</code> arrive with the menu row in the middle. Watch the list grow until the category is known.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "values = [\"O|1,dosa,45\", \"M|meal\", \"O|4,dosa,45\"]",
+  "category = None",
+  "buffered = []",
+  "for v in values:",
+  "    if v.startswith(\"M|\"):",
+  "        category = v[2:]",
+  "    else:",
+  "        buffered.append(v[2:])",
+  "for o in buffered:",
+  "    print(o + \",\" + category)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>values<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]"
+   ],
+   "newVar": "values"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>category<\/code> is created: None.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "None"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]"
+   ],
+   "newVar": "category"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>buffered<\/code> is created: → list #2. A new list object (#2) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "None"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "buffered"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>v<\/code> is created: &#x27;O|1,dosa,45&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "None"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|1,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "None"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|1,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Buffer",
+   "note": "Orders are kept, not written, until the loop ends. Object #2 list now holds [&#x27;1,dosa,45&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "None"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|1,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;1,dosa,45&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>v<\/code> changes to &#x27;M|meal&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "None"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'M|meal'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;1,dosa,45&#x27;]"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "None"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'M|meal'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;1,dosa,45&#x27;]"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Menu",
+   "note": "The category is learned in the middle of the loop. <code>category<\/code> changes to &#x27;meal&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "'meal'"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'M|meal'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;1,dosa,45&#x27;]"
+   ],
+   "newVar": "category"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>v<\/code> changes to &#x27;O|4,dosa,45&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "'meal'"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|4,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;1,dosa,45&#x27;]"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "'meal'"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|4,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;1,dosa,45&#x27;]"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #2 list now holds [&#x27;1,dosa,45&#x27;, &#x27;4,dosa,45&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "'meal'"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|4,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;1,dosa,45&#x27;, &#x27;4,dosa,45&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "'meal'"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|4,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;1,dosa,45&#x27;, &#x27;4,dosa,45&#x27;]"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>o<\/code> is created: &#x27;1,dosa,45&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "'meal'"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|4,dosa,45'"
+      ],
+      [
+       "o",
+       "'1,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;1,dosa,45&#x27;, &#x27;4,dosa,45&#x27;]"
+   ],
+   "newVar": "o"
+  },
+  {
+   "line": 10,
+   "phase": "Join",
+   "note": "Only now can every order be completed. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "'meal'"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|4,dosa,45'"
+      ],
+      [
+       "o",
+       "'1,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;1,dosa,45&#x27;, &#x27;4,dosa,45&#x27;]"
+   ],
+   "out": "1,dosa,45,meal\n"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>o<\/code> changes to &#x27;4,dosa,45&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "'meal'"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|4,dosa,45'"
+      ],
+      [
+       "o",
+       "'4,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;1,dosa,45&#x27;, &#x27;4,dosa,45&#x27;]"
+   ],
+   "newVar": "o"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "'meal'"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|4,dosa,45'"
+      ],
+      [
+       "o",
+       "'4,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;1,dosa,45&#x27;, &#x27;4,dosa,45&#x27;]"
+   ],
+   "out": "4,dosa,45,meal\n"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "values",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "'meal'"
+      ],
+      [
+       "buffered",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'O|4,dosa,45'"
+      ],
+      [
+       "o",
+       "'4,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;O|1,dosa,45&#x27;, &#x27;M|meal&#x27;, &#x27;O|4,dosa,45&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;1,dosa,45&#x27;, &#x27;4,dosa,45&#x27;]"
+   ]
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three reduce-side join problems: the shuffle cost, the memory risk, and choosing the join type.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Design · tags</span></div>
+    <h4>Join students with their hostel</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p><code>orders.csv</code>: <code>order_id,student_id,item,amount</code>. <code>students.csv</code>: <code>student_id,name,hostel</code>. The warden wants revenue per hostel. What is the join key, what do the two mappers emit, and what does the reducer write?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>3 orders · 2 students</pre></div><div><small>Expected output</small><pre>S1 Ganga [45, 80]
+S2 Yamuna [15]</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Join key = student_id, in both files.</li><li>Order mapper: (student_id, "O|amount"); student mapper: (student_id, "S|hostel").</li><li>Reducer: find the hostel, write (hostel, amount) for each order; a second job (or step) sums per hostel.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Summing per hostel needs a different key (hostel), so it is a second MapReduce job, or a Hive query.",
+   "code": "orders = [\"1,S1,dosa,45\", \"2,S2,chai,15\", \"3,S1,thali,80\"]\nstudents = [\"S1,Riya,Ganga\", \"S2,Kabir,Yamuna\"]\ngroups = {}\nfor o in orders:\n    f = o.split(\",\"); groups.setdefault(f[1], []).append(\"O|\" + f[3])\nfor s in students:\n    f = s.split(\",\"); groups.setdefault(f[0], []).append(\"S|\" + f[2])\nfor sid, vals in sorted(groups.items()):\n    hostel = next(v[2:] for v in vals if v.startswith(\"S|\"))\n    print(sid, hostel, [int(v[2:]) for v in vals if v.startswith(\"O|\")])\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "orders = [\"1,S1,dosa,45\", \"2,S2,chai,15\", \"3,S1,thali,80\"]",
+  "students = [\"S1,Riya,Ganga\", \"S2,Kabir,Yamuna\"]",
+  "groups = {}",
+  "for o in orders:",
+  "    f = o.split(\",\"); groups.setdefault(f[1], []).append(\"O|\" + f[3])",
+  "for s in students:",
+  "    f = s.split(\",\"); groups.setdefault(f[0], []).append(\"S|\" + f[2])",
+  "for sid, vals in sorted(groups.items()):",
+  "    hostel = next(v[2:] for v in vals if v.startswith(\"S|\"))",
+  "    print(sid, hostel, [int(v[2:]) for v in vals if v.startswith(\"O|\")])"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>orders<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]"
+   ],
+   "newVar": "orders"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>students<\/code> is created: → list #2. A new list object (#2) is created: [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]"
+   ],
+   "newVar": "students"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>groups<\/code> is created: → dict #3. A new dict object (#3) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (0)<\/b> {}"
+   ],
+   "newVar": "groups"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>o<\/code> is created: &#x27;1,S1,dosa,45&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'1,S1,dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (0)<\/b> {}"
+   ],
+   "newVar": "o"
+  },
+  {
+   "line": 5,
+   "phase": "Tag",
+   "note": "O| and S| tell the reducer which file each value came from. <code>f<\/code> is created: → list #4. Object #3 dict now holds {&#x27;S1&#x27;: → list #5} A new list object (#4) is created: [&#x27;1&#x27;, &#x27;S1&#x27;, &#x27;dosa&#x27;, &#x27;45&#x27;] A new list object (#5) is created: [&#x27;O|45&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'1,S1,dosa,45'"
+      ],
+      [
+       "f",
+       "→ list #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (1)<\/b> {&#x27;S1&#x27;: → list #5}",
+    "<b>#4 list (4)<\/b> [&#x27;1&#x27;, &#x27;S1&#x27;, &#x27;dosa&#x27;, &#x27;45&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;O|45&#x27;]"
+   ],
+   "newVar": "f"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>o<\/code> changes to &#x27;2,S2,chai,15&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'2,S2,chai,15'"
+      ],
+      [
+       "f",
+       "→ list #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (1)<\/b> {&#x27;S1&#x27;: → list #5}",
+    "<b>#4 list (4)<\/b> [&#x27;1&#x27;, &#x27;S1&#x27;, &#x27;dosa&#x27;, &#x27;45&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;O|45&#x27;]"
+   ],
+   "newVar": "o"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>f<\/code> changes to → list #6. Object #3 dict now holds {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7} A new list object (#6) is created: [&#x27;2&#x27;, &#x27;S2&#x27;, &#x27;chai&#x27;, &#x27;15&#x27;] A new list object (#7) is created: [&#x27;O|15&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'2,S2,chai,15'"
+      ],
+      [
+       "f",
+       "→ list #6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (1)<\/b> [&#x27;O|45&#x27;]",
+    "<b>#6 list (4)<\/b> [&#x27;2&#x27;, &#x27;S2&#x27;, &#x27;chai&#x27;, &#x27;15&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;O|15&#x27;]"
+   ],
+   "newVar": "f"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>o<\/code> changes to &#x27;3,S1,thali,80&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (1)<\/b> [&#x27;O|45&#x27;]",
+    "<b>#6 list (4)<\/b> [&#x27;2&#x27;, &#x27;S2&#x27;, &#x27;chai&#x27;, &#x27;15&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;O|15&#x27;]"
+   ],
+   "newVar": "o"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>f<\/code> changes to → list #8. Object #5 list now holds [&#x27;O|45&#x27;, &#x27;O|80&#x27;] A new list object (#8) is created: [&#x27;3&#x27;, &#x27;S1&#x27;, &#x27;thali&#x27;, &#x27;80&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (2)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;O|15&#x27;]",
+    "<b>#8 list (4)<\/b> [&#x27;3&#x27;, &#x27;S1&#x27;, &#x27;thali&#x27;, &#x27;80&#x27;]"
+   ],
+   "newVar": "f"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (2)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;O|15&#x27;]",
+    "<b>#8 list (4)<\/b> [&#x27;3&#x27;, &#x27;S1&#x27;, &#x27;thali&#x27;, &#x27;80&#x27;]"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>s<\/code> is created: &#x27;S1,Riya,Ganga&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #8"
+      ],
+      [
+       "s",
+       "'S1,Riya,Ganga'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (2)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;O|15&#x27;]",
+    "<b>#8 list (4)<\/b> [&#x27;3&#x27;, &#x27;S1&#x27;, &#x27;thali&#x27;, &#x27;80&#x27;]"
+   ],
+   "newVar": "s"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>f<\/code> changes to → list #9. Object #5 list now holds [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;] A new list object (#9) is created: [&#x27;S1&#x27;, &#x27;Riya&#x27;, &#x27;Ganga&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #9"
+      ],
+      [
+       "s",
+       "'S1,Riya,Ganga'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;O|15&#x27;]",
+    "<b>#9 list (3)<\/b> [&#x27;S1&#x27;, &#x27;Riya&#x27;, &#x27;Ganga&#x27;]"
+   ],
+   "newVar": "f"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>s<\/code> changes to &#x27;S2,Kabir,Yamuna&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #9"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;O|15&#x27;]",
+    "<b>#9 list (3)<\/b> [&#x27;S1&#x27;, &#x27;Riya&#x27;, &#x27;Ganga&#x27;]"
+   ],
+   "newVar": "s"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>f<\/code> changes to → list #10. Object #7 list now holds [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;] A new list object (#10) is created: [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ],
+   "newVar": "f"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>sid<\/code> is created: &#x27;S1&#x27;. <code>vals<\/code> is created: → list #5.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S1'"
+      ],
+      [
+       "vals",
+       "→ list #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ],
+   "newVar": "vals"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>hostel<\/code> is created: &#x27;Ganga&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S1'"
+      ],
+      [
+       "vals",
+       "→ list #5"
+      ],
+      [
+       "hostel",
+       "'Ganga'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ],
+   "newVar": "hostel"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S1'"
+      ],
+      [
+       "vals",
+       "→ list #5"
+      ],
+      [
+       "hostel",
+       "'Ganga'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S1'"
+      ],
+      [
+       "vals",
+       "→ list #5"
+      ],
+      [
+       "hostel",
+       "'Ganga'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S1'"
+      ],
+      [
+       "vals",
+       "→ list #5"
+      ],
+      [
+       "hostel",
+       "'Ganga'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S1'"
+      ],
+      [
+       "vals",
+       "→ list #5"
+      ],
+      [
+       "hostel",
+       "'Ganga'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ],
+   "out": "S1 Ganga [45, 80]\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>sid<\/code> changes to &#x27;S2&#x27;. <code>vals<\/code> changes to → list #7.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S2'"
+      ],
+      [
+       "vals",
+       "→ list #7"
+      ],
+      [
+       "hostel",
+       "'Ganga'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ],
+   "newVar": "vals"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>hostel<\/code> changes to &#x27;Yamuna&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S2'"
+      ],
+      [
+       "vals",
+       "→ list #7"
+      ],
+      [
+       "hostel",
+       "'Yamuna'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ],
+   "newVar": "hostel"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S2'"
+      ],
+      [
+       "vals",
+       "→ list #7"
+      ],
+      [
+       "hostel",
+       "'Yamuna'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S2'"
+      ],
+      [
+       "vals",
+       "→ list #7"
+      ],
+      [
+       "hostel",
+       "'Yamuna'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S2'"
+      ],
+      [
+       "vals",
+       "→ list #7"
+      ],
+      [
+       "hostel",
+       "'Yamuna'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ],
+   "out": "S2 Yamuna [15]\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "students",
+       "→ list #2"
+      ],
+      [
+       "groups",
+       "→ dict #3"
+      ],
+      [
+       "o",
+       "'3,S1,thali,80'"
+      ],
+      [
+       "f",
+       "→ list #10"
+      ],
+      [
+       "s",
+       "'S2,Kabir,Yamuna'"
+      ],
+      [
+       "sid",
+       "'S2'"
+      ],
+      [
+       "vals",
+       "→ list #7"
+      ],
+      [
+       "hostel",
+       "'Yamuna'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;1,S1,dosa,45&#x27;, &#x27;2,S2,chai,15&#x27;, &#x27;3,S1,thali,80&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;S1,Riya,Ganga&#x27;, &#x27;S2,Kabir,Yamuna&#x27;]",
+    "<b>#3 dict (2)<\/b> {&#x27;S1&#x27;: → list #5, &#x27;S2&#x27;: → list #7}",
+    "<b>#5 list (3)<\/b> [&#x27;O|45&#x27;, &#x27;O|80&#x27;, &#x27;S|Ganga&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;O|15&#x27;, &#x27;S|Yamuna&#x27;]",
+    "<b>#10 list (3)<\/b> [&#x27;S2&#x27;, &#x27;Kabir&#x27;, &#x27;Yamuna&#x27;]"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Sizing · shuffle</span></div>
+    <h4>What does a reduce-side join cost?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Join 200 GB of orders with a 50 MB menu using a reduce-side join on a 20-node cluster where each node can receive shuffle data at 100 MB/s. Roughly how long does the shuffle alone take, and how much of it is the menu?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>200 GB + 50 MB · 20 × 100 MB/s</pre></div><div><small>Expected output</small><pre>shuffle ≈ 1.7 min; menu is 0.024% of it</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Everything is shuffled: both inputs.</li><li>Total bandwidth = nodes × per-node rate.</li><li>Compare with the menu size.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "With a map-side join (Lesson 9.6), the shuffle disappears: the 50 MB menu is copied once to each node instead.",
+   "code": "total_mb = 200 * 1024 + 50\nseconds = total_mb / (20 * 100)\nprint(f\"shuffle ≈ {seconds / 60:.1f} min; menu is {50 / total_mb * 100:.3f}% of it\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "total_mb = 200 * 1024 + 50",
+  "seconds = total_mb / (20 * 100)",
+  "print(f\"shuffle ≈ {seconds / 60:.1f} min; menu is {50 / total_mb * 100:.3f}% of it\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>total_mb<\/code> is created: 204850.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "total_mb",
+       "204850"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "total_mb"
+  },
+  {
+   "line": 2,
+   "phase": "Bandwidth",
+   "note": "Every reducer receives data in parallel. <code>seconds<\/code> is created: 102.425.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "total_mb",
+       "204850"
+      ],
+      [
+       "seconds",
+       "102.425"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "seconds"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "total_mb",
+       "204850"
+      ],
+      [
+       "seconds",
+       "102.425"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "shuffle ≈ 1.7 min; menu is 0.024% of it\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Memory · skew</span></div>
+    <h4>Will the reducer run out of memory?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A reducer buffers all orders of one item as Java Strings of about 40 characters (≈ 120 bytes each in memory). chai has 149,669 orders in our data; a real chain has 4 crore chai orders a month. The reduce container has a 300 MB heap. Does each case fit?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>149,669 vs 4 crore · 120 B · 300 MB heap</pre></div><div><small>Expected output</small><pre>our lab   :      17 MB -&gt; fits
+real chain:    4578 MB -&gt; OutOfMemoryError</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Memory = records × bytes per record.</li><li>Compare with the heap.</li><li>Decide: buffer the small side instead, or stream with secondary sort.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Buffer the menu side (one row per item) and stream the orders: possible only if the menu row is guaranteed first, which secondary sort (Lesson 9.7) provides.",
+   "code": "for name, n in [(\"our lab\", 149_669), (\"real chain\", 40_000_000)]:\n    mb = n * 120 / 1024**2\n    print(f\"{name:10}: {mb:7.0f} MB -> {'fits' if mb < 300 else 'OutOfMemoryError'}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "for name, n in [(\"our lab\", 149_669), (\"real chain\", 40_000_000)]:",
+  "    mb = n * 120 / 1024**2",
+  "    print(f\"{name:10}: {mb:7.0f} MB -> {'fits' if mb < 300 else 'OutOfMemoryError'}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>name<\/code> is created: &#x27;our lab&#x27;. <code>n<\/code> is created: 149669.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "name",
+       "'our lab'"
+      ],
+      [
+       "n",
+       "149669"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>mb<\/code> is created: 17.1283.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "name",
+       "'our lab'"
+      ],
+      [
+       "n",
+       "149669"
+      ],
+      [
+       "mb",
+       "17.1283"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "mb"
+  },
+  {
+   "line": 3,
+   "phase": "Memory",
+   "note": "4 crore × 120 B is about 4.5 GB. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "name",
+       "'our lab'"
+      ],
+      [
+       "n",
+       "149669"
+      ],
+      [
+       "mb",
+       "17.1283"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "our lab   :      17 MB -> fits\n"
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;real chain&#x27;. <code>n<\/code> changes to 40000000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "name",
+       "'real chain'"
+      ],
+      [
+       "n",
+       "40000000"
+      ],
+      [
+       "mb",
+       "17.1283"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>mb<\/code> changes to 4577.6367.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "name",
+       "'real chain'"
+      ],
+      [
+       "n",
+       "40000000"
+      ],
+      [
+       "mb",
+       "4577.6367"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "mb"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "name",
+       "'real chain'"
+      ],
+      [
+       "n",
+       "40000000"
+      ],
+      [
+       "mb",
+       "4577.6367"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "real chain:    4578 MB -> OutOfMemoryError\n"
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "name",
+       "'real chain'"
+      ],
+      [
+       "n",
+       "40000000"
+      ],
+      [
+       "mb",
+       "4577.6367"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "In a reduce-side join, what is the map output key?",
+  "options": [
+   "The file name",
+   "The byte offset",
+   "The join key, from both inputs",
+   "A random number"
+  ],
+  "answer": 2,
+  "why": "Same key from both sides, so the shuffle brings matches together."
+ },
+ {
+  "q": "Why are values tagged (O| and M|)?",
+  "options": [
+   "To compress them",
+   "So the reducer knows which input each value came from",
+   "Hadoop requires a prefix",
+   "To sort them"
+  ],
+  "answer": 1,
+  "why": "Both inputs produce values of the same type; the tag is the only way to tell them apart."
+ },
+ {
+  "q": "What lets one job use a different Mapper for each input path?",
+  "options": [
+   "MultipleInputs.addInputPath",
+   "setMapperClass twice",
+   "CombineFileInputFormat",
+   "The distributed cache"
+  ],
+  "answer": 0,
+  "why": "Each path gets its own InputFormat and Mapper."
+ },
+ {
+  "q": "In our run, MENU_NOT_FIRST=4. What does that show?",
+  "options": [
+   "4 menu rows were lost",
+   "The job failed 4 times",
+   "4 reducers were used",
+   "The menu row can arrive after orders, so orders must be buffered"
+  ],
+  "answer": 3,
+  "why": "Values from several map tasks are merged in no guaranteed order."
+ },
+ {
+  "q": "Why were 40,364 orders not in the output?",
+  "options": [
+   "A bug in the mapper",
+   "They were duplicates",
+   "They were coffee orders, and coffee had no menu row: an inner join drops them",
+   "The reducer ran out of memory"
+  ],
+  "answer": 2,
+  "why": "ORDERS_WITHOUT_MENU=40,364, exactly the coffee orders."
+ },
+ {
+  "q": "Which join type keeps every order, with an empty category if no menu row exists?",
+  "options": [
+   "Inner join",
+   "Left outer join (orders on the left)",
+   "Right outer join (orders on the left)",
+   "Anti join"
+  ],
+  "answer": 1,
+  "why": "Left outer keeps all left-side records."
+ },
+ {
+  "q": "What is the main cost of a reduce-side join?",
+  "options": [
+   "All records of all inputs are shuffled across the network",
+   "It needs sorted input",
+   "It only works for small files",
+   "It needs a combiner"
+  ],
+  "answer": 0,
+  "why": "24.4 MB were shuffled just to meet 7 menu rows."
+ },
+ {
+  "q": "When is a reduce-side join the right choice?",
+  "options": [
+   "When one side fits easily in memory",
+   "When there is no join key",
+   "When the job is map-only",
+   "When both data sets are large"
+  ],
+  "answer": 3,
+  "why": "If one side is small, a map-side join (Lesson 9.6) avoids the shuffle."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 9.5 in one screen</h3>
+    <ul><li>Reduce-side join: both mappers emit <b>(join key, tagged record)</b>; the shuffle groups by key; the reducer separates by tag and combines.</li><li><code>MultipleInputs.addInputPath(job, path, InputFormat, Mapper)</code> for each input.</li><li>Values arrive in no fixed order: lab counters MENU_FIRST=3, MENU_NOT_FIRST=4. Buffer one side, or use secondary sort to put the small side first.</li><li>Lab: 500,007 records and 24.4 MB shuffled, 8 groups, 459,636 joined, 40,364 coffee orders dropped, 24.8 s.</li><li>Join types: inner, left outer, right outer, full outer, anti; only the reducer's output rule changes.</li><li>Costs: everything is shuffled; buffering a hot key (chai 149,669 orders) can exhaust memory.</li><li>Use when both sides are big; if one side is small, use a map-side join.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What is a reduce-side join in Hadoop?</summary><p>A join performed in the reduce phase. Each input has a mapper that emits the join key as the map output key and the record, tagged with its source, as the value. The shuffle sends all records with the same key to one reduce call, where the reducer separates them by tag and emits the joined records. It handles inputs of any size but shuffles all data.</p></details>
+    <details><summary>What is the difference between a map-side join and a reduce-side join?</summary><p>A reduce-side join shuffles both data sets by the join key and joins in the reducer; it works for any sizes. A map-side join loads the small data set into every mapper's memory (via the distributed cache) and joins while reading the large one, with no shuffle; it needs one side small enough to fit in memory. In our lab both produced the same 459,636 rows; the map-side join took 18.9 s instead of 24.8 s.</p></details>
+    <details><summary>Why do reduce-side joins need buffering?</summary><p>The values for a key come from several map tasks and are merged in no guaranteed order, so the reducer may see many records from one side before the matching record from the other side. It must keep them in memory until the loop is complete, unless secondary sort is used to make one side arrive first.</p></details>
+    <details><summary>How do you do an outer join in MapReduce?</summary><p>The map side is unchanged. In the reducer, after separating the values by tag, emit unmatched records too: for a left outer join, emit every left-side record with empty fields if the right side is missing; for a right outer join, the reverse; for a full outer join, both.</p></details>
+    <details><summary>How do you handle skew in a reduce-side join?</summary><p>A key with very many records sends them all to one reducer, which becomes slow or runs out of memory. Options: filter out junk keys like NULL, buffer only the smaller side and stream the larger with secondary sort, split (salt) the hot key across several reducers while replicating the small side, or use a map-side join when one side is small.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Reduce-side join exercises using the real numbers from the lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Check the counters</h4></div>
+      <p>ORDERS_JOINED=459,636 and ORDERS_WITHOUT_MENU=40,364. Do they add up to all orders?</p>
+      <div class="prob__io"><div><small>Input</small><pre>two counters</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(459636 + 40364 == 500000)</code></pre><div class="output">True</div></div>
+        <p><b>How it works:</b> True: every order was either joined or counted as unmatched; none was lost silently.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Where do 500,007 records come from?</h4></div>
+      <p>Map input records were 500,007. Explain the 7.</p>
+      <div class="prob__io"><div><small>Input</small><pre>orders + menu</pre></div><div><small>Expected output</small><pre>500007</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(500000 + 7)</code></pre><div class="output">500007</div></div>
+        <p><b>How it works:</b> 5 lakh orders plus the 7 rows of menu_nocoffee.csv; both inputs go through map and shuffle.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Bytes per shuffled record</h4></div>
+      <p>24,448,645 shuffle bytes for 500,007 records. What is the average size of one tagged record?</p>
+      <div class="prob__io"><div><small>Input</small><pre>bytes / records</pre></div><div><small>Expected output</small><pre>48.9 bytes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(24448645 / 500007, 1), &quot;bytes&quot;)</code></pre><div class="output">48.9 bytes</div></div>
+        <p><b>How it works:</b> About 49 bytes: the whole order line plus the “O|” tag and the item key, plus framing.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Full outer join</h4></div>
+      <p>Write the reducer output for a full outer join: orders without a menu row get an empty category, menu items without orders get one line “,,item,category”.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 groups</pre></div><div><small>Expected output</small><pre>3,coffee,
+1,dosa,meal
+,,thali,meal</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>groups = {&quot;coffee&quot;: [&quot;O|3,coffee&quot;], &quot;dosa&quot;: [&quot;O|1,dosa&quot;, &quot;M|meal&quot;], &quot;thali&quot;: [&quot;M|meal&quot;]}
+for item, vals in sorted(groups.items()):
+    cat = next((v[2:] for v in vals if v.startswith(&quot;M|&quot;)), None)
+    ords = [v[2:] for v in vals if v.startswith(&quot;O|&quot;)]
+    for o in ords:
+        print(o + &quot;,&quot; + (cat or &quot;&quot;))
+    if not ords:
+        print(&quot;,,&quot; + item + &quot;,&quot; + cat)</code></pre><div class="output">3,coffee,
+1,dosa,meal
+,,thali,meal</div></div>
+        <p><b>How it works:</b> coffee kept with a blank, dosa joined, thali printed once with no order.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Menu first with a composite key</h4></div>
+      <p>Sort the values by a tag rank so the menu row (rank 0) always comes before orders (rank 1), then stream without a list.</p>
+      <div class="prob__io"><div><small>Input</small><pre>mixed values</pre></div><div><small>Expected output</small><pre>1,dosa,45,meal
+4,dosa,45,meal</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>values = [&quot;O|1,dosa,45&quot;, &quot;M|meal&quot;, &quot;O|4,dosa,45&quot;]
+values.sort(key=lambda v: 0 if v.startswith(&quot;M|&quot;) else 1)
+category = None
+for v in values:
+    if v.startswith(&quot;M|&quot;):
+        category = v[2:]
+    else:
+        print(v[2:] + &quot;,&quot; + category)</code></pre><div class="output">1,dosa,45,meal
+4,dosa,45,meal</div></div>
+        <p><b>How it works:</b> In Hadoop the sort happens in the shuffle via a composite key (item, tag) with grouping on item only: Lesson 9.7.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Reducer load</h4></div>
+      <p>With one reducer per item, which reducer has the most work? Use the real order counts.</p>
+      <div class="prob__io"><div><small>Input</small><pre>orders per item</pre></div><div><small>Expected output</small><pre>chai 149669 = 30% of all orders</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>counts = {&quot;chai&quot;: 149669, &quot;coffee&quot;: 40364, &quot;samosa&quot;: 69884, &quot;vada pav&quot;: 69754, &quot;poha&quot;: 45336, &quot;idli&quot;: 44774, &quot;dosa&quot;: 49927, &quot;thali&quot;: 30292}
+top = max(counts, key=counts.get)
+print(top, counts[top], f&quot;= {counts[top] / sum(counts.values()) * 100:.0f}% of all orders&quot;)</code></pre><div class="output">chai 149669 = 30% of all orders</div></div>
+        <p><b>How it works:</b> chai: 30% of all records go to one reduce call. That is join skew.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Unmatched means lost money</h4></div>
+      <p>The finance report used an inner join and missed every coffee order (40,364 orders at ₹20). How much revenue was missing from the report?</p>
+      <div class="prob__io"><div><small>Input</small><pre>40,364 × ₹20</pre></div><div><small>Expected output</small><pre>Rs 807,280</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;Rs {40364 * 20:,}&quot;)</code></pre><div class="output">Rs 807,280</div></div>
+        <p><b>How it works:</b> ₹8,07,280 missing for one month. Count unmatched records, or use a left outer join, in every financial join.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>Salting a hot key</h4></div>
+      <p>Split chai into 3 reducers by appending a salt to the key on the order side, and replicate the menu row to all 3 salts. Show that every chai order still gets its category.</p>
+      <div class="prob__io"><div><small>Input</small><pre>5 chai orders</pre></div><div><small>Expected output</small><pre>chai#0 [&#x27;1,chai,15,drink&#x27;, &#x27;4,chai,15,drink&#x27;]
+chai#1 [&#x27;2,chai,15,drink&#x27;, &#x27;5,chai,15,drink&#x27;]
+chai#2 [&#x27;3,chai,15,drink&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>orders = [f&quot;O|{i},chai,15&quot; for i in range(1, 6)]
+groups = {}
+for n, o in enumerate(orders):
+    groups.setdefault(f&quot;chai#{n % 3}&quot;, []).append(o)            # salt orders
+for s in range(3):
+    groups.setdefault(f&quot;chai#{s}&quot;, []).append(&quot;M|drink&quot;)       # replicate menu row
+for key in sorted(groups):
+    cat = next(v[2:] for v in groups[key] if v.startswith(&quot;M|&quot;))
+    print(key, [v[2:] + &quot;,&quot; + cat for v in groups[key] if v.startswith(&quot;O|&quot;)])</code></pre><div class="output">chai#0 [&#x27;1,chai,15,drink&#x27;, &#x27;4,chai,15,drink&#x27;]
+chai#1 [&#x27;2,chai,15,drink&#x27;, &#x27;5,chai,15,drink&#x27;]
+chai#2 [&#x27;3,chai,15,drink&#x27;]</div></div>
+        <p><b>How it works:</b> Three smaller groups instead of one; the small side is copied to every salt. Spark's skew-join handling does the same.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Joins are among the most asked MapReduce and Spark interview topics: how they work, what they cost and what goes wrong.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Concepts · joins</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“How do you join two datasets in MapReduce?”</h4>
+      <p class="scn__situation">Asked right after word count.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> key choice, tagging and the shuffle.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Reduce-side: both mappers emit (join key, tagged record) via MultipleInputs; the shuffle groups by key; the reducer separates by tag and combines.</li>
+          <li>Map-side: if one side is small, load it in every mapper from the distributed cache and join while reading; no shuffle.</li>
+          <li>Mention the trade-off: reduce-side works for any sizes but shuffles everything.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Debugging · data</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>The joined output has fewer rows than the orders table</h4>
+      <p class="scn__situation">Finance says revenue in the joined report is lower than in the raw orders.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> inner join semantics and counters.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>An inner join drops records without a match: check a counter for unmatched keys (our lab: 40,364 coffee orders, no menu row).</li>
+          <li>Fix the master data, or switch to a left outer join so unmatched rows appear with blanks.</li>
+          <li>Add a reconciliation check: joined + unmatched = input.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Internals · ordering</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>“My join reducer works in testing but loses rows in production”</h4>
+      <p class="scn__situation">The reducer writes orders as soon as it has the category, and assumes the dimension row comes first.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> value order is not guaranteed.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Values for a key are merged from many map tasks in no fixed order; with one map task in testing it looked ordered.</li>
+          <li>Buffer one side until the loop ends, or make the order deterministic with secondary sort: composite key (join key, tag), partition and group on the join key.</li>
+          <li>Add a counter for “dimension not first” to detect it.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Performance · skew</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>One reducer of a join runs for hours; the other 199 finish in minutes</h4>
+      <p class="scn__situation">Joining page views with users; one user_id is the anonymous value “0”.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> skew diagnosis and fixes.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Check reduce input records per task: one key holds most records.</li>
+          <li>Filter or handle the junk key separately; salt hot keys and replicate the small side; or use a map-side join if the users table fits in memory.</li>
+          <li>In Spark, adaptive query execution can split skewed partitions automatically.</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

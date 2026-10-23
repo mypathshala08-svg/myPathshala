@@ -1,0 +1,2501 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parquet and ORC | MyPhatshala</title>
+<meta name="description" content="Columnar file formats measured on a real Hadoop 3.5.0 cluster: 5 lakh orders written by MapReduce as Parquet (uncompressed 7.4 MB, Snappy 4.4 MB, ZSTD 2.8 MB) and ORC (ZLIB 3.3 MB, ZSTD 2.9 MB) vs a 19.4 MB CSV. Inside an ORC file with orc-tools (576 bytes for 2 lakh order ids), projection (192,526 bytes read instead of 19.4 MB, same answer), predicate pushdown with row-group statistics (1 of 10 row groups when sorted), Parquet row groups, column chunks and pages, ORC stripes, encodings, Parquet vs ORC, Python simulations, quiz and interview scenarios.">
+<meta name="mp:minutes" content="30">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/10-data-formats/02-parquet-and-orc/">
+<meta property="og:title" content="Parquet and ORC · MyPhatshala">
+<meta property="og:description" content="Same job, same answer, 100× fewer bytes read: Parquet and ORC measured on a real Hadoop cluster.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Parquet and ORC", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="10-data-formats/02-parquet-and-orc" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 10.2</b></nav>
+    <h1>Parquet and ORC</h1>
+    <p class="lead">Parquet and ORC store a table column by column. A query then reads only the columns it needs, repeated values shrink to almost nothing, and per-block statistics let readers skip data that cannot match. This lesson writes both formats from MapReduce, opens them up, and measures what projection and predicate pushdown save.</p>
+    <div class="lesson-meta"><span>Module 10 · Data formats and compression</span><span>⏱ 30 min</span><span>Intermediate</span><span>192 KB read instead of 19.4 MB</span><span>Inside real Parquet and ORC files</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>One question, one column</h2>
+  <div class="story">
+    <p class="narration">The canteen manager asks Riya one question every Monday: how many orders of each item last month? Her job reads the whole 19.4 MB CSV of 5 lakh orders, every order id, every student, every timestamp, only to look at one word per line: the item. Kabir stores the same orders as Parquet and runs the same job. It reads 192,526 bytes. That is 100 times less, for exactly the same answer: chai 149,669.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="A row file stores whole orders one after another; a column file stores each column together, so a job that needs only the item column reads a small part of the file.">
+        <g font-size="10">
+          <text x="150" y="20" text-anchor="middle" font-weight="700" class="s-ink">Row layout (CSV, Avro)</text>
+          <g font-size="8.4" class="s-ink">
+            <rect x="30" y="32" width="240" height="18" rx="3" class="s-card2"/><text x="40" y="45">1 · S1413 · 09-14 15:30 · <tspan class="s-acc" font-weight="700">dosa</tspan> · 45</text>
+            <rect x="30" y="54" width="240" height="18" rx="3" class="s-card2"/><text x="40" y="67">2 · S0973 · 09-26 20:11 · <tspan class="s-acc" font-weight="700">samosa</tspan> · 18</text>
+            <rect x="30" y="76" width="240" height="18" rx="3" class="s-card2"/><text x="40" y="89">3 · S0007 · 09-01 13:37 · <tspan class="s-acc" font-weight="700">samosa</tspan> · 18</text>
+          </g>
+          <text x="150" y="114" text-anchor="middle" font-size="8.6" class="s-ink2">to read every item, read every byte</text>
+          <rect x="30" y="124" width="240" height="40" rx="8" class="s-board"/>
+          <text x="150" y="141" text-anchor="middle" font-size="9" style="fill:#F5C77E">CSV: 19,427,239 bytes read</text>
+          <text x="150" y="156" text-anchor="middle" font-size="8.6" style="fill:#9FD3B8">chai = 149,669</text>
+
+          <text x="480" y="20" text-anchor="middle" font-weight="700" class="s-ink">Column layout (Parquet, ORC)</text>
+          <g font-size="8.4">
+            <rect x="350" y="32" width="44" height="62" rx="3" class="s-card2"/><text x="372" y="66" text-anchor="middle" class="s-ink2">id</text>
+            <rect x="398" y="32" width="50" height="62" rx="3" class="s-card2"/><text x="423" y="66" text-anchor="middle" class="s-ink2">student</text>
+            <rect x="452" y="32" width="44" height="62" rx="3" class="s-card2"/><text x="474" y="66" text-anchor="middle" class="s-ink2">time</text>
+            <rect x="500" y="32" width="58" height="62" rx="3" class="s-soft-acc" style="stroke:var(--track);stroke-width:2"/><text x="529" y="58" text-anchor="middle" font-weight="700" class="s-acc">item</text><text x="529" y="72" text-anchor="middle" font-size="7.6" class="s-acc">read this</text>
+            <rect x="562" y="32" width="48" height="62" rx="3" class="s-card2"/><text x="586" y="66" text-anchor="middle" class="s-ink2">amount</text>
+          </g>
+          <text x="480" y="114" text-anchor="middle" font-size="8.6" class="s-ink2">read only the column you ask for</text>
+          <rect x="360" y="124" width="240" height="40" rx="8" class="s-board"/>
+          <text x="480" y="141" text-anchor="middle" font-size="9" style="fill:#F5C77E">Parquet, item only: 192,526 bytes read</text>
+          <text x="480" y="156" text-anchor="middle" font-size="8.6" style="fill:#9FD3B8">chai = 149,669</text>
+        </g>
+        <text x="320" y="186" text-anchor="middle" font-size="9.6" class="s-ink2">Real HDFS counters from our lab: same job, same answer, 100× fewer bytes.</text>
+        <text x="632" y="196" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, it's the same data. How can it read so little?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Because of how the bytes are arranged. A CSV or an Avro file stores one whole order after another, so every item name sits between a student id and a timestamp. Parquet and ORC turn the table sideways: all order ids together, all students together, all items together. A job that needs only items reads only that part of the file.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>And a column full of the same eight words compresses beautifully. Our item column for 2 lakh orders was 92,796 bytes in ORC. The order id column was 576 bytes.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Today we write both formats from MapReduce, look inside them, and measure what projection and predicate pushdown save. These two formats are what nearly every data lake stores today.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Columnar file formats</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A <b>columnar file format</b> stores a table column by column instead of row by row. <b>Apache Parquet</b> divides a file into <b>row groups</b>; each row group holds one <b>column chunk</b> per column, made of <b>pages</b>, and a footer at the end of the file stores the schema and per-chunk metadata such as encodings, sizes and min/max <b>statistics</b>. <b>Apache ORC</b> (Optimized Row Columnar) divides a file into <b>stripes</b>, each with index data (statistics every 10,000 rows by default), column data streams and a stripe footer, followed by a file footer and a postscript. Because values of one type are stored together, both formats apply encodings such as <b>dictionary</b>, <b>run-length (RLE)</b> and <b>delta</b> encoding before general compression (Snappy, ZSTD, ZLIB). Readers use <b>projection</b> (column pruning) to read only requested columns and <b>predicate pushdown</b> to skip row groups or stripes whose statistics show they cannot match a filter.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Keep each column together. Then a query reads only the columns it needs, similar values squeeze very small, and a little summary (min and max) of every block lets the reader skip blocks that can't contain what it's looking for.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Row group (Parquet)</b><span>A horizontal slice of rows; inside it, one chunk per column.</span></div>
+    <div class="term"><b>Column chunk</b><span>All values of one column in one row group, stored as pages.</span></div>
+    <div class="term"><b>Stripe (ORC)</b><span>ORC's row group, about 64 MB by default, with its own index.</span></div>
+    <div class="term"><b>Footer</b><span>Metadata at the end of the file: schema, offsets, statistics.</span></div>
+    <div class="term"><b>Dictionary encoding</b><span>Store each distinct value once; the column holds small numbers.</span></div>
+    <div class="term"><b>RLE</b><span>Run-length encoding: “chai × 40” instead of 40 copies.</span></div>
+    <div class="term"><b>Projection</b><span>Reading only the columns a query asks for (column pruning).</span></div>
+    <div class="term"><b>Predicate pushdown</b><span>Skipping row groups whose min/max can't match the filter.</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, 5 lakh orders, written by MapReduce)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>Size</th><td>CSV 19,418,699 · Avro deflate 4,793,471 · Parquet uncompressed 7,428,043 · Snappy 4,438,970 · ZSTD 2,775,449 · ORC uncompressed 9,238,947 · ZLIB 3,252,876 · ZSTD 2,909,570 bytes</td></tr>
+    <tr><th>Inside ORC</th><td>One part file, 217,602 rows: order_id 576 bytes, item 92,796, student 352,126, time 901,599; student and item dictionary-encoded (2,000 and 8 distinct values)</td></tr>
+    <tr><th>Projection</th><td>Same item-count job: CSV read 19,427,239 bytes; Parquet all columns 4,431,110; Parquet item only 192,526; ORC item only 263,343; every run: chai 149,669</td></tr>
+    <tr><th>Pushdown</th><td>Filter student = 'S1413' on 10 row groups: unsorted file must read 10 of 10; file sorted by student reads 1 of 10. Both return 184 rows</td></tr>
+  </table>
+
+  <h3 id="levels">Columnar formats at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A register turned sideways</h4>
+      <ul>
+        <li>The canteen keeps a bill book: one bill per line with number, student, time, item and amount. That is a <b>row</b> format.</li>
+        <li>Now imagine five separate registers: one with only bill numbers, one with only students, one with only items… That is a <b>column</b> format.</li>
+        <li>To count items, you pick up just the item register. And because the item register only contains eight different words, you can write it in shorthand: “chai, chai, chai” becomes “chai ×3”.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> Where the savings come from</h4>
+      <ul>
+        <li><b>Projection:</b> the reader opens the footer, finds where the item column lives in each row group, and reads only those byte ranges. Our job read 192,526 instead of 4,431,110 bytes from the same Parquet files.</li>
+        <li><b>Encoding:</b> in ORC, sequential order ids became 576 bytes for 2 lakh rows (delta + RLE: “start at 1, add 1, 217,602 times”). Items became 3-bit dictionary codes.</li>
+        <li><b>Compression on top:</b> similar values sit next to each other, so Snappy, ZSTD or ZLIB work better than on mixed rows. Parquet ZSTD was 7× smaller than the CSV.</li>
+        <li><b>Statistics:</b> each row group (Parquet) or stripe and 10,000-row index group (ORC) stores min and max per column, so a filter can skip what can't match.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Designing for the reader</h4>
+      <ul>
+        <li>Pushdown only helps when values are <b>clustered</b>. In our unsorted file every row group held students S0001 to S2000, so nothing could be skipped; sorted by student, one of ten row groups was enough. Sort or partition by the columns people filter on.</li>
+        <li>Row group or stripe size is a trade-off: bigger means better compression and fewer seeks, smaller means finer skipping and less memory while writing. Parquet's writer default is 128 MB; ORC's stripe default is 64 MB.</li>
+        <li>Columnar files are written in big batches. They are bad for row-at-a-time appends and updates, and many tiny Parquet files bring back the small files problem (Lesson 7.5).</li>
+        <li>Table formats (Apache Iceberg, Delta Lake, Apache Hudi) keep Parquet or ORC files as the data and add a transaction log, schema evolution and file-level statistics on top.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “Why are columnar formats faster for analytics?”, give three reasons: <b>projection</b> (read only needed columns), <b>better compression</b> (same-type values together, dictionary and RLE encodings) and <b>predicate pushdown</b> (min/max statistics per row group or stripe). Name the structures: Parquet file → row groups → column chunks → pages + footer; ORC file → stripes (index, data, stripe footer) + file footer + postscript.</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Parquet and ORC compared</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Feature</th><th>Apache Parquet</th><th>Apache ORC</th></tr></thead>
+    <tbody>
+      <tr><td><b>Origin</b></td><td>Twitter and Cloudera, 2013 (based on Google's Dremel paper)</td><td>Hortonworks for Hive, 2013</td></tr>
+      <tr><td><b>Horizontal unit</b></td><td>Row group (writer default 128 MB) → column chunks → pages</td><td>Stripe (default 64 MB) with index, data and stripe footer</td></tr>
+      <tr><td><b>Statistics</b></td><td>Min/max/null count per column chunk and page; optional bloom filters</td><td>Min/max/sum at file, stripe and every 10,000 rows; optional bloom filters</td></tr>
+      <tr><td><b>Nested data</b></td><td>Repetition and definition levels (Dremel), very strong</td><td>Struct, list and map types</td></tr>
+      <tr><td><b>Our lab size</b></td><td>Snappy 4,438,970 · ZSTD 2,775,449 bytes</td><td>ZLIB 3,252,876 · ZSTD 2,909,570 bytes</td></tr>
+      <tr><td><b>Where it's the default</b></td><td>Spark, Impala, Trino/Presto, Iceberg, Delta, most cloud engines</td><td>Hive (required for Hive ACID tables), also read by Spark and Trino</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Choosing a layout for the job</h3>
+  <div class="cards">
+    <div class="card"><h4>Analytics tables</h4><p>Few columns read, many rows scanned, filters on dates or ids: Parquet or ORC, sorted or partitioned by the filter columns.</p><span class="tag">columnar</span></div>
+    <div class="card"><h4>Event streams and exchange</h4><p>Record-at-a-time writes, whole records read, schemas that change: Avro (Lesson 10.1), then compact to Parquet later.</p><span class="tag">row</span></div>
+    <div class="card"><h4>MapReduce intermediates</h4><p>Key-value data between chained jobs: SequenceFile with block compression (Lesson 10.1).</p><span class="tag">row</span></div>
+    <div class="card"><h4>Lakehouse tables</h4><p>Parquet (or ORC) files managed by Iceberg, Delta Lake or Hudi for transactions, time travel and updates.</p><span class="tag">columnar + log</span></div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>Pick the compression codec separately from the format. In our lab Parquet went from 7.4 MB (uncompressed) to 4.4 MB with Snappy and 2.8 MB with ZSTD. Snappy is the common default for speed; ZSTD is now popular for cold data because it is smaller at similar read speed. Lesson 10.3 compares codecs.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Writing, opening and reading columnar files</h2>
+  <p>On the Module 8 lab with the Module 9 dataset (<code>student_orders.csv</code>). Hadoop ships Avro but not Parquet or ORC, so <code>get_jars.sh</code> downloads them and <code>formats_env.sh</code> puts them on the classpath (see “Run it on your PC”).</p>
+  <ol class="stepper">
+    <li><h4>Write Parquet and ORC from a MapReduce job</h4>
+      <div class="code" data-lang="java" data-file="ToColumnar.java (core)"><pre><code>// Parquet: schema + ExampleOutputFormat + codec
+GroupWriteSupport.setSchema(schema, job.getConfiguration());
+job.setOutputFormatClass(ExampleOutputFormat.class);
+ParquetOutputFormat.setCompression(job, CompressionCodecName.SNAPPY);
+
+// ORC: schema string + OrcOutputFormat + codec
+OrcConf.MAPRED_OUTPUT_SCHEMA.setString(conf, "struct&lt;order_id:bigint,student:string,time:string,item:string,amount:int&gt;");
+OrcConf.COMPRESS.setString(conf, "ZLIB");
+job.setOutputFormatClass(OrcOutputFormat.class);</code></pre></div>
+      <span class="behind">A map-only job: each mapper turns CSV lines into a Parquet <code>Group</code> or an <code>OrcStruct</code>. The output format buffers rows in memory and writes a whole row group or stripe at a time, column by column.</span></li>
+    <li><h4>Compare the sizes</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>bash columnar_lab.sh      # writes 6 variants, then hdfs dfs -du -s each</code></pre><div class="output">text.csv            19418699
+avro_deflate         4793471
+parquet_none         7428043
+parquet_snappy       4438970
+parquet_zstd         2775449
+orc_none             9238947
+orc_zlib             3252876
+orc_zstd             2909570</div></div>
+      <span class="behind">Even without any codec, Parquet is 2.6× smaller than the CSV, only from encodings. With ZSTD it is 7× smaller, and smaller than row-oriented Avro with deflate.</span></li>
+    <li><h4>When the first try fails</h4>
+      <div class="code" data-lang="text" data-file="task log, parquet_zstd"><pre><code>Error: java.lang.ClassNotFoundException: com.github.luben.zstd.RecyclingBufferPool</code></pre></div>
+      <span class="behind">Our first Parquet ZSTD job failed in every map task. Parquet's ZSTD codec needs the <code>zstd-jni</code> jar, which Hadoop keeps in <code>share/hadoop/tools/lib</code>, not on the task classpath. Adding it to <code>-libjars</code> fixed it. ClassNotFoundException in a task almost always means a jar that the client had but the containers didn't.</span></li>
+    <li><h4>Open an ORC file</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>java -jar lib/orc-tools-1.9.5-uber.jar meta /tmp/orders.orc</code></pre><div class="output">Rows: 217602
+Compression: ZLIB
+Type: struct&lt;order_id:bigint,student:string,time:string,item:string,amount:int&gt;
+  Column 1: count: 217602 hasNull: false bytesOnDisk: 576 min: 1 max: 217602
+  Column 2: count: 217602 hasNull: false bytesOnDisk: 352126 min: S0001 max: S2000
+  Column 3: count: 217602 hasNull: false bytesOnDisk: 901599 min: 2026-09-01 08:00 max: 2026-09-30 20:59
+  Column 4: count: 217602 hasNull: false bytesOnDisk: 92796 min: chai max: vada pav
+  Column 5: count: 217602 hasNull: false bytesOnDisk: 105756 min: 15 max: 80
+    Encoding column 2: DICTIONARY_V2[2000]
+    Encoding column 4: DICTIONARY_V2[8]</div></div>
+      <span class="behind">The footer knows the schema, row count, and per-column statistics and sizes. 2 lakh sequential order ids took 576 bytes. The timestamp column, with almost every value different, is the biggest: columnar formats shine when values repeat.</span></li>
+    <li><h4>Read one column, then all of them</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr10.jar ItemCountAny -libjars $LIBJARS -D in.format=parquet -D proj=true  /out/f_parquet_snappy /out/r1
+hadoop jar mr10.jar ItemCountAny -libjars $LIBJARS -D in.format=parquet -D proj=false /out/f_parquet_snappy /out/r2</code></pre><div class="output">text_csv                26917 ms  HDFS bytes read   19427239  chai=149669
+parquet_all_columns     28564 ms  HDFS bytes read    4431110  chai=149669
+parquet_item_only       25180 ms  HDFS bytes read     192526  chai=149669
+orc_all_columns         26269 ms  HDFS bytes read    3297403  chai=149669
+orc_item_only           25064 ms  HDFS bytes read     263343  chai=149669</div></div>
+      <span class="behind">Projection is one line: <code>parquet.read.schema</code> with only the item field, or <code>orc.include.columns=3</code>. Bytes read fell 23× for Parquet. The run times hardly moved because on 19 MB the 25 s of job start-up dominates; at terabyte scale, bytes read is what decides the time.</span></li>
+    <li><h4>Skip row groups with statistics</h4>
+      <div class="code" data-lang="bash" data-file="your PC (pyarrow)"><pre><code>python parquet_inside.py</code></pre><div class="output">orders.parquet         student = 'S1413': must read 10 of 10 row groups [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  -> 184 rows
+orders_sorted.parquet  student = 'S1413': must read 1 of 10 row groups [7]  -> 184 rows</div></div>
+      <span class="behind">Every row group stores min and max per column. In the unsorted file each group spans S0001 to S2000, so the filter can't skip anything. Sorted by student, only row group 7 can contain S1413. Same answer, a tenth of the reading.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Projection and pushdown only work if the reader is told what you need. A job that reads every column and filters in the mapper gets the size benefit but none of the I/O savings. In Spark and Hive this happens automatically from <code>SELECT</code> and <code>WHERE</code>; in plain MapReduce you set the read schema or included columns yourself.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>How a Parquet reader answers “orders of S1413 per item”</h2>
+  <p>Six steps: footer, projection, statistics, skipping, decoding, the answer.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Projection and pushdown <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Query and reader output">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">query on orders_sorted.parquet</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">SELECT item, count(*)</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#7F8C86">WHERE student = 'S1413'</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#9FD3B8">reading footer …</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">columns needed: student, item</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#7F8C86">order_id, time, amount: not read</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">row groups: 10</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">checking min/max of student …</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#F5C77E">must read 1 of 10 row groups [7]</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#7F8C86">9 row groups skipped</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">decoding 2 column chunks</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">of row group 7 …</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">184 rows match</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#7F8C86">(the unsorted file: 10 of 10</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#7F8C86"> row groups, same 184 rows)</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The query needs two columns and has a filter on student.</li>
+          <li>Only the student and item columns will be read.</li>
+          <li>The reader looks at each row group's statistics.</li>
+          <li>Only one row group can contain S1413; nine are skipped.</li>
+          <li>Two column chunks of one row group are read and decoded.</li>
+          <li>184 orders found. The unsorted file needed all ten row groups for the same answer.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Parquet file with row groups and column chunks; most are skipped">
+          <g font-size="7.6" class="s-ink2">
+            <text x="62" y="18" text-anchor="middle">id</text><text x="110" y="18" text-anchor="middle">student</text><text x="158" y="18" text-anchor="middle">time</text><text x="206" y="18" text-anchor="middle">item</text><text x="254" y="18" text-anchor="middle">amount</text>
+            <text x="16" y="36">RG 0</text><text x="16" y="60">RG 1</text><text x="16" y="84">…</text><text x="16" y="108">RG 7</text><text x="16" y="132">RG 8</text><text x="16" y="156">RG 9</text>
+          </g>
+          <g class="s-card2">
+            <rect x="40" y="26" width="44" height="16" rx="2"/><rect x="88" y="26" width="44" height="16" rx="2"/><rect x="136" y="26" width="44" height="16" rx="2"/><rect x="184" y="26" width="44" height="16" rx="2"/><rect x="232" y="26" width="44" height="16" rx="2"/>
+            <rect x="40" y="50" width="44" height="16" rx="2"/><rect x="88" y="50" width="44" height="16" rx="2"/><rect x="136" y="50" width="44" height="16" rx="2"/><rect x="184" y="50" width="44" height="16" rx="2"/><rect x="232" y="50" width="44" height="16" rx="2"/>
+            <rect x="40" y="98" width="44" height="16" rx="2"/><rect x="88" y="98" width="44" height="16" rx="2"/><rect x="136" y="98" width="44" height="16" rx="2"/><rect x="184" y="98" width="44" height="16" rx="2"/><rect x="232" y="98" width="44" height="16" rx="2"/>
+            <rect x="40" y="122" width="44" height="16" rx="2"/><rect x="88" y="122" width="44" height="16" rx="2"/><rect x="136" y="122" width="44" height="16" rx="2"/><rect x="184" y="122" width="44" height="16" rx="2"/><rect x="232" y="122" width="44" height="16" rx="2"/>
+            <rect x="40" y="146" width="44" height="16" rx="2"/><rect x="88" y="146" width="44" height="16" rx="2"/><rect x="136" y="146" width="44" height="16" rx="2"/><rect x="184" y="146" width="44" height="16" rx="2"/><rect x="232" y="146" width="44" height="16" rx="2"/>
+          </g>
+          <rect x="40" y="172" width="236" height="18" rx="3" class="s-board"/><text x="158" y="184" text-anchor="middle" font-size="7.8" class="s-chalk">footer: schema + min/max per chunk · PAR1</text>
+          <g data-on="1"><rect x="40" y="172" width="236" height="18" rx="3" style="fill:none;stroke:var(--track);stroke-width:2.4"/><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">1. read the footer at the end of the file first</text></g>
+          <g data-on="2"><g style="fill:var(--ink);opacity:.18"><rect x="40" y="26" width="44" height="136"/><rect x="136" y="26" width="44" height="136"/><rect x="232" y="26" width="44" height="136"/></g><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">2. projection: 3 of 5 columns are never touched</text></g>
+          <g data-on="3"><g style="fill:var(--ink);opacity:.18"><rect x="40" y="26" width="44" height="136"/><rect x="136" y="26" width="44" height="136"/><rect x="232" y="26" width="44" height="136"/></g><g font-size="6.6" class="s-blue"><text x="292" y="38">S0001–S0013</text><text x="292" y="62">S0013–S0118</text><text x="292" y="110">S1295–S1530</text><text x="292" y="134">S1530–S1766</text><text x="292" y="158">S1766–S2000</text></g><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">3. min–max of student per row group (sorted file)</text><text x="180" y="230" text-anchor="middle" font-size="7.4" class="s-ink2">(real ranges; RG 0 is narrow: the 20 heavy users)</text></g>
+          <g data-on="4"><g style="fill:var(--ink);opacity:.18"><rect x="40" y="26" width="44" height="136"/><rect x="136" y="26" width="44" height="136"/><rect x="232" y="26" width="44" height="136"/><rect x="88" y="26" width="44" height="40"/><rect x="184" y="26" width="44" height="40"/><rect x="88" y="122" width="44" height="40"/><rect x="184" y="122" width="44" height="40"/></g><rect x="86" y="96" width="144" height="20" rx="3" style="fill:none;stroke:var(--track);stroke-width:2.4"/><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">4. pushdown: only row group 7 can hold S1413</text></g>
+          <g data-on="5"><rect x="88" y="98" width="44" height="16" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><rect x="184" y="98" width="44" height="16" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">5. read 2 column chunks: dictionary + RLE decode</text></g>
+          <g data-on="6"><rect x="88" y="98" width="44" height="16" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="184" y="98" width="44" height="16" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">6. 2 chunks of 50 read instead of the whole file</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A Parquet reader starts at the end: the footer holds the schema and where every column chunk is.</li>
+          <li>Projection: the order_id, time and amount chunks are never read.</li>
+          <li>Each row group's footer entry has the min and max student it contains.</li>
+          <li>Pushdown: only one row group's range includes S1413; the other nine are skipped.</li>
+          <li>The student and item chunks of that row group are read and decoded.</li>
+          <li>Two column chunks out of fifty: that is how columnar files save I/O.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Columnar files at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="18" height="46" rx="3" class="s-card2"/><rect x="38" y="22" width="18" height="46" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><rect x="60" y="22" width="18" height="46" rx="3" class="s-card2"/><rect x="82" y="22" width="18" height="46" rx="3" class="s-card2"/></svg></div>
+    <div><h4>1. The data lake's default</h4>
+      <p>Raw events land as JSON or Avro; nightly jobs rewrite them into Parquet tables partitioned by date, which analysts query with Spark, Trino, Hive or a cloud engine.</p>
+      <div class="uc-flow"><span>Raw JSON/Avro</span><i>→</i><span class="java">Spark job</span><i>→</i><span>Parquet, by date</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="22" y="24" width="76" height="42" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="44" text-anchor="middle" font-size="8.6" class="s-blue">Hive ACID</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">ORC only</text></svg></div>
+    <div><h4>2. Hive warehouses on ORC</h4>
+      <p>Hive's transactional (ACID) tables, with INSERT, UPDATE and DELETE, must be stored as ORC. Many older Hadoop warehouses keep their big fact tables in ORC with ZLIB or ZSTD.</p>
+      <div class="uc-flow"><span>Hive table</span><i>→</i><span class="java">ORC stripes + delta files</span><i>→</i><span>Compaction</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><path d="M20 66h80M20 66V24" style="fill:none;stroke:var(--ink2);stroke-width:1.5"/><rect x="30" y="30" width="14" height="36" class="s-soft-acc"/><rect x="54" y="54" width="14" height="12" class="s-soft-green"/><text x="84" y="44" font-size="8" class="s-ink">₹ ↓</text></svg></div>
+    <div><h4>3. Pay-per-byte query engines</h4>
+      <p>Cloud engines such as Amazon Athena and Google BigQuery on external tables bill by bytes scanned. Moving a table from CSV to compressed Parquet commonly cuts both the bill and the time by an order of magnitude, as our 19.4 MB → 192 KB read shows.</p>
+      <div class="uc-flow"><span>CSV table</span><i>→</i><span class="java">Parquet + ZSTD</span><i>→</i><span>Fewer bytes scanned</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="24" y="20" width="72" height="50" rx="6" class="s-card2"/><text x="60" y="40" text-anchor="middle" font-size="8.6" class="s-ink">Iceberg / Delta</text><text x="60" y="56" text-anchor="middle" font-size="8" class="s-acc">over Parquet</text></svg></div>
+    <div><h4>4. Lakehouse tables</h4>
+      <p>Apache Iceberg, Delta Lake and Apache Hudi store data as Parquet files and add a metadata layer with per-file statistics, so engines skip whole files before opening any footer.</p>
+      <div class="uc-flow"><span>Parquet files</span><i>→</i><span class="java">Table metadata + stats</span><i>→</i><span>File and row-group skipping</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Store the same rows by row and by column</h2>
+  <p>This model stores a few orders row by row (like CSV) and column by column with the two tricks columnar formats use: a <b>dictionary</b> for repeated strings and <b>run-length encoding</b> for repeats in a row. It counts bytes so you can compare.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>rows = [(1, &quot;S0001&quot;, &quot;chai&quot;, 15), (2, &quot;S0001&quot;, &quot;chai&quot;, 15), (3, &quot;S0002&quot;, &quot;chai&quot;, 15),
+        (4, &quot;S0002&quot;, &quot;dosa&quot;, 45), (5, &quot;S0003&quot;, &quot;chai&quot;, 15), (6, &quot;S0003&quot;, &quot;chai&quot;, 15),
+        (7, &quot;S0003&quot;, &quot;poha&quot;, 25), (8, &quot;S0004&quot;, &quot;chai&quot;, 15)]
+
+row_bytes = sum(len(&quot;,&quot;.join(map(str, r))) + 1 for r in rows)          # CSV-style
+
+def dictionary(col):                       # each distinct value once + a small code per row
+    d = {v: i for i, v in enumerate(dict.fromkeys(col))}
+    return sum(len(str(v)) for v in d) + len(col), [d[v] for v in col]   # 1 byte per code
+
+def rle(codes):                            # (value, run length) pairs
+    runs = []
+    for c in codes:
+        if runs and runs[-1][0] == c: runs[-1][1] += 1
+        else: runs.append([c, 1])
+    return runs
+
+col_bytes = 0
+for name, i in [(&quot;order_id&quot;, 0), (&quot;student&quot;, 1), (&quot;item&quot;, 2), (&quot;amount&quot;, 3)]:
+    col = [r[i] for r in rows]
+    if name == &quot;order_id&quot;:                  # delta: start + step, like ORC&#x27;s RLE v2
+        size = 2
+    else:
+        dict_size, codes = dictionary(col)
+        size = dict_size - len(col) + 2 * len(rle(codes))
+    col_bytes += size
+    print(f&quot;{name:9} {size:3} bytes&quot;)
+print(f&quot;row layout {row_bytes} bytes, column layout {col_bytes} bytes&quot;)</code></pre><div class="output">order_id    2 bytes
+student    28 bytes
+item       22 bytes
+amount     16 bytes
+row layout 128 bytes, column layout 68 bytes</div></div>
+  <ul class="anno"><li><code>def dictionary(col):                       # each distinct value once + a small code per row</code><span>Our real item column has only 8 distinct values: ORC wrote DICTIONARY_V2[8] and stored 2 lakh items in 92,796 bytes.</span></li><li><code>        size = 2</code><span>Sequential ids are “start at 1, add 1”: ORC stored 217,602 order ids in 576 bytes.</span></li><li><code>        size = dict_size - len(col) + 2 * len(rle(codes))</code><span>Runs of the same code collapse into one (value, count) pair.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Row vs column",
+   "hint": "Press <b>Run<\/b>. Which column shrinks the most, and why?",
+   "code": "rows = [(1, \"S0001\", \"chai\", 15), (2, \"S0001\", \"chai\", 15), (3, \"S0002\", \"chai\", 15),\n        (4, \"S0002\", \"dosa\", 45), (5, \"S0003\", \"chai\", 15), (6, \"S0003\", \"chai\", 15),\n        (7, \"S0003\", \"poha\", 25), (8, \"S0004\", \"chai\", 15)]\n\nrow_bytes = sum(len(\",\".join(map(str, r))) + 1 for r in rows)          # CSV-style\n\ndef dictionary(col):                       # each distinct value once + a small code per row\n    d = {v: i for i, v in enumerate(dict.fromkeys(col))}\n    return sum(len(str(v)) for v in d) + len(col), [d[v] for v in col]   # 1 byte per code\n\ndef rle(codes):                            # (value, run length) pairs\n    runs = []\n    for c in codes:\n        if runs and runs[-1][0] == c: runs[-1][1] += 1\n        else: runs.append([c, 1])\n    return runs\n\ncol_bytes = 0\nfor name, i in [(\"order_id\", 0), (\"student\", 1), (\"item\", 2), (\"amount\", 3)]:\n    col = [r[i] for r in rows]\n    if name == \"order_id\":                  # delta: start + step, like ORC's RLE v2\n        size = 2\n    else:\n        dict_size, codes = dictionary(col)\n        size = dict_size - len(col) + 2 * len(rle(codes))\n    col_bytes += size\n    print(f\"{name:9} {size:3} bytes\")\nprint(f\"row layout {row_bytes} bytes, column layout {col_bytes} bytes\")\n"
+  },
+  {
+   "label": "2 · Projection",
+   "hint": "<b>Predict first:<\/b> a query needs only the item column. What fraction of a CSV line does it actually use?",
+   "code": "line = \"1,S1413,2026-09-14 15:30,dosa,45\\n\"\nitem = line.split(\",\")[3]\nprint(f\"line {len(line)} bytes, item {len(item)} bytes: {len(item) / len(line):.0%} of what a row reader reads\")\nprint(\"lab: Parquet item only read\", 192526, \"of\", 19427239, f\"CSV bytes = {192526 / 19427239:.1%}\")\n"
+  },
+  {
+   "label": "3 · Skip row groups",
+   "hint": "Each row group has a min and max student. Which ones must be read for S1413? Try the unsorted ranges too.",
+   "code": "sorted_groups = [(\"S0001\", \"S0013\"), (\"S0013\", \"S0118\"), (\"S0118\", \"S0354\"), (\"S0354\", \"S0589\"), (\"S0589\", \"S0823\"),\n                 (\"S0823\", \"S1058\"), (\"S1058\", \"S1295\"), (\"S1295\", \"S1530\"), (\"S1530\", \"S1766\"), (\"S1766\", \"S2000\")]\nunsorted_groups = [(\"S0001\", \"S2000\")] * 10\nfor name, groups in [(\"sorted\", sorted_groups), (\"unsorted\", unsorted_groups)]:\n    need = [i for i, (lo, hi) in enumerate(groups) if lo <= \"S1413\" <= hi]\n    print(f\"{name:8}: read {len(need)} of {len(groups)} row groups {need}\")\n"
+  },
+  {
+   "label": "4 · Compression ratios",
+   "hint": "Compute each file's size as a percentage of the CSV, using the real lab sizes.",
+   "code": "csv = 19418699\nsizes = {\"avro_deflate\": 4793471, \"parquet_none\": 7428043, \"parquet_snappy\": 4438970, \"parquet_zstd\": 2775449,\n         \"orc_none\": 9238947, \"orc_zlib\": 3252876, \"orc_zstd\": 2909570}\nfor name, b in sorted(sizes.items(), key=lambda x: x[1]):\n    print(f\"{name:15} {b:>10,}  {b / csv:6.1%}\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This reader asks for a column that is not in the schema. Fix the column name.",
+   "code": "schema = [\"order_id\", \"student\", \"time\", \"item\", \"amount\"]\nwanted = [\"items\"]\nprint([schema.index(c) for c in wanted])\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: write, inspect and read Parquet and ORC</h3>
+  <p>Use the Module 8 lab and the Module 9 dataset (<code>student_orders.csv</code> in HDFS). Hadoop ships Avro but not Parquet or ORC, so first run <code>get_jars.sh</code> inside the namenode container (in <code>/tmp/mr10</code>), then <code>source formats_env.sh</code> before every job: it puts the jars on your client classpath and ships them to the tasks with <code>-libjars</code>. Compile with <code>javac -cp $(hadoop classpath):$HADOOP_CLASSPATH -d classes *.java && jar cf mr10.jar -C classes .</code></p>
+  <div class="pcrun"><h4>Classpath for the format jars</h4>
+  <div class="code" data-lang="bash" data-file="formats_env.sh"><pre><code># formats_env.sh: put the Avro-MapReduce, Parquet and ORC jars on the client and task classpaths
+L=/tmp/mr10/lib
+export LIBJARS=$(ls $L/*.jar | grep -vE &quot;tools|cli&quot; | paste -sd,)
+export HADOOP_CLASSPATH=$(echo $LIBJARS | tr , :)
+export LIBJARS=$LIBJARS,$(ls /opt/hadoop/share/hadoop/tools/lib/zstd-jni-*.jar)   # Parquet ZSTD needs zstd-jni (in tools/lib, not on the task classpath)
+export HADOOP_CLASSPATH=$(echo $LIBJARS | tr , :)
+
+# In /tmp/mr10 inside the namenode container:
+#   bash get_jars.sh
+#   source formats_env.sh</code></pre><div class="output">(no output: it only sets LIBJARS and HADOOP_CLASSPATH)
+
+Without the zstd-jni line, our first Parquet ZSTD job failed in every map task:
+Error: java.lang.ClassNotFoundException: com.github.luben.zstd.RecyclingBufferPool</div></div>
+  <p class="muted">Real error from our first run. zstd-jni ships in share/hadoop/tools/lib, which is not on the task classpath by default.</p></div>
+  <div class="pcrun"><h4>Write Parquet and ORC from MapReduce</h4>
+  <div class="code" data-lang="bash" data-file="ToColumnar.java"><pre><code>// ToColumnar.java: map-only job. CSV orders -&gt; Parquet (-D col.format=parquet) or ORC (-D col.format=orc).
+//   -D col.codec=UNCOMPRESSED|SNAPPY|ZSTD|GZIP (Parquet)   NONE|SNAPPY|ZSTD|ZLIB (ORC)
+import java.io.IOException;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+import org.apache.orc.OrcConf;
+import org.apache.orc.TypeDescription;
+import org.apache.orc.mapred.OrcStruct;
+import org.apache.orc.mapreduce.OrcOutputFormat;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.example.data.simple.SimpleGroupFactory;
+import org.apache.parquet.hadoop.ParquetOutputFormat;
+import org.apache.parquet.hadoop.example.ExampleOutputFormat;
+import org.apache.parquet.hadoop.example.GroupWriteSupport;
+import org.apache.parquet.hadoop.metadata.CompressionCodecName;
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.MessageTypeParser;
+
+public class ToColumnar {
+  static final String PARQUET_SCHEMA = &quot;message order { required int64 order_id; required binary student (UTF8); &quot;
+      + &quot;required binary time (UTF8); required binary item (UTF8); required int32 amount; }&quot;;
+  static final String ORC_SCHEMA = &quot;struct&lt;order_id:bigint,student:string,time:string,item:string,amount:int&gt;&quot;;
+
+  public static class ParquetMapper extends Mapper&lt;LongWritable, Text, Void, Group&gt; {
+    private SimpleGroupFactory factory;
+    @Override
+    protected void setup(Context ctx) { factory = new SimpleGroupFactory(GroupWriteSupport.getSchema(ctx.getConfiguration())); }
+    @Override
+    protected void map(LongWritable k, Text line, Context ctx) throws IOException, InterruptedException {
+      String[] f = line.toString().split(&quot;,&quot;);
+      Group g = factory.newGroup().append(&quot;order_id&quot;, Long.parseLong(f[0])).append(&quot;student&quot;, f[1])
+          .append(&quot;time&quot;, f[2]).append(&quot;item&quot;, f[3]).append(&quot;amount&quot;, Integer.parseInt(f[4]));
+      ctx.write(null, g);
+    }
+  }
+
+  public static class OrcMapper extends Mapper&lt;LongWritable, Text, NullWritable, OrcStruct&gt; {
+    private final OrcStruct row = (OrcStruct) OrcStruct.createValue(TypeDescription.fromString(ORC_SCHEMA));
+    @Override
+    protected void map(LongWritable k, Text line, Context ctx) throws IOException, InterruptedException {
+      String[] f = line.toString().split(&quot;,&quot;);
+      row.setFieldValue(0, new LongWritable(Long.parseLong(f[0])));
+      row.setFieldValue(1, new Text(f[1]));
+      row.setFieldValue(2, new Text(f[2]));
+      row.setFieldValue(3, new Text(f[3]));
+      row.setFieldValue(4, new IntWritable(Integer.parseInt(f[4])));
+      ctx.write(NullWritable.get(), row);
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] rest = new GenericOptionsParser(conf, args).getRemainingArgs();
+    String fmt = conf.get(&quot;col.format&quot;, &quot;parquet&quot;);
+    Job job = Job.getInstance(conf, &quot;to &quot; + fmt);
+    job.setJarByClass(ToColumnar.class);
+    job.setNumReduceTasks(0);
+    if (fmt.equals(&quot;parquet&quot;)) {
+      MessageType schema = MessageTypeParser.parseMessageType(PARQUET_SCHEMA);
+      GroupWriteSupport.setSchema(schema, job.getConfiguration());
+      job.setMapperClass(ParquetMapper.class);
+      job.setOutputKeyClass(Void.class);
+      job.setOutputValueClass(Group.class);
+      job.setOutputFormatClass(ExampleOutputFormat.class);
+      ParquetOutputFormat.setCompression(job, CompressionCodecName.valueOf(conf.get(&quot;col.codec&quot;, &quot;SNAPPY&quot;)));
+    } else {
+      OrcConf.MAPRED_OUTPUT_SCHEMA.setString(job.getConfiguration(), ORC_SCHEMA);
+      OrcConf.COMPRESS.setString(job.getConfiguration(), conf.get(&quot;col.codec&quot;, &quot;ZLIB&quot;));
+      job.setMapperClass(OrcMapper.class);
+      job.setOutputKeyClass(NullWritable.class);
+      job.setOutputValueClass(OrcStruct.class);
+      job.setOutputFormatClass(OrcOutputFormat.class);
+    }
+    FileInputFormat.addInputPath(job, new Path(rest[0]));
+    FileOutputFormat.setOutputPath(job, new Path(rest[1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+
+// Inside the container, after source formats_env.sh:
+//   hadoop jar mr10.jar ToColumnar -libjars $LIBJARS -D col.format=parquet -D col.codec=SNAPPY \
+//       /user/hadoop/data/student_orders.csv /out/f_parquet_snappy
+//   hadoop jar mr10.jar ToColumnar -libjars $LIBJARS -D col.format=orc -D col.codec=ZLIB \
+//       /user/hadoop/data/student_orders.csv /out/f_orc_zlib</code></pre><div class="output">== size on HDFS (one replica)
+text.csv            19418699
+avro_deflate         4793471
+parquet_none         7428043
+parquet_snappy       4438970
+parquet_zstd         2775449
+orc_none             9238947
+orc_zlib             3252876
+orc_zstd             2909570
+== inside one ORC file (orc-tools meta)
+Rows: 217602
+Compression: ZLIB
+Type: struct&lt;order_id:bigint,student:string,time:string,item:string,amount:int&gt;
+File Statistics:
+  Column 0: count: 217602 hasNull: false
+  Column 1: count: 217602 hasNull: false bytesOnDisk: 576 min: 1 max: 217602 sum: 23675424003
+  Column 2: count: 217602 hasNull: false bytesOnDisk: 352126 min: S0001 max: S2000 sum: 1088010
+  Column 3: count: 217602 hasNull: false bytesOnDisk: 901599 min: 2026-09-01 08:00 max: 2026-09-30 20:59 sum: 3481632
+  Column 4: count: 217602 hasNull: false bytesOnDisk: 92796 min: chai max: vada pav sum: 1101261
+  Column 5: count: 217602 hasNull: false bytesOnDisk: 105756 min: 15 max: 80 sum: 5598914
+
+  Stripe: offset: 3 data: 1452853 rows: 217602 tail: 124 index: 1637
+    Encoding column 0: DIRECT
+    Encoding column 1: DIRECT_V2
+    Encoding column 2: DICTIONARY_V2[2000]
+    Encoding column 3: DIRECT_V2
+    Encoding column 4: DICTIONARY_V2[8]
+    Encoding column 5: DIRECT_V2</div></div>
+  <p class="muted">Real output of columnar_lab.sh: the sizes of all six variants (plus the CSV and Avro from Lesson 10.1), then orc-tools meta on one ORC part file.</p></div>
+  <div class="pcrun"><h4>Count items from any format, with projection</h4>
+  <div class="code" data-lang="bash" data-file="ItemCountAny.java"><pre><code>// ItemCountAny.java: orders per item, reading any of our formats.  -D in.format=text|seq|avro|parquet|orc
+// For parquet and orc only the &quot;item&quot; column is requested (column projection); -D proj=false reads all columns.
+import java.io.IOException;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.mapred.AvroKey;
+import org.apache.avro.mapreduce.AvroJob;
+import org.apache.avro.mapreduce.AvroKeyInputFormat;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.SequenceFileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.mapreduce.lib.reduce.LongSumReducer;
+import org.apache.hadoop.util.GenericOptionsParser;
+import org.apache.orc.OrcConf;
+import org.apache.orc.mapred.OrcStruct;
+import org.apache.orc.mapreduce.OrcInputFormat;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.hadoop.example.ExampleInputFormat;
+
+public class ItemCountAny {
+  static final LongWritable ONE = new LongWritable(1);
+
+  public static class TextM extends Mapper&lt;LongWritable, Text, Text, LongWritable&gt; {
+    private final Text item = new Text();
+    @Override protected void map(LongWritable k, Text v, Context c) throws IOException, InterruptedException {
+      item.set(v.toString().split(&quot;,&quot;)[3]); c.write(item, ONE);
+    }
+  }
+  public static class SeqM extends Mapper&lt;LongWritable, Text, Text, LongWritable&gt; {   // value = student,time,item,amount
+    private final Text item = new Text();
+    @Override protected void map(LongWritable k, Text v, Context c) throws IOException, InterruptedException {
+      item.set(v.toString().split(&quot;,&quot;)[2]); c.write(item, ONE);
+    }
+  }
+  public static class AvroM extends Mapper&lt;AvroKey&lt;GenericRecord&gt;, NullWritable, Text, LongWritable&gt; {
+    private final Text item = new Text();
+    @Override protected void map(AvroKey&lt;GenericRecord&gt; k, NullWritable v, Context c) throws IOException, InterruptedException {
+      item.set(k.datum().get(&quot;item&quot;).toString()); c.write(item, ONE);
+    }
+  }
+  public static class ParquetM extends Mapper&lt;Void, Group, Text, LongWritable&gt; {
+    private final Text item = new Text();
+    @Override protected void map(Void k, Group g, Context c) throws IOException, InterruptedException {
+      item.set(g.getString(&quot;item&quot;, 0)); c.write(item, ONE);
+    }
+  }
+  public static class OrcM extends Mapper&lt;NullWritable, OrcStruct, Text, LongWritable&gt; {
+    @Override protected void map(NullWritable k, OrcStruct row, Context c) throws IOException, InterruptedException {
+      c.write((Text) row.getFieldValue(&quot;item&quot;), ONE);
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] rest = new GenericOptionsParser(conf, args).getRemainingArgs();
+    String fmt = conf.get(&quot;in.format&quot;, &quot;text&quot;);
+    Job job = Job.getInstance(conf, &quot;item count from &quot; + fmt);
+    job.setJarByClass(ItemCountAny.class);
+    switch (fmt) {
+      case &quot;seq&quot;: job.setInputFormatClass(SequenceFileInputFormat.class); job.setMapperClass(SeqM.class); break;
+      case &quot;avro&quot;:
+        job.setInputFormatClass(AvroKeyInputFormat.class);
+        AvroJob.setInputKeySchema(job, new Schema.Parser().parse(ToAvro.SCHEMA));
+        job.setMapperClass(AvroM.class); break;
+      case &quot;parquet&quot;:
+        job.setInputFormatClass(ExampleInputFormat.class);
+        if (conf.getBoolean(&quot;proj&quot;, true))
+          job.getConfiguration().set(&quot;parquet.read.schema&quot;, &quot;message order { required binary item (UTF8); }&quot;);   // projection
+        job.setMapperClass(ParquetM.class); break;
+      case &quot;orc&quot;:
+        job.setInputFormatClass(OrcInputFormat.class);
+        if (conf.getBoolean(&quot;proj&quot;, true))
+          OrcConf.INCLUDE_COLUMNS.setString(job.getConfiguration(), &quot;3&quot;);                                       // only column 3: item
+        job.setMapperClass(OrcM.class); break;
+      default: job.setMapperClass(TextM.class);
+    }
+    job.setCombinerClass(LongSumReducer.class);
+    job.setReducerClass(LongSumReducer.class);
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(LongWritable.class);
+    FileInputFormat.addInputPath(job, new Path(rest[0]));
+    FileOutputFormat.setOutputPath(job, new Path(rest[1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+
+// -D in.format=parquet|orc and -D proj=true|false, e.g.:
+//   hadoop jar mr10.jar ItemCountAny -libjars $LIBJARS -D in.format=parquet -D proj=true /out/f_parquet_snappy /out/r_p1</code></pre><div class="output">== read: all columns vs only the item column
+text_csv                26917 ms  HDFS bytes read   19427239  chai=149669
+parquet_all_columns     28564 ms  HDFS bytes read    4431110  chai=149669
+parquet_item_only       25180 ms  HDFS bytes read     192526  chai=149669
+orc_all_columns         26269 ms  HDFS bytes read    3297403  chai=149669
+orc_item_only           25064 ms  HDFS bytes read     263343  chai=149669</div></div>
+  <p class="muted">Real output. Compare “HDFS bytes read”: projection cut Parquet from 4,431,110 to 192,526 bytes. Times barely differ because 19 MB is tiny next to the ~25 s of job start-up.</p></div>
+  <div class="pcrun"><h4>The whole lab</h4>
+  <div class="code" data-lang="bash" data-file="columnar_lab.sh"><pre><code># columnar_lab.sh: the same orders as Parquet and ORC: size, what&#x27;s inside, and reading only one column
+cd /tmp/mr10; source formats_env.sh
+D=/user/hadoop/data/student_orders.csv
+conv() { name=$1; shift
+  hdfs dfs -rm -r -f -skipTrash /out/f_$name &gt; /dev/null 2&gt;&amp;1
+  hadoop jar mr10.jar ToColumnar -libjars $LIBJARS &quot;$@&quot; $D /out/f_$name &gt; /tmp/conv_$name.log 2&gt;&amp;1 || echo &quot;$name FAILED&quot;; }
+conv parquet_none   -D col.format=parquet -D col.codec=UNCOMPRESSED
+conv parquet_snappy -D col.format=parquet -D col.codec=SNAPPY
+conv parquet_zstd   -D col.format=parquet -D col.codec=ZSTD
+conv orc_none   -D col.format=orc -D col.codec=NONE
+conv orc_zlib   -D col.format=orc -D col.codec=ZLIB
+conv orc_zstd   -D col.format=orc -D col.codec=ZSTD
+echo &quot;== size on HDFS (one replica)&quot;
+printf &quot;%-15s %12s\n&quot; text.csv $(hdfs dfs -du -s $D | awk &#x27;{print $1}&#x27;)
+printf &quot;%-15s %12s\n&quot; avro_deflate $(hdfs dfs -du -s /out/f_avro_deflate | awk &#x27;{print $1}&#x27;)
+for n in parquet_none parquet_snappy parquet_zstd orc_none orc_zlib orc_zstd; do
+  printf &quot;%-15s %12s\n&quot; $n $(hdfs dfs -du -s /out/f_$n | awk &#x27;{print $1}&#x27;)
+done
+echo &quot;== inside one ORC file (orc-tools meta)&quot;
+f=$(hdfs dfs -ls /out/f_orc_zlib | grep part | head -1 | awk &#x27;{print $8}&#x27;)
+hdfs dfs -get -f $f /tmp/orders.orc 2&gt;/dev/null
+java -jar lib/orc-tools-1.9.5-uber.jar meta /tmp/orders.orc 2&gt;/dev/null &gt; /tmp/orc_meta.txt
+grep -E &quot;^Rows:|^Compression:|^Type:&quot; /tmp/orc_meta.txt
+sed -n &#x27;/^File Statistics:/,/^$/p&#x27; /tmp/orc_meta.txt | cut -c1-150
+grep -m1 &quot;Stripe: offset&quot; /tmp/orc_meta.txt; grep -m6 &quot;Encoding column&quot; /tmp/orc_meta.txt
+echo &quot;== read: all columns vs only the item column&quot;
+read_job() {  # name, input, format, projection
+  hdfs dfs -rm -r -f -skipTrash /out/r_$1 &gt; /dev/null 2&gt;&amp;1
+  start=$(date +%s%N)
+  hadoop jar mr10.jar ItemCountAny -libjars $LIBJARS -D in.format=$3 -D proj=$4 $2 /out/r_$1 &gt; /tmp/read_$1.log 2&gt;&amp;1
+  printf &quot;%-22s %6d ms  HDFS bytes read %10s  chai=%s\n&quot; $1 $(( ($(date +%s%N) - start) / 1000000 )) \
+    $(grep &quot;HDFS: Number of bytes read=&quot; /tmp/read_$1.log | head -1 | cut -d= -f2) $(hdfs dfs -cat /out/r_$1/part-r-00000 | grep chai | cut -f2)
+}
+read_job text_csv $D text true
+read_job parquet_all_columns /out/f_parquet_snappy parquet false
+read_job parquet_item_only /out/f_parquet_snappy parquet true
+read_job orc_all_columns /out/f_orc_zlib orc false
+read_job orc_item_only /out/f_orc_zlib orc true
+
+# Run inside the namenode container, in /tmp/mr10:  bash columnar_lab.sh</code></pre><div class="output">== size on HDFS (one replica)
+text.csv            19418699
+avro_deflate         4793471
+parquet_none         7428043
+parquet_snappy       4438970
+parquet_zstd         2775449
+orc_none             9238947
+orc_zlib             3252876
+orc_zstd             2909570
+== inside one ORC file (orc-tools meta)
+Rows: 217602
+Compression: ZLIB
+Type: struct&lt;order_id:bigint,student:string,time:string,item:string,amount:int&gt;
+File Statistics:
+  Column 0: count: 217602 hasNull: false
+  Column 1: count: 217602 hasNull: false bytesOnDisk: 576 min: 1 max: 217602 sum: 23675424003
+  Column 2: count: 217602 hasNull: false bytesOnDisk: 352126 min: S0001 max: S2000 sum: 1088010
+  Column 3: count: 217602 hasNull: false bytesOnDisk: 901599 min: 2026-09-01 08:00 max: 2026-09-30 20:59 sum: 3481632
+  Column 4: count: 217602 hasNull: false bytesOnDisk: 92796 min: chai max: vada pav sum: 1101261
+  Column 5: count: 217602 hasNull: false bytesOnDisk: 105756 min: 15 max: 80 sum: 5598914
+
+  Stripe: offset: 3 data: 1452853 rows: 217602 tail: 124 index: 1637
+    Encoding column 0: DIRECT
+    Encoding column 1: DIRECT_V2
+    Encoding column 2: DICTIONARY_V2[2000]
+    Encoding column 3: DIRECT_V2
+    Encoding column 4: DICTIONARY_V2[8]
+    Encoding column 5: DIRECT_V2
+== read: all columns vs only the item column
+text_csv                26917 ms  HDFS bytes read   19427239  chai=149669
+parquet_all_columns     28564 ms  HDFS bytes read    4431110  chai=149669
+parquet_item_only       25180 ms  HDFS bytes read     192526  chai=149669
+orc_all_columns         26269 ms  HDFS bytes read    3297403  chai=149669
+orc_item_only           25064 ms  HDFS bytes read     263343  chai=149669</div></div>
+  <p class="muted">Real output, about 5 minutes. Run Lesson 10.1's rowformats_lab.sh first if you want the Avro size line filled in.</p></div>
+  <div class="pcrun"><h4>Inside a Parquet file, and row-group skipping</h4>
+  <div class="code" data-lang="bash" data-file="parquet_inside.py"><pre><code># parquet_inside.py: look inside a Parquet file and see row-group skipping (predicate pushdown).
+# Needs: pip install pyarrow.  Run next to student_orders.csv (from Module 9&#x27;s make_student_orders.py).
+import pyarrow as pa, pyarrow.csv as csv, pyarrow.parquet as pq, pyarrow.compute as pc
+
+names = [&quot;order_id&quot;, &quot;student&quot;, &quot;time&quot;, &quot;item&quot;, &quot;amount&quot;]
+t = csv.read_csv(&quot;student_orders.csv&quot;, read_options=csv.ReadOptions(column_names=names))
+pq.write_table(t, &quot;orders.parquet&quot;, row_group_size=50_000, compression=&quot;snappy&quot;)
+pq.write_table(t.sort_by(&quot;student&quot;), &quot;orders_sorted.parquet&quot;, row_group_size=50_000, compression=&quot;snappy&quot;)
+
+md = pq.ParquetFile(&quot;orders.parquet&quot;).metadata
+print(f&quot;rows {md.num_rows:,}  row groups {md.num_row_groups}  created by: {md.created_by}&quot;)
+rg = md.row_group(0)
+print(&quot;row group 0, per column chunk:&quot;)
+for i in range(rg.num_columns):
+    c = rg.column(i)
+    print(f&quot;  {c.path_in_schema:9} {c.compression:7} {c.total_compressed_size:&gt;8,} bytes  &quot;
+          f&quot;encodings {&#x27;,&#x27;.join(e for e in c.encodings)}  min={c.statistics.min} max={c.statistics.max}&quot;)
+
+def groups_to_read(path, student):
+    f = pq.ParquetFile(path)
+    hits = []
+    for i in range(f.metadata.num_row_groups):
+        s = f.metadata.row_group(i).column(1).statistics          # column 1 = student
+        if s.min &lt;= student &lt;= s.max:                              # the footer says it MIGHT be here
+            hits.append(i)
+    return hits, f.metadata.num_row_groups
+
+for path in [&quot;orders.parquet&quot;, &quot;orders_sorted.parquet&quot;]:
+    hits, total = groups_to_read(path, &quot;S1413&quot;)
+    rows = pq.read_table(path, filters=[(&quot;student&quot;, &quot;=&quot;, &quot;S1413&quot;)]).num_rows
+    print(f&quot;{path:22} student = &#x27;S1413&#x27;: must read {len(hits)} of {total} row groups {hits}  -&gt; {rows} rows&quot;)
+
+# On your PC, next to student_orders.csv:
+#   pip install pyarrow
+#   python parquet_inside.py</code></pre><div class="output">rows 500,000  row groups 10  created by: parquet-cpp-arrow version 26.0.0
+row group 0, per column chunk:
+  order_id  SNAPPY   297,991 bytes  encodings PLAIN,RLE,RLE_DICTIONARY  min=1 max=50000
+  student   SNAPPY    77,573 bytes  encodings PLAIN,RLE,RLE_DICTIONARY  min=S0001 max=S2000
+  time      SNAPPY   210,234 bytes  encodings PLAIN,RLE,RLE_DICTIONARY  min=2026-09-01 08:00:00 max=2026-09-30 20:59:00
+  item      SNAPPY    19,107 bytes  encodings PLAIN,RLE,RLE_DICTIONARY  min=chai max=vada pav
+  amount    SNAPPY    19,147 bytes  encodings PLAIN,RLE,RLE_DICTIONARY  min=15 max=80
+orders.parquet         student = &#x27;S1413&#x27;: must read 10 of 10 row groups [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  -&gt; 184 rows
+orders_sorted.parquet  student = &#x27;S1413&#x27;: must read 1 of 10 row groups [7]  -&gt; 184 rows</div></div>
+  <p class="muted">Real output with pyarrow 26. pyarrow guessed the time column as a timestamp, so its statistics print with seconds. The unsorted file must read every row group; sorted by student, only row group 7.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Run-length encoding a column</h2>
+  <p>Columnar files store runs of equal values as (value, count). Follow how a sorted item column collapses.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "col = [\"chai\", \"chai\", \"chai\", \"dosa\", \"dosa\", \"poha\"]",
+  "runs = []",
+  "for v in col:",
+  "    if runs and runs[-1][0] == v:",
+  "        runs[-1][1] += 1",
+  "    else:",
+  "        runs.append([v, 1])",
+  "print(runs)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>col<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]"
+   ],
+   "newVar": "col"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>runs<\/code> is created: → list #2. A new list object (#2) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "runs"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>v<\/code> is created: &#x27;chai&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'chai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'chai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "New value",
+   "note": "A new (value, 1) pair starts. Object #2 list now holds [→ list #3] A new list object (#3) is created: [&#x27;chai&#x27;, 1]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'chai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (1)<\/b> [→ list #3]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 1]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The loop takes the next item (it has the same value as the previous one).",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'chai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (1)<\/b> [→ list #3]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 1]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'chai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (1)<\/b> [→ list #3]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 1]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Same as before",
+   "note": "The run just gets longer; nothing new is stored. Object #3 list now holds [&#x27;chai&#x27;, 2]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'chai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (1)<\/b> [→ list #3]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 2]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The loop takes the next item (it has the same value as the previous one).",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'chai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (1)<\/b> [→ list #3]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 2]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'chai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (1)<\/b> [→ list #3]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 2]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #3 list now holds [&#x27;chai&#x27;, 3]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'chai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (1)<\/b> [→ list #3]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>v<\/code> changes to &#x27;dosa&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'dosa'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (1)<\/b> [→ list #3]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'dosa'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (1)<\/b> [→ list #3]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #2 list now holds [→ list #3, → list #4] A new list object (#4) is created: [&#x27;dosa&#x27;, 1]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'dosa'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (2)<\/b> [→ list #3, → list #4]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]",
+    "<b>#4 list (2)<\/b> [&#x27;dosa&#x27;, 1]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The loop takes the next item (it has the same value as the previous one).",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'dosa'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (2)<\/b> [→ list #3, → list #4]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]",
+    "<b>#4 list (2)<\/b> [&#x27;dosa&#x27;, 1]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'dosa'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (2)<\/b> [→ list #3, → list #4]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]",
+    "<b>#4 list (2)<\/b> [&#x27;dosa&#x27;, 1]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #4 list now holds [&#x27;dosa&#x27;, 2]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'dosa'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (2)<\/b> [→ list #3, → list #4]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]",
+    "<b>#4 list (2)<\/b> [&#x27;dosa&#x27;, 2]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>v<\/code> changes to &#x27;poha&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'poha'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (2)<\/b> [→ list #3, → list #4]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]",
+    "<b>#4 list (2)<\/b> [&#x27;dosa&#x27;, 2]"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'poha'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (2)<\/b> [→ list #3, → list #4]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]",
+    "<b>#4 list (2)<\/b> [&#x27;dosa&#x27;, 2]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #2 list now holds [→ list #3, → list #4, → list #5] A new list object (#5) is created: [&#x27;poha&#x27;, 1]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'poha'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (3)<\/b> [→ list #3, → list #4, → list #5]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]",
+    "<b>#4 list (2)<\/b> [&#x27;dosa&#x27;, 2]",
+    "<b>#5 list (2)<\/b> [&#x27;poha&#x27;, 1]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'poha'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (3)<\/b> [→ list #3, → list #4, → list #5]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]",
+    "<b>#4 list (2)<\/b> [&#x27;dosa&#x27;, 2]",
+    "<b>#5 list (2)<\/b> [&#x27;poha&#x27;, 1]"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "col",
+       "→ list #1"
+      ],
+      [
+       "runs",
+       "→ list #2"
+      ],
+      [
+       "v",
+       "'poha'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;dosa&#x27;, &#x27;poha&#x27;]",
+    "<b>#2 list (3)<\/b> [→ list #3, → list #4, → list #5]",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, 3]",
+    "<b>#4 list (2)<\/b> [&#x27;dosa&#x27;, 2]",
+    "<b>#5 list (2)<\/b> [&#x27;poha&#x27;, 1]"
+   ],
+   "out": "[['chai', 3], ['dosa', 2], ['poha', 1]]\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three columnar-format problems: how many bytes a query reads, how sorting changes skipping, and what a format switch saves.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Projection · bytes</span></div>
+    <h4>How much does a two-column query read?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>In one ORC part file, the column sizes on disk are order_id 576, student 352,126, time 901,599, item 92,796 and amount 105,756 bytes. A query needs item and amount. How many column bytes does it read, and what share of all columns is that?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>5 column sizes from orc-tools meta</pre></div><div><small>Expected output</small><pre>read 198,552 of 1,452,853 bytes = 13.7%</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Add up all column sizes.</li><li>Add up only the columns the query needs.</li><li>Divide.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Now add the time column. It alone is 62% of the file: high-cardinality columns are the expensive ones.",
+   "code": "cols = {\"order_id\": 576, \"student\": 352126, \"time\": 901599, \"item\": 92796, \"amount\": 105756}\nneed = cols[\"item\"] + cols[\"amount\"]\ntotal = sum(cols.values())\nprint(f\"read {need:,} of {total:,} bytes = {need / total:.1%}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "cols = {\"order_id\": 576, \"student\": 352126, \"time\": 901599, \"item\": 92796, \"amount\": 105756}",
+  "need = cols[\"item\"] + cols[\"amount\"]",
+  "total = sum(cols.values())",
+  "print(f\"read {need:,} of {total:,} bytes = {need / total:.1%}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>cols<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_id&#x27;: 576, &#x27;student&#x27;: 352126, &#x27;time&#x27;: 901599, &#x27;item&#x27;: 92796, &#x27;amount&#x27;: 105756}"
+   ],
+   "newVar": "cols"
+  },
+  {
+   "line": 2,
+   "phase": "Projection",
+   "note": "Only the requested columns' streams are read. <code>need<\/code> is created: 198552.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "need",
+       "198552"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_id&#x27;: 576, &#x27;student&#x27;: 352126, &#x27;time&#x27;: 901599, &#x27;item&#x27;: 92796, &#x27;amount&#x27;: 105756}"
+   ],
+   "newVar": "need"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>total<\/code> is created: 1452853.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "need",
+       "198552"
+      ],
+      [
+       "total",
+       "1452853"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_id&#x27;: 576, &#x27;student&#x27;: 352126, &#x27;time&#x27;: 901599, &#x27;item&#x27;: 92796, &#x27;amount&#x27;: 105756}"
+   ],
+   "newVar": "total"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "need",
+       "198552"
+      ],
+      [
+       "total",
+       "1452853"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_id&#x27;: 576, &#x27;student&#x27;: 352126, &#x27;time&#x27;: 901599, &#x27;item&#x27;: 92796, &#x27;amount&#x27;: 105756}"
+   ],
+   "out": "read 198,552 of 1,452,853 bytes = 13.7%\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Pushdown · sorting</span></div>
+    <h4>Why sorting decides how much you skip</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A 10-row-group file holds orders of 2,000 students. Unsorted, every row group contains students S0001 to S2000. Sorted by student, each row group covers a narrow range. For a query on one student, how many row groups must be read in each case, and how many rows is that?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>10 row groups of 50,000 rows</pre></div><div><small>Expected output</small><pre>unsorted: 10 row groups, 500,000 rows decoded for 184 matches
+sorted  : 1 row groups, 50,000 rows decoded for 184 matches</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>A row group is read if min ≤ value ≤ max.</li><li>Unsorted: every range is S0001–S2000.</li><li>Sorted: only the group whose range contains the student.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Row group 0 covers only S0001–S0013: the 20 heavy users fill it. Sorting also packs similar values together, so the sorted file was smaller too (5.9 MB vs 6.2 MB).",
+   "code": "groups_sorted = [(\"S0001\", \"S0013\"), (\"S0013\", \"S0118\"), (\"S0118\", \"S0354\"), (\"S0354\", \"S0589\"), (\"S0589\", \"S0823\"),\n                 (\"S0823\", \"S1058\"), (\"S1058\", \"S1295\"), (\"S1295\", \"S1530\"), (\"S1530\", \"S1766\"), (\"S1766\", \"S2000\")]\nfor name, groups in [(\"unsorted\", [(\"S0001\", \"S2000\")] * 10), (\"sorted\", groups_sorted)]:\n    n = sum(lo <= \"S1413\" <= hi for lo, hi in groups)\n    print(f\"{name:8}: {n} row groups, {n * 50_000:,} rows decoded for 184 matches\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "groups_sorted = [(\"S0001\", \"S0013\"), (\"S0013\", \"S0118\"), (\"S0118\", \"S0354\"), (\"S0354\", \"S0589\"), (\"S0589\", \"S0823\"),",
+  "                 (\"S0823\", \"S1058\"), (\"S1058\", \"S1295\"), (\"S1295\", \"S1530\"), (\"S1530\", \"S1766\"), (\"S1766\", \"S2000\")]",
+  "for name, groups in [(\"unsorted\", [(\"S0001\", \"S2000\")] * 10), (\"sorted\", groups_sorted)]:",
+  "    n = sum(lo <= \"S1413\" <= hi for lo, hi in groups)",
+  "    print(f\"{name:8}: {n} row groups, {n * 50_000:,} rows decoded for 184 matches\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>groups_sorted<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "groups_sorted",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (10)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7, → tuple #8, → tu…",
+    "<b>#2 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;S0013&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;S0013&#x27;, &#x27;S0118&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;S0118&#x27;, &#x27;S0354&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;S0354&#x27;, &#x27;S0589&#x27;)",
+    "<b>#6 tuple (2)<\/b> (&#x27;S0589&#x27;, &#x27;S0823&#x27;)",
+    "<b>#7 tuple (2)<\/b> (&#x27;S0823&#x27;, &#x27;S1058&#x27;)",
+    "<b>#8 tuple (2)<\/b> (&#x27;S1058&#x27;, &#x27;S1295&#x27;)",
+    "<b>#9 tuple (2)<\/b> (&#x27;S1295&#x27;, &#x27;S1530&#x27;)",
+    "<b>#10 tuple (2)<\/b> (&#x27;S1530&#x27;, &#x27;S1766&#x27;)",
+    "<b>#11 tuple (2)<\/b> (&#x27;S1766&#x27;, &#x27;S2000&#x27;)"
+   ],
+   "newVar": "groups_sorted"
+  },
+  {
+   "line": 3,
+   "phase": "Statistics",
+   "note": "The real min/max per row group from orders_sorted.parquet. <code>name<\/code> is created: &#x27;unsorted&#x27;. <code>groups<\/code> is created: → list #12. A new list object (#12) is created: [→ tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #1… A new tuple object (#13) is created: (&#x27;S0001&#x27;, &#x27;S2000&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "groups_sorted",
+       "→ list #1"
+      ],
+      [
+       "name",
+       "'unsorted'"
+      ],
+      [
+       "groups",
+       "→ list #12"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (10)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7, → tuple #8, → tu…",
+    "<b>#2 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;S0013&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;S0013&#x27;, &#x27;S0118&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;S0118&#x27;, &#x27;S0354&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;S0354&#x27;, &#x27;S0589&#x27;)",
+    "<b>#6 tuple (2)<\/b> (&#x27;S0589&#x27;, &#x27;S0823&#x27;)",
+    "<b>#7 tuple (2)<\/b> (&#x27;S0823&#x27;, &#x27;S1058&#x27;)",
+    "<b>#8 tuple (2)<\/b> (&#x27;S1058&#x27;, &#x27;S1295&#x27;)",
+    "<b>#9 tuple (2)<\/b> (&#x27;S1295&#x27;, &#x27;S1530&#x27;)",
+    "<b>#10 tuple (2)<\/b> (&#x27;S1530&#x27;, &#x27;S1766&#x27;)",
+    "<b>#11 tuple (2)<\/b> (&#x27;S1766&#x27;, &#x27;S2000&#x27;)",
+    "<b>#12 list (10)<\/b> [→ tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #1…",
+    "<b>#13 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;S2000&#x27;)"
+   ],
+   "newVar": "groups"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> is created: 10.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "groups_sorted",
+       "→ list #1"
+      ],
+      [
+       "name",
+       "'unsorted'"
+      ],
+      [
+       "groups",
+       "→ list #12"
+      ],
+      [
+       "n",
+       "10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (10)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7, → tuple #8, → tu…",
+    "<b>#2 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;S0013&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;S0013&#x27;, &#x27;S0118&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;S0118&#x27;, &#x27;S0354&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;S0354&#x27;, &#x27;S0589&#x27;)",
+    "<b>#6 tuple (2)<\/b> (&#x27;S0589&#x27;, &#x27;S0823&#x27;)",
+    "<b>#7 tuple (2)<\/b> (&#x27;S0823&#x27;, &#x27;S1058&#x27;)",
+    "<b>#8 tuple (2)<\/b> (&#x27;S1058&#x27;, &#x27;S1295&#x27;)",
+    "<b>#9 tuple (2)<\/b> (&#x27;S1295&#x27;, &#x27;S1530&#x27;)",
+    "<b>#10 tuple (2)<\/b> (&#x27;S1530&#x27;, &#x27;S1766&#x27;)",
+    "<b>#11 tuple (2)<\/b> (&#x27;S1766&#x27;, &#x27;S2000&#x27;)",
+    "<b>#12 list (10)<\/b> [→ tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #1…",
+    "<b>#13 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;S2000&#x27;)"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "groups_sorted",
+       "→ list #1"
+      ],
+      [
+       "name",
+       "'unsorted'"
+      ],
+      [
+       "groups",
+       "→ list #12"
+      ],
+      [
+       "n",
+       "10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (10)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7, → tuple #8, → tu…",
+    "<b>#2 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;S0013&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;S0013&#x27;, &#x27;S0118&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;S0118&#x27;, &#x27;S0354&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;S0354&#x27;, &#x27;S0589&#x27;)",
+    "<b>#6 tuple (2)<\/b> (&#x27;S0589&#x27;, &#x27;S0823&#x27;)",
+    "<b>#7 tuple (2)<\/b> (&#x27;S0823&#x27;, &#x27;S1058&#x27;)",
+    "<b>#8 tuple (2)<\/b> (&#x27;S1058&#x27;, &#x27;S1295&#x27;)",
+    "<b>#9 tuple (2)<\/b> (&#x27;S1295&#x27;, &#x27;S1530&#x27;)",
+    "<b>#10 tuple (2)<\/b> (&#x27;S1530&#x27;, &#x27;S1766&#x27;)",
+    "<b>#11 tuple (2)<\/b> (&#x27;S1766&#x27;, &#x27;S2000&#x27;)",
+    "<b>#12 list (10)<\/b> [→ tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #13, → tuple #1…",
+    "<b>#13 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;S2000&#x27;)"
+   ],
+   "out": "unsorted: 10 row groups, 500,000 rows decoded for 184 matches\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;sorted&#x27;. <code>groups<\/code> changes to → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "groups_sorted",
+       "→ list #1"
+      ],
+      [
+       "name",
+       "'sorted'"
+      ],
+      [
+       "groups",
+       "→ list #1"
+      ],
+      [
+       "n",
+       "10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (10)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7, → tuple #8, → tu…",
+    "<b>#2 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;S0013&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;S0013&#x27;, &#x27;S0118&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;S0118&#x27;, &#x27;S0354&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;S0354&#x27;, &#x27;S0589&#x27;)",
+    "<b>#6 tuple (2)<\/b> (&#x27;S0589&#x27;, &#x27;S0823&#x27;)",
+    "<b>#7 tuple (2)<\/b> (&#x27;S0823&#x27;, &#x27;S1058&#x27;)",
+    "<b>#8 tuple (2)<\/b> (&#x27;S1058&#x27;, &#x27;S1295&#x27;)",
+    "<b>#9 tuple (2)<\/b> (&#x27;S1295&#x27;, &#x27;S1530&#x27;)",
+    "<b>#10 tuple (2)<\/b> (&#x27;S1530&#x27;, &#x27;S1766&#x27;)",
+    "<b>#11 tuple (2)<\/b> (&#x27;S1766&#x27;, &#x27;S2000&#x27;)"
+   ],
+   "newVar": "groups"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "groups_sorted",
+       "→ list #1"
+      ],
+      [
+       "name",
+       "'sorted'"
+      ],
+      [
+       "groups",
+       "→ list #1"
+      ],
+      [
+       "n",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (10)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7, → tuple #8, → tu…",
+    "<b>#2 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;S0013&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;S0013&#x27;, &#x27;S0118&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;S0118&#x27;, &#x27;S0354&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;S0354&#x27;, &#x27;S0589&#x27;)",
+    "<b>#6 tuple (2)<\/b> (&#x27;S0589&#x27;, &#x27;S0823&#x27;)",
+    "<b>#7 tuple (2)<\/b> (&#x27;S0823&#x27;, &#x27;S1058&#x27;)",
+    "<b>#8 tuple (2)<\/b> (&#x27;S1058&#x27;, &#x27;S1295&#x27;)",
+    "<b>#9 tuple (2)<\/b> (&#x27;S1295&#x27;, &#x27;S1530&#x27;)",
+    "<b>#10 tuple (2)<\/b> (&#x27;S1530&#x27;, &#x27;S1766&#x27;)",
+    "<b>#11 tuple (2)<\/b> (&#x27;S1766&#x27;, &#x27;S2000&#x27;)"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "groups_sorted",
+       "→ list #1"
+      ],
+      [
+       "name",
+       "'sorted'"
+      ],
+      [
+       "groups",
+       "→ list #1"
+      ],
+      [
+       "n",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (10)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7, → tuple #8, → tu…",
+    "<b>#2 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;S0013&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;S0013&#x27;, &#x27;S0118&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;S0118&#x27;, &#x27;S0354&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;S0354&#x27;, &#x27;S0589&#x27;)",
+    "<b>#6 tuple (2)<\/b> (&#x27;S0589&#x27;, &#x27;S0823&#x27;)",
+    "<b>#7 tuple (2)<\/b> (&#x27;S0823&#x27;, &#x27;S1058&#x27;)",
+    "<b>#8 tuple (2)<\/b> (&#x27;S1058&#x27;, &#x27;S1295&#x27;)",
+    "<b>#9 tuple (2)<\/b> (&#x27;S1295&#x27;, &#x27;S1530&#x27;)",
+    "<b>#10 tuple (2)<\/b> (&#x27;S1530&#x27;, &#x27;S1766&#x27;)",
+    "<b>#11 tuple (2)<\/b> (&#x27;S1766&#x27;, &#x27;S2000&#x27;)"
+   ],
+   "out": "sorted  : 1 row groups, 50,000 rows decoded for 184 matches\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "groups_sorted",
+       "→ list #1"
+      ],
+      [
+       "name",
+       "'sorted'"
+      ],
+      [
+       "groups",
+       "→ list #1"
+      ],
+      [
+       "n",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (10)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7, → tuple #8, → tu…",
+    "<b>#2 tuple (2)<\/b> (&#x27;S0001&#x27;, &#x27;S0013&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;S0013&#x27;, &#x27;S0118&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;S0118&#x27;, &#x27;S0354&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;S0354&#x27;, &#x27;S0589&#x27;)",
+    "<b>#6 tuple (2)<\/b> (&#x27;S0589&#x27;, &#x27;S0823&#x27;)",
+    "<b>#7 tuple (2)<\/b> (&#x27;S0823&#x27;, &#x27;S1058&#x27;)",
+    "<b>#8 tuple (2)<\/b> (&#x27;S1058&#x27;, &#x27;S1295&#x27;)",
+    "<b>#9 tuple (2)<\/b> (&#x27;S1295&#x27;, &#x27;S1530&#x27;)",
+    "<b>#10 tuple (2)<\/b> (&#x27;S1530&#x27;, &#x27;S1766&#x27;)",
+    "<b>#11 tuple (2)<\/b> (&#x27;S1766&#x27;, &#x27;S2000&#x27;)"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Cost · migration</span></div>
+    <h4>Is converting a table to Parquet worth it?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A 50 TB CSV table is scanned by 400 queries a month, each reading 3 of 20 columns on average. A query engine charges ₹400 per TB scanned (illustrative). Parquet with ZSTD makes the table 7× smaller and projection reads about 3/20 of it. Converting costs one 50 TB scan. Compare the monthly bill and the payback time.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>50 TB · 400 queries · 3 of 20 columns · 7× compression</pre></div><div><small>Expected output</small><pre>CSV Rs 8,000,000/month, Parquet Rs 171,429/month
+conversion Rs 20,000, paid back in 0.1 days</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>CSV cost per query = 50 TB × ₹400.</li><li>Parquet per query = 50 / 7 × 3/20 TB × ₹400.</li><li>Payback = conversion cost / monthly saving.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The saving is about 98%. Real columns differ in size, so measure with your engine's “bytes scanned” rather than trusting the column count.",
+   "code": "tb, price, queries = 50, 400, 400\ncsv_month = queries * tb * price\npq_month = queries * tb / 7 * 3 / 20 * price\nconvert = tb * price\nprint(f\"CSV Rs {csv_month:,.0f}/month, Parquet Rs {pq_month:,.0f}/month\")\nprint(f\"conversion Rs {convert:,.0f}, paid back in {convert / (csv_month - pq_month) * 30:.1f} days\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "tb, price, queries = 50, 400, 400",
+  "csv_month = queries * tb * price",
+  "pq_month = queries * tb / 7 * 3 / 20 * price",
+  "convert = tb * price",
+  "print(f\"CSV Rs {csv_month:,.0f}/month, Parquet Rs {pq_month:,.0f}/month\")",
+  "print(f\"conversion Rs {convert:,.0f}, paid back in {convert / (csv_month - pq_month) * 30:.1f} days\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>tb<\/code> is created: 50. <code>price<\/code> is created: 400. <code>queries<\/code> is created: 400.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "tb",
+       "50"
+      ],
+      [
+       "price",
+       "400"
+      ],
+      [
+       "queries",
+       "400"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "queries"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>csv_month<\/code> is created: 8000000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "tb",
+       "50"
+      ],
+      [
+       "price",
+       "400"
+      ],
+      [
+       "queries",
+       "400"
+      ],
+      [
+       "csv_month",
+       "8000000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "csv_month"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>pq_month<\/code> is created: 171428.5714.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "tb",
+       "50"
+      ],
+      [
+       "price",
+       "400"
+      ],
+      [
+       "queries",
+       "400"
+      ],
+      [
+       "csv_month",
+       "8000000"
+      ],
+      [
+       "pq_month",
+       "171428.5714"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "pq_month"
+  },
+  {
+   "line": 4,
+   "phase": "Columns",
+   "note": "Projection and compression multiply. <code>convert<\/code> is created: 20000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "tb",
+       "50"
+      ],
+      [
+       "price",
+       "400"
+      ],
+      [
+       "queries",
+       "400"
+      ],
+      [
+       "csv_month",
+       "8000000"
+      ],
+      [
+       "pq_month",
+       "171428.5714"
+      ],
+      [
+       "convert",
+       "20000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "convert"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "tb",
+       "50"
+      ],
+      [
+       "price",
+       "400"
+      ],
+      [
+       "queries",
+       "400"
+      ],
+      [
+       "csv_month",
+       "8000000"
+      ],
+      [
+       "pq_month",
+       "171428.5714"
+      ],
+      [
+       "convert",
+       "20000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "CSV Rs 8,000,000/month, Parquet Rs 171,429/month\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "tb",
+       "50"
+      ],
+      [
+       "price",
+       "400"
+      ],
+      [
+       "queries",
+       "400"
+      ],
+      [
+       "csv_month",
+       "8000000"
+      ],
+      [
+       "pq_month",
+       "171428.5714"
+      ],
+      [
+       "convert",
+       "20000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "conversion Rs 20,000, paid back in 0.1 days\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Why did the Parquet item-only job read 192,526 bytes while the CSV job read 19,427,239?",
+  "options": [
+   "Parquet deletes duplicate rows",
+   "It read a cached copy",
+   "It read only the item column chunks (projection), which are small and encoded",
+   "It sampled 1% of the rows"
+  ],
+  "answer": 2,
+  "why": "Same answer, chai 149,669, from a 100× smaller read."
+ },
+ {
+  "q": "What is a Parquet row group?",
+  "options": [
+   "One row of the table",
+   "A horizontal slice of rows, holding one column chunk per column",
+   "A folder of Parquet files",
+   "The file footer"
+  ],
+  "answer": 1,
+  "why": "File → row groups → column chunks → pages, plus a footer."
+ },
+ {
+  "q": "Where does a Parquet reader find the schema and column statistics?",
+  "options": [
+   "In the footer at the end of the file",
+   "In the first line of the file",
+   "In the NameNode",
+   "In a separate .schema file"
+  ],
+  "answer": 0,
+  "why": "Readers seek to the end, read the footer, then jump to the chunks they need."
+ },
+ {
+  "q": "Why did 217,602 order ids take only 576 bytes in ORC?",
+  "options": [
+   "They were dropped",
+   "ORC stores ids in the footer only",
+   "They were compressed with ZLIB to 1%",
+   "Sequential numbers are stored as start + step with run-length/delta encoding"
+  ],
+  "answer": 3,
+  "why": "The encoding, not the codec, did most of that work."
+ },
+ {
+  "q": "Filtering student = S1413 had to read 10 of 10 row groups in one file and 1 of 10 in another. What was different?",
+  "options": [
+   "The codec",
+   "The second file was ORC",
+   "The second file was sorted by student, so min/max ranges were narrow",
+   "The second file had fewer rows"
+  ],
+  "answer": 2,
+  "why": "Predicate pushdown depends on clustering."
+ },
+ {
+  "q": "Which ORC structure plays the role of a Parquet row group?",
+  "options": [
+   "Postscript",
+   "Stripe",
+   "Page",
+   "Dictionary"
+  ],
+  "answer": 1,
+  "why": "Stripes (64 MB by default) with index data every 10,000 rows."
+ },
+ {
+  "q": "Our Parquet ZSTD job failed in every map task with a ClassNotFoundException for a zstd class. What fixes it?",
+  "options": [
+   "Ship the zstd-jni jar to the tasks, e.g. with -libjars",
+   "Use more reducers",
+   "Format HDFS",
+   "Switch to text output"
+  ],
+  "answer": 0,
+  "why": "The client had the class, the task containers did not."
+ },
+ {
+  "q": "When is a columnar format a poor choice?",
+  "options": [
+   "Large analytical scans",
+   "Queries reading few columns",
+   "Data with many repeated values",
+   "Writing one record at a time with frequent appends"
+  ],
+  "answer": 3,
+  "why": "Use a row format (Avro) for record-at-a-time writes, then compact to Parquet."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 10.2 in one screen</h3>
+    <ul><li><b>Columnar</b> = values of one column stored together: <b>projection</b>, better <b>encoding/compression</b>, <b>predicate pushdown</b>.</li><li><b>Parquet</b>: file → row groups (128 MB default) → column chunks → pages; footer with schema and min/max; magic “PAR1”.</li><li><b>ORC</b>: stripes (64 MB) with index (every 10,000 rows), data streams, stripe footer; file footer + postscript.</li><li>Lab sizes: CSV 19.4 MB · Parquet Snappy 4.4 · ZSTD 2.8 · ORC ZLIB 3.3 · ZSTD 2.9 MB.</li><li>Lab reads: CSV 19,427,239 bytes · Parquet all columns 4,431,110 · item only 192,526 · ORC item only 263,343.</li><li>Pushdown needs clustering: S1413 → 10 of 10 row groups unsorted, 1 of 10 sorted.</li><li>Parquet: default in Spark/Trino/Impala/Iceberg/Delta. ORC: Hive, required for Hive ACID.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What is the difference between Parquet and ORC?</summary><p>Both are columnar formats with encodings, compression and statistics. Parquet organises a file into row groups, column chunks and pages, has strong support for nested data and is the default for Spark, Trino, Impala and table formats like Iceberg and Delta. ORC organises a file into stripes with lightweight indexes every 10,000 rows, came from the Hive project and is required for Hive ACID tables. Sizes and speed are usually similar; ecosystem decides.</p></details>
+    <details><summary>Why is Parquet faster than CSV?</summary><p>A Parquet reader reads only the columns a query needs (projection), the data is much smaller because each column is encoded (dictionary, run-length, delta) and compressed, and min/max statistics let it skip row groups that cannot match a filter. In our lab a job needing one column read 192,526 bytes from Parquet against 19,427,239 bytes from the CSV.</p></details>
+    <details><summary>What is predicate pushdown?</summary><p>Pushing a filter (a predicate such as student = &#39;S1413&#39;) down to the file reader so it can skip data using the statistics stored in the file. If a row group&#39;s min and max for a column cannot satisfy the filter, the reader skips the whole row group. It works best when data is sorted or clustered by the filtered column.</p></details>
+    <details><summary>What is a row group in Parquet?</summary><p>A horizontal partition of a Parquet file containing a set of rows, stored as one column chunk per column. Each column chunk is divided into pages. The writer default size is 128 MB; statistics are kept per column chunk (and per page), so the row group is the main unit for skipping and for parallel reading.</p></details>
+    <details><summary>Should I use Avro or Parquet?</summary><p>Use Avro (row-oriented) for writing records one at a time, messaging and data exchange where whole records are read and schemas evolve. Use Parquet (columnar) for analytical tables that are scanned with few columns and filters. A common pipeline writes Avro or JSON on ingest and compacts it into Parquet tables.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Columnar format exercises using the real sizes and reads from our lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>How much smaller?</h4></div>
+      <p>Compute how many times smaller each Parquet variant is than the CSV.</p>
+      <div class="prob__io"><div><small>Input</small><pre>19,418,699 vs 7,428,043 / 4,438,970 / 2,775,449</pre></div><div><small>Expected output</small><pre>parquet uncompressed 2.6x smaller
+parquet snappy       4.4x smaller
+parquet zstd         7.0x smaller</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>csv = 19418699
+for name, b in [(&quot;uncompressed&quot;, 7428043), (&quot;snappy&quot;, 4438970), (&quot;zstd&quot;, 2775449)]:
+    print(f&quot;parquet {name:12} {csv / b:.1f}x smaller&quot;)</code></pre><div class="output">parquet uncompressed 2.6x smaller
+parquet snappy       4.4x smaller
+parquet zstd         7.0x smaller</div></div>
+        <p><b>How it works:</b> 2.6×, 4.4× and 7.0×. Even with no codec, encodings alone made Parquet 2.6× smaller.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Projection saving</h4></div>
+      <p>How many times fewer bytes did the item-only read take than the all-columns read, for Parquet and for ORC?</p>
+      <div class="prob__io"><div><small>Input</small><pre>4,431,110 / 192,526 · 3,297,403 / 263,343</pre></div><div><small>Expected output</small><pre>parquet 23x, orc 12.5x</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;parquet {4431110 / 192526:.0f}x, orc {3297403 / 263343:.1f}x&quot;)</code></pre><div class="output">parquet 23x, orc 12.5x</div></div>
+        <p><b>How it works:</b> 23× and 12.5×. The item column is one of the cheapest columns, so the saving is large.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Bytes per value</h4></div>
+      <p>How many bits per row did ORC use for order_id and for item?</p>
+      <div class="prob__io"><div><small>Input</small><pre>576 and 92,796 bytes for 217,602 rows</pre></div><div><small>Expected output</small><pre>order_id 0.02 bits per row
+item     3.41 bits per row</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>rows = 217602
+for name, b in [(&quot;order_id&quot;, 576), (&quot;item&quot;, 92796)]:
+    print(f&quot;{name:8} {b * 8 / rows:.2f} bits per row&quot;)</code></pre><div class="output">order_id 0.02 bits per row
+item     3.41 bits per row</div></div>
+        <p><b>How it works:</b> 0.02 and 3.4 bits per row. A CSV spends about 6 bytes (48 bits) per order id.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Dictionary encode a column</h4></div>
+      <p>Dictionary-encode the item column: print the dictionary and the codes.</p>
+      <div class="prob__io"><div><small>Input</small><pre>6 values</pre></div><div><small>Expected output</small><pre>{&#x27;dosa&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;chai&#x27;: 2}
+[0, 1, 1, 2, 0, 2]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>col = [&quot;dosa&quot;, &quot;samosa&quot;, &quot;samosa&quot;, &quot;chai&quot;, &quot;dosa&quot;, &quot;chai&quot;]
+d = {}
+codes = [d.setdefault(v, len(d)) for v in col]
+print(d)
+print(codes)</code></pre><div class="output">{&#x27;dosa&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;chai&#x27;: 2}
+[0, 1, 1, 2, 0, 2]</div></div>
+        <p><b>How it works:</b> Three distinct strings stored once; the column becomes small integers that pack into a few bits each.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Delta encoding</h4></div>
+      <p>Delta-encode a sorted id column and decode it back.</p>
+      <div class="prob__io"><div><small>Input</small><pre>ids 1001..1006</pre></div><div><small>Expected output</small><pre>encoded: [1001, 1, 1, 1, 1, 1]
+decoded: [1001, 1002, 1003, 1004, 1005, 1006] True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>ids = [1001, 1002, 1003, 1004, 1005, 1006]
+deltas = [ids[0]] + [b - a for a, b in zip(ids, ids[1:])]
+print(&quot;encoded:&quot;, deltas)
+back = [deltas[0]]
+for d in deltas[1:]:
+    back.append(back[-1] + d)
+print(&quot;decoded:&quot;, back, back == ids)</code></pre><div class="output">encoded: [1001, 1, 1, 1, 1, 1]
+decoded: [1001, 1002, 1003, 1004, 1005, 1006] True</div></div>
+        <p><b>How it works:</b> All deltas are 1, which run-length encoding then turns into “1 × 5”: why 2 lakh ids took 576 bytes.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Row groups to read</h4></div>
+      <p>Given row-group min/max dates, which groups must be read for orders on 2026-09-17?</p>
+      <div class="prob__io"><div><small>Input</small><pre>4 row groups</pre></div><div><small>Expected output</small><pre>[2]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>groups = [(&quot;2026-09-01&quot;, &quot;2026-09-08&quot;), (&quot;2026-09-08&quot;, &quot;2026-09-15&quot;), (&quot;2026-09-15&quot;, &quot;2026-09-23&quot;), (&quot;2026-09-23&quot;, &quot;2026-09-30&quot;)]
+print([i for i, (lo, hi) in enumerate(groups) if lo &lt;= &quot;2026-09-17&quot; &lt;= hi])</code></pre><div class="output">[2]</div></div>
+        <p><b>How it works:</b> Only group 2. ISO dates compare correctly as strings; that is one reason to store dates in sortable form.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Storage bill</h4></div>
+      <p>The canteen chain keeps 3 years of orders: 200 GB of CSV per year, stored with replication 3 at ₹2 per GB per month. What is the monthly storage bill as CSV and as Parquet ZSTD (7× smaller)?</p>
+      <div class="prob__io"><div><small>Input</small><pre>600 GB · ×3 replicas · ₹2/GB-month</pre></div><div><small>Expected output</small><pre>CSV          Rs 3,600 per month
+Parquet ZSTD Rs 514 per month</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>csv_gb = 3 * 200
+for name, gb in [(&quot;CSV&quot;, csv_gb), (&quot;Parquet ZSTD&quot;, csv_gb / 7)]:
+    print(f&quot;{name:12} Rs {gb * 3 * 2:,.0f} per month&quot;)</code></pre><div class="output">CSV          Rs 3,600 per month
+Parquet ZSTD Rs 514 per month</div></div>
+        <p><b>How it works:</b> ₹3,600 vs about ₹514 per month (illustrative prices), before counting the faster queries.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>Choose a sort column</h4></div>
+      <p>Queries filter by student 70% of the time and by item 30%. With 10 row groups, how many row groups does an average query read if the file is sorted by student, and if sorted by item? Assume a sorted column narrows to 1 group and an unsorted one needs all 10, except that 8 items sorted means about 2 groups per item.</p>
+      <div class="prob__io"><div><small>Input</small><pre>70% student, 30% item</pre></div><div><small>Expected output</small><pre>sorted by student: 3.7 groups per query, sorted by item: 7.6</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>by_student = 0.7 * 1 + 0.3 * 10
+by_item = 0.7 * 10 + 0.3 * 2
+print(f&quot;sorted by student: {by_student:.1f} groups per query, sorted by item: {by_item:.1f}&quot;)</code></pre><div class="output">sorted by student: 3.7 groups per query, sorted by item: 7.6</div></div>
+        <p><b>How it works:</b> 3.7 vs 7.6 groups: sort by the column most queries filter on. Engines also offer Z-ordering or bloom filters to help a second column.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">File formats come up in every data engineering interview, often as “Parquet or ORC?” or “why is this query slow?”.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Formats · basics</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“Why is Parquet better than CSV for analytics?”</h4>
+      <p class="scn__situation">The standard opener.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> the three mechanisms, not just “it's compressed”.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Columnar: a query reads only the columns it needs (projection).</li>
+          <li>Each column is encoded (dictionary, RLE, delta) and compressed; similar values compress far better.</li>
+          <li>Footer statistics (min/max per row group) let readers skip data for filters; the schema travels with the file.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Performance · pushdown</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>“Our Parquet table is filtered by customer_id but every query scans the whole table.”</h4>
+      <p class="scn__situation">The table is partitioned by date only.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> clustering and statistics.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Min/max statistics only skip row groups when values are clustered; random order makes every row group span all customers.</li>
+          <li>Sort (or Z-order) data by customer_id within each date partition when writing or compacting; consider bloom filters for point lookups.</li>
+          <li>Check the engine's “row groups skipped / bytes scanned” metrics before and after.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Design · choice</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>“Parquet or ORC for our new lake?”</h4>
+      <p class="scn__situation">The team uses Spark for ETL and Trino and Hive for queries.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> ecosystem reasoning.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Both perform similarly; choose by ecosystem. Spark, Trino, Iceberg and Delta default to Parquet.</li>
+          <li>Pick ORC if you need Hive ACID tables or have an existing ORC warehouse.</li>
+          <li>Standardise the codec (Snappy for hot, ZSTD for cold) and target file sizes of hundreds of MB.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Operations · failure</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>A job writing Parquet with ZSTD fails with ClassNotFoundException in every map task</h4>
+      <p class="scn__situation">The same code worked with Snappy, and the class compiles fine on the edge node.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> client vs task classpath.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>The task containers lack a jar the client has (here zstd-jni, which lives in share/hadoop/tools/lib).</li>
+          <li>Ship it with -libjars (or build a fat jar, or set mapreduce.application.classpath on the cluster).</li>
+          <li>Read the attempt diagnostics in the JobHistory server to see the exact missing class.</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

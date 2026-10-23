@@ -1,0 +1,3206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Reducer | MyPhatshala</title>
+<meta name="description" content="The Hadoop MapReduce Reducer on a real Hadoop 3.5.0 cluster: reduce(key, Iterable values) once per key in sorted order, setup and cleanup, HashPartitioner and how many reducers to run. Real runs: 3 reducers give files of 0, 79 and 38 bytes (keys dealt by hash, reproduced in Python), 10 reducers give 4 empty files and a speculative reduce, 0 reducers make a map-only job. The object-reuse trap caught live: chai [113456, 113456, 113456]. Output committer, _SUCCESS, skew, Python simulation, quiz and interview scenarios.">
+<meta name="mp:minutes" content="26">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/08-mapreduce-fundamentals/05-the-reducer/">
+<meta property="og:title" content="The Reducer · MyPhatshala">
+<meta property="og:description" content="Three reducers, one empty file, and the same order ID three times: two reducer surprises explained on a real cluster.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "The Reducer", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="08-mapreduce-fundamentals/05-the-reducer" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 8.5</b></nav>
+    <h1>The Reducer</h1>
+    <p class="lead">The reducer is where the answer for each key is computed and written. This lesson shows exactly how it is called, how keys are dealt to reducers, what the number of reducers does to your output, and the one Java habit (copying values) that every Hadoop programmer learns the hard way, all with real runs on the Module 8 cluster.</p>
+    <div class="lesson-meta"><span>Module 8 · MapReduce fundamentals</span><span>⏱ 26 min</span><span>Intermediate</span><span>Partitions reproduced in Python</span><span>Object-reuse bug caught live</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Three desks, one of them empty</h2>
+  <div class="story">
+    <p class="narration">Riya's item revenue job works, but it has one reducer doing all the adding. “Let's use three,” says Kabir, and reruns it with <code>-D mapreduce.job.reduces=3</code>. Three output files appear. The first one is <b>empty</b>. The second holds four items, the third holds two. Then Riya writes a small reducer that lists the first three order IDs of each item, and every item shows the <b>same ID three times</b>. Two surprises, both caused by how a reducer really works.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="Six items are sent to three reducers by hash of the key: reducer 0 gets none, reducer 1 gets chai, dosa, samosa and vada pav, reducer 2 gets idli and poha.">
+        <g font-size="10">
+          <text x="100" y="20" text-anchor="middle" font-weight="700" class="s-ink">6 keys from the maps</text>
+          <g font-size="8.6">
+            <rect x="40" y="32" width="120" height="20" rx="4" class="s-card2"/><text x="100" y="46" text-anchor="middle" class="s-ink">chai · dosa · idli</text>
+            <rect x="40" y="58" width="120" height="20" rx="4" class="s-card2"/><text x="100" y="72" text-anchor="middle" class="s-ink">poha · samosa · vada pav</text>
+          </g>
+          <text x="100" y="104" text-anchor="middle" font-size="8.6" class="s-ink2">partition = hash(key) % 3</text>
+
+          <path d="M160 55C220 55 230 40 290 40M160 55C220 55 230 95 290 95M160 55C220 55 230 150 290 150" style="fill:none;stroke:var(--track);stroke-width:1.6"/>
+
+          <rect x="290" y="22" width="180" height="36" rx="6" class="s-card2"/><text x="380" y="38" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">reducer 0</text><text x="380" y="51" text-anchor="middle" font-size="8.4" class="s-red">nothing: part-r-00000 is 0 bytes</text>
+          <rect x="290" y="76" width="180" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="380" y="92" text-anchor="middle" font-size="8.8" font-weight="700" class="s-green">reducer 1 (79 bytes)</text><text x="380" y="106" text-anchor="middle" font-size="8.4" class="s-ink">chai · dosa · samosa · vada pav</text>
+          <rect x="290" y="132" width="180" height="36" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="380" y="148" text-anchor="middle" font-size="8.8" font-weight="700" class="s-blue">reducer 2 (38 bytes)</text><text x="380" y="161" text-anchor="middle" font-size="8.4" class="s-ink">idli · poha</text>
+
+          <rect x="494" y="56" width="132" height="84" rx="8" class="s-board"/>
+          <text x="560" y="76" text-anchor="middle" font-size="8.6" style="fill:#F5C77E">first 3 ids, no copy:</text>
+          <text x="560" y="94" text-anchor="middle" font-size="8.4" style="fill:#9FD3B8">chai [113456,</text>
+          <text x="560" y="108" text-anchor="middle" font-size="8.4" style="fill:#9FD3B8">113456, 113456]</text>
+          <text x="560" y="126" text-anchor="middle" font-size="8.4" style="fill:#F5C77E">same object 3 times</text>
+        </g>
+        <text x="320" y="186" text-anchor="middle" font-size="9.6" class="s-ink2">Real lab output. Keys are dealt to reducers by hash, not evenly; and the reducer hands you one reused value object.</text>
+        <text x="632" y="198" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, three reducers and one of them did nothing? Isn't Hadoop supposed to divide the work equally?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Hadoop divides <b>keys</b>, not work. Each key goes to reducer <code>hash(key) % 3</code>. With only six keys, the dice fell four, two and zero. With crores of keys it evens out; with a few keys, or one huge key, it doesn't.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>And the repeated IDs? I saved the values in a list, just like in any Java program.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>The reducer gives you an <code>Iterable</code> that reads the values off a sorted stream, and it puts each one into the <b>same</b> <code>Text</code> object. You saved three references to one object, which ended up holding the last value. Copy what you keep. Today: how the reducer is called, how many to run, where its output goes, and these two traps.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>The Reducer</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>In Hadoop MapReduce, a <b>Reducer</b> is the user class, extending <code>org.apache.hadoop.mapreduce.Reducer&lt;KEYIN, VALUEIN, KEYOUT, VALUEOUT&gt;</code>, whose <code>reduce(key, Iterable&lt;VALUEIN&gt; values, Context context)</code> method is called once for every distinct intermediate key in its <b>partition</b>, in sorted key order, with all the values for that key. A job has <code>mapreduce.job.reduces</code> reduce tasks (default 1); the <b>Partitioner</b> (by default <code>HashPartitioner</code>, <code>(key.hashCode() &amp; Integer.MAX_VALUE) % numReduceTasks</code>) decides which reduce task receives each key. Each reduce task runs <code>setup()</code> once, <code>reduce()</code> per key and <code>cleanup()</code> once, and writes its output through the job's <b>OutputFormat</b> to one file, <code>part-r-NNNNN</code>, which the <b>output committer</b> moves into the output directory when the task succeeds. The values are delivered as a single-pass iterator that reuses one value object, and their order within a key is not defined.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>A reducer gets one key at a time, with every value for that key, and writes the answer for that key. The number of reducers decides how many output files you get, and the hash of each key decides which reducer it lands on.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Reduce task</b><span>One reducer instance; handles one partition and writes one file.</span></div>
+    <div class="term"><b>Partition</b><span>The share of keys a reduce task receives; numbered 0 … reduces − 1.</span></div>
+    <div class="term"><b>HashPartitioner</b><span>Default rule: <code>(hash &amp; MAX_VALUE) % reduces</code>.</span></div>
+    <div class="term"><b>Reduce input group</b><span>One key with its values: one call of <code>reduce()</code>.</span></div>
+    <div class="term"><b>Object reuse</b><span>The framework fills the same key and value objects again and again.</span></div>
+    <div class="term"><b>part-r-NNNNN</b><span>Output file of reduce task NNNNN (part-m- for map-only jobs).</span></div>
+    <div class="term"><b>Output committer</b><span>Moves a task's output from <code>_temporary</code> into place, writes <code>_SUCCESS</code>.</span></div>
+    <div class="term"><b>Skew</b><span>Some reducers get far more data than others.</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, 3 workers, canteen_orders.csv)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>3 reducers</th><td>part-r-00000: 0 bytes · part-r-00001: chai, dosa, samosa, vada pav (79 bytes) · part-r-00002: idli, poha (38 bytes)</td></tr>
+    <tr><th>10 reducers</th><td>10 files, 4 of them empty, one item per non-empty file; “Launched reduce tasks=11” (one speculative reduce attempt)</td></tr>
+    <tr><th>0 reducers</th><td>Map-only: <code>part-m-00000</code>, 2,699,986 bytes of unsorted <code>item  amount</code> lines, no shuffle at all</td></tr>
+    <tr><th>Object reuse</th><td>Copying values: <code>chai [104221, 150350, 113456]</code> · keeping references: <code>chai [113456, 113456, 113456]</code></td></tr>
+  </table>
+
+  <h3 id="levels">The Reducer at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Counting desks</h4>
+      <ul>
+        <li>On counting day each desk is responsible for some candidates. A rule fixed in advance says which desk gets which candidate, so every slip for a candidate reaches the same desk.</li>
+        <li>A desk takes one candidate's pile at a time, adds it up, writes one line, and moves to the next candidate in alphabetical order.</li>
+        <li>With few candidates, some desks may get none. That desk still opens, and still files an empty result sheet.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How reduce() is called</h4>
+      <ul>
+        <li><code>setup(context)</code> runs once, then <code>reduce(key, values, context)</code> once per key, in sorted key order, then <code>cleanup(context)</code> once.</li>
+        <li><code>values</code> is an <code>Iterable</code> over a merged, sorted stream on disk and in memory. You can loop over it <b>once</b>; there is no going back.</li>
+        <li>Each step of the loop overwrites the same <code>Text</code> or <code>IntWritable</code> object. Use the value immediately, or copy it (<code>new Text(v)</code>, <code>v.get()</code>) if you keep it.</li>
+        <li>The order of values inside one key is not guaranteed: our correct run listed chai's IDs as 104221, 150350, 113456. If you need them ordered, that is a secondary sort (Lesson 9.7).</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> How many reducers, and what they write</h4>
+      <ul>
+        <li>Default is 1. Set it with <code>job.setNumReduceTasks(n)</code> or <code>-D mapreduce.job.reduces=n</code>. Hadoop's own guideline: about <b>0.95 or 1.75 × (nodes × containers per node)</b>: 0.95 finishes in one wave, 1.75 lets fast nodes take a second wave for better balance.</li>
+        <li>Too few: each reducer is huge and slow. Too many: many tiny output files (Lesson 7.5) and task overhead.</li>
+        <li>Partitioning is by key, so one hot key (say 60% of all orders are chai) goes to one reducer no matter how many you add. Fixes: combiners (9.1), custom partitioners (9.2), salting keys.</li>
+        <li>Each reduce task writes to <code>_temporary/…/attempt_…</code>; when it succeeds the <b>FileOutputCommitter</b> (algorithm version 2 in our logs) moves the file into the output folder. After all tasks, <code>_SUCCESS</code> is written. Output goes to HDFS with normal replication (3 here).</li>
+        <li>With 0 reducers there is no shuffle and no sort: map output is written straight to HDFS as <code>part-m-NNNNN</code>.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “What is the role of the Reducer?” write: receives each key with all its values (after shuffle and sort), called once per key in sorted order, output written to HDFS as part-r-NNNNN, number set by <code>setNumReduceTasks</code> (default 1), keys assigned by the Partitioner (<code>hash % n</code>). Mention that 0 reducers gives a map-only job.</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Choosing the number of reducers</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Reducers</th><th>Output</th><th>Shuffle and sort</th><th>Use when</th><th>Our lab</th></tr></thead>
+    <tbody>
+      <tr><td><b>0</b></td><td>part-m-* (one per map)</td><td>None</td><td>Filtering, cleaning, format conversion</td><td>part-m-00000, 2.7 MB unsorted</td></tr>
+      <tr><td><b>1</b> (default)</td><td>One sorted file</td><td>Yes</td><td>Small results, a single globally sorted file</td><td>part-r-00000, 6 lines</td></tr>
+      <tr><td><b>A few</b></td><td>part-r-00000 … n−1</td><td>Yes</td><td>Moderate output; each file sorted on its own</td><td>3: sizes 0, 79, 38 bytes</td></tr>
+      <tr><td><b>≈ 0.95–1.75 × containers</b></td><td>Many files</td><td>Yes</td><td>Big aggregations with many keys</td><td>10: four files empty (only 6 keys)</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>What a reducer typically does</h3>
+  <div class="cards">
+    <div class="card"><h4>Aggregate</h4><p>Count, sum, min, max, average per key. Our ItemRevenue: orders and revenue per item.</p><span class="tag">most common</span></div>
+    <div class="card"><h4>Collect</h4><p>Build a list per key: an inverted index, first N order IDs. Copy each value you keep.</p><span class="tag">watch memory</span></div>
+    <div class="card"><h4>Combine two sides</h4><p>Reduce-side join: records from two inputs meet under the same key (Lesson 9.5).</p><span class="tag">joins</span></div>
+    <div class="card"><h4>Identity</h4><p>Write values unchanged: used just to get the data partitioned and sorted by key.</p><span class="tag">sorting</span></div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>The output of a job with n reducers is n files, each sorted, but <b>not</b> sorted across files: our 3-reducer run has chai in file 1 and idli in file 2. For one globally sorted result use 1 reducer, or TotalOrderPartitioner, which gives each reducer a key range instead of a hash.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Reducers on a real cluster</h2>
+  <p>All runs use the Module 8 lab and <code>reducer_lab.sh</code> (in “Run it on your PC”). Input: <code>canteen_orders.csv</code>, 3 lakh orders, 6 items.</p>
+  <ol class="stepper">
+    <li><h4>The reducer we are running</h4>
+      <div class="code" data-lang="java" data-file="ItemRevenue.java (reducer)"><pre><code>public static class SumReducer extends Reducer&lt;Text, IntWritable, Text, Text&gt; {
+  protected void reduce(Text item, Iterable&lt;IntWritable&gt; amounts, Context ctx) … {
+    long orders = 0, revenue = 0;
+    for (IntWritable a : amounts) { orders++; revenue += a.get(); }
+    ctx.write(item, new Text(orders + "\t" + revenue));
+  }
+}</code></pre></div>
+      <span class="behind">The four type parameters: input key Text, input value IntWritable (they must match the map output), output key Text, output value Text. <code>a.get()</code> copies the number out at once, so object reuse does no harm here.</span></li>
+    <li><h4>Run with 3 reducers</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr.jar ItemRevenue -D mapreduce.job.reduces=3 /user/hadoop/data/canteen_orders.csv /out/red_3</code></pre><div class="output">Launched reduce tasks=3
+Reduce input groups=6
+Reduce output records=6
+part-r-00000 (0 bytes):
+part-r-00001 (79 bytes): chai dosa samosa vada pav
+part-r-00002 (38 bytes): idli poha</div></div>
+      <span class="behind">The default HashPartitioner sent chai, dosa, samosa and vada pav to partition 1, idli and poha to 2, and nothing to 0. Reducer 0 still started, found no keys and wrote an empty file. Each file is sorted on its own.</span></li>
+    <li><h4>Check the partitions yourself</h4>
+      <div class="code" data-lang="python" data-file="partition.py"><pre><code>def text_hash(s):                     # Hadoop Text.hashCode()
+    h = 1
+    for b in s.encode():
+        h = (31 * h + b) &amp; 0xffffffff
+    return h
+for item in ["chai", "dosa", "idli", "poha", "samosa", "vada pav"]:
+    print(item, (text_hash(item) &amp; 0x7fffffff) % 3)</code></pre><div class="output">chai 1
+dosa 1
+idli 2
+poha 2
+samosa 1
+vada pav 1</div></div>
+      <span class="behind">Exactly the files Hadoop wrote. The partition depends only on the key and the number of reducers, so the same key always lands on the same reducer.</span></li>
+    <li><h4>Run with 10 reducers</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr.jar ItemRevenue -D mapreduce.job.reduces=10 /user/hadoop/data/canteen_orders.csv /out/red_10</code></pre><div class="output">Launched reduce tasks=11
+part-r-00000 (0 bytes):
+part-r-00001 (0 bytes):
+part-r-00002 (22 bytes): vada pav
+part-r-00003 (0 bytes):
+part-r-00004 (19 bytes): dosa
+part-r-00005 (19 bytes): poha
+part-r-00006 (18 bytes): chai
+part-r-00007 (20 bytes): samosa
+part-r-00008 (0 bytes):
+part-r-00009 (19 bytes): idli</div></div>
+      <span class="behind">Ten tasks, ten files, four empty: you can never use more reducers than you have keys. “Launched reduce tasks=11” is one extra speculative attempt, the same mechanism we saw for maps in Lesson 8.1.</span></li>
+    <li><h4>Run with 0 reducers</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr.jar ItemRevenue -D mapreduce.job.reduces=0 /user/hadoop/data/canteen_orders.csv /out/red_0
+hdfs dfs -cat /out/red_0/part-m-00000 | head -3</code></pre><div class="output">Launched map tasks=1
+2699986 /out/red_0/part-m-00000
+samosa	18
+vada pav	20
+poha	25</div></div>
+      <span class="behind">The reducer class is ignored. Map output goes straight to HDFS, in input order, one pair per order: the shuffle, sort and reduce simply don't happen.</span></li>
+    <li><h4>The object-reuse trap</h4>
+      <div class="code" data-lang="java" data-file="SampleOrders.java (reducer)"><pre><code>for (Text id : ids) {
+  first3.add(copy ? new Text(id) : id);   // without a copy: the SAME object 3 times
+  if (first3.size() == 3) break;
+}</code></pre><div class="output">-- copy (correct)                      -- no copy (-D sample.copy=false)
+chai	[104221, 150350, 113456]          chai	[113456, 113456, 113456]
+dosa	[78778, 213441, 200658]           dosa	[200658, 200658, 200658]
+idli	[101007, 50991, 101001]           idli	[101001, 101001, 101001]</div></div>
+      <span class="behind">The iterator reuses one <code>Text</code>; after three steps it holds the third ID, and all three list entries point to it. Notice too that the correct IDs are not in order: values arrive in no defined order within a key.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Never collect all values of a key into a list unless you know the key is small. A hot key with crores of values will exhaust the reducer's heap (ours had 300 MB). Aggregate as you iterate, or keep only what you need.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Three reducers and one reused object</h2>
+  <p>Six steps: keys are partitioned, each reducer is called per key, files are committed, then the object-reuse bug in slow motion.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Inside the reduce phase <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Terminal output of the reducer runs">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@namenode : /tmp/mr</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop jar mr.jar ItemRevenue \</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#7F8C86">    -D mapreduce.job.reduces=3 …</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">Launched reduce tasks=3</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">map 100% reduce 100%</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">Reduce input groups=6</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#F5C77E">Reduce output records=6</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hdfs dfs -ls /out/red_3</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">_SUCCESS</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#F5C77E">part-r-00000      0 bytes</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#9FD3B8">part-r-00001     79 bytes</text><text x="26" y="122" font-size="8.2" class="mono" style="fill:#9FD3B8">part-r-00002     38 bytes</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hdfs dfs -cat /out/red_3/part-r-00001</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">chai      50170   752550</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">dosa      49948   2247660</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#9FD3B8">samosa    50021   900378</text><text x="26" y="122" font-size="8.2" class="mono" style="fill:#9FD3B8">vada pav  49986   999720</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ … SampleOrders -D sample.copy=false</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">chai  [113456, 113456, 113456]</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#F5C77E">dosa  [200658, 200658, 200658]</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ … SampleOrders   (copies each value)</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">chai  [104221, 150350, 113456]</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">dosa  [78778, 213441, 200658]</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The job is submitted with three reduce tasks.</li>
+          <li>All three reducers finish; together they saw 6 key groups.</li>
+          <li>Three output files: one is empty.</li>
+          <li>File 1 holds four items, sorted by key.</li>
+          <li>The sampling reducer without copies prints the same ID three times per item.</li>
+          <li>With a copy of each value, the three IDs are different (and in no particular order).</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Partitions sent to three reducers; a reused value object">
+          <g font-size="8">
+            <rect x="12" y="140" width="104" height="60" rx="6" class="s-card2"/><text x="64" y="154" text-anchor="middle" font-weight="700" class="s-ink">reducer 0</text>
+            <rect x="128" y="140" width="104" height="60" rx="6" class="s-card2"/><text x="180" y="154" text-anchor="middle" font-weight="700" class="s-ink">reducer 1</text>
+            <rect x="244" y="140" width="104" height="60" rx="6" class="s-card2"/><text x="296" y="154" text-anchor="middle" font-weight="700" class="s-ink">reducer 2</text>
+          </g>
+          <g data-on="1"><rect x="80" y="20" width="200" height="40" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="180" y="36" text-anchor="middle" font-size="8.4" class="s-acc">map output: 300,000 pairs, 6 keys</text><text x="180" y="50" text-anchor="middle" font-size="8.2" class="s-ink">partition = (hash &amp; MAX) % 3</text><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-ink2">each pair is tagged with a partition number</text></g>
+          <g data-on="2"><rect x="80" y="20" width="200" height="40" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="180" y="44" text-anchor="middle" font-size="8.4" class="s-acc">map output, sorted per partition</text><path d="M180 60C180 100 180 110 180 140M220 60C260 100 296 110 296 140" style="fill:none;stroke:var(--blue);stroke-width:1.8;stroke-dasharray:4 3"/><g font-size="8" class="s-ink"><text x="180" y="170" text-anchor="middle">chai, dosa,</text><text x="180" y="182" text-anchor="middle">samosa, vada pav</text><text x="296" y="174" text-anchor="middle">idli, poha</text><text x="64" y="174" text-anchor="middle" class="s-red">(no keys)</text></g><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-ink2">the shuffle: each reducer fetches only its partition</text></g>
+          <g data-on="3"><g font-size="8" class="s-ink"><text x="180" y="170" text-anchor="middle">reduce(chai, …)</text><text x="180" y="182" text-anchor="middle">reduce(dosa, …) …</text><text x="296" y="170" text-anchor="middle">reduce(idli, …)</text><text x="296" y="182" text-anchor="middle">reduce(poha, …)</text><text x="64" y="174" text-anchor="middle" class="s-red">0 calls</text></g><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-ink2">setup → reduce() once per key, in sorted order → cleanup</text></g>
+          <g data-on="4"><g font-size="7.8" class="mono s-ink"><text x="64" y="176" text-anchor="middle">part-r-00000</text><text x="64" y="188" text-anchor="middle">0 B</text><text x="180" y="176" text-anchor="middle">part-r-00001</text><text x="180" y="188" text-anchor="middle">79 B</text><text x="296" y="176" text-anchor="middle">part-r-00002</text><text x="296" y="188" text-anchor="middle">38 B</text></g><rect x="80" y="20" width="200" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180" y="36" text-anchor="middle" font-size="8.4" class="s-green">HDFS /out/red_3</text><text x="180" y="50" text-anchor="middle" font-size="8.2" class="s-ink">_temporary → committed → _SUCCESS</text><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-ink2">each task's file is committed, replicated 3 times</text></g>
+          <g data-on="5"><rect x="40" y="20" width="120" height="44" rx="6" class="s-board"/><text x="100" y="38" text-anchor="middle" font-size="8.2" class="s-chalk">one Text object</text><text x="100" y="54" text-anchor="middle" font-size="9" style="fill:#F5C77E">"113456"</text><g font-size="8" class="s-ink"><rect x="200" y="22" width="130" height="40" rx="5" class="s-card2"/><text x="265" y="38" text-anchor="middle">first3 = [ref, ref, ref]</text><text x="265" y="52" text-anchor="middle" class="s-red">all point to the same object</text></g><path d="M200 42h-40" style="fill:none;stroke:var(--red);stroke-width:1.6"/><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-ink2">each loop step overwrote the object: 104221 → 150350 → 113456</text></g>
+          <g data-on="6"><g font-size="8"><rect x="20" y="20" width="96" height="20" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="68" y="34" text-anchor="middle" class="s-green">new Text("104221")</text><rect x="132" y="20" width="96" height="20" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="180" y="34" text-anchor="middle" class="s-green">new Text("150350")</text><rect x="244" y="20" width="96" height="20" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="292" y="34" text-anchor="middle" class="s-green">new Text("113456")</text></g><text x="180" y="62" text-anchor="middle" font-size="8.4" class="s-ink">three separate copies</text><text x="180" y="226" text-anchor="middle" font-size="8.6" class="s-ink2">copy what you keep; values come in no fixed order</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Every map output pair gets a partition number from the hash of its key.</li>
+          <li>Each reducer fetches only its own partition from every map: reducer 0's partition is empty.</li>
+          <li>Each reducer calls reduce() once per key, in sorted key order.</li>
+          <li>Each task writes one file under _temporary; the committer moves it into /out/red_3 and _SUCCESS is written.</li>
+          <li>The iterator fills ONE Text object again and again; a list of references sees only the last value.</li>
+          <li>Copying each value keeps three different objects.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Reducers at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="24" width="84" height="42" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="44" text-anchor="middle" font-size="8.6" class="s-blue">reduces = 200</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">≈ 0.95 × slots</text></svg></div>
+    <div><h4>1. Sizing reducers for nightly aggregates</h4>
+      <p>Teams set the reducer count from cluster capacity and output size, aiming for output files of a few hundred MB each, so the result is neither one giant file nor thousands of tiny ones.</p>
+      <div class="uc-flow"><span>Output size</span><i>→</i><span class="java">reduces ≈ size / 256 MB</span><i>→</i><span>Healthy files</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="20" width="22" height="50" class="s-soft-acc" style="stroke:var(--track)"/><rect x="48" y="56" width="22" height="14" class="s-card2"/><rect x="78" y="60" width="22" height="10" class="s-card2"/></svg></div>
+    <div><h4>2. Hunting skewed reducers</h4>
+      <p>When a job sits at “reduce 99%” for an hour, one reducer usually has a hot key (a default city, a null customer ID). Engineers find it from the reducer counters and fix it with combiners, salting or a custom partitioner.</p>
+      <div class="uc-flow"><span>One slow reducer</span><i>→</i><span class="java">Reduce input records per task</span><i>→</i><span>Find the hot key</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="24" y="22" width="72" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="8.6" class="s-ink">0 reducers</text><text x="60" y="56" text-anchor="middle" font-size="8" class="s-green">no shuffle</text></svg></div>
+    <div><h4>3. Map-only ETL</h4>
+      <p>Cleaning, filtering and format conversion jobs set reducers to 0 and skip the whole shuffle, often halving the run time. DistCp is a map-only job too.</p>
+      <div class="uc-flow"><span>Raw files</span><i>→</i><span class="java">map-only job</span><i>→</i><span>part-m-* files</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><text x="60" y="40" text-anchor="middle" font-size="9" class="s-red">[x, x, x]</text><text x="60" y="58" text-anchor="middle" font-size="9" class="s-green">[a, b, c]</text></svg></div>
+    <div><h4>4. Code reviews catch object reuse</h4>
+      <p>“Copy Writables you keep” is a standard review check in Hadoop teams; the same reuse appears in Hive UDFs and in Spark when reading Hadoop input formats.</p>
+      <div class="uc-flow"><span>list.add(value)</span><i>→</i><span class="java">review</span><i>→</i><span>list.add(new Text(value))</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Partition, group and reduce like Hadoop</h2>
+  <p>This model deals keys to reducers with Hadoop's real <code>Text</code> hash, groups values per key, and calls a reduce function once per key in sorted order. Its partitions match the files our cluster wrote.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>pairs = [(&quot;samosa&quot;, 18), (&quot;vada pav&quot;, 20), (&quot;poha&quot;, 25), (&quot;samosa&quot;, 18), (&quot;chai&quot;, 15),
+         (&quot;idli&quot;, 30), (&quot;dosa&quot;, 45), (&quot;chai&quot;, 15), (&quot;poha&quot;, 25), (&quot;idli&quot;, 30)]
+
+def text_hash(s):                         # Hadoop&#x27;s Text.hashCode()
+    h = 1
+    for b in s.encode():
+        h = (31 * h + b) &amp; 0xffffffff
+    return h
+
+def partition(key, n):                    # HashPartitioner
+    return (text_hash(key) &amp; 0x7fffffff) % n
+
+def reduce_fn(key, values):
+    return f&quot;{key}\t{len(values)}\t{sum(values)}&quot;
+
+R = 3
+parts = [{} for _ in range(R)]
+for k, v in pairs:
+    parts[partition(k, R)].setdefault(k, []).append(v)
+
+for r in range(R):
+    lines = [reduce_fn(k, parts[r][k]) for k in sorted(parts[r])]
+    print(f&quot;part-r-{r:05d}:&quot;, lines if lines else &quot;(empty)&quot;)</code></pre><div class="output">part-r-00000: (empty)
+part-r-00001: [&#x27;chai\t2\t30&#x27;, &#x27;dosa\t1\t45&#x27;, &#x27;samosa\t2\t36&#x27;, &#x27;vada pav\t1\t20&#x27;]
+part-r-00002: [&#x27;idli\t2\t60&#x27;, &#x27;poha\t2\t50&#x27;]</div></div>
+  <ul class="anno"><li><code>    return (text_hash(key) &amp; 0x7fffffff) % n</code><span>The HashPartitioner: clear the sign bit, then modulo the number of reducers. Same key, same reducer, always.</span></li><li><code>    lines = [reduce_fn(k, parts[r][k]) for k in sorted(parts[r])]</code><span>Each reducer handles its keys in sorted order, one reduce() call per key.</span></li><li><code>    print(f&quot;part-r-{r:05d}:&quot;, lines if lines else &quot;(empty)&quot;)</code><span>Reducer 0 gets no keys but still writes a file: our part-r-00000 was 0 bytes.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Three reducers",
+   "hint": "Press <b>Run<\/b>. Compare with the real files: 00001 had chai, dosa, samosa, vada pav; 00002 had idli, poha.",
+   "code": "pairs = [(\"samosa\", 18), (\"vada pav\", 20), (\"poha\", 25), (\"samosa\", 18), (\"chai\", 15),\n         (\"idli\", 30), (\"dosa\", 45), (\"chai\", 15), (\"poha\", 25), (\"idli\", 30)]\n\ndef text_hash(s):                         # Hadoop's Text.hashCode()\n    h = 1\n    for b in s.encode():\n        h = (31 * h + b) & 0xffffffff\n    return h\n\ndef partition(key, n):                    # HashPartitioner\n    return (text_hash(key) & 0x7fffffff) % n\n\ndef reduce_fn(key, values):\n    return f\"{key}\\t{len(values)}\\t{sum(values)}\"\n\nR = 3\nparts = [{} for _ in range(R)]\nfor k, v in pairs:\n    parts[partition(k, R)].setdefault(k, []).append(v)\n\nfor r in range(R):\n    lines = [reduce_fn(k, parts[r][k]) for k in sorted(parts[r])]\n    print(f\"part-r-{r:05d}:\", lines if lines else \"(empty)\")\n"
+  },
+  {
+   "label": "2 · Ten reducers",
+   "hint": "<b>Predict first:<\/b> how many of 10 files will be empty with 6 keys? Then check where each item goes.",
+   "code": "def text_hash(s):\n    h = 1\n    for b in s.encode():\n        h = (31 * h + b) & 0xffffffff\n    return h\nitems = [\"chai\", \"dosa\", \"idli\", \"poha\", \"samosa\", \"vada pav\"]\nused = {}\nfor it in items:\n    used.setdefault((text_hash(it) & 0x7fffffff) % 10, []).append(it)\nfor r in range(10):\n    print(f\"part-r-{r:05d}\", used.get(r, \"(empty)\"))\n"
+  },
+  {
+   "label": "3 · The reuse trap",
+   "hint": "The framework reuses one value object. This simulates it with a mutable class. Fix the bug by storing a copy.",
+   "code": "class Text:                         # a mutable value, like Hadoop's Text\n    def __init__(self): self.v = \"\"\n    def set(self, v): self.v = v\n    def __repr__(self): return self.v\n\ndef values_iterator(ids):           # like Hadoop: ONE object, refilled each step\n    t = Text()\n    for i in ids:\n        t.set(i)\n        yield t\n\nfirst3 = []\nfor t in values_iterator([\"104221\", \"150350\", \"113456\"]):\n    first3.append(t)                # keeps a reference, not a copy\nprint(first3)\n"
+  },
+  {
+   "label": "4 · Skew check",
+   "hint": "One key holds most records. Compute records per reducer for 4 reducers and the ratio of the largest to the average.",
+   "code": "counts = {\"chai\": 900_000, \"dosa\": 40_000, \"idli\": 35_000, \"poha\": 30_000, \"samosa\": 50_000, \"vada pav\": 45_000}\ndef text_hash(s):\n    h = 1\n    for b in s.encode():\n        h = (31 * h + b) & 0xffffffff\n    return h\nload = [0] * 4\nfor k, c in counts.items():\n    load[(text_hash(k) & 0x7fffffff) % 4] += c\navg = sum(load) / 4\nprint(load, f\"largest is {max(load) / avg:.1f}x the average\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "Values can be read only once. This reducer loops twice (once to count, once to sum). Fix it with a single pass.",
+   "code": "def values():                      # a one-pass iterator, like Hadoop's Iterable\n    for v in [15, 15, 15]:\n        yield v\nvals = values()\ncount = sum(1 for _ in vals)\ntotal = sum(vals)\nprint(\"average\", total / count, \"count\", count)\nassert total == 45, \"second pass saw no values\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: number of reducers and the reuse trap</h3>
+  <p>Use the Module 8 lab from Lesson 8.1, with <code>canteen_orders.csv</code> in HDFS and <code>mr.jar</code> built from <code>ItemRevenue.java</code> and <code>SampleOrders.java</code>. The script runs ItemRevenue with 3, 10 and 0 reducers, lists every output file with its size and keys, then runs SampleOrders with and without copying values. It takes about 3 minutes.</p>
+  <div class="pcrun"><h4>First three order IDs per item</h4>
+  <div class="code" data-lang="bash" data-file="SampleOrders.java"><pre><code>// SampleOrders.java: for each item, list the first 3 order ids the reducer sees.
+// Run with -D sample.copy=false to see the famous &quot;object reuse&quot; bug.
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+
+public class SampleOrders {
+  public static class M extends Mapper&lt;LongWritable, Text, Text, Text&gt; {
+    private final Text item = new Text(), id = new Text();
+    @Override
+    protected void map(LongWritable k, Text line, Context ctx) throws IOException, InterruptedException {
+      String[] f = line.toString().split(&quot;,&quot;);
+      if (f.length != 3 || f[0].equals(&quot;order_id&quot;)) return;
+      item.set(f[1]); id.set(f[0]);
+      ctx.write(item, id);
+    }
+  }
+
+  public static class R extends Reducer&lt;Text, Text, Text, Text&gt; {
+    @Override
+    protected void reduce(Text item, Iterable&lt;Text&gt; ids, Context ctx) throws IOException, InterruptedException {
+      boolean copy = ctx.getConfiguration().getBoolean(&quot;sample.copy&quot;, true);
+      List&lt;Text&gt; first3 = new ArrayList&lt;&gt;();
+      for (Text id : ids) {
+        first3.add(copy ? new Text(id) : id);       // without a copy we keep the SAME object 3 times
+        if (first3.size() == 3) break;
+      }
+      ctx.write(item, new Text(first3.toString()));
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] rest = new GenericOptionsParser(conf, args).getRemainingArgs();
+    Job job = Job.getInstance(conf, &quot;sample orders&quot;);
+    job.setJarByClass(SampleOrders.class);
+    job.setMapperClass(M.class);
+    job.setReducerClass(R.class);
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(Text.class);
+    FileInputFormat.addInputPath(job, new Path(rest[0]));
+    FileOutputFormat.setOutputPath(job, new Path(rest[1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+
+// Inside the namenode container, in /tmp/mr:
+//   javac -cp $(hadoop classpath) -d classes *.java &amp;&amp; jar cf mr.jar -C classes .
+//   hadoop jar mr.jar SampleOrders /user/hadoop/data/canteen_orders.csv /out/sample_ok
+//   hadoop jar mr.jar SampleOrders -D sample.copy=false /user/hadoop/data/canteen_orders.csv /out/sample_bug</code></pre><div class="output">$ hdfs dfs -cat /out/sample_ok/part-r-00000
+chai	[104221, 150350, 113456]
+dosa	[78778, 213441, 200658]
+idli	[101007, 50991, 101001]
+poha	[199796, 104049, 99562]
+samosa	[151000, 300992, 300987]
+vada pav	[101030, 268025, 50984]
+$ hdfs dfs -cat /out/sample_bug/part-r-00000
+chai	[113456, 113456, 113456]
+dosa	[200658, 200658, 200658]
+idli	[101001, 101001, 101001]
+poha	[99562, 99562, 99562]
+samosa	[300987, 300987, 300987]
+vada pav	[50984, 50984, 50984]</div></div>
+  <p class="muted">Real output. In the buggy run every list holds the last ID that the reused object contained. Your IDs may differ (value order within a key is not defined), but the bug pattern is the same.</p></div>
+  <div class="pcrun"><h4>3, 10 and 0 reducers, and the reuse trap</h4>
+  <div class="code" data-lang="bash" data-file="reducer_lab.sh"><pre><code># reducer_lab.sh: number of reducers = number of output files; which key goes where; the object-reuse trap
+cd /tmp/mr
+D=/user/hadoop/data/canteen_orders.csv
+for r in 3 10; do
+  hdfs dfs -rm -r -f -skipTrash /out/red_$r &gt; /dev/null 2&gt;&amp;1
+  hadoop jar mr.jar ItemRevenue -D mapreduce.job.reduces=$r $D /out/red_$r 2&gt;&amp;1 | grep -E &quot;Launched reduce tasks|Reduce input groups|Reduce output records&quot;
+  echo &quot;== $r reducers: output files&quot;
+  for f in $(hdfs dfs -ls /out/red_$r | grep part-r | awk &#x27;{print $8}&#x27;); do
+    echo &quot;$(basename $f) ($(hdfs dfs -stat %b $f) bytes): $(hdfs dfs -cat $f | cut -f1 | tr &#x27;\n&#x27; &#x27; &#x27;)&quot;
+  done
+done
+echo &quot;== 0 reducers (map-only): mapper output written directly, unsorted&quot;
+hdfs dfs -rm -r -f -skipTrash /out/red_0 &gt; /dev/null 2&gt;&amp;1
+hadoop jar mr.jar ItemRevenue -D mapreduce.job.reduces=0 $D /out/red_0 2&gt;&amp;1 | grep -E &quot;Launched (map|reduce)&quot;
+hdfs dfs -ls /out/red_0 | grep part | awk &#x27;{print $5, $8}&#x27;
+hdfs dfs -cat /out/red_0/part-m-00000 2&gt;/dev/null | head -3
+echo &quot;== first 3 order ids per item, copying each value (correct)&quot;
+hdfs dfs -rm -r -f -skipTrash /out/sample_ok /out/sample_bug &gt; /dev/null 2&gt;&amp;1
+hadoop jar mr.jar SampleOrders $D /out/sample_ok &gt; /dev/null 2&gt;&amp;1
+hdfs dfs -cat /out/sample_ok/part-r-00000
+echo &quot;== the same job WITHOUT copying (-D sample.copy=false)&quot;
+hadoop jar mr.jar SampleOrders -D sample.copy=false $D /out/sample_bug &gt; /dev/null 2&gt;&amp;1
+hdfs dfs -cat /out/sample_bug/part-r-00000
+
+# Copy into the namenode container and run:
+#   docker cp reducer_lab.sh lab8-namenode-1:/tmp/mr/
+#   docker exec lab8-namenode-1 bash /tmp/mr/reducer_lab.sh</code></pre><div class="output">Launched reduce tasks=3
+		Reduce input groups=6
+		Reduce output records=6
+== 3 reducers: output files
+part-r-00000 (0 bytes): 
+part-r-00001 (79 bytes): chai dosa samosa vada pav 
+part-r-00002 (38 bytes): idli poha 
+		Launched reduce tasks=11
+		Reduce input groups=6
+		Reduce output records=6
+== 10 reducers: output files
+part-r-00000 (0 bytes): 
+part-r-00001 (0 bytes): 
+part-r-00002 (22 bytes): vada pav 
+part-r-00003 (0 bytes): 
+part-r-00004 (19 bytes): dosa 
+part-r-00005 (19 bytes): poha 
+part-r-00006 (18 bytes): chai 
+part-r-00007 (20 bytes): samosa 
+part-r-00008 (0 bytes): 
+part-r-00009 (19 bytes): idli 
+== 0 reducers (map-only): mapper output written directly, unsorted
+		Launched map tasks=1
+2699986 /out/red_0/part-m-00000
+samosa	18
+vada pav	20
+poha	25
+== first 3 order ids per item, copying each value (correct)
+chai	[104221, 150350, 113456]
+dosa	[78778, 213441, 200658]
+idli	[101007, 50991, 101001]
+poha	[199796, 104049, 99562]
+samosa	[151000, 300992, 300987]
+vada pav	[101030, 268025, 50984]
+== the same job WITHOUT copying (-D sample.copy=false)
+chai	[113456, 113456, 113456]
+dosa	[200658, 200658, 200658]
+idli	[101001, 101001, 101001]
+poha	[99562, 99562, 99562]
+samosa	[300987, 300987, 300987]
+vada pav	[50984, 50984, 50984]</div></div>
+  <p class="muted">Real output, unedited. The empty files and their positions follow directly from the hash of each item name; “Launched reduce tasks=11” for 10 reducers includes one speculative attempt.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>How a reducer walks through its keys</h2>
+  <p>A reducer's input is one sorted stream of (key, value) pairs. Grouping means: keep reading while the key stays the same, then call reduce for that key.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "stream = [(\"chai\", 15), (\"chai\", 15), (\"dosa\", 45), (\"samosa\", 18), (\"samosa\", 18)]",
+  "current, values = None, []",
+  "for key, value in stream:",
+  "    if key != current and current is not None:",
+  "        print(\"reduce\", current, sum(values))",
+  "        values = []",
+  "    current = key",
+  "    values.append(value)",
+  "print(\"reduce\", current, sum(values))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>stream<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)"
+   ],
+   "newVar": "stream"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>current<\/code> is created: None. <code>values<\/code> is created: → list #5. A new list object (#5) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "None"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (0)<\/b> []"
+   ],
+   "newVar": "values"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>key<\/code> is created: &#x27;chai&#x27;. <code>value<\/code> is created: 15.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "None"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ],
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "value",
+       "15"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (0)<\/b> []"
+   ],
+   "newVar": "value"
+  },
+  {
+   "line": 4,
+   "phase": "New key",
+   "note": "The stream is sorted, so a change of key means the previous group is complete. The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "None"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ],
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "value",
+       "15"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>current<\/code> changes to &#x27;chai&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'chai'"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ],
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "value",
+       "15"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (0)<\/b> []"
+   ],
+   "newVar": "current"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #5 list now holds [15]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'chai'"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ],
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "value",
+       "15"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (1)<\/b> [15]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The loop takes the next item (it has the same value as the previous one).",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'chai'"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ],
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "value",
+       "15"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (1)<\/b> [15]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'chai'"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ],
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "value",
+       "15"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (1)<\/b> [15]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'chai'"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ],
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "value",
+       "15"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (1)<\/b> [15]"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #5 list now holds [15, 15]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'chai'"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ],
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "value",
+       "15"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (2)<\/b> [15, 15]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;dosa&#x27;. <code>value<\/code> changes to 45.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'chai'"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ],
+      [
+       "key",
+       "'dosa'"
+      ],
+      [
+       "value",
+       "45"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (2)<\/b> [15, 15]"
+   ],
+   "newVar": "value"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'chai'"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ],
+      [
+       "key",
+       "'dosa'"
+      ],
+      [
+       "value",
+       "45"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (2)<\/b> [15, 15]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Call",
+   "note": "One reduce call per key; the values were collected only for this key. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'chai'"
+      ],
+      [
+       "values",
+       "→ list #5"
+      ],
+      [
+       "key",
+       "'dosa'"
+      ],
+      [
+       "value",
+       "45"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#5 list (2)<\/b> [15, 15]"
+   ],
+   "out": "reduce chai 30\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>values<\/code> changes to → list #6. A new list object (#6) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'chai'"
+      ],
+      [
+       "values",
+       "→ list #6"
+      ],
+      [
+       "key",
+       "'dosa'"
+      ],
+      [
+       "value",
+       "45"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#6 list (0)<\/b> []"
+   ],
+   "newVar": "values"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>current<\/code> changes to &#x27;dosa&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'dosa'"
+      ],
+      [
+       "values",
+       "→ list #6"
+      ],
+      [
+       "key",
+       "'dosa'"
+      ],
+      [
+       "value",
+       "45"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#6 list (0)<\/b> []"
+   ],
+   "newVar": "current"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #6 list now holds [45]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'dosa'"
+      ],
+      [
+       "values",
+       "→ list #6"
+      ],
+      [
+       "key",
+       "'dosa'"
+      ],
+      [
+       "value",
+       "45"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#6 list (1)<\/b> [45]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;samosa&#x27;. <code>value<\/code> changes to 18.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'dosa'"
+      ],
+      [
+       "values",
+       "→ list #6"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#6 list (1)<\/b> [45]"
+   ],
+   "newVar": "value"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'dosa'"
+      ],
+      [
+       "values",
+       "→ list #6"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#6 list (1)<\/b> [45]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'dosa'"
+      ],
+      [
+       "values",
+       "→ list #6"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#6 list (1)<\/b> [45]"
+   ],
+   "out": "reduce dosa 45\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>values<\/code> changes to → list #7. A new list object (#7) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'dosa'"
+      ],
+      [
+       "values",
+       "→ list #7"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "values"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>current<\/code> changes to &#x27;samosa&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'samosa'"
+      ],
+      [
+       "values",
+       "→ list #7"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "current"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #7 list now holds [18]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'samosa'"
+      ],
+      [
+       "values",
+       "→ list #7"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#7 list (1)<\/b> [18]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The loop takes the next item (it has the same value as the previous one).",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'samosa'"
+      ],
+      [
+       "values",
+       "→ list #7"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#7 list (1)<\/b> [18]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'samosa'"
+      ],
+      [
+       "values",
+       "→ list #7"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#7 list (1)<\/b> [18]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'samosa'"
+      ],
+      [
+       "values",
+       "→ list #7"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#7 list (1)<\/b> [18]"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #7 list now holds [18, 18]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'samosa'"
+      ],
+      [
+       "values",
+       "→ list #7"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#7 list (2)<\/b> [18, 18]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'samosa'"
+      ],
+      [
+       "values",
+       "→ list #7"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#7 list (2)<\/b> [18, 18]"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Last group",
+   "note": "The final key is reduced when the stream ends. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stream",
+       "→ list #1"
+      ],
+      [
+       "current",
+       "'samosa'"
+      ],
+      [
+       "values",
+       "→ list #7"
+      ],
+      [
+       "key",
+       "'samosa'"
+      ],
+      [
+       "value",
+       "18"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [→ tuple #2, → tuple #2, → tuple #3, → tuple #4, → tuple #4]",
+    "<b>#2 tuple (2)<\/b> (&#x27;chai&#x27;, 15)",
+    "<b>#3 tuple (2)<\/b> (&#x27;dosa&#x27;, 45)",
+    "<b>#4 tuple (2)<\/b> (&#x27;samosa&#x27;, 18)",
+    "<b>#7 list (2)<\/b> [18, 18]"
+   ],
+   "out": "reduce samosa 36\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three reducer problems: choosing the count, predicting output files, and spotting skew.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Sizing · count</span></div>
+    <h4>How many reducers for this cluster?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A cluster has 20 workers, each able to run 6 reduce containers at once. Using Hadoop's guideline of 0.95 or 1.75 × total containers, what are the two candidate reducer counts?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>20 nodes × 6 containers</pre></div><div><small>Expected output</small><pre>one wave : 114
+two waves: 210</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Total containers = nodes × containers per node.</li><li>0.95 × total: all reducers start in one wave.</li><li>1.75 × total: two waves, better load balancing.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Then check the output: if the job writes 20 GB, 114 reducers give files of about 180 MB each, which is healthy.",
+   "code": "slots = 20 * 6\nprint(\"one wave :\", int(0.95 * slots))\nprint(\"two waves:\", int(1.75 * slots))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "slots = 20 * 6",
+  "print(\"one wave :\", int(0.95 * slots))",
+  "print(\"two waves:\", int(1.75 * slots))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>slots<\/code> is created: 120.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "slots",
+       "120"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "slots"
+  },
+  {
+   "line": 2,
+   "phase": "One wave",
+   "note": "Slightly below capacity leaves room for failed tasks to rerun. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "slots",
+       "120"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "one wave : 114\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "slots",
+       "120"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "two waves: 210\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Prediction · files</span></div>
+    <h4>Which file will each item land in?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Using Hadoop's Text hash and the HashPartitioner, predict the output file of each item for 4 reducers.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>6 items · 4 reducers</pre></div><div><small>Expected output</small><pre>part-r-00000 []
+part-r-00001 [&#x27;idli&#x27;, &#x27;poha&#x27;]
+part-r-00002 [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]
+part-r-00003 [&#x27;samosa&#x27;]</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Take each item's Text hash with the sign bit cleared (h = 31h + byte, 32-bit).</li><li>Take the remainder by 4.</li><li>Group the items by remainder.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Change 4 to 3 and you get exactly the files from our lab.",
+   "code": "hashes = {\"chai\": 3975886, \"dosa\": 4012954, \"idli\": 4151129,      # Text hash & MAX_VALUE,\n          \"poha\": 4370105, \"samosa\": 2125311487, \"vada pav\": 827806702}  # computed as in the Run box\nfiles = {}\nfor item, h in hashes.items():\n    files.setdefault(h % 4, []).append(item)\nfor r in range(4):\n    print(f\"part-r-{r:05d}\", files.get(r, []))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "hashes = {\"chai\": 3975886, \"dosa\": 4012954, \"idli\": 4151129,      # Text hash & MAX_VALUE,",
+  "          \"poha\": 4370105, \"samosa\": 2125311487, \"vada pav\": 827806702}  # computed as in the Run box",
+  "files = {}",
+  "for item, h in hashes.items():",
+  "    files.setdefault(h % 4, []).append(item)",
+  "for r in range(4):",
+  "    print(f\"part-r-{r:05d}\", files.get(r, []))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>hashes<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…"
+   ],
+   "newVar": "hashes"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>files<\/code> is created: → dict #2. A new dict object (#2) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "files"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> is created: &#x27;chai&#x27;. <code>h<\/code> is created: 3975886.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'chai'"
+      ],
+      [
+       "h",
+       "3975886"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "h"
+  },
+  {
+   "line": 5,
+   "phase": "Partition",
+   "note": "The same arithmetic Hadoop uses: (hash & Integer.MAX_VALUE) % reducers. Object #2 dict now holds {2: → list #3} A new list object (#3) is created: [&#x27;chai&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'chai'"
+      ],
+      [
+       "h",
+       "3975886"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (1)<\/b> {2: → list #3}",
+    "<b>#3 list (1)<\/b> [&#x27;chai&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;dosa&#x27;. <code>h<\/code> changes to 4012954.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "h",
+       "4012954"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (1)<\/b> {2: → list #3}",
+    "<b>#3 list (1)<\/b> [&#x27;chai&#x27;]"
+   ],
+   "newVar": "h"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #3 list now holds [&#x27;chai&#x27;, &#x27;dosa&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "h",
+       "4012954"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (1)<\/b> {2: → list #3}",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;idli&#x27;. <code>h<\/code> changes to 4151129.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'idli'"
+      ],
+      [
+       "h",
+       "4151129"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (1)<\/b> {2: → list #3}",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;]"
+   ],
+   "newVar": "h"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {2: → list #3, 1: → list #4} A new list object (#4) is created: [&#x27;idli&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'idli'"
+      ],
+      [
+       "h",
+       "4151129"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (2)<\/b> {2: → list #3, 1: → list #4}",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;]",
+    "<b>#4 list (1)<\/b> [&#x27;idli&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;poha&#x27;. <code>h<\/code> changes to 4370105.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'poha'"
+      ],
+      [
+       "h",
+       "4370105"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (2)<\/b> {2: → list #3, 1: → list #4}",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;]",
+    "<b>#4 list (1)<\/b> [&#x27;idli&#x27;]"
+   ],
+   "newVar": "h"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #4 list now holds [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'poha'"
+      ],
+      [
+       "h",
+       "4370105"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (2)<\/b> {2: → list #3, 1: → list #4}",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;samosa&#x27;. <code>h<\/code> changes to 2125311487.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'samosa'"
+      ],
+      [
+       "h",
+       "2125311487"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (2)<\/b> {2: → list #3, 1: → list #4}",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]"
+   ],
+   "newVar": "h"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {2: → list #3, 1: → list #4, 3: → list #5} A new list object (#5) is created: [&#x27;samosa&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'samosa'"
+      ],
+      [
+       "h",
+       "2125311487"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;vada pav&#x27;. <code>h<\/code> changes to 827806702.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (2)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ],
+   "newVar": "h"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #3 list now holds [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (3)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (3)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>r<\/code> is created: 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ],
+      [
+       "r",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (3)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ],
+      [
+       "r",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (3)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ],
+   "out": "part-r-00000 []\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ],
+      [
+       "r",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (3)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ],
+      [
+       "r",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (3)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ],
+   "out": "part-r-00001 ['idli', 'poha']\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ],
+      [
+       "r",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (3)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ],
+      [
+       "r",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (3)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ],
+   "out": "part-r-00002 ['chai', 'dosa', 'vada pav']\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (3)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (3)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ],
+   "out": "part-r-00003 ['samosa']\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "hashes",
+       "→ dict #1"
+      ],
+      [
+       "files",
+       "→ dict #2"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "h",
+       "827806702"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (6)<\/b> {&#x27;chai&#x27;: 3975886, &#x27;dosa&#x27;: 4012954, &#x27;idli&#x27;: 4151129, &#x27;poha&#x27;: 4370105, &#x27;samosa&#x27;: 2125311487…",
+    "<b>#2 dict (3)<\/b> {2: → list #3, 1: → list #4, 3: → list #5}",
+    "<b>#3 list (3)<\/b> [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]",
+    "<b>#4 list (2)<\/b> [&#x27;idli&#x27;, &#x27;poha&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;samosa&#x27;]"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Skew · diagnosis</span></div>
+    <h4>Why does one reducer take an hour?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A job with 50 reducers shows 49 reducers finishing in 2 minutes and one running for 60. The reducer counters show “Reduce input records” of about 2 lakh for most tasks and 9 crore for the slow one. What is the cause, and roughly how much faster could the job be if the load were spread evenly?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>49 × 2 lakh records · 1 × 9 crore records · 60 min</pre></div><div><small>Expected output</small><pre>hot reducer has 450x the normal load
+even spread: 1,996,000 records each, about 1.3 min</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>The slow reducer has about 450× more records: one hot key.</li><li>Time is roughly proportional to records.</li><li>Even spread = total records / 50 per reducer.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The fix is in the key, not the reducer count: combine early (9.1), or salt the hot key into several sub-keys and add the results in a second step.",
+   "code": "normal, hot = 200_000, 90_000_000\ntotal = 49 * normal + hot\nper_minute = hot / 60\neven = total / 50\nprint(f\"hot reducer has {hot / normal:.0f}x the normal load\")\nprint(f\"even spread: {even:,.0f} records each, about {even / per_minute:.1f} min\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "normal, hot = 200_000, 90_000_000",
+  "total = 49 * normal + hot",
+  "per_minute = hot / 60",
+  "even = total / 50",
+  "print(f\"hot reducer has {hot / normal:.0f}x the normal load\")",
+  "print(f\"even spread: {even:,.0f} records each, about {even / per_minute:.1f} min\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>normal<\/code> is created: 200000. <code>hot<\/code> is created: 90000000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "normal",
+       "200000"
+      ],
+      [
+       "hot",
+       "90000000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "hot"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>total<\/code> is created: 99800000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "normal",
+       "200000"
+      ],
+      [
+       "hot",
+       "90000000"
+      ],
+      [
+       "total",
+       "99800000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "total"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>per_minute<\/code> is created: 1500000.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "normal",
+       "200000"
+      ],
+      [
+       "hot",
+       "90000000"
+      ],
+      [
+       "total",
+       "99800000"
+      ],
+      [
+       "per_minute",
+       "1500000.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "per_minute"
+  },
+  {
+   "line": 4,
+   "phase": "Even",
+   "note": "Adding reducers does not help: one key always goes to one reducer. <code>even<\/code> is created: 1996000.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "normal",
+       "200000"
+      ],
+      [
+       "hot",
+       "90000000"
+      ],
+      [
+       "total",
+       "99800000"
+      ],
+      [
+       "per_minute",
+       "1500000.0"
+      ],
+      [
+       "even",
+       "1996000.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "even"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "normal",
+       "200000"
+      ],
+      [
+       "hot",
+       "90000000"
+      ],
+      [
+       "total",
+       "99800000"
+      ],
+      [
+       "per_minute",
+       "1500000.0"
+      ],
+      [
+       "even",
+       "1996000.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "hot reducer has 450x the normal load\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "normal",
+       "200000"
+      ],
+      [
+       "hot",
+       "90000000"
+      ],
+      [
+       "total",
+       "99800000"
+      ],
+      [
+       "per_minute",
+       "1500000.0"
+      ],
+      [
+       "even",
+       "1996000.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "even spread: 1,996,000 records each, about 1.3 min\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "How often is reduce() called in a reduce task?",
+  "options": [
+   "Once per record",
+   "Once per map task",
+   "Once per distinct key in its partition, in sorted key order",
+   "Once per reduce task"
+  ],
+  "answer": 2,
+  "why": "setup once, reduce per key, cleanup once."
+ },
+ {
+  "q": "What is the default number of reducers in Hadoop MapReduce?",
+  "options": [
+   "0",
+   "1",
+   "One per DataNode",
+   "Equal to the number of maps"
+  ],
+  "answer": 1,
+  "why": "mapreduce.job.reduces defaults to 1."
+ },
+ {
+  "q": "With 3 reducers, our part-r-00000 was empty. Why?",
+  "options": [
+   "No item name hashed to partition 0",
+   "Reducer 0 crashed",
+   "The file was still being written",
+   "HDFS hides small files"
+  ],
+  "answer": 0,
+  "why": "Keys are assigned by (hash & MAX) % 3; none of the six items gave 0."
+ },
+ {
+  "q": "Why did every item show the same order ID three times without a copy?",
+  "options": [
+   "The data had duplicates",
+   "The mapper emitted each ID three times",
+   "The partitioner was wrong",
+   "The values iterator reuses one Text object, so the list held three references to it"
+  ],
+  "answer": 3,
+  "why": "Copy what you keep: new Text(value)."
+ },
+ {
+  "q": "What happens with mapreduce.job.reduces=0?",
+  "options": [
+   "The job fails",
+   "One reducer is used anyway",
+   "A map-only job: no shuffle or sort, output files part-m-*",
+   "Maps write to the NameNode"
+  ],
+  "answer": 2,
+  "why": "Our run wrote part-m-00000 with unsorted map output."
+ },
+ {
+  "q": "Is the output of a job with several reducers globally sorted?",
+  "options": [
+   "Yes, always",
+   "No: each part file is sorted, but keys are spread across files by hash",
+   "Only if there are 10 reducers",
+   "Only for numeric keys"
+  ],
+  "answer": 1,
+  "why": "Use one reducer or TotalOrderPartitioner for a global order."
+ },
+ {
+  "q": "In what order do the values of one key arrive at the reducer?",
+  "options": [
+   "In no guaranteed order",
+   "Sorted ascending",
+   "In input file order",
+   "Sorted descending"
+  ],
+  "answer": 0,
+  "why": "Our IDs came as 104221, 150350, 113456; ordering values needs a secondary sort."
+ },
+ {
+  "q": "Which change does NOT fix a reducer overloaded by one hot key?",
+  "options": [
+   "Adding a combiner",
+   "Salting the hot key",
+   "A custom partitioner",
+   "Doubling the number of reducers"
+  ],
+  "answer": 3,
+  "why": "All values of one key still go to a single reducer."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 8.5 in one screen</h3>
+    <ul><li><code>Reducer&lt;KEYIN, VALUEIN, KEYOUT, VALUEOUT&gt;</code>: setup once, <b>reduce(key, values, ctx)</b> once per key in sorted order, cleanup once.</li><li>Keys go to reducers by <b>HashPartitioner</b>: <code>(hash &amp; MAX_VALUE) % reduces</code>; same key → same reducer.</li><li>Default 1 reducer; set with <code>setNumReduceTasks</code> or <code>-D mapreduce.job.reduces</code>; guideline 0.95 or 1.75 × containers.</li><li>Lab: 3 reducers → 0, 79, 38 bytes; 10 reducers → 4 empty files; 0 reducers → part-m-00000, unsorted.</li><li><b>Values are a one-pass iterator over a reused object</b>: aggregate as you go, copy anything you keep.</li><li>Value order within a key is undefined; each part file is sorted, not the whole output.</li><li>Output: part-r-NNNNN via the output committer (_temporary → final), then _SUCCESS; replicated in HDFS.</li><li>Skew: one hot key = one slow reducer; more reducers don't help.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What does the Reducer do in Hadoop MapReduce?</summary><p>After the shuffle and sort, each reduce task receives a partition of the intermediate keys. For each key, in sorted order, Hadoop calls reduce(key, values, context) with all the values for that key. The reducer typically aggregates them and writes output records, which go to one file per reduce task (part-r-NNNNN) in HDFS.</p></details>
+    <details><summary>How do I set the number of reducers?</summary><p>In the driver call job.setNumReduceTasks(n), or pass -D mapreduce.job.reduces=n on the command line when the driver uses GenericOptionsParser or ToolRunner. The default is 1. The Hadoop documentation suggests 0.95 or 1.75 times (nodes × maximum containers per node); in practice also aim for output files of reasonable size.</p></details>
+    <details><summary>Why are some reducer output files empty?</summary><p>Keys are assigned to reducers by the partitioner, by default (key.hashCode() &amp; Integer.MAX_VALUE) % numReduceTasks. If no key hashes to a given partition, that reducer receives nothing but still writes its (empty) part file. In our lab, 6 keys and 10 reducers left 4 files empty.</p></details>
+    <details><summary>Why do I get the same value repeated when I store reducer values in a list?</summary><p>Hadoop reuses a single Writable instance for the values of the Iterable and refills it at every step. Storing the object stores a reference to that one instance, which ends up holding the last value. Store a copy instead, for example new Text(value) or the primitive from value.get().</p></details>
+    <details><summary>Can a MapReduce job have zero reducers?</summary><p>Yes. With setNumReduceTasks(0) the job is map-only: there is no shuffle or sort, and each map task writes its output directly to the output directory as part-m-NNNNN. This is used for filtering, cleaning and conversion jobs.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Reducer exercises using the real files and counters from our lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Bytes per file</h4></div>
+      <p>part-r-00001 (chai, dosa, samosa, vada pav) is 79 bytes and part-r-00002 (idli, poha) is 38. Check 79 by building the four lines.</p>
+      <div class="prob__io"><div><small>Input</small><pre>4 output lines</pre></div><div><small>Expected output</small><pre>79 bytes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>lines = [&quot;chai\t50170\t752550&quot;, &quot;dosa\t49948\t2247660&quot;, &quot;samosa\t50021\t900378&quot;, &quot;vada pav\t49986\t999720&quot;]
+print(sum(len(l) + 1 for l in lines), &quot;bytes&quot;)</code></pre><div class="output">79 bytes</div></div>
+        <p><b>How it works:</b> 79: each line plus its newline character.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Empty files</h4></div>
+      <p>With 6 keys and 10 reducers, how many files must be empty at the very least?</p>
+      <div class="prob__io"><div><small>Input</small><pre>6 keys · 10 reducers</pre></div><div><small>Expected output</small><pre>4 at least; more if two keys share a reducer</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(10 - 6, &quot;at least; more if two keys share a reducer&quot;)</code></pre><div class="output">4 at least; more if two keys share a reducer</div></div>
+        <p><b>How it works:</b> 4, which is exactly what we got: every item happened to land on a different reducer.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Reducer input</h4></div>
+      <p>The reducer saw Reduce input records=300000 and Reduce input groups=6. How many values per reduce() call, on average?</p>
+      <div class="prob__io"><div><small>Input</small><pre>300,000 / 6</pre></div><div><small>Expected output</small><pre>50000.0</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(300000 / 6)</code></pre><div class="output">50000.0</div></div>
+        <p><b>How it works:</b> 50,000 values per call: each item has about 50,000 orders.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Single pass</h4></div>
+      <p>Write a reducer that returns count, sum and max of a key's values in ONE loop over an iterator.</p>
+      <div class="prob__io"><div><small>Input</small><pre>iterator of amounts</pre></div><div><small>Expected output</small><pre>(&#x27;dosa&#x27;, 4, 175, 45)</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>def reduce_fn(key, values):
+    n = s = 0
+    m = None
+    for v in values:
+        n += 1; s += v
+        m = v if m is None or v &gt; m else m
+    return key, n, s, m
+print(reduce_fn(&quot;dosa&quot;, iter([45, 45, 40, 45])))</code></pre><div class="output">(&#x27;dosa&#x27;, 4, 175, 45)</div></div>
+        <p><b>How it works:</b> One pass is all you get; keep running totals instead of a list.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Group a sorted stream</h4></div>
+      <p>Given a sorted stream of (key, value), produce one line per key with the sum, without building a dictionary.</p>
+      <div class="prob__io"><div><small>Input</small><pre>sorted pairs</pre></div><div><small>Expected output</small><pre>chai 30
+idli 30
+poha 50</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>from itertools import groupby
+stream = [(&quot;chai&quot;, 15), (&quot;chai&quot;, 15), (&quot;idli&quot;, 30), (&quot;poha&quot;, 25), (&quot;poha&quot;, 25)]
+for key, group in groupby(stream, key=lambda kv: kv[0]):
+    print(key, sum(v for _, v in group))</code></pre><div class="output">chai 30
+idli 30
+poha 50</div></div>
+        <p><b>How it works:</b> This is how Hadoop groups: the input is sorted, so equal keys are next to each other.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Partition a new item</h4></div>
+      <p>The canteen adds “upma”. With 3 reducers, which file will it go to?</p>
+      <div class="prob__io"><div><small>Input</small><pre>“upma”, 3 reducers</pre></div><div><small>Expected output</small><pre>part-r-00001</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>h = 1
+for b in &quot;upma&quot;.encode():
+    h = (31 * h + b) &amp; 0xffffffff
+print(&quot;part-r-%05d&quot; % ((h &amp; 0x7fffffff) % 3))</code></pre><div class="output">part-r-00001</div></div>
+        <p><b>How it works:</b> The hash decides; adding one key never moves the other items.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Files per day</h4></div>
+      <p>A daily job uses 400 reducers and writes 8 GB. A team keeps the output for a year. How many files and what average size? Suggest a better reducer count for files of about 256 MB.</p>
+      <div class="prob__io"><div><small>Input</small><pre>400 reducers · 8 GB/day · 365 days</pre></div><div><small>Expected output</small><pre>146,000 files a year, 20 MB each
+better reducer count: 32</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>files = 400 * 365
+print(f&quot;{files:,} files a year, {8 * 1024 / 400:.0f} MB each&quot;)
+print(&quot;better reducer count:&quot;, 8 * 1024 // 256)</code></pre><div class="output">146,000 files a year, 20 MB each
+better reducer count: 32</div></div>
+        <p><b>How it works:</b> 1,46,000 files of 20 MB a year; 32 reducers would give 256 MB files and about 11,700 files (Lesson 7.5).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>Salting a hot key</h4></div>
+      <p>chai has 9 lakh records and the other keys 50,000 each. Salt chai into 4 sub-keys (chai#0 … chai#3) and show the load per reducer drops, then combine the salted totals.</p>
+      <div class="prob__io"><div><small>Input</small><pre>record counts per key</pre></div><div><small>Expected output</small><pre>largest group before: 900000 after: 225000
+chai recombined: 900000</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>counts = {&quot;chai&quot;: 900_000, &quot;dosa&quot;: 50_000, &quot;idli&quot;: 50_000, &quot;poha&quot;: 50_000}
+salted = {}
+for k, c in counts.items():
+    parts = 4 if k == &quot;chai&quot; else 1
+    for i in range(parts):
+        key = f&quot;{k}#{i}&quot; if parts &gt; 1 else k
+        salted[key] = c // parts
+print(&quot;largest group before:&quot;, max(counts.values()), &quot;after:&quot;, max(salted.values()))
+total_chai = sum(v for k, v in salted.items() if k.startswith(&quot;chai#&quot;))
+print(&quot;chai recombined:&quot;, total_chai)</code></pre><div class="output">largest group before: 900000 after: 225000
+chai recombined: 900000</div></div>
+        <p><b>How it works:</b> The biggest reduce group drops from 9 lakh to 2.25 lakh records; a small second step adds chai#0 … chai#3 back to 9 lakh.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Reducer questions test whether you have actually written MapReduce code: partitioning, reducer count and object reuse come up again and again.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Concepts · partitioning</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“How does Hadoop decide which reducer gets a key?”</h4>
+      <p class="scn__situation">A standard follow-up after explaining word count.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> the Partitioner and its guarantee.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>The Partitioner; by default HashPartitioner: (key.hashCode() &amp; Integer.MAX_VALUE) % numReduceTasks.</li>
+          <li>Guarantee: all values of one key go to the same reducer, so reduce sees the complete group.</li>
+          <li>Side effect: load depends on key distribution; few keys or a hot key give uneven reducers (we saw files of 0, 79 and 38 bytes).</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Coding · bug</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>A reducer collects values into a list and all entries are identical</h4>
+      <p class="scn__situation">Code review of a reducer that builds a list of the last 10 transactions per customer.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> knowledge of Writable reuse.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Hadoop reuses one key and one value object while iterating; the list stores references to the same instance.</li>
+          <li>Fix: add a copy (new Text(v), WritableUtils.clone, or extract primitives).</li>
+          <li>Also check memory: collecting all values of a hot key can exhaust the heap; keep only what is needed.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Performance · skew</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>The job is stuck at “reduce 99%” for an hour</h4>
+      <p class="scn__situation">All but one reducer finished quickly.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> skew diagnosis and fixes.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Compare “Reduce input records” and shuffle bytes per reduce task; one task with far more input means a hot key.</li>
+          <li>Find the key (sample the map output or count keys in a quick job); often null or a default value.</li>
+          <li>Fix: filter or handle the junk key, use a combiner, salt the hot key and merge in a second step, or a custom partitioner. More reducers alone won't help.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Design · output</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“I need one sorted output file. Do I set 1 reducer?”</h4>
+      <p class="scn__situation">An analyst wants a single report file sorted by customer.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> trade-offs between one reducer and total order.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>1 reducer works for small outputs, but all data passes through one task: slow for big outputs.</li>
+          <li>For large data use TotalOrderPartitioner (sampled key ranges), so files 0 … n−1 are in order and can be concatenated.</li>
+          <li>Or keep many reducers and sort/merge downstream (getmerge only concatenates, it does not sort).</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

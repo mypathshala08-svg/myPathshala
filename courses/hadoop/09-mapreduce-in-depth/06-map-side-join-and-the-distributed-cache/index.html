@@ -1,0 +1,2604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Map-side join and the distributed cache | MyPhatshala</title>
+<meta name="description" content="Map-side (replicated, broadcast) join in Hadoop MapReduce, run on a real Hadoop 3.5.0 cluster: the menu shipped to every map task with the distributed cache (addCacheFile with #symlink, -files, -archives, -libjars), loaded into a HashMap in setup(), and 5 lakh orders joined in a map-only job. 459,636 joined rows, 0 bytes shuffled, 18.9 s vs 24.8 s and 24.4 MB shuffled for the reduce-side join. Localization, memory limits, composite join, Hive map join and Spark broadcast join. Python simulation, quiz and interview scenarios.">
+<meta name="mp:minutes" content="26">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/09-mapreduce-in-depth/06-map-side-join-and-the-distributed-cache/">
+<meta property="og:title" content="Map-side join and the distributed cache · MyPhatshala">
+<meta property="og:description" content="Ship the small table to every mapper and skip the shuffle: a real map-side join with the distributed cache, 0 bytes shuffled.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Map-side join and the distributed cache", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="09-mapreduce-in-depth/06-map-side-join-and-the-distributed-cache" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 9.6</b></nav>
+    <h1>Map-side join and the distributed cache</h1>
+    <p class="lead">When one side of a join is small, the cheapest join moves nothing but that small side. This lesson ships a menu file to every map task with Hadoop's distributed cache, joins 5 lakh orders while they are read, and compares it with the reduce-side join of Lesson 9.5 on the same cluster and data.</p>
+    <div class="lesson-meta"><span>Module 9 · MapReduce in depth</span><span>⏱ 26 min</span><span>Intermediate</span><span>0 bytes shuffled, measured</span><span>Distributed cache explained</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Give every worker a copy of the menu card</h2>
+  <div class="story">
+    <p class="narration">The reduce-side join from Lesson 9.5 worked, but Riya keeps looking at one counter: <b>24,448,645 bytes shuffled</b>. Five lakh orders crossed the network just so each could meet one line of a menu that has seven lines. Kabir laughs: “It's like sending every customer to the head office to ask what category a samosa is. Just print the menu card and stick it on every counter.”</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="Reduce-side join sends all orders across the network to the reducer. Map-side join copies the small menu to every map task, so orders are joined where they are read and nothing is shuffled.">
+        <g font-size="10">
+          <text x="160" y="20" text-anchor="middle" font-weight="700" class="s-ink">Reduce-side join (Lesson 9.5)</text>
+          <rect x="30" y="34" width="80" height="26" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="70" y="51" text-anchor="middle" font-size="8.4" class="s-green">orders split 1</text>
+          <rect x="30" y="66" width="80" height="26" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="70" y="83" text-anchor="middle" font-size="8.4" class="s-green">orders split 2</text>
+          <rect x="30" y="98" width="80" height="26" rx="5" class="s-soft-acc" style="stroke:var(--track)"/><text x="70" y="115" text-anchor="middle" font-size="8.4" class="s-acc">menu (7 lines)</text>
+          <path d="M110 47C160 47 170 78 210 78M110 79h100M110 111C160 111 170 82 210 82" style="fill:none;stroke:var(--red);stroke-width:2"/>
+          <rect x="210" y="62" width="80" height="36" rx="6" class="s-board"/><text x="250" y="78" text-anchor="middle" font-size="8.4" class="s-chalk">reducer</text><text x="250" y="91" text-anchor="middle" font-size="8" style="fill:#F5C77E">joins here</text>
+          <text x="160" y="146" text-anchor="middle" font-size="8.8" class="s-red">24.4 MB shuffled · 24.8 s</text>
+
+          <text x="480" y="20" text-anchor="middle" font-weight="700" class="s-ink">Map-side join (this lesson)</text>
+          <rect x="370" y="34" width="110" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="425" y="50" text-anchor="middle" font-size="8.4" class="s-green">map 1: orders split 1</text><text x="425" y="65" text-anchor="middle" font-size="8" class="s-acc">+ menu copy</text>
+          <rect x="370" y="84" width="110" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="425" y="100" text-anchor="middle" font-size="8.4" class="s-green">map 2: orders split 2</text><text x="425" y="115" text-anchor="middle" font-size="8" class="s-acc">+ menu copy</text>
+          <path d="M480 54h40M480 104h40" style="fill:none;stroke:var(--green);stroke-width:2"/>
+          <rect x="520" y="40" width="96" height="28" rx="5" class="s-card2"/><text x="568" y="58" text-anchor="middle" font-size="8.4" class="s-ink">part-m-00000</text>
+          <rect x="520" y="90" width="96" height="28" rx="5" class="s-card2"/><text x="568" y="108" text-anchor="middle" font-size="8.4" class="s-ink">part-m-00001</text>
+          <text x="480" y="146" text-anchor="middle" font-size="8.8" class="s-green">0 bytes shuffled · 18.9 s</text>
+        </g>
+        <text x="320" y="178" text-anchor="middle" font-size="9.6" class="s-ink2">Real lab numbers, 5 lakh orders. Same 459,636 joined rows either way.</text>
+        <text x="632" y="194" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>When one side of a join is small, don't move the big side to meet it. Move the small side to every map task instead. Hadoop has a built-in delivery service for exactly that: the <b>distributed cache</b>.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So each map task loads the menu into memory once, and then looks up every order as it reads it?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Exactly. A map-only job: no shuffle, no sort, no reducer. Today we ran it on the same 5 lakh orders and got the same 459,636 joined rows, about six seconds faster, with nothing crossing the network.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>And the catch, I'm guessing, is that the menu must fit in memory.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>That is the one rule. A seven-line menu fits anywhere. A 50 GB customer table does not, and then you are back to the reduce-side join.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Map-side join and the distributed cache</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A <b>map-side join</b> combines records from two data sets inside the map phase, without a shuffle. In its most common form, the <b>replicated</b> (or <b>broadcast</b>) join, the smaller data set is copied to every map task, loaded into an in-memory hash table in <code>setup()</code>, and each record of the larger data set is joined by a lookup as it is read; the job can be map-only. The copy is delivered by the <b>distributed cache</b>: files registered with <code>Job.addCacheFile()</code> or the <code>-files</code>, <code>-archives</code> and <code>-libjars</code> generic options are downloaded from HDFS by each NodeManager once per node into a local cache, and made available to every container of the job, optionally under a symlink name given after <code>#</code>. A second form, the <b>composite</b> (sort-merge) map-side join, needs no memory but requires both inputs to be sorted by the join key and partitioned identically into the same number of files.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Give every worker its own copy of the small table, keep it in a dictionary, and add the matching column to each big-table row while reading it. Nothing is sent to a reducer, so it is fast, as long as the small table really is small.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Replicated join</b><span>The small side is replicated to every map task. Also called broadcast join.</span></div>
+    <div class="term"><b>Distributed cache</b><span>Hadoop's way to ship read-only files (data, jars, archives) to every task of a job.</span></div>
+    <div class="term"><b>addCacheFile(uri)</b><span>Registers an HDFS file for the cache from the driver; <code>#name</code> sets the symlink.</span></div>
+    <div class="term"><b>-files / -archives / -libjars</b><span>Generic options that do the same from the command line (comma-separated lists).</span></div>
+    <div class="term"><b>Localization</b><span>The NodeManager downloads cache files to the node's local disk before containers start.</span></div>
+    <div class="term"><b>Symlink</b><span>A link in the container's working directory, e.g. <code>./menu</code>, pointing at the localized file.</span></div>
+    <div class="term"><b>Map-only job</b><span><code>setNumReduceTasks(0)</code>: output written straight from the maps as part-m files.</span></div>
+    <div class="term"><b>Composite join</b><span>Map-side merge of two inputs already sorted and partitioned the same way (CompositeInputFormat).</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, 5 lakh orders, menu without “coffee”)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>Map-side join</th><td>3 splits, 3 map tasks, 0 reducers: Map input records 500,000, Map output records 459,636; 18.9 s</td></tr>
+    <tr><th>Reduce-side join</th><td>4 map tasks (3 order splits + menu), 1 reducer: Reduce shuffle bytes 24,448,645; 24.8 s</td></tr>
+    <tr><th>Counters</th><td>ORDERS_JOINED = 459,636 and ORDERS_WITHOUT_MENU = 40,364 (all the coffee orders) in both jobs</td></tr>
+    <tr><th>Output</th><td>Map-side: part-m-00000/1/2 of 9,020,852 + 8,993,924 + 2,836,286 bytes; reduce-side: one part-r-00000 of 20,851,062 bytes. Same rows once sorted</td></tr>
+    <tr><th>Task log</th><td><code>cache files: [/user/hadoop/data/menu_nocoffee.csv#menu]</code>, <code>menu loaded in setup(): 7 items</code>, working dir <code>…/appcache/application_…/container_…_000003/</code></td></tr>
+  </table>
+
+  <h3 id="levels">Map-side join at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A menu card on every counter</h4>
+      <ul>
+        <li>Each counter (map task) gets a printed copy of the menu card (the small table).</li>
+        <li>When an order comes in, the counter reads the category off its own card and writes the bill at once. No one walks to the head office.</li>
+        <li>This only works because the card is small. If the “card” were a phone book of every student, you couldn't print one for every counter.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How the job is built</h4>
+      <ul>
+        <li><b>Driver:</b> <code>job.addCacheFile(new URI("/user/hadoop/data/menu.csv#menu"))</code> and <code>job.setNumReduceTasks(0)</code>.</li>
+        <li><b>setup():</b> open <code>./menu</code> (the symlink), read every line into a <code>HashMap&lt;item, category&gt;</code>. It runs once per map task, not once per record.</li>
+        <li><b>map():</b> look up the item; if found, write the order plus its category; if not, increment a counter. Each line is handled on its own, so the output keeps the input order.</li>
+        <li><b>Output:</b> one <code>part-m-NNNNN</code> per map task, unsorted. Our three files were 9.0 MB, 9.0 MB and 2.8 MB because the third split was the short tail of the file.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Where it breaks and what else exists</h4>
+      <ul>
+        <li><b>Memory:</b> the hash table lives in the map JVM's heap (300 MB in our lab, <code>-Xmx300m</code>). Java objects take several times the file size, so a 100 MB file can need 300–500 MB of heap. Measure, and raise <code>mapreduce.map.memory.mb</code> and <code>-Xmx</code> together if needed.</li>
+        <li><b>Inner vs outer:</b> unmatched big-side rows can be dropped (inner) or written with an empty value (left outer). Unmatched small-side rows can't be reported, because no single task sees all big-side rows.</li>
+        <li><b>Composite join:</b> if both inputs are already sorted by the key and split into the same number of identically partitioned files (for example, outputs of two jobs with the same partitioner and reducer count), <code>CompositeInputFormat</code> merges them in the map with no memory limit.</li>
+        <li><b>Today:</b> Hive converts joins with a small table into a <b>map join</b> automatically (<code>hive.auto.convert.join</code>), and Spark does a <b>broadcast hash join</b> below <code>spark.sql.autoBroadcastJoinThreshold</code> (10 MB by default). Same idea, same memory rule.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “Explain map-side join”, give: small table shipped with the distributed cache, loaded into a hash map in <code>setup()</code>, lookup in <code>map()</code>, no reducer and no shuffle; the condition (small side fits in memory); and the alternative for two big tables (reduce-side join, or a composite join when both are sorted and identically partitioned).</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Reduce-side vs map-side joins</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th></th><th>Reduce-side join (9.5)</th><th>Replicated map-side join</th><th>Composite map-side join</th></tr></thead>
+    <tbody>
+      <tr><td><b>Input condition</b></td><td>None</td><td>One side fits in map memory</td><td>Both sorted by key, same number of partitions</td></tr>
+      <tr><td><b>Shuffle</b></td><td>Both sides (24.4 MB in our lab)</td><td>None</td><td>None</td></tr>
+      <tr><td><b>Reducers</b></td><td>Needed</td><td>Not needed (map-only)</td><td>Not needed</td></tr>
+      <tr><td><b>Lab time</b></td><td>24.8 s</td><td>18.9 s</td><td>(not run)</td></tr>
+      <tr><td><b>Join types</b></td><td>Inner, left, right, full outer</td><td>Inner, outer on the big side</td><td>Inner, outer</td></tr>
+      <tr><td><b>Risk</b></td><td>Hot keys overload one reducer</td><td>Out of memory if the small side grows</td><td>Preparing sorted inputs costs jobs of its own</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Three ways to put a file in the distributed cache</h3>
+  <div class="cards">
+    <div class="card"><h4>addCacheFile (driver)</h4><p><code>job.addCacheFile(new URI("/data/menu.csv#menu"))</code>. The file must already be in HDFS. Our JoinMapSide uses this.</p><span class="tag">Java</span></div>
+    <div class="card"><h4>-files (command line)</h4><p><code>-files menu.csv,lookup.py</code>: local or HDFS files, uploaded to the staging folder for you. Lesson 9.8 ships <code>menu.csv</code> to Python scripts this way.</p><span class="tag">any job</span></div>
+    <div class="card"><h4>-archives</h4><p><code>-archives dict.zip#dict</code>: a zip, tar or jar that is <b>unpacked</b> on each node; tasks see a folder.</p><span class="tag">many files</span></div>
+    <div class="card"><h4>-libjars</h4><p><code>-libjars gson.jar</code>: extra jars added to the task classpath, for libraries your mapper needs.</p><span class="tag">code</span></div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><code>-files</code>, <code>-archives</code> and <code>-libjars</code> only work if your <code>main()</code> passes the arguments through <code>GenericOptionsParser</code> (or implements <code>Tool</code> and runs via <code>ToolRunner</code>). All our programs do, which is why <code>-D</code> options also worked in Modules 8 and 9.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>A replicated join on the lab cluster</h2>
+  <p>Same data as Lesson 9.5: <code>student_orders.csv</code> (5 lakh orders, 3 splits) and a menu with “coffee” removed on purpose. Full scripts are in “Run it on your PC”.</p>
+  <ol class="stepper">
+    <li><h4>Register the small file and switch off reducers</h4>
+      <div class="code" data-lang="java" data-file="JoinMapSide.java (driver)"><pre><code>job.addCacheFile(new URI(rest[1] + "#menu"));   // ship the menu, linked as ./menu
+job.setMapperClass(JoinMapper.class);
+job.setNumReduceTasks(0);                       // no reducer, so no shuffle at all</code></pre></div>
+      <span class="behind">The client records the HDFS path in the job configuration. Before any map container starts on a node, that node's NodeManager downloads the file once into its local file cache.</span></li>
+    <li><h4>Load it once per task, in setup()</h4>
+      <div class="code" data-lang="java" data-file="JoinMapSide.java (setup)"><pre><code>try (BufferedReader r = new BufferedReader(new FileReader("menu"))) {
+  String line;
+  while ((line = r.readLine()) != null) {
+    String[] f = line.split(",");
+    category.put(f[0], f[1]);
+  }
+}</code></pre><div class="output">cache files: [/user/hadoop/data/menu_nocoffee.csv#menu]
+menu loaded in setup(): 7 items, working dir = /tmp/hadoop-hadoop/nm-local-dir/usercache/hadoop/appcache/application_1792643020992_0040/container_1792643020992_0040_01_000003/.</div></div>
+      <span class="behind">The file is opened by its plain name <code>menu</code>: YARN placed a symlink with that name in the container's working directory, pointing to the localized copy. No HDFS client code is needed.</span></li>
+    <li><h4>Join while reading</h4>
+      <div class="code" data-lang="java" data-file="JoinMapSide.java (map)"><pre><code>String cat = category.get(line.toString().split(",")[3]);
+if (cat == null) { ctx.getCounter(Join.ORDERS_WITHOUT_MENU).increment(1); return; }
+out.set(line + "," + cat);
+ctx.write(out, NullWritable.get());</code></pre></div>
+      <span class="behind">One hash lookup per order. Orders with no menu row (all coffee orders) are counted and dropped: an inner join. Writing them with an empty category instead would make it a left outer join.</span></li>
+    <li><h4>Run it</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr9.jar JoinMapSide /user/hadoop/data/student_orders.csv /user/hadoop/data/menu_nocoffee.csv /out/JoinMapSide</code></pre><div class="output">number of splits:3
+Launched map tasks=3
+Map input records=500000
+Map output records=459636
+ORDERS_JOINED=459636
+ORDERS_WITHOUT_MENU=40364
+Bytes Written=20851062
+took 18943 ms</div></div>
+      <span class="behind">No “Launched reduce tasks”, no shuffle counters, no Spilled Records: map output goes straight to HDFS. The reduce-side join of the same data needed a reducer and moved 24,448,645 bytes.</span></li>
+    <li><h4>Look at the output</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs dfs -ls /out/JoinMapSide
+hdfs dfs -cat /out/JoinMapSide/part-m-00000 | head -2</code></pre><div class="output">9020852 /out/JoinMapSide/part-m-00000
+8993924 /out/JoinMapSide/part-m-00001
+2836286 /out/JoinMapSide/part-m-00002
+1,S1413,2026-09-14 15:30,dosa,45,meal
+2,S0973,2026-09-26 20:11,samosa,18,snack</div></div>
+      <span class="behind">One file per map task, rows in the same order as the input (order 1, then order 2). The reduce-side output came out grouped by item instead, because the reducer received it sorted by key.</span></li>
+    <li><h4>Check it against the reduce-side join</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>diff &lt;(hdfs dfs -cat /out/JoinReduceSide/part-* | sort) &lt;(hdfs dfs -cat /out/JoinMapSide/part-* | sort)</code></pre><div class="output">identical (459,636 rows each, compared after sorting)</div></div>
+      <span class="behind">Same answer, different route. Always verify a rewritten join this way before trusting its speed.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>A replicated join that works on test data can fail in production when the “small” table grows: every map task holds its own full copy in heap, so the job dies with <code>OutOfMemoryError</code> or containers are killed for exceeding memory. Check the small side's size in the driver (or in your scheduler) and fall back to a reduce-side join above a limit.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>From HDFS to every container, then a lookup per order</h2>
+  <p>Six steps of the JoinMapSide job: register, localize, symlink, load, join, write.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">A broadcast join <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Terminal and task log of the map-side join">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@namenode : /tmp/mr9</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop jar mr9.jar JoinMapSide orders menu …</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">number of splits:3</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">Submitted application_…_0040</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">map 0% reduce 0%</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#7F8C86">(NodeManagers download menu once per node)</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">task log (stderr):</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">cache files: [/user/hadoop/data/</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#F5C77E">  menu_nocoffee.csv#menu]</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">task log (stderr):</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">menu loaded in setup(): 7 items</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">working dir = …/container_…_000003/.</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">map 100% reduce 0%</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">ORDERS_JOINED=459636</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#F5C77E">ORDERS_WITHOUT_MENU=40364</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#7F8C86">(no reduce tasks, no shuffle)</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hdfs dfs -cat …/part-m-00000 | head -2</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">1,S1413,2026-09-14 15:30,dosa,45,meal</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">2,S0973,2026-09-26 20:11,samosa,18,snack</text><text x="26" y="108" font-size="8.2" class="mono" style="fill:#F5C77E">took 18943 ms</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The job is submitted with the menu registered as a cache file.</li>
+          <li>Before tasks start, each worker's NodeManager fetches the menu.</li>
+          <li>The task log shows the cache file the task received, with its #menu link name.</li>
+          <li>setup() reads ./menu into a HashMap: 7 items.</li>
+          <li>Every order is joined during the map; coffee orders are only counted.</li>
+          <li>Joined rows land in part-m files, in input order. 18.9 s in total.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="HDFS, NodeManager file cache, container symlink, HashMap, and map output">
+          <g font-size="8">
+            <rect x="12" y="14" width="100" height="40" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="62" y="31" text-anchor="middle" font-weight="700" class="s-blue">HDFS</text><text x="62" y="45" text-anchor="middle" class="s-ink">menu_nocoffee.csv</text>
+            <rect x="130" y="14" width="218" height="150" rx="6" class="s-card2"/><text x="239" y="28" text-anchor="middle" font-weight="700" class="s-ink">worker2 (NodeManager)</text>
+          </g>
+          <g data-on="1"><text x="180" y="200" text-anchor="middle" font-size="8.6" class="s-ink">the driver only records the path in job.xml:</text><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">mapreduce.job.cache.files = …/menu_nocoffee.csv#menu</text></g>
+          <g data-on="2"><path d="M112 34h40" style="fill:none;stroke:var(--blue);stroke-width:2;stroke-dasharray:4 3"/><rect x="152" y="38" width="180" height="24" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/><text x="242" y="54" text-anchor="middle" font-size="8" class="s-blue">filecache: menu_nocoffee.csv (once per node)</text><text x="180" y="200" text-anchor="middle" font-size="8.6" class="s-ink">localization: downloaded once per node,</text><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">shared by every container of the job on it</text></g>
+          <g data-on="3"><rect x="152" y="38" width="180" height="24" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/><text x="242" y="54" text-anchor="middle" font-size="8" class="s-blue">filecache: menu_nocoffee.csv</text><rect x="152" y="76" width="180" height="78" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="242" y="90" text-anchor="middle" font-size="8" class="s-green">container_…_000003 (map task)</text><text x="166" y="108" font-size="8" class="mono s-ink">./menu  →  filecache copy  ↗</text><path d="M318 104V62" style="fill:none;stroke:var(--green);stroke-width:1.6;stroke-dasharray:3 2"/><text x="180" y="200" text-anchor="middle" font-size="8.6" class="s-ink">a symlink named after “#menu” appears</text><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">in the container's working directory</text></g>
+          <g data-on="4"><rect x="152" y="76" width="180" height="78" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="242" y="90" text-anchor="middle" font-size="8" class="s-green">map task heap (300 MB)</text><g font-size="7.8" class="mono s-ink"><text x="166" y="106">HashMap: chai→drink</text><text x="166" y="118">samosa→snack, dosa→meal</text><text x="166" y="130">… 7 items (no coffee)</text></g><text x="180" y="200" text-anchor="middle" font-size="8.6" class="s-ink">setup() runs once per task:</text><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">the whole small table goes into memory</text></g>
+          <g data-on="5"><rect x="152" y="76" width="180" height="78" rx="5" class="s-soft-green" style="stroke:var(--green)"/><g font-size="7.8" class="mono"><text x="160" y="94" class="s-ink">1,S1413,…,dosa,45</text><text x="160" y="108" class="s-green">  get("dosa") → meal ✓</text><text x="160" y="124" class="s-ink">…,coffee,20</text><text x="160" y="138" class="s-red">  get("coffee") → null, count it</text></g><text x="180" y="200" text-anchor="middle" font-size="8.6" class="s-ink">one hash lookup per order,</text><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">no sort, no spill, no shuffle</text></g>
+          <g data-on="6"><rect x="152" y="76" width="180" height="78" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="242" y="100" text-anchor="middle" font-size="8" class="s-green">3 map tasks: 459,636 rows</text><text x="242" y="116" text-anchor="middle" font-size="8" class="s-ink">(9.0 + 9.0 + 2.8 MB)</text><path d="M152 100H62V58" style="fill:none;stroke:var(--green);stroke-width:2"/><rect x="12" y="62" width="100" height="22" rx="4" class="s-card2"/><text x="62" y="77" text-anchor="middle" font-size="8" class="s-ink">part-m-00001</text><text x="180" y="200" text-anchor="middle" font-size="8.6" class="s-ink">each map writes its own part-m file to HDFS,</text><text x="180" y="214" text-anchor="middle" font-size="8.6" class="s-ink">rows in the same order as its input split</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>addCacheFile only writes the HDFS path into the job's configuration.</li>
+          <li>The NodeManager downloads the file to its local filecache once, for all containers on that node.</li>
+          <li>Each container gets a symlink ./menu pointing at the local copy.</li>
+          <li>setup() reads the file into a HashMap that lives in the task's heap.</li>
+          <li>map() joins each order with one lookup; unknown items only increment a counter.</li>
+          <li>Joined rows are written directly to HDFS as part-m files.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Map-side joins at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="24" width="50" height="42" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="41" y="49" text-anchor="middle" font-size="8" class="s-green">txns</text><rect x="76" y="34" width="28" height="22" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="90" y="49" text-anchor="middle" font-size="7.6" class="s-acc">IFSC</text></svg></div>
+    <div><h4>1. Enriching transactions with a code table</h4>
+      <p>Billions of UPI or card transactions get the bank name and branch city from a few-MB IFSC or merchant-category table, joined in memory on every mapper.</p>
+      <div class="uc-flow"><span>Transactions</span><i>→</i><span class="java">broadcast lookup</span><i>→</i><span>Enriched rows</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><circle cx="60" cy="45" r="24" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="49" text-anchor="middle" font-size="8.4" class="s-blue">IP → city</text></svg></div>
+    <div><h4>2. Geo-tagging web logs</h4>
+      <p>A GeoIP range file shipped with <code>-files</code> lets each mapper convert client IPs to city and state while parsing log lines.</p>
+      <div class="uc-flow"><span>Access logs</span><i>→</i><span class="java">-files geoip.csv</span><i>→</i><span>Visits per city</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="22" y="22" width="76" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="8.4" class="s-ink">MAPJOIN</text><text x="60" y="56" text-anchor="middle" font-size="8" class="s-acc">auto</text></svg></div>
+    <div><h4>3. Hive and Spark do it for you</h4>
+      <p>A Hive query joining a fact table with a small dimension table becomes a map join automatically; Spark SQL broadcasts tables under 10 MB by default. Knowing the idea helps you read their plans and fix out-of-memory errors.</p>
+      <div class="uc-flow"><span>SQL JOIN</span><i>→</i><span class="java">small table broadcast</span><i>→</i><span>No shuffle of the big side</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="26" width="38" height="38" rx="5" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="26" width="38" height="38" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="80" text-anchor="middle" font-size="8" class="s-ink">same buckets</text></svg></div>
+    <div><h4>4. Bucketed tables for big-big joins</h4>
+      <p>Two large tables bucketed and sorted on the same key into the same number of files (Hive sort-merge-bucket join) can be joined file by file in the map phase: the composite join idea.</p>
+      <div class="uc-flow"><span>Bucket 7 of A</span><i>+</i><span class="java">Bucket 7 of B</span><i>→</i><span>Merged in one map</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Simulate a broadcast join, split by split</h2>
+  <p>Every “map task” below gets its own copy of the small table, builds a dictionary once (its <code>setup()</code>), and joins its own split. There is no shuffle step at all, and each task's output keeps its input order.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>menu_lines = [&quot;chai,drink,15,A&quot;, &quot;samosa,snack,18,B&quot;, &quot;dosa,meal,45,D&quot;, &quot;idli,breakfast,30,C&quot;]
+splits = [[&quot;1,S1413,2026-09-14 15:30,dosa,45&quot;, &quot;2,S0973,2026-09-26 20:11,samosa,18&quot;],
+          [&quot;3,S0007,2026-09-01 13:37,coffee,20&quot;, &quot;4,S0002,2026-09-03 08:10,chai,15&quot;],
+          [&quot;5,S0042,2026-09-09 14:05,idli,30&quot;]]
+joined = without_menu = 0
+for n, split in enumerate(splits):
+    category = {}                                   # setup(): once per map task
+    for line in menu_lines:
+        f = line.split(&quot;,&quot;)
+        category[f[0]] = f[1]
+    out = []
+    for order in split:                             # map(): once per record
+        cat = category.get(order.split(&quot;,&quot;)[3])
+        if cat is None:
+            without_menu += 1
+            continue
+        joined += 1
+        out.append(order + &quot;,&quot; + cat)
+    print(f&quot;part-m-0000{n}: {out}&quot;)
+print(&quot;ORDERS_JOINED =&quot;, joined, &quot; ORDERS_WITHOUT_MENU =&quot;, without_menu)</code></pre><div class="output">part-m-00000: [&#x27;1,S1413,2026-09-14 15:30,dosa,45,meal&#x27;, &#x27;2,S0973,2026-09-26 20:11,samosa,18,snack&#x27;]
+part-m-00001: [&#x27;4,S0002,2026-09-03 08:10,chai,15,drink&#x27;]
+part-m-00002: [&#x27;5,S0042,2026-09-09 14:05,idli,30,breakfast&#x27;]
+ORDERS_JOINED = 4  ORDERS_WITHOUT_MENU = 1</div></div>
+  <ul class="anno"><li><code>    category = {}                                   # setup(): once per map task</code><span>In Java this is the HashMap filled in setup() from the ./menu symlink: once per task, never per record.</span></li><li><code>        cat = category.get(order.split(&quot;,&quot;)[3])</code><span>The join itself: one dictionary lookup. No shuffle, no sort, no reducer.</span></li><li><code>            without_menu += 1</code><span>Coffee is missing from this menu, so its order is counted and dropped (an inner join). Our lab counted 40,364 of them.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Join each split",
+   "hint": "Press <b>Run<\/b>. Notice each part file keeps the order of its split.",
+   "code": "menu_lines = [\"chai,drink,15,A\", \"samosa,snack,18,B\", \"dosa,meal,45,D\", \"idli,breakfast,30,C\"]\nsplits = [[\"1,S1413,2026-09-14 15:30,dosa,45\", \"2,S0973,2026-09-26 20:11,samosa,18\"],\n          [\"3,S0007,2026-09-01 13:37,coffee,20\", \"4,S0002,2026-09-03 08:10,chai,15\"],\n          [\"5,S0042,2026-09-09 14:05,idli,30\"]]\njoined = without_menu = 0\nfor n, split in enumerate(splits):\n    category = {}                                   # setup(): once per map task\n    for line in menu_lines:\n        f = line.split(\",\")\n        category[f[0]] = f[1]\n    out = []\n    for order in split:                             # map(): once per record\n        cat = category.get(order.split(\",\")[3])\n        if cat is None:\n            without_menu += 1\n            continue\n        joined += 1\n        out.append(order + \",\" + cat)\n    print(f\"part-m-0000{n}: {out}\")\nprint(\"ORDERS_JOINED =\", joined, \" ORDERS_WITHOUT_MENU =\", without_menu)\n"
+  },
+  {
+   "label": "2 · Left outer join",
+   "hint": "Change the code so orders without a menu row are still written, with the category <code>unknown<\/code>. How many rows come out now?",
+   "code": "category = {\"chai\": \"drink\", \"dosa\": \"meal\"}\norders = [\"1,S1413,2026-09-14 15:30,dosa,45\", \"3,S0007,2026-09-01 13:37,coffee,20\", \"4,S0002,2026-09-03 08:10,chai,15\"]\nfor o in orders:\n    print(o + \",\" + category.get(o.split(\",\")[3], \"unknown\"))\n"
+  },
+  {
+   "label": "3 · Will it fit?",
+   "hint": "<b>Predict first:<\/b> a Java HashMap entry costs roughly 5× the raw line size. Which small tables fit in our 300 MB map heap, leaving half the heap for the task itself?",
+   "code": "heap_mb, overhead = 300, 5\nfor name, mb in [(\"menu.csv\", 0.0002), (\"IFSC codes\", 25), (\"students\", 40), (\"customers\", 2048)]:\n    need = mb * overhead\n    print(f\"{name:10} {mb:>9} MB on disk -> ~{need:8.1f} MB in heap ->\", \"fits\" if need < heap_mb / 2 else \"too big: use a reduce-side join\")\n"
+  },
+  {
+   "label": "4 · Shuffle saved",
+   "hint": "How many bytes did the map-side join avoid moving, and what share of the input file is that?",
+   "code": "shuffle_reduce_side = 24_448_645\ninput_bytes = 19_417_051\nprint(f\"{shuffle_reduce_side:,} bytes not shuffled = {shuffle_reduce_side / input_bytes:.0%} of the input size\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This setup() code reads the menu but builds the dictionary with the wrong column order. Fix the key so lookups by item work.",
+   "code": "menu_lines = [\"chai,drink,15,A\", \"dosa,meal,45,D\"]\ncategory = {}\nfor line in menu_lines:\n    f = line.split(\",\")\n    category[f[1]] = f[0]\nprint(category[\"dosa\"])\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: map-side vs reduce-side join</h3>
+  <p>Use the Module 8 lab cluster (lab8) with <code>student_orders.csv</code> and <code>menu.csv</code> from Lesson 9.1 (<code>make_student_orders.py</code>). Copy both Java files of Lessons 9.5 and 9.6 into <code>/tmp/mr9</code> in the namenode container, compile them into <code>mr9.jar</code>, and run <code>join_lab.sh</code>. It removes “coffee” from the menu first so you can see unmatched orders being counted.</p>
+  <div class="pcrun"><h4>The map-side join</h4>
+  <div class="code" data-lang="bash" data-file="JoinMapSide.java"><pre><code>// JoinMapSide.java: map-side join, a map-only job. The small menu is shipped to every map task
+// with the distributed cache and loaded into a HashMap in setup(); orders are joined as they are read.
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+import java.net.URI;
+import java.util.HashMap;
+import java.util.Map;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+
+public class JoinMapSide {
+  enum Join { ORDERS_JOINED, ORDERS_WITHOUT_MENU }
+
+  public static class JoinMapper extends Mapper&lt;LongWritable, Text, Text, NullWritable&gt; {
+    private final Map&lt;String, String&gt; category = new HashMap&lt;&gt;();
+    private final Text out = new Text();
+
+    @Override
+    protected void setup(Context ctx) throws IOException {
+      URI[] files = ctx.getCacheFiles();
+      System.err.println(&quot;cache files: &quot; + java.util.Arrays.toString(files));
+      // &quot;#menu&quot; in the URI makes YARN create a symlink called &quot;menu&quot; in the task&#x27;s working directory
+      try (BufferedReader r = new BufferedReader(new FileReader(&quot;menu&quot;))) {
+        String line;
+        while ((line = r.readLine()) != null) {
+          String[] f = line.split(&quot;,&quot;);
+          category.put(f[0], f[1]);
+        }
+      }
+      System.err.println(&quot;menu loaded in setup(): &quot; + category.size() + &quot; items, working dir = &quot; + new java.io.File(&quot;.&quot;).getAbsolutePath());
+    }
+
+    @Override
+    protected void map(LongWritable k, Text line, Context ctx) throws IOException, InterruptedException {
+      String cat = category.get(line.toString().split(&quot;,&quot;)[3]);
+      if (cat == null) { ctx.getCounter(Join.ORDERS_WITHOUT_MENU).increment(1); return; }
+      ctx.getCounter(Join.ORDERS_JOINED).increment(1);
+      out.set(line + &quot;,&quot; + cat);
+      ctx.write(out, NullWritable.get());
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] rest = new GenericOptionsParser(conf, args).getRemainingArgs();   // orders menu out
+    Job job = Job.getInstance(conf, &quot;map-side join&quot;);
+    job.setJarByClass(JoinMapSide.class);
+    job.addCacheFile(new URI(rest[1] + &quot;#menu&quot;));     // ship the menu to every task, linked as ./menu
+    job.setMapperClass(JoinMapper.class);
+    job.setNumReduceTasks(0);                         // no reducer, so no shuffle at all
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(NullWritable.class);
+    FileInputFormat.addInputPath(job, new Path(rest[0]));
+    FileOutputFormat.setOutputPath(job, new Path(rest[2]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+
+// Inside the namenode container, in /tmp/mr9:
+//   mkdir -p classes &amp;&amp; javac -cp $(hadoop classpath) -d classes *.java &amp;&amp; jar cf mr9.jar -C classes .
+//   hadoop jar mr9.jar JoinMapSide /user/hadoop/data/student_orders.csv /user/hadoop/data/menu.csv /out/JoinMapSide</code></pre><div class="output">== menu.csv (minus &#x27;coffee&#x27;, to show an order without a menu row)
+chai,drink,15,A
+samosa,snack,18,B
+vada pav,snack,20,B
+poha,breakfast,25,C
+idli,breakfast,30,C
+dosa,meal,45,D
+thali,meal,80,D
+== JoinReduceSide   24828 ms
+  JobSubmitter:203 - number of splits:4
+  Launched map tasks=4
+  Launched reduce tasks=1
+  Map input records=500007
+  Map output records=500007
+  Reduce input groups=8
+  Reduce shuffle bytes=24448645
+  MENU_FIRST=3
+  MENU_NOT_FIRST=4
+  ORDERS_JOINED=459636
+  ORDERS_WITHOUT_MENU=40364
+  Bytes Written=20851062
+  20851062 /out/JoinReduceSide/part-r-00000
+== JoinMapSide   18943 ms
+  JobSubmitter:203 - number of splits:3
+  Launched map tasks=3
+  Map input records=500000
+  Map output records=459636
+  ORDERS_JOINED=459636
+  ORDERS_WITHOUT_MENU=40364
+  Bytes Written=20851062
+  9020852 /out/JoinMapSide/part-m-00000
+  8993924 /out/JoinMapSide/part-m-00001
+  2836286 /out/JoinMapSide/part-m-00002
+== a joined row
+1,S1413,2026-09-14 15:30,dosa,45,meal
+2,S0973,2026-09-26 20:11,samosa,18,snack
+== same rows from both joins?
+identical (459,636 rows each, compared after sorting)
+== map task log of JoinMapSide: the cached menu
+cache files: [/user/hadoop/data/menu_nocoffee.csv#menu]
+menu loaded in setup(): 7 items, working dir = /tmp/hadoop-hadoop/nm-local-dir/usercache/hadoop/appcache/application_1792643020992_0040/container_1792643020992_0040_01_000003/.</div></div>
+  <p class="muted">Real output of join_lab.sh, which runs both joins. Times vary from run to run; the shuffle bytes and counters do not.</p></div>
+  <div class="pcrun"><h4>Both joins, compared</h4>
+  <div class="code" data-lang="bash" data-file="join_lab.sh"><pre><code># join_lab.sh: join 5 lakh orders with the 8-line menu, reduce-side and map-side, and compare
+cd /tmp/mr9
+O=/user/hadoop/data/student_orders.csv; MENU=/user/hadoop/data/menu.csv
+hdfs dfs -put -f menu.csv $MENU
+echo &quot;== menu.csv (minus &#x27;coffee&#x27;, to show an order without a menu row)&quot;
+grep -v coffee menu.csv &gt; menu_nocoffee.csv; hdfs dfs -put -f menu_nocoffee.csv /user/hadoop/data/
+cat menu_nocoffee.csv
+for j in JoinReduceSide JoinMapSide; do
+  hdfs dfs -rm -r -f -skipTrash /out/$j &gt; /dev/null 2&gt;&amp;1
+  start=$(date +%s%N)
+  hadoop jar mr9.jar $j $O /user/hadoop/data/menu_nocoffee.csv /out/$j &gt; /tmp/$j.log 2&gt;&amp;1
+  echo &quot;== $j   $(( ($(date +%s%N) - start) / 1000000 )) ms&quot;
+  grep -E &quot;number of splits|Launched (map|reduce) tasks|Map input records|Map output records|Reduce shuffle bytes|Reduce input groups|ORDERS_JOINED|ORDERS_WITHOUT_MENU|MENU_(NOT_)?FIRST|Bytes Written&quot; /tmp/$j.log | sed -E &#x27;s/^[0-9-]+ [0-9:]+ INFO  //; s/^\s*/  /&#x27;
+  hdfs dfs -ls /out/$j | grep part | awk &#x27;{print &quot;  &quot; $5, $8}&#x27;
+done
+echo &quot;== a joined row&quot;
+hdfs dfs -cat /out/JoinMapSide/part-m-00000 2&gt;/dev/null | head -2
+echo &quot;== same rows from both joins?&quot;
+diff &lt;(hdfs dfs -cat /out/JoinReduceSide/part-* | sort) &lt;(hdfs dfs -cat /out/JoinMapSide/part-* | sort) &gt; /dev/null &amp;&amp; echo &quot;identical (459,636 rows each, compared after sorting)&quot;
+echo &quot;== map task log of JoinMapSide: the cached menu&quot;
+app=$(grep -o &quot;application_[0-9_]*&quot; /tmp/JoinMapSide.log | head -1); sleep 5
+yarn logs -applicationId $app -log_files stderr 2&gt;/dev/null | grep -E &quot;cache files|menu loaded&quot; | head -2 | cut -c1-200
+
+# Inside the namenode container:  bash /tmp/mr9/join_lab.sh</code></pre><div class="output">== menu.csv (minus &#x27;coffee&#x27;, to show an order without a menu row)
+chai,drink,15,A
+samosa,snack,18,B
+vada pav,snack,20,B
+poha,breakfast,25,C
+idli,breakfast,30,C
+dosa,meal,45,D
+thali,meal,80,D
+== JoinReduceSide   24828 ms
+  JobSubmitter:203 - number of splits:4
+  Launched map tasks=4
+  Launched reduce tasks=1
+  Map input records=500007
+  Map output records=500007
+  Reduce input groups=8
+  Reduce shuffle bytes=24448645
+  MENU_FIRST=3
+  MENU_NOT_FIRST=4
+  ORDERS_JOINED=459636
+  ORDERS_WITHOUT_MENU=40364
+  Bytes Written=20851062
+  20851062 /out/JoinReduceSide/part-r-00000</div></div>
+  <p class="muted">The reduce-side half of the same run. MENU_NOT_FIRST=4 shows why the reduce-side reducer must buffer orders: for 4 of 8 items the menu row did not arrive first.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>setup() once, map() many times</h2>
+  <p>Watch the dictionary being built once, then used for every order. Coffee is not in the menu.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "menu = [\"chai,drink\", \"dosa,meal\"]",
+  "category = {}",
+  "for line in menu:",
+  "    item, cat = line.split(\",\")",
+  "    category[item] = cat",
+  "orders = [\"dosa,45\", \"coffee,20\", \"chai,15\"]",
+  "for o in orders:",
+  "    item = o.split(\",\")[0]",
+  "    print(o, \"->\", category.get(item))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>menu<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]"
+   ],
+   "newVar": "menu"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>category<\/code> is created: → dict #2. A new dict object (#2) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "category"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>line<\/code> is created: &#x27;chai,drink&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'chai,drink'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "line"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> is created: &#x27;chai&#x27;. <code>cat<\/code> is created: &#x27;drink&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'chai,drink'"
+      ],
+      [
+       "item",
+       "'chai'"
+      ],
+      [
+       "cat",
+       "'drink'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "cat"
+  },
+  {
+   "line": 5,
+   "phase": "setup()",
+   "note": "The whole small table goes into memory before the first order is read. Object #2 dict now holds {&#x27;chai&#x27;: &#x27;drink&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'chai,drink'"
+      ],
+      [
+       "item",
+       "'chai'"
+      ],
+      [
+       "cat",
+       "'drink'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (1)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>line<\/code> changes to &#x27;dosa,meal&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'chai'"
+      ],
+      [
+       "cat",
+       "'drink'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (1)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;}"
+   ],
+   "newVar": "line"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;dosa&#x27;. <code>cat<\/code> changes to &#x27;meal&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (1)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;}"
+   ],
+   "newVar": "cat"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>orders<\/code> is created: → list #3. A new list object (#3) is created: [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ],
+      [
+       "orders",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+    "<b>#3 list (3)<\/b> [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]"
+   ],
+   "newVar": "orders"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>o<\/code> is created: &#x27;dosa,45&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ],
+      [
+       "orders",
+       "→ list #3"
+      ],
+      [
+       "o",
+       "'dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+    "<b>#3 list (3)<\/b> [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]"
+   ],
+   "newVar": "o"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ],
+      [
+       "orders",
+       "→ list #3"
+      ],
+      [
+       "o",
+       "'dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+    "<b>#3 list (3)<\/b> [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "map()",
+   "note": "One lookup per order; coffee gives None and would be counted as ORDERS_WITHOUT_MENU. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ],
+      [
+       "orders",
+       "→ list #3"
+      ],
+      [
+       "o",
+       "'dosa,45'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+    "<b>#3 list (3)<\/b> [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]"
+   ],
+   "out": "dosa,45 -> meal\n"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>o<\/code> changes to &#x27;coffee,20&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ],
+      [
+       "orders",
+       "→ list #3"
+      ],
+      [
+       "o",
+       "'coffee,20'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+    "<b>#3 list (3)<\/b> [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]"
+   ],
+   "newVar": "o"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;coffee&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'coffee'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ],
+      [
+       "orders",
+       "→ list #3"
+      ],
+      [
+       "o",
+       "'coffee,20'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+    "<b>#3 list (3)<\/b> [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]"
+   ],
+   "newVar": "item"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'coffee'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ],
+      [
+       "orders",
+       "→ list #3"
+      ],
+      [
+       "o",
+       "'coffee,20'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+    "<b>#3 list (3)<\/b> [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]"
+   ],
+   "out": "coffee,20 -> None\n"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>o<\/code> changes to &#x27;chai,15&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'coffee'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ],
+      [
+       "orders",
+       "→ list #3"
+      ],
+      [
+       "o",
+       "'chai,15'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+    "<b>#3 list (3)<\/b> [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]"
+   ],
+   "newVar": "o"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;chai&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'chai'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ],
+      [
+       "orders",
+       "→ list #3"
+      ],
+      [
+       "o",
+       "'chai,15'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+    "<b>#3 list (3)<\/b> [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]"
+   ],
+   "newVar": "item"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'chai'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ],
+      [
+       "orders",
+       "→ list #3"
+      ],
+      [
+       "o",
+       "'chai,15'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+    "<b>#3 list (3)<\/b> [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]"
+   ],
+   "out": "chai,15 -> drink\n"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "menu",
+       "→ list #1"
+      ],
+      [
+       "category",
+       "→ dict #2"
+      ],
+      [
+       "line",
+       "'dosa,meal'"
+      ],
+      [
+       "item",
+       "'chai'"
+      ],
+      [
+       "cat",
+       "'meal'"
+      ],
+      [
+       "orders",
+       "→ list #3"
+      ],
+      [
+       "o",
+       "'chai,15'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [&#x27;chai,drink&#x27;, &#x27;dosa,meal&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai&#x27;: &#x27;drink&#x27;, &#x27;dosa&#x27;: &#x27;meal&#x27;}",
+    "<b>#3 list (3)<\/b> [&#x27;dosa,45&#x27;, &#x27;coffee,20&#x27;, &#x27;chai,15&#x27;]"
+   ]
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three map-side join decisions: memory sizing, choosing the join, and how much the cache really copies.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Sizing · memory</span></div>
+    <h4>Can the student table be broadcast?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>The college wants every order joined with its student's department. The student file has 20,000 lines of about 60 bytes. Map tasks have a 300 MB heap. Assuming a hash map entry costs about 5× the raw line, does it fit comfortably (under half the heap)?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>20,000 × 60 B · 5× overhead · 300 MB heap</pre></div><div><small>Expected output</small><pre>raw 1.14 MB -&gt; about 5.7 MB of heap; fits: True</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Raw size = lines × bytes per line.</li><li>Heap needed ≈ raw × 5.</li><li>Compare with half the heap.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Try 2 crore customers of 100 bytes each. The answer changes completely.",
+   "code": "raw_mb = 20_000 * 60 / 1024**2\nneed = raw_mb * 5\nprint(f\"raw {raw_mb:.2f} MB -> about {need:.1f} MB of heap; fits: {need < 300 / 2}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "raw_mb = 20_000 * 60 / 1024**2",
+  "need = raw_mb * 5",
+  "print(f\"raw {raw_mb:.2f} MB -> about {need:.1f} MB of heap; fits: {need < 300 / 2}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>raw_mb<\/code> is created: 1.1444.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "raw_mb",
+       "1.1444"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "raw_mb"
+  },
+  {
+   "line": 2,
+   "phase": "Overhead",
+   "note": "Strings, map entries and object headers make Java data several times larger than the file. <code>need<\/code> is created: 5.722.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "raw_mb",
+       "1.1444"
+      ],
+      [
+       "need",
+       "5.722"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "need"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "raw_mb",
+       "1.1444"
+      ],
+      [
+       "need",
+       "5.722"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "raw 1.14 MB -> about 5.7 MB of heap; fits: True\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Design · choice</span></div>
+    <h4>Which join for which pair of tables?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Pick a join method for each: (a) 2 TB of orders with an 8-line menu; (b) 2 TB of orders with 1.5 TB of payments, both written by jobs with 200 reducers using the same partitioner on order_id, sorted; (c) 2 TB of orders with 1.5 TB of complaints, no special layout.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>3 pairs of tables</pre></div><div><small>Expected output</small><pre>a -&gt; replicated map-side join (distributed cache)
+b -&gt; composite map-side join (CompositeInputFormat)
+c -&gt; reduce-side join</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Small side fits in memory → replicated map-side join.</li><li>Both sorted and identically partitioned → composite map-side join.</li><li>Otherwise → reduce-side join.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Add a case: 2 TB of orders with a 900 MB product table. Which would you pick, and what would you change first?",
+   "code": "def choose(small_mb, same_layout):\n    if small_mb < 100:\n        return \"replicated map-side join (distributed cache)\"\n    if same_layout:\n        return \"composite map-side join (CompositeInputFormat)\"\n    return \"reduce-side join\"\nfor name, small, layout in [(\"a\", 0.001, False), (\"b\", 1.5e6, True), (\"c\", 1.5e6, False)]:\n    print(name, \"->\", choose(small, layout))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "def choose(small_mb, same_layout):",
+  "    if small_mb < 100:",
+  "        return \"replicated map-side join (distributed cache)\"",
+  "    if same_layout:",
+  "        return \"composite map-side join (CompositeInputFormat)\"",
+  "    return \"reduce-side join\"",
+  "for name, small, layout in [(\"a\", 0.001, False), (\"b\", 1.5e6, True), (\"c\", 1.5e6, False)]:",
+  "    print(name, \"->\", choose(small, layout))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>choose<\/code> is created: function choose().",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "choose"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>name<\/code> is created: &#x27;a&#x27;. <code>small<\/code> is created: 0.001. <code>layout<\/code> is created: False.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'a'"
+      ],
+      [
+       "small",
+       "0.001"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "layout"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>choose()<\/code> is called: a new frame is pushed with <code>small_mb<\/code> = 0.001, <code>same_layout<\/code> = False.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'a'"
+      ],
+      [
+       "small",
+       "0.001"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    },
+    {
+     "frame": "choose()",
+     "vars": [
+      [
+       "small_mb",
+       "0.001"
+      ],
+      [
+       "same_layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "same_layout"
+  },
+  {
+   "line": 2,
+   "phase": "Rule",
+   "note": "The memory check comes first; it is the cheapest join when it applies. The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'a'"
+      ],
+      [
+       "small",
+       "0.001"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    },
+    {
+     "frame": "choose()",
+     "vars": [
+      [
+       "small_mb",
+       "0.001"
+      ],
+      [
+       "same_layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'a'"
+      ],
+      [
+       "small",
+       "0.001"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    },
+    {
+     "frame": "choose()",
+     "vars": [
+      [
+       "small_mb",
+       "0.001"
+      ],
+      [
+       "same_layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 8,
+   "phase": "Return",
+   "note": "<code>choose()<\/code> returns <b>&#x27;replicated map-side join (distributed cache)&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'a'"
+      ],
+      [
+       "small",
+       "0.001"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "a -> replicated map-side join (distributed cache)\n"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;b&#x27;. <code>small<\/code> changes to 1500000.0. <code>layout<\/code> changes to True.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'b'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "layout"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>choose()<\/code> is called: a new frame is pushed with <code>small_mb<\/code> = 1500000.0, <code>same_layout<\/code> = True.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'b'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "True"
+      ]
+     ]
+    },
+    {
+     "frame": "choose()",
+     "vars": [
+      [
+       "small_mb",
+       "1500000.0"
+      ],
+      [
+       "same_layout",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "same_layout"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'b'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "True"
+      ]
+     ]
+    },
+    {
+     "frame": "choose()",
+     "vars": [
+      [
+       "small_mb",
+       "1500000.0"
+      ],
+      [
+       "same_layout",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'b'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "True"
+      ]
+     ]
+    },
+    {
+     "frame": "choose()",
+     "vars": [
+      [
+       "small_mb",
+       "1500000.0"
+      ],
+      [
+       "same_layout",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'b'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "True"
+      ]
+     ]
+    },
+    {
+     "frame": "choose()",
+     "vars": [
+      [
+       "small_mb",
+       "1500000.0"
+      ],
+      [
+       "same_layout",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 8,
+   "phase": "Return",
+   "note": "<code>choose()<\/code> returns <b>&#x27;composite map-side join (CompositeInputFormat)&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'b'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "b -> composite map-side join (CompositeInputFormat)\n"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;c&#x27;. <code>layout<\/code> changes to False.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'c'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "layout"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>choose()<\/code> is called: a new frame is pushed with <code>small_mb<\/code> = 1500000.0, <code>same_layout<\/code> = False.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'c'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    },
+    {
+     "frame": "choose()",
+     "vars": [
+      [
+       "small_mb",
+       "1500000.0"
+      ],
+      [
+       "same_layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "same_layout"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'c'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    },
+    {
+     "frame": "choose()",
+     "vars": [
+      [
+       "small_mb",
+       "1500000.0"
+      ],
+      [
+       "same_layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'c'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    },
+    {
+     "frame": "choose()",
+     "vars": [
+      [
+       "small_mb",
+       "1500000.0"
+      ],
+      [
+       "same_layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'c'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    },
+    {
+     "frame": "choose()",
+     "vars": [
+      [
+       "small_mb",
+       "1500000.0"
+      ],
+      [
+       "same_layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 8,
+   "phase": "Return",
+   "note": "<code>choose()<\/code> returns <b>&#x27;reduce-side join&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'c'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "c -> reduce-side join\n"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "choose",
+       "function choose()"
+      ],
+      [
+       "name",
+       "'c'"
+      ],
+      [
+       "small",
+       "1500000.0"
+      ],
+      [
+       "layout",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Internals · cache</span></div>
+    <h4>How many copies does the distributed cache make?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A job with 400 map tasks runs on 50 workers (8 tasks per worker) and ships a 30 MB lookup file with <code>-files</code>. How much is downloaded from HDFS if the file is localized per node, compared with a naive design that reads it from HDFS in every task?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>400 tasks · 50 nodes · 30 MB</pre></div><div><small>Expected output</small><pre>distributed cache: 1,500 MB   naive per task: 12,000 MB</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Localization downloads once per node per job.</li><li>Naive: once per task.</li><li>Compare.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Public cache files (world-readable in HDFS) can even be shared across jobs and users on the same node.",
+   "code": "tasks, nodes, mb = 400, 50, 30\nprint(f\"distributed cache: {nodes * mb:,} MB   naive per task: {tasks * mb:,} MB\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "tasks, nodes, mb = 400, 50, 30",
+  "print(f\"distributed cache: {nodes * mb:,} MB   naive per task: {tasks * mb:,} MB\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>tasks<\/code> is created: 400. <code>nodes<\/code> is created: 50. <code>mb<\/code> is created: 30.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "tasks",
+       "400"
+      ],
+      [
+       "nodes",
+       "50"
+      ],
+      [
+       "mb",
+       "30"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "mb"
+  },
+  {
+   "line": 2,
+   "phase": "Per node",
+   "note": "The NodeManager keeps one local copy and every container of the job links to it. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "tasks",
+       "400"
+      ],
+      [
+       "nodes",
+       "50"
+      ],
+      [
+       "mb",
+       "30"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "distributed cache: 1,500 MB   naive per task: 12,000 MB\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "What makes a replicated map-side join possible?",
+  "options": [
+   "Both tables are sorted",
+   "The tables have the same number of columns",
+   "One table is small enough to hold in each map task's memory",
+   "There is exactly one reducer"
+  ],
+  "answer": 2,
+  "why": "Each map task loads the full small table into a hash map."
+ },
+ {
+  "q": "How much data did our map-side join shuffle?",
+  "options": [
+   "24,448,645 bytes",
+   "0 bytes: it was a map-only job",
+   "20,851,062 bytes",
+   "459,636 bytes"
+  ],
+  "answer": 1,
+  "why": "No reducer means no shuffle; the reduce-side join shuffled 24.4 MB."
+ },
+ {
+  "q": "Where is the small table loaded?",
+  "options": [
+   "In setup(), once per map task",
+   "In map(), for every record",
+   "In the driver",
+   "In the reducer"
+  ],
+  "answer": 0,
+  "why": "Real log: “menu loaded in setup(): 7 items”."
+ },
+ {
+  "q": "What does \"#menu\" do in addCacheFile(new URI(\".../menu_nocoffee.csv#menu\"))?",
+  "options": [
+   "Comments out the file",
+   "Renames the file in HDFS",
+   "Makes the file private",
+   "Creates a symlink called menu in the task's working directory"
+  ],
+  "answer": 3,
+  "why": "The mapper opened it with new FileReader(\"menu\")."
+ },
+ {
+  "q": "How often does a NodeManager download a cache file for one job?",
+  "options": [
+   "Once per record",
+   "Once per map task",
+   "Once per node; containers on that node link to the local copy",
+   "Never, tasks read it from HDFS"
+  ],
+  "answer": 2,
+  "why": "This is called localization."
+ },
+ {
+  "q": "In what order are rows written by a map-only join?",
+  "options": [
+   "Sorted by key",
+   "In the same order as each task's input split",
+   "Random",
+   "Grouped by category"
+  ],
+  "answer": 1,
+  "why": "There is no sort phase without a reducer: order 1, then order 2 in part-m-00000."
+ },
+ {
+  "q": "Which generic option ships extra jars to the task classpath?",
+  "options": [
+   "-libjars",
+   "-files",
+   "-archives",
+   "-D"
+  ],
+  "answer": 0,
+  "why": "-archives unpacks zip/tar files; -files ships plain files."
+ },
+ {
+  "q": "Two 2 TB tables, both sorted by key and partitioned identically into 200 files. Which map-side join fits?",
+  "options": [
+   "Replicated join",
+   "No join is possible",
+   "A combiner join",
+   "Composite join (CompositeInputFormat)"
+  ],
+  "answer": 3,
+  "why": "It merges matching partitions in the map, with no memory limit."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 9.6 in one screen</h3>
+    <ul><li><b>Replicated (broadcast) join</b>: ship the small table to every map task, load into a HashMap in <code>setup()</code>, look up in <code>map()</code>; map-only, no shuffle.</li><li>Ship files with <code>job.addCacheFile(uri#name)</code>, or <code>-files</code>, <code>-archives</code> (unpacked), <code>-libjars</code> (classpath); needs GenericOptionsParser/ToolRunner.</li><li>NodeManagers <b>localize</b> cache files once per node; each container gets a symlink (<code>./menu</code>).</li><li>Lab: 459,636 joined rows, 0 bytes shuffled, 18.9 s vs reduce-side 24.8 s and 24,448,645 bytes shuffled; same rows.</li><li>Output: one <code>part-m</code> per map task, in input order (no sort).</li><li>Rule: small side must fit in the map heap (Java objects take several times the file size).</li><li>Two big tables: reduce-side join, or <b>composite join</b> if both are sorted and identically partitioned.</li><li>Modern equivalents: Hive map join, Spark broadcast hash join (10 MB default threshold).</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What is a map-side join in Hadoop?</summary><p>A join performed in the map phase without a shuffle. In the replicated form, the smaller data set is distributed to every map task (usually with the distributed cache), loaded into memory in setup(), and each record of the larger data set is joined by a lookup. The job can be map-only, so it avoids sorting and transferring data to reducers.</p></details>
+    <details><summary>What is the distributed cache in Hadoop?</summary><p>A mechanism to make read-only files, archives and jars available to all tasks of a job. Files are registered with Job.addCacheFile() or the -files, -archives and -libjars options; each NodeManager downloads them from HDFS once per node (localization) and links them into each container's working directory, optionally under a name given after # in the URI.</p></details>
+    <details><summary>When should I use a map-side join instead of a reduce-side join?</summary><p>When one input is small enough to fit in each map task's memory (with room to spare), or when both inputs are already sorted by the join key and partitioned identically. Otherwise use a reduce-side join, which works for any sizes but shuffles both inputs.</p></details>
+    <details><summary>Why is a map-side join faster?</summary><p>It avoids the shuffle: no map output sorting and spilling, no network transfer to reducers, no merge and no reduce tasks. In our lab the reduce-side join moved 24.4 MB across the network and took 24.8 s; the map-side join moved nothing and took 18.9 s for the same 459,636 rows.</p></details>
+    <details><summary>What happens if the small table is too big for a map-side join?</summary><p>Each map task holds its own full copy in heap, so the tasks fail with OutOfMemoryError or are killed by YARN for exceeding container memory, and retries fail the same way. Increase map memory only if the table is moderately sized; otherwise switch to a reduce-side join or pre-partition both inputs for a composite join.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Map-side join exercises using the real numbers from the lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Check the counters</h4></div>
+      <p>Show that ORDERS_JOINED + ORDERS_WITHOUT_MENU equals Map input records.</p>
+      <div class="prob__io"><div><small>Input</small><pre>459,636 + 40,364</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(459636 + 40364 == 500000)</code></pre><div class="output">True</div></div>
+        <p><b>How it works:</b> True: every order was either joined or counted as having no menu row.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Output sizes</h4></div>
+      <p>Add the three part-m file sizes and compare with Bytes Written.</p>
+      <div class="prob__io"><div><small>Input</small><pre>9,020,852 + 8,993,924 + 2,836,286</pre></div><div><small>Expected output</small><pre>20851062 vs 20851062</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(9020852 + 8993924 + 2836286, &quot;vs&quot;, 20851062)</code></pre><div class="output">20851062 vs 20851062</div></div>
+        <p><b>How it works:</b> 20,851,062 both: the same bytes as the reduce-side join's single part-r file.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Time saved</h4></div>
+      <p>How much faster was the map-side join, in seconds and percent?</p>
+      <div class="prob__io"><div><small>Input</small><pre>24,828 ms vs 18,943 ms</pre></div><div><small>Expected output</small><pre>5.9 s faster, 24% less time</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{(24828 - 18943) / 1000:.1f} s faster, {1 - 18943 / 24828:.0%} less time&quot;)</code></pre><div class="output">5.9 s faster, 24% less time</div></div>
+        <p><b>How it works:</b> About 5.9 s (24%) on a tiny lab; on terabytes the saved shuffle matters far more.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Build the lookup</h4></div>
+      <p>Read menu lines into a dictionary item → (category, price) and join two orders, printing the order with category and menu price.</p>
+      <div class="prob__io"><div><small>Input</small><pre>menu + 2 orders</pre></div><div><small>Expected output</small><pre>7,S0010,2026-09-02 13:05,thali,80 -&gt; meal 80
+8,S0011,2026-09-02 13:06,chai,15 -&gt; drink 15</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>menu = [&quot;chai,drink,15,A&quot;, &quot;thali,meal,80,D&quot;]
+lookup = {}
+for line in menu:
+    item, cat, price, counter = line.split(&quot;,&quot;)
+    lookup[item] = (cat, int(price))
+for o in [&quot;7,S0010,2026-09-02 13:05,thali,80&quot;, &quot;8,S0011,2026-09-02 13:06,chai,15&quot;]:
+    cat, price = lookup[o.split(&quot;,&quot;)[3]]
+    print(o, &quot;-&gt;&quot;, cat, price)</code></pre><div class="output">7,S0010,2026-09-02 13:05,thali,80 -&gt; meal 80
+8,S0011,2026-09-02 13:06,chai,15 -&gt; drink 15</div></div>
+        <p><b>How it works:</b> The same setup()/map() pattern, carrying two columns from the small table.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Check the bill</h4></div>
+      <p>Using the joined lookup, count orders whose amount differs from the menu price.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 orders</pre></div><div><small>Expected output</small><pre>1 mismatched: [&#x27;2,S2,t,dosa,40&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>price = {&quot;chai&quot;: 15, &quot;dosa&quot;: 45}
+orders = [&quot;1,S1,t,chai,15&quot;, &quot;2,S2,t,dosa,40&quot;, &quot;3,S3,t,dosa,45&quot;]
+bad = [o for o in orders if int(o.split(&quot;,&quot;)[4]) != price[o.split(&quot;,&quot;)[3]]]
+print(len(bad), &quot;mismatched:&quot;, bad)</code></pre><div class="output">1 mismatched: [&#x27;2,S2,t,dosa,40&#x27;]</div></div>
+        <p><b>How it works:</b> 1 mismatch. A map-side join plus a counter is a cheap data-quality check over billions of rows.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Cache downloads</h4></div>
+      <p>3 workers ran our 3 map tasks. How many times was the menu downloaded from HDFS if each task landed on a different node, and if all 3 landed on one node?</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 tasks</pre></div><div><small>Expected output</small><pre>tasks on 3 node(s): 3 download(s)
+tasks on 1 node(s): 1 download(s)</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for nodes_used in (3, 1):
+    print(f&quot;tasks on {nodes_used} node(s): {nodes_used} download(s)&quot;)</code></pre><div class="output">tasks on 3 node(s): 3 download(s)
+tasks on 1 node(s): 1 download(s)</div></div>
+        <p><b>How it works:</b> Once per node per job, however many tasks run there.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Broadcast or shuffle?</h4></div>
+      <p>A daily job joins 3 TB of transactions with a 5 MB merchant table. A reduce-side join shuffles the 3 TB; at 1 GB/s of total network bandwidth, how long does the shuffle alone take, and what does broadcasting cost instead to 400 nodes?</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 TB · 1 GB/s · 5 MB × 400 nodes</pre></div><div><small>Expected output</small><pre>shuffle ~51 min of network time; broadcast 2.0 GB in total</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>shuffle_s = 3 * 1024 / 1
+broadcast_mb = 5 * 400
+print(f&quot;shuffle ~{shuffle_s / 60:.0f} min of network time; broadcast {broadcast_mb / 1024:.1f} GB in total&quot;)</code></pre><div class="output">shuffle ~51 min of network time; broadcast 2.0 GB in total</div></div>
+        <p><b>How it works:</b> About 51 minutes of network time versus copying 2 GB once. That is why every engine broadcasts small tables.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>Composite join by hand</h4></div>
+      <p>Two inputs are sorted by order_id and split into the same 2 partitions. Merge-join partition by partition without loading either fully into memory.</p>
+      <div class="prob__io"><div><small>Input</small><pre>2 × 2 sorted partitions</pre></div><div><small>Expected output</small><pre>1 dosa UPI
+3 chai UPI
+4 idli card
+6 thali UPI</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>A = [[(1, &quot;dosa&quot;), (3, &quot;chai&quot;)], [(4, &quot;idli&quot;), (6, &quot;thali&quot;)]]
+B = [[(1, &quot;UPI&quot;), (2, &quot;cash&quot;), (3, &quot;UPI&quot;)], [(4, &quot;card&quot;), (6, &quot;UPI&quot;)]]
+for pa, pb in zip(A, B):
+    i = j = 0
+    while i &lt; len(pa) and j &lt; len(pb):
+        if pa[i][0] == pb[j][0]:
+            print(pa[i][0], pa[i][1], pb[j][1]); i += 1; j += 1
+        elif pa[i][0] &lt; pb[j][0]:
+            i += 1
+        else:
+            j += 1</code></pre><div class="output">1 dosa UPI
+3 chai UPI
+4 idli card
+6 thali UPI</div></div>
+        <p><b>How it works:</b> Orders 1, 3, 4 and 6 are joined, walking both sorted lists once. This only works because both sides use the same partitioning and sort order.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Join strategies are a favourite interview topic for data engineers, from MapReduce to Spark.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Concepts · joins</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is the difference between a map-side and a reduce-side join?”</h4>
+      <p class="scn__situation">Asked in almost every Hadoop interview.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> where the join happens and the condition.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Reduce-side: both inputs are mapped to (join key, tagged record) and shuffled; the reducer combines them. Works for any sizes but moves all data.</li>
+          <li>Map-side: the small table is broadcast with the distributed cache and looked up in each mapper; no shuffle, often map-only.</li>
+          <li>Condition: the small side fits in mapper memory (or both inputs are sorted and identically partitioned for a composite join).</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Operations · memory</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>A map-side join job that ran for a year now fails with OutOfMemoryError</h4>
+      <p class="scn__situation">Every map attempt fails four times; nothing in the code changed.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> that you suspect the growing small side.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Check the size of the cached file: the “small” table has probably grown. Each task holds a full copy in heap.</li>
+          <li>Short term: raise mapreduce.map.memory.mb and -Xmx together, or load only the needed columns and rows.</li>
+          <li>Long term: add a size check in the driver and fall back to a reduce-side join above a threshold, as Hive and Spark do automatically.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Internals · cache</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>“How does a file added with -files reach the mapper?”</h4>
+      <p class="scn__situation">A follow-up after you mention the distributed cache.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> the localization path.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>The client uploads local files to the job's staging directory in HDFS and records them in job.xml.</li>
+          <li>Before launching containers, each NodeManager downloads (localizes) the files once into its local cache.</li>
+          <li>Each container gets a symlink in its working directory, so the task opens the file by its plain name.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Design · modern</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>“Spark is doing a sort-merge join with a 3 MB table. Why, and how do you fix it?”</h4>
+      <p class="scn__situation">A slow Spark job joins a fact table with a small lookup table.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> broadcast joins beyond MapReduce.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Spark broadcasts only when it knows the table is below spark.sql.autoBroadcastJoinThreshold (10 MB default); missing statistics or a filtered subquery can hide the size.</li>
+          <li>Use a broadcast hint (broadcast(df) or /*+ BROADCAST(t) */) or compute statistics.</li>
+          <li>It is the same idea as the MapReduce replicated join: ship the small side, avoid shuffling the big side.</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

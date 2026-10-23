@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# protect_lab.sh: snapshots, quotas and trash on the lab cluster.
+NN="docker exec lab5-namenode-1"
+run() { echo "\$ $1"; $NN bash -c "$1" 2>&1 | grep -v -E "^\s*$|WARN|^\s+at |INFO  (Configuration|deprecation)"; echo; }
+D=/user/hadoop/results
+run "for s in before_results after_append; do hdfs dfs -deleteSnapshot $D \$s > /dev/null 2>&1; done; hdfs dfsadmin -disallowSnapshot $D > /dev/null 2>&1; hdfs dfs -rm -r -f -skipTrash $D /user/hadoop/quota_lab > /dev/null; hdfs dfs -mkdir -p $D/2026 && printf 'roll,marks\n101,78\n102,91\n' | hdfs dfs -put - $D/2026/sem1.csv"
+echo "=== SNAPSHOTS"
+run "hdfs dfsadmin -allowSnapshot $D"
+run "time hdfs dfs -createSnapshot $D before_results"
+run "hdfs dfs -rm -skipTrash $D/2026/sem1.csv; hdfs dfs -ls $D/2026"
+run "hdfs dfs -ls $D/.snapshot/before_results/2026"
+run "hdfs dfs -cp $D/.snapshot/before_results/2026/sem1.csv $D/2026/ && hdfs dfs -cat $D/2026/sem1.csv"
+run "printf '103,66\n' | hdfs dfs -appendToFile - $D/2026/sem1.csv; hdfs dfs -createSnapshot $D after_append > /dev/null; hdfs snapshotDiff $D before_results after_append"
+run "hdfs dfs -rm -r -skipTrash $D/.snapshot/before_results"
+run "hdfs dfs -rm -r -skipTrash $D"
+run "hdfs lsSnapshottableDir"
+echo "=== QUOTAS"
+Q=/user/hadoop/quota_lab
+run "hdfs dfs -mkdir -p $Q/names $Q/space && hdfs dfsadmin -setQuota 3 $Q/names && hdfs dfsadmin -setSpaceQuota 10m $Q/space"
+run "for i in 1 2 3; do echo x | hdfs dfs -put - $Q/names/f\$i.txt && echo put f\$i ok; done 2>&1 | grep -E '^put'"
+run "echo x | hdfs dfs -put - $Q/space/tiny.txt 2>&1 | grep -E '^put'"
+run "hdfs dfsadmin -setSpaceQuota 1g $Q/space && hdfs dfs -put /tmp/canteen_orders.csv $Q/space/ && echo put ok"
+run "hdfs dfs -count -q -h -v $Q/names $Q/space"
+echo "=== TRASH"
+run "hdfs getconf -confKey fs.trash.interval"
+run "hdfs dfs -D fs.trash.interval=1440 -rm $Q/names/f1.txt"
+run "hdfs dfs -ls -R /user/hadoop/.Trash | grep f1.txt"
+run "hdfs dfs -mv /user/hadoop/.Trash/Current$Q/names/f1.txt $Q/names/ && hdfs dfs -ls $Q/names"
+run "hdfs dfs -D fs.trash.interval=1440 -rm $Q/names/f2.txt"
+run "hdfs dfs -D fs.trash.interval=1440 -expunge -immediate 2>&1 | grep -oE '(Created|Deleted) trash checkpoint: .*'; hdfs dfs -ls /user/hadoop/.Trash"

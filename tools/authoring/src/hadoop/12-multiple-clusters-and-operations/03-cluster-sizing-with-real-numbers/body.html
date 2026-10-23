@@ -1,0 +1,341 @@
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“How many servers should we buy?”</h2>
+  <div class="story">
+    <p class="narration">Kabir's internship has moved to a payments startup. Its UPI switch writes about 2 TB of transaction logs a day, the regulator wants three years kept, and the fraud reports must be ready by 6 AM. The CFO wants one number by Friday: how many servers. Kabir's first guess comes from the lab: “Our three containers wrote 210 MB/s, so…” Riya stops him.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 196" role="img" aria-label="From 2 TB a day to 40 workers: compress, keep 3 years, 3 copies, temp space and headroom, divide by disk per node.">
+        <g font-size="9" text-anchor="middle">
+          <rect x="10" y="30" width="92" height="58" rx="8" class="s-soft-acc" style="stroke:var(--track)"/><text x="56" y="52" font-weight="700" class="s-acc">2 TB / day</text><text x="56" y="68" class="s-ink2">raw UPI logs</text>
+          <rect x="128" y="30" width="92" height="58" rx="8" class="s-card2"/><text x="174" y="52" font-weight="700" class="s-ink">0.5 TB</text><text x="174" y="68" class="s-ink2">Parquet + zstd</text>
+          <rect x="246" y="30" width="92" height="58" rx="8" class="s-card2"/><text x="292" y="52" font-weight="700" class="s-ink">547.5 TB</text><text x="292" y="68" class="s-ink2">× 1,095 days</text>
+          <rect x="364" y="30" width="92" height="58" rx="8" class="s-card2"/><text x="410" y="52" font-weight="700" class="s-ink">1,642.5 TB</text><text x="410" y="68" class="s-ink2">× 3 copies</text>
+          <rect x="482" y="30" width="148" height="58" rx="8" class="s-board"/><text x="556" y="52" font-weight="700" style="fill:#F5C77E">3,812.9 TB of disk</text><text x="556" y="68" style="fill:#9FD3B8">+temp, 70% full, +30%</text>
+          <path d="M102 59h26M220 59h26M338 59h26M456 59h26" style="fill:none;stroke:var(--track);stroke-width:2"/>
+          <rect x="230" y="112" width="180" height="40" rx="8" class="s-soft-green" style="stroke:var(--green)"/><text x="320" y="130" font-weight="700" class="s-green">÷ 96 TB per worker</text><text x="320" y="145" class="s-ink">= 40 workers</text>
+          <path d="M556 88v44H410" style="fill:none;stroke:var(--green);stroke-width:2"/>
+        </g>
+        <text x="320" y="178" text-anchor="middle" font-size="9.4" class="s-ink2">Every arrow is an assumption you can name. That is what makes a sizing defensible.</text>
+        <text x="632" y="192" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+R> Kabir, those 210 MB/s came from three containers sharing one laptop disk. A real server has twelve disks and its own network card. You can't multiply a laptop.
+K> Then where do I even start?
+A> From the data, not from the hardware. How much arrives each day, how small it gets on disk, how long you keep it, how many copies. That gives the storage, and storage usually decides the server count. Then you check three things against it: can the nightly work finish in its window, can the NameNode hold all the file and block objects, and does the network keep up. Today we do the whole calculation and also benchmark our own lab properly, so you know what a benchmark number really means.
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Cluster sizing</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Cluster sizing</b> (capacity planning) is the process of estimating the hardware a cluster needs to meet its storage, processing, availability and growth requirements. For Hadoop it combines: <b>storage</b> = data ingested per period × compression ratio × retention × replication factor (or erasure-coding overhead), plus space for temporary and intermediate data and headroom to keep disks below a target fill level; <b>compute</b> = the number of concurrent containers needed so that the workload, expressed in container-seconds, completes within its time window; <b>memory and CPU per node</b> derived from container sizes after reserving resources for the operating system and daemons; <b>NameNode heap</b> estimated from the expected number of files, directories and blocks; <b>network</b> bandwidth for ingest, replication and shuffle; and the <b>master and edge nodes</b> required for high availability and access. Estimates rest on stated assumptions and on benchmarks (such as TestDFSIO) of representative hardware.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Work out how much data you will keep and how much work you must finish in how much time, add safety margins, and turn that into servers. Write down every assumption, and measure real hardware before trusting a number.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Retention</b><span>How long data must be kept (here 3 years = 1,095 days).</span></div>
+    <div class="term"><b>Compression ratio</b><span>Stored size ÷ raw size; 0.25 for our Parquet + zstd assumption.</span></div>
+    <div class="term"><b>Headroom</b><span>Free space kept on purpose; target fill 70%.</span></div>
+    <div class="term"><b>Temp space</b><span>Room for map output, staging and new files; +25% here.</span></div>
+    <div class="term"><b>Container-seconds</b><span>Total work: number of containers × seconds each.</span></div>
+    <div class="term"><b>Batch window</b><span>The time a nightly job is allowed to take.</span></div>
+    <div class="term"><b>TestDFSIO</b><span>Hadoop's HDFS read/write benchmark (MapReduce tests jar).</span></div>
+    <div class="term"><b>Oversubscription</b><span>Servers' total bandwidth ÷ the rack's uplink bandwidth.</span></div>
+  </div>
+
+  <h3>From our lab (TestDFSIO, 64 MB files, replication 3, 3 workers on one laptop)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>Write</th><td>1 task: 113.48 MB/s · 3 tasks: 61.82 MB/s each (about 185 in total) · 6 tasks: 34.99 MB/s each (about 210 in total)</td></tr>
+    <tr><th>Read</th><td>1 task: 320 MB/s · 3 tasks: 175.34 MB/s each · 6 tasks: 130.3 MB/s each (files just written, so mostly from memory)</td></tr>
+    <tr><th>Why it flattens</th><td>All three workers are containers on one laptop with one disk: more writers share the same disk</td></tr>
+    <tr><th>Example cluster</th><td>2 TB/day, 3 years, replication 3 → 3,812.9 TB of disk → <b>40 workers</b>; with cold data on RS-6-3 → <b>22 workers</b></td></tr>
+  </table>
+
+  <h3 id="architecture">Architecture at a glance: the cluster we are sizing</h3>
+  <p>The UPI example, sized. Typical hardware values (disks, RAM, NICs) are assumptions for illustration.</p>
+  <div class="scene">
+    <svg viewBox="0 0 640 286" role="img" aria-label="Sized cluster: 3 racks, 40 workers with 12 by 8 TB disks, 256 GB RAM and 32 cores each, 3 master nodes, 2 edge nodes, 10 GbE to top-of-rack switches with 2 by 40 Gb uplinks.">
+      <g font-size="8.4">
+        <rect x="210" y="8" width="220" height="26" rx="6" class="s-board"/><text x="320" y="25" text-anchor="middle" font-weight="700" class="s-chalk">spine / core switches</text>
+        <path d="M320 34v14M110 48h420M110 48v14M320 48v14M530 48v14" style="fill:none;stroke:var(--line);stroke-width:1.6"/>
+        <text x="440" y="44" font-size="7.6" class="s-ink2">2 × 40 Gb uplink per rack</text>
+
+        <rect x="12" y="62" width="196" height="200" rx="8" class="s-card2"/>
+        <rect x="222" y="62" width="196" height="200" rx="8" class="s-card2"/>
+        <rect x="432" y="62" width="196" height="200" rx="8" class="s-card2"/>
+        <text x="110" y="78" text-anchor="middle" font-weight="700" class="s-ink">rack 1 · ToR switch</text>
+        <text x="320" y="78" text-anchor="middle" font-weight="700" class="s-ink">rack 2 · ToR switch</text>
+        <text x="530" y="78" text-anchor="middle" font-weight="700" class="s-ink">rack 3 · ToR switch</text>
+
+        <rect x="22" y="88" width="176" height="22" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><text x="110" y="103" text-anchor="middle" class="s-blue">master 1: NameNode · JN · ZK</text>
+        <rect x="232" y="88" width="176" height="22" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><text x="320" y="103" text-anchor="middle" class="s-blue">master 2: NameNode · RM · JN · ZK</text>
+        <rect x="442" y="88" width="176" height="22" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><text x="530" y="103" text-anchor="middle" class="s-blue">master 3: RM · JN · ZK · JobHistory</text>
+
+        <rect x="22" y="116" width="176" height="96" rx="4" class="s-soft-green" style="stroke:var(--green)"/>
+        <text x="110" y="132" text-anchor="middle" font-weight="700" class="s-green">14 workers</text>
+        <text x="110" y="148" text-anchor="middle" class="s-ink">each: 12 × 8 TB disks</text>
+        <text x="110" y="162" text-anchor="middle" class="s-ink">256 GB RAM · 32 cores</text>
+        <text x="110" y="176" text-anchor="middle" class="s-ink">DataNode + NodeManager</text>
+        <text x="110" y="190" text-anchor="middle" class="s-ink2">224 GB YARN · 30 containers</text>
+        <text x="110" y="204" text-anchor="middle" class="s-ink2">10 GbE to the ToR</text>
+
+        <rect x="232" y="116" width="176" height="96" rx="4" class="s-soft-green" style="stroke:var(--green)"/>
+        <text x="320" y="132" text-anchor="middle" font-weight="700" class="s-green">13 workers</text>
+        <text x="320" y="148" text-anchor="middle" class="s-ink">same hardware</text>
+        <text x="320" y="176" text-anchor="middle" class="s-ink">40 workers in total</text>
+        <text x="320" y="190" text-anchor="middle" class="s-ink2">3,840 TB raw disk</text>
+
+        <rect x="442" y="116" width="176" height="96" rx="4" class="s-soft-green" style="stroke:var(--green)"/>
+        <text x="530" y="132" text-anchor="middle" font-weight="700" class="s-green">13 workers</text>
+        <text x="530" y="148" text-anchor="middle" class="s-ink">same hardware</text>
+        <text x="530" y="176" text-anchor="middle" class="s-ink">1,200 containers</text>
+        <text x="530" y="190" text-anchor="middle" class="s-ink2">night job needs 291</text>
+
+        <rect x="22" y="220" width="176" height="32" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="110" y="240" text-anchor="middle" class="s-acc">edge node 1 (users, Airflow)</text>
+        <rect x="442" y="220" width="176" height="32" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="530" y="240" text-anchor="middle" class="s-acc">edge node 2 (ingest gateway)</text>
+        <text x="320" y="240" text-anchor="middle" class="s-ink2">masters spread over 3 racks</text>
+      </g>
+      <text x="320" y="278" text-anchor="middle" font-size="8.6" class="s-ink2">JN = JournalNode · ZK = ZooKeeper · RM = ResourceManager · ToR = top-of-rack switch</text>
+      <text x="632" y="282" text-anchor="end" class="s-wm">myphatshala.in</text>
+    </svg>
+  </div>
+
+LEVELS> Sizing at three levels
+L1> Building a godown
+      <ul>
+        <li>A grain trader asks: how big a godown? You ask how many sacks arrive a day, how long they stay, and whether every sack must be stored three times (copies) in different corners.</li>
+        <li>You never fill a godown to the roof: you need aisles and space for a sudden delivery (headroom and temp space).</li>
+        <li>Then you check the loading crew: can they move tonight's sacks before morning? That is compute against the batch window.</li>
+      </ul>
+L2> The calculation, in order
+      <ul>
+        <li><b>Storage:</b> 2 TB × 0.25 = 0.5 TB/day → × 1,095 = 547.5 TB → × 3 = 1,642.5 TB → × 1.25 ÷ 0.70 × 1.3 = 3,812.9 TB → ÷ 96 = <b>40 workers</b>.</li>
+        <li><b>NameNode:</b> 2,048 files of 256 MB a day → 2,242,560 files and 4,485,120 blocks in 3 years → about 0.9 GB of objects at 150 B each. Plan a heap several times larger.</li>
+        <li><b>Compute:</b> 60 TB scanned nightly at 20 MB/s per container = 3,145,728 container-seconds ÷ 10,800 s = <b>291 containers</b>, against 40 × 30 = 1,200.</li>
+        <li><b>Per node:</b> 256 GB − 32 GB reserved = 224 GB for YARN; 30 vcores → about 7.5 GB per vcore (Lesson 11.4).</li>
+      </ul>
+L3> What experienced planners add
+      <ul>
+        <li><b>Tiering:</b> keep 90 hot days with 3 copies and older data in erasure coding: 888.8 TB of data and 22 workers instead of 40 (Lesson 7.3).</li>
+        <li><b>Network:</b> 20 workers × 10 Gb = 200 Gb against 80 Gb of uplink is 2.5:1 oversubscription; replication and shuffle cross racks, so keep it modest.</li>
+        <li><b>Failure budget:</b> losing one 96 TB node means re-replicating up to 96 TB; headroom and network decide how long that takes.</li>
+        <li><b>Benchmark, then re-plan:</b> run TestDFSIO and a real job on one candidate server, replace the assumed throughput, and review against actual growth every quarter.</li>
+      </ul>
+/LEVELS
+EXAM> For “How will you size a Hadoop cluster for X TB per day?”, write the storage formula (daily × ratio × retention × replication × temp ÷ fill × growth ÷ disk per node), then one line each for compute (container-seconds ÷ window), NameNode heap (objects × ~150 B) and masters (2 NN, 3 JN, 3 ZK, 2 RM).
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>The levers that change a sizing</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Lever</th><th>Example change</th><th>Effect in our example</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td><b>File format</b></td><td>Raw CSV → Parquet + zstd</td><td>159 → 40 workers</td><td>Conversion jobs (Lesson 10.2)</td></tr>
+      <tr><td><b>Retention</b></td><td>3 years → 1 year</td><td>40 → 14 workers</td><td>A policy decision, often regulatory</td></tr>
+      <tr><td><b>Erasure coding</b></td><td>Cold data (90+ days) on RS-6-3</td><td>40 → 22 workers</td><td>Slower recovery, more CPU (Lesson 7.3)</td></tr>
+      <tr><td><b>File size</b></td><td>1 MB → 256 MB files</td><td>NameNode objects ÷ about 170</td><td>Compaction or batching (Lesson 7.5)</td></tr>
+      <tr><td><b>Disk fill target</b></td><td>70% → 85%</td><td>Fewer disks, less safety</td><td>Risk during failures and rebalancing</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Roles to size</h3>
+  <div class="cards">
+    <div class="card"><h4>Workers</h4><p>DataNode + NodeManager. Sized by storage first, then checked for compute.</p><span class="tag">many</span></div>
+    <div class="card"><h4>Masters</h4><p>2 NameNodes, 3 JournalNodes, 3 ZooKeeper, 2 ResourceManagers, JobHistory: usually 3 servers with lots of RAM, spread over racks.</p><span class="tag">3–5</span></div>
+    <div class="card"><h4>Edge nodes</h4><p>Where users and tools (Airflow, Hive clients, ingest) connect; no data stored.</p><span class="tag">2+</span></div>
+    <div class="card"><h4>Network</h4><p>10/25 GbE per server, top-of-rack switches, uplinks; watch oversubscription.</p><span class="tag">racks</span></div>
+  </div>
+
+  <h3 id="walkthrough">Animated example: sizing the payments cluster</h3>
+  <div class="anim anim--one" data-frames="6" data-delay="4800">
+    <div class="anim__title">From 2 TB a day to 40 servers <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Sizing steps for a payments company cluster">
+          <rect x="10" y="8" width="340" height="24" rx="6" class="s-board"/>
+          <text x="180" y="24" text-anchor="middle" font-size="8.6" class="mono" style="fill:#9FD3B8">UPI switch logs · 2 TB/day · keep 3 years</text>
+          <g data-on="1-"><rect x="14" y="42" width="100" height="34" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="64" y="57" text-anchor="middle" font-size="8.4" font-weight="700" class="s-acc">0.5 TB/day</text><text x="64" y="70" text-anchor="middle" font-size="7.6" class="s-ink2">Parquet + zstd</text></g>
+          <g data-on="2-"><rect x="130" y="42" width="100" height="34" rx="6" class="s-card2"/><text x="180" y="57" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">1,642.5 TB</text><text x="180" y="70" text-anchor="middle" font-size="7.6" class="s-ink2">3 years × 3 copies</text></g>
+          <g data-on="3-"><rect x="246" y="42" width="100" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="296" y="57" text-anchor="middle" font-size="8.4" font-weight="700" class="s-green">40 workers</text><text x="296" y="70" text-anchor="middle" font-size="7.6" class="s-ink2">3,812.9 TB ÷ 96</text></g>
+          <g data-on="4-"><rect x="14" y="86" width="160" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="94" y="101" text-anchor="middle" font-size="8.4" font-weight="700" class="s-blue">NameNode ≈ 0.9 GB objects</text><text x="94" y="114" text-anchor="middle" font-size="7.6" class="s-ink2">2.2 M files + 4.5 M blocks</text></g>
+          <g data-on="5-"><rect x="186" y="86" width="160" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="266" y="101" text-anchor="middle" font-size="8.4" font-weight="700" class="s-blue">291 of 1,200 containers</text><text x="266" y="114" text-anchor="middle" font-size="7.6" class="s-ink2">60 TB scan in 3 h fits</text></g>
+          <g data-on="6"><rect x="14" y="130" width="332" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180" y="149" text-anchor="middle" font-size="8.6" font-weight="700" class="s-green">cold data on RS-6-3 → 22 workers instead of 40</text></g>
+          <g data-on="1"><text x="180" y="186" text-anchor="middle" font-size="9" class="s-ink">Step 1 · compress: 2 TB of logs becomes about 0.5 TB of Parquet.</text></g>
+          <g data-on="2"><text x="180" y="186" text-anchor="middle" font-size="9" class="s-ink">Step 2 · keep 1,095 days, three copies of each.</text></g>
+          <g data-on="3"><text x="180" y="186" text-anchor="middle" font-size="9" class="s-ink">Step 3 · +25% temp, 70% fill, +30% growth, ÷ 96 TB.</text></g>
+          <g data-on="4"><text x="180" y="186" text-anchor="middle" font-size="9" class="s-ink">Step 4 · count files and blocks for the NameNode heap.</text></g>
+          <g data-on="5"><text x="180" y="186" text-anchor="middle" font-size="9" class="s-ink">Step 5 · check the fraud job fits its 3-hour window.</text></g>
+          <g data-on="6"><text x="180" y="186" text-anchor="middle" font-size="9" class="s-ink">Step 6 · tiering: the biggest saving of all.</text></g>
+          <text x="180" y="204" text-anchor="middle" font-size="7.8" class="s-ink2">Hardware values are assumptions; real projects benchmark them.</text>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li><b>Compress:</b> 2 TB of raw logs a day becomes about 0.5 TB as Parquet with zstd (an assumption based on Lesson 10.2).</li>
+          <li><b>Keep and copy:</b> 1,095 days × 0.5 TB = 547.5 TB, three copies = 1,642.5 TB.</li>
+          <li><b>Margins:</b> +25% temp, keep disks 70% full, +30% growth = 3,812.9 TB; with 96 TB per server that is 40 workers.</li>
+          <li><b>NameNode:</b> 256 MB files give 2.2 million files and 4.5 million blocks: under 1 GB of objects, so the heap is comfortable.</li>
+          <li><b>Compute:</b> the nightly 60 TB scan needs 291 containers at once; 40 workers offer 1,200. Storage decides, compute fits.</li>
+          <li><b>Tiering:</b> keep 90 hot days with three copies and the rest in erasure coding: 22 workers.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+TIP> Size from the data, check with benchmarks. A sizing that starts from “we have budget for 20 servers” and works backwards is a budget, not a plan.
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Benchmark first, then size</h2>
+  <p>Run on the Module 8 lab with <code>dfsio_lab.sh</code> (in “Run it on your PC”), then do the arithmetic for the payments example.</p>
+  <ol class="stepper">
+    <li><h4>Benchmark writes with one task</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>yarn org.apache.hadoop.fs.TestDFSIO -libjars $T -write -nrFiles 1 -fileSize 64MB</code></pre><div class="output">Total MBytes processed: 64
+Throughput mb/sec: 113.48
+Test exec time sec: 17.6</div></div>
+      <span class="behind">One map task writes one 64 MB file with three replicas. 113 MB/s is what one writer gets from our laptop's disk, through the DataNode pipeline.</span></li>
+    <li><h4>Add writers</h4>
+      <div class="code" data-lang="text" data-file="dfsio_lab.sh output"><pre><code>write, 3 files: Throughput mb/sec: 61.82
+write, 6 files: Throughput mb/sec: 34.99</code></pre></div>
+      <span class="behind">Per task the number drops; the total grows from about 113 to 185 to 210 MB/s and then flattens. Three “workers” sharing one disk can't add disk speed. On real servers, each node adds its own disks and the total keeps growing.</span></li>
+    <li><h4>Benchmark reads</h4>
+      <div class="code" data-lang="text" data-file="dfsio_lab.sh output"><pre><code>read, 1 file:  Throughput mb/sec: 320
+read, 3 files: Throughput mb/sec: 175.34
+read, 6 files: Throughput mb/sec: 130.3</code></pre></div>
+      <span class="behind">Reads look faster because the files were written seconds earlier and are still in memory (page cache). For an honest read benchmark, use files much larger than RAM or drop the caches first.</span></li>
+    <li><h4>Storage for the payments company</h4>
+      <div class="code" data-lang="text" data-file="sizing"><pre><code>2 TB × 0.25 = 0.5 TB/day × 1,095 days = 547.5 TB
+× 3 copies = 1,642.5 TB × 1.25 temp ÷ 0.70 fill × 1.3 growth = 3,812.9 TB
+÷ 96 TB per worker (12 × 8 TB) = 39.7 → 40 workers</code></pre></div>
+      <span class="behind">Storage decides the cluster size. The compression ratio and disk per node are assumptions; measure the ratio on a sample of your real data (Lesson 10.2 measured about 0.14 for Parquet + zstd on our CSV, so 0.25 is a cautious choice).</span></li>
+    <li><h4>Check NameNode heap and compute</h4>
+      <div class="code" data-lang="text" data-file="sizing"><pre><code>files: 2,048 a day × 1,095 = 2,242,560; blocks: 4,485,120
+objects × 150 B ≈ 0.9 GB  (rule of thumb; plan a much larger heap)
+nightly work: 60 TB ÷ 20 MB/s = 3,145,728 container-seconds
+÷ 10,800 s (3 h) = 291 containers at once; available 40 × 30 = 1,200</code></pre></div>
+      <span class="behind">Both fit with room to spare. If either did not, it would add nodes (compute), larger files (heap) or a second namespace (Lesson 7.2).</span></li>
+    <li><h4>Masters, edge and network</h4>
+      <div class="code" data-lang="text" data-file="sizing"><pre><code>masters: 3 servers (2 NN, 2 RM, 3 JN, 3 ZK, JobHistory), one per rack
+edge: 2 servers
+racks: 45 servers ÷ 20 per rack = 3 racks
+oversubscription: 20 × 10 Gb ÷ 80 Gb uplink = 2.5 : 1</code></pre></div>
+      <span class="behind">Spreading masters across racks means a single rack failure can't take the NameNode pair or the JournalNode quorum down (Lesson 7.1).</span></li>
+  </ol>
+WARN> Never copy a benchmark from a laptop, a VM or another company's blog into a purchase order. Run TestDFSIO and one real job on a candidate server first, and treat every typical value in this lesson as a placeholder for your own measurement.
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Why more writers didn't mean more speed</h2>
+  <p>Six steps of our TestDFSIO runs: what the tool printed and what was happening on the one shared disk.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Per task vs in total <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="TestDFSIO output">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@namenode : /tmp</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ TestDFSIO -write -nrFiles 1 -fileSize 64MB</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">Throughput mb/sec: 113.48</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">Test exec time sec: 17.6</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ TestDFSIO -write -nrFiles 3 ...</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">Throughput mb/sec: 61.82</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">Average IO rate mb/sec: 68.42</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ TestDFSIO -write -nrFiles 6 ...</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">Throughput mb/sec: 34.99</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">Test exec time sec: 31.82</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">total = per task × tasks</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">1 × 113.48 = 113</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">3 ×  61.82 = 185</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#F5C77E">6 ×  34.99 = 210</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ TestDFSIO -read -nrFiles 1 ...</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">Throughput mb/sec: 320</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#7F8C86">-read -nrFiles 6:</text><text x="26" y="108" font-size="8.2" class="mono" style="fill:#9FD3B8">Throughput mb/sec: 130.3</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">production worker (assumed):</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">12 disks × ~150 MB/s</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#F5C77E">≈ 1,800 MB/s of disk per node</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#9FD3B8">10 GbE NIC ≈ 1,250 MB/s</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>One writer: 113.48 MB/s for one 64 MB file with three replicas.</li>
+          <li>Three writers: each gets 61.82 MB/s.</li>
+          <li>Six writers: each gets only 34.99 MB/s.</li>
+          <li>In total the cluster wrote about 113, 185 and 210 MB/s: it stopped scaling.</li>
+          <li>Reads: 320 MB/s for one task, 130.3 each for six, helped by data still in memory.</li>
+          <li>A real worker has many disks and its own network card, so totals keep growing with nodes.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Writers sharing one disk">
+          <g font-size="8">
+            <rect x="14" y="16" width="100" height="40" rx="6" class="s-card2"/><text x="64" y="40" text-anchor="middle" font-weight="700" class="s-ink">worker1</text>
+            <rect x="130" y="16" width="100" height="40" rx="6" class="s-card2"/><text x="180" y="40" text-anchor="middle" font-weight="700" class="s-ink">worker2</text>
+            <rect x="246" y="16" width="100" height="40" rx="6" class="s-card2"/><text x="296" y="40" text-anchor="middle" font-weight="700" class="s-ink">worker3</text>
+            <rect x="110" y="150" width="140" height="34" rx="6" class="s-board"/><text x="180" y="171" text-anchor="middle" font-size="8.4" class="s-chalk">ONE laptop disk</text>
+          </g>
+          <g data-on="1"><path d="M64 56L170 150" style="fill:none;stroke:var(--track);stroke-width:4"/><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink2">one writer has the disk to itself: 113 MB/s</text></g>
+          <g data-on="2"><path d="M64 56L170 150M180 56v94M296 56L190 150" style="fill:none;stroke:var(--track);stroke-width:2.4"/><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink2">three writers share it: 62 MB/s each</text></g>
+          <g data-on="3"><path d="M54 56L166 150M74 56L172 150M174 56l2 94M186 56l-2 94M286 56L188 150M306 56L194 150" style="fill:none;stroke:var(--track);stroke-width:1.4"/><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink2">six writers: 35 MB/s each</text></g>
+          <g data-on="4"><rect x="270" y="90" width="12" height="23" style="fill:var(--track)"/><rect x="290" y="75" width="12" height="38" style="fill:var(--track)"/><rect x="310" y="70" width="12" height="43" style="fill:var(--track)"/><text x="296" y="128" text-anchor="middle" font-size="7.6" class="s-ink2">113 · 185 · 210</text><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink2">the total flattens: the disk is the limit</text></g>
+          <g data-on="5"><rect x="268" y="150" width="78" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="307" y="171" text-anchor="middle" font-size="8" class="s-blue">page cache</text><path d="M250 167h18" style="fill:none;stroke:var(--blue);stroke-width:2"/><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink2">reads come partly from memory: faster than the disk</text></g>
+          <g data-on="6"><rect x="14" y="66" width="100" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="64" y="78" text-anchor="middle" font-size="7.4" class="s-green">12 disks</text><rect x="130" y="66" width="100" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="180" y="78" text-anchor="middle" font-size="7.4" class="s-green">12 disks</text><rect x="246" y="66" width="100" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="296" y="78" text-anchor="middle" font-size="7.4" class="s-green">12 disks</text><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink2">real workers bring their own disks: totals add up</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The three “workers” are containers on one laptop, all writing to the same physical disk.</li>
+          <li>With three writers the disk's bandwidth is shared three ways.</li>
+          <li>With six, each gets a smaller slice.</li>
+          <li>The total grows only from 185 to 210 MB/s: the disk is saturated.</li>
+          <li>Freshly written files are still in memory, so reads beat the disk's real speed.</li>
+          <li>On real hardware every worker adds its own disks, which is why benchmarks must be run on the real thing.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Sizing at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="20" y="22" width="80" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="44" text-anchor="middle" font-size="8.6" class="s-acc">UPI logs</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">3 years kept</text></svg></div>
+    <div><h4>1. Payments: regulation drives retention</h4>
+      <p>Payment companies keep transaction records for years by regulation. Retention × copies decides most of the cluster, so tiering old data to erasure coding or archive storage is the biggest cost lever.</p>
+      <div class="uc-flow"><span>Retention rule</span><i>→</i><span class="java">Storage formula</span><i>→</i><span>Workers + tiering plan</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><path d="M20 66l20-24 18 12 22-30 20 16" style="fill:none;stroke:var(--green);stroke-width:2.5"/></svg></div>
+    <div><h4>2. E-commerce: the sale day sets the compute</h4>
+      <p>Clickstream volume can be many times normal during a festival sale. Teams size compute for the peak night's window, and often burst extra capacity in the cloud for those days.</p>
+      <div class="uc-flow"><span>Peak volume</span><i>→</i><span class="java">Container-seconds ÷ window</span><i>→</i><span>Containers needed</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="24" y="22" width="72" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="44" text-anchor="middle" font-size="8.6" class="s-blue">CDRs</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">ORC 20%</text></svg></div>
+    <div><h4>3. Telecom: format is the cheapest saving</h4>
+      <p>Call records compress very well in columnar formats. Converting raw CDR text to ORC or Parquet often reduces the hardware more than any server discount.</p>
+      <div class="uc-flow"><span>Raw CDR text</span><i>→</i><span class="java">ORC conversion</span><i>→</i><span>Fewer disks</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="30" y="22" width="60" height="46" rx="6" class="s-card2"/><text x="60" y="44" text-anchor="middle" font-size="8.6" class="s-ink">NameNode</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-red">heap!</text></svg></div>
+    <div><h4>4. Healthcare: file counts, not bytes</h4>
+      <p>Hospitals store millions of small reports and image metadata files. Their sizing worry is NameNode heap, solved by packing files into containers or object storage, not by more disks.</p>
+      <div class="uc-flow"><span>Millions of files</span><i>→</i><span class="java">Objects × 150 B</span><i>→</i><span>Pack or federate</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="24" width="38" height="42" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="37" y="49" text-anchor="middle" font-size="8.6" class="s-green">own</text><rect x="64" y="24" width="38" height="42" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="83" y="49" text-anchor="middle" font-size="8.6" class="s-acc">cloud</text></svg></div>
+    <div><h4>5. Government: phased buying and growth</h4>
+      <p>Public schemes grow as enrolment grows and data is rarely deleted. Planners model growth year by year and buy hardware in phases, reviewing against real usage before each purchase.</p>
+      <div class="uc-flow"><span>Growth model</span><i>→</i><span class="java">Yearly sizing</span><i>→</i><span>Phased purchase</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies. Hardware figures in this lesson are assumptions for illustration.</p>
+</section>

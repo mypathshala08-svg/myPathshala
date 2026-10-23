@@ -1,0 +1,4697 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Partitioner | MyPhatshala</title>
+<meta name="description" content="The MapReduce Partitioner on a real Hadoop 3.5.0 cluster: 5 lakh canteen orders, 4 reducers. The default HashPartitioner left reducer 0 empty and gave reducer 2 54% of the records; a custom CounterPartitioner put each canteen counter in its own file. A partitioner returning an invalid number failed every map task with “Illegal partition for chai (4)”. Text hashCode and the (hash &amp; Integer.MAX_VALUE) % n formula reproduced in Python, hot keys and salting, TotalOrderPartitioner, KeyFieldBasedPartitioner, quiz and interview scenarios.">
+<meta name="mp:minutes" content="24">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/09-mapreduce-in-depth/02-partitioner/">
+<meta property="og:title" content="Partitioner · MyPhatshala">
+<meta property="og:description" content="4 reducers, one of them empty: see why the default partitioner did that, and write one that puts each canteen counter in its own file.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Partitioner", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="09-mapreduce-in-depth/02-partitioner" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 9.2</b></nav>
+    <h1>Partitioner</h1>
+    <p class="lead">Between map and reduce, something must decide which reducer receives each key. That is the partitioner. This lesson runs the default hash partitioner and a custom one on the same 5 lakh orders, measures every reducer's load, reproduces Hadoop's hash in Python, and breaks a job on purpose with an invalid partition number.</p>
+    <div class="lesson-meta"><span>Module 9 · MapReduce in depth</span><span>⏱ 24 min</span><span>Intermediate</span><span>Real reducer loads measured</span><span>Hadoop's hash reproduced in Python</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Four counters, four reducers, one empty</h2>
+  <div class="story">
+    <p class="narration">The canteen has four counters: A for drinks, B for snacks, C for breakfast and D for meals. Riya runs the item-revenue job on 5 lakh orders with 4 reducers, hoping for one output file per counter. She gets four files, but one is completely empty, one holds four items from three different counters, and one does more than three times the work of another. Nobody told Hadoop about counters. It sent each item wherever its hash number pointed.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="With the default hash partitioner, reducer 0 gets nothing and reducer 2 gets 269,350 records. With a counter partitioner, each reducer gets one counter's two items.">
+        <g font-size="10">
+          <text x="160" y="20" text-anchor="middle" font-weight="700" class="s-ink">Default: HashPartitioner</text>
+          <text x="40" y="44" font-size="8.6" class="s-ink2">r0</text><rect x="62" y="34" width="2" height="14" class="s-card2"/><text x="72" y="45" font-size="8.4" class="s-ink2">empty</text>
+          <text x="40" y="70" font-size="8.6" class="s-ink2">r1</text><rect x="62" y="60" width="131" height="14" rx="3" style="fill:var(--blue);opacity:.75"/><text x="198" y="71" font-size="8.4" class="s-ink">160,766 · coffee idli poha thali</text>
+          <text x="40" y="96" font-size="8.6" class="s-ink2">r2</text><rect x="62" y="86" width="220" height="14" rx="3" style="fill:var(--track);opacity:.85"/><text x="62" y="114" font-size="8.4" class="s-ink">269,350 · chai dosa vada pav</text>
+          <text x="40" y="136" font-size="8.6" class="s-ink2">r3</text><rect x="62" y="126" width="57" height="14" rx="3" style="fill:var(--green);opacity:.75"/><text x="124" y="137" font-size="8.4" class="s-ink">69,884 · samosa</text>
+
+          <text x="480" y="20" text-anchor="middle" font-weight="700" class="s-ink">Custom: CounterPartitioner</text>
+          <text x="360" y="44" font-size="8.6" class="s-ink2">r0</text><rect x="382" y="34" width="155" height="14" rx="3" style="fill:var(--track);opacity:.85"/><text x="542" y="45" font-size="8.4" class="s-ink">190,033 · A</text>
+          <text x="360" y="70" font-size="8.6" class="s-ink2">r1</text><rect x="382" y="60" width="114" height="14" rx="3" style="fill:var(--blue);opacity:.75"/><text x="501" y="71" font-size="8.4" class="s-ink">139,638 · B</text>
+          <text x="360" y="96" font-size="8.6" class="s-ink2">r2</text><rect x="382" y="86" width="74" height="14" rx="3" style="fill:var(--green);opacity:.75"/><text x="461" y="97" font-size="8.4" class="s-ink">90,110 · C</text>
+          <text x="360" y="122" font-size="8.6" class="s-ink2">r3</text><rect x="382" y="112" width="66" height="14" rx="3" style="fill:var(--violet,#8B5CF6);opacity:.7"/><text x="453" y="123" font-size="8.4" class="s-ink">80,219 · D</text>
+        </g>
+        <text x="320" y="170" text-anchor="middle" font-size="9.6" class="s-ink2">Real reduce input records from our lab. The partitioner decides which reducer gets each key.</text>
+        <text x="632" y="192" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, I asked for 4 reducers. Why does one get nothing?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Because only 8 different keys exist, and the default <b>HashPartitioner</b> sends each key to <code>hash(key) mod 4</code>. With 8 keys and 4 buckets, it is quite possible that no key lands in bucket 0. It's like 8 students choosing 4 rows by their roll number: nobody planned it to be fair.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>And chai alone is 30% of all orders, so whichever reducer gets chai is always the busiest.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Today we write our own <b>Partitioner</b>: one reducer per canteen counter. We'll also see what happens when a partitioner returns a number that doesn't exist: every map task fails.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Partitioner</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A <b>Partitioner</b> decides, for every intermediate key-value pair produced by a map task, which reduce task will receive it. It implements <code>int getPartition(KEY key, VALUE value, int numReduceTasks)</code>, which must return a number from <code>0</code> to <code>numReduceTasks − 1</code> and must return the same number for equal keys, so that all values of a key reach one reducer. It runs inside the map task (and before the combiner), on every map output record, and is only used when the job has more than one reducer. The default, <b>HashPartitioner</b>, computes <code>(key.hashCode() &amp; Integer.MAX_VALUE) % numReduceTasks</code>. A custom partitioner is set with <code>job.setPartitionerClass()</code>, for example to group related keys, to balance load, or (with <b>TotalOrderPartitioner</b>) to produce globally sorted output.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>The partitioner is the sorting clerk at the end of every map task: for each pair it writes a reducer number on the envelope. By default the number comes from the key's hash. Write your own when you want to choose which keys travel together.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Partition</b><span>The share of map output for one reducer; one partition = one reduce task = one part-r file.</span></div>
+    <div class="term"><b>getPartition()</b><span>Returns the reducer number (0 … n−1) for one key-value pair.</span></div>
+    <div class="term"><b>HashPartitioner</b><span>The default: hash of the key, made non-negative, modulo the number of reducers.</span></div>
+    <div class="term"><b>Hot key</b><span>A key with far more records than others (chai: 30% of orders).</span></div>
+    <div class="term"><b>Skew</b><span>Uneven work across reducers; the slowest reducer decides when the job ends.</span></div>
+    <div class="term"><b>Salting</b><span>Adding a random suffix to a hot key so it spreads over several reducers.</span></div>
+    <div class="term"><b>TotalOrderPartitioner</b><span>Sends key ranges to reducers so all output files together are sorted.</span></div>
+    <div class="term"><b>Illegal partition</b><span>The error when getPartition() returns a number outside 0 … n−1.</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, 5 lakh orders, 4 reducers)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>HashPartitioner</th><td>reducer 0: 0 records (empty file) · r1: 160,766 (coffee, idli, poha, thali) · r2: 269,350 (chai, dosa, vada pav) · r3: 69,884 (samosa)</td></tr>
+    <tr><th>CounterPartitioner</th><td>r0: 190,033 (chai, coffee) · r1: 139,638 (samosa, vada pav) · r2: 90,110 (poha, idli) · r3: 80,219 (dosa, thali); 2 keys each</td></tr>
+    <tr><th>Busiest vs average</th><td>hash: 269,350 vs 125,000 (2.2×) · counter: 190,033 vs 125,000 (1.5×)</td></tr>
+    <tr><th>Bad partitioner</th><td>returned the item's length (4 to 8) for 4 reducers: “java.io.IOException: Illegal partition for chai (4)”, Failed map tasks=10, job FAILED</td></tr>
+    <tr><th>1 reducer</th><td>Hadoop skips the partitioner entirely: everything is partition 0 (Lesson 8.5)</td></tr>
+  </table>
+
+  <h3 id="levels">Partitioners at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> The letter sorter</h4>
+      <ul>
+        <li>A post office has 4 delivery vans. A clerk stamps each letter with a van number before it leaves the counter. That clerk is the partitioner.</li>
+        <li>The default clerk uses a formula on the PIN code. Letters with the same PIN always go in the same van, but some vans may get many more letters, and one may get none.</li>
+        <li>A smarter clerk can be told: “all letters for Kharghar go in van 2”. That is a custom partitioner.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How the default works</h4>
+      <ul>
+        <li>For each map output pair, the map task calls <code>getPartition(key, value, 4)</code> and stores the pair in that partition of its sort buffer (Lesson 8.4).</li>
+        <li>HashPartitioner: <code>(key.hashCode() &amp; Integer.MAX_VALUE) % 4</code>. The <code>&amp; Integer.MAX_VALUE</code> clears the sign bit, because Java's <code>%</code> of a negative number is negative.</li>
+        <li>For <code>Text</code>, hashCode starts at 1 and does <code>h = 31 × h + byte</code> over the UTF-8 bytes. “chai” → 2, “samosa” → 3, “coffee” → 1. No item gives 0.</li>
+        <li>With millions of different keys (student IDs, words) hashing spreads load well. With a handful of keys it is a lottery.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Designing partitioners</h4>
+      <ul>
+        <li><b>Correctness:</b> equal keys must always get the same number, from every map task. Never use randomness or the value alone unless that's the plan (salting changes the key itself).</li>
+        <li><b>Balance:</b> the job ends when the slowest reducer ends. Estimate key sizes (counters or a sample) and pack big keys apart.</li>
+        <li><b>Hot keys:</b> one key can't be split by any partitioner, because all its values must meet in one reduce call. Split it in the key: <code>chai#0 … chai#3</code>, then add the four partial results in a second step.</li>
+        <li><b>Composite keys:</b> with a (student, time) key, partition on the student only, or one student's records scatter over reducers (Lesson 9.7).</li>
+        <li><b>Global sort:</b> TotalOrderPartitioner with a sampled partition file gives reducer 0 the smallest keys, reducer 1 the next range and so on.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “What is a Partitioner? Write a custom one”, give the signature <code>getPartition(key, value, numReduceTasks)</code>, the default formula <code>(hashCode &amp; Integer.MAX_VALUE) % numReduceTasks</code>, the rule “0 to n−1, same key → same number”, and a 6-line example that maps a category to a reducer number with <code>% numReduceTasks</code>.</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Partitioners Hadoop ships, and when to write one</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Partitioner</th><th>How it decides</th><th>Use it for</th><th>Watch out</th></tr></thead>
+    <tbody>
+      <tr><td><b>HashPartitioner</b> (default)</td><td>key hash mod n</td><td>Many distinct keys</td><td>Few keys: empty or overloaded reducers</td></tr>
+      <tr><td><b>Custom</b> (<code>extends Partitioner</code>)</td><td>Your rule</td><td>Grouping related keys, one file per category, balancing known sizes</td><td>Must return 0 … n−1 for every key</td></tr>
+      <tr><td><b>KeyFieldBasedPartitioner</b></td><td>Hash of chosen fields of a text key</td><td>Streaming jobs, keys like <code>student\ttime</code></td><td>Field options syntax (<code>-k1,1</code>)</td></tr>
+      <tr><td><b>TotalOrderPartitioner</b></td><td>Key ranges from a partition file</td><td>Globally sorted output across all part files</td><td>Needs a sample (InputSampler) and the same key type</td></tr>
+      <tr><td><b>BinaryPartitioner</b></td><td>Hash of a byte range of a BinaryComparable key</td><td>Binary composite keys</td><td>Rarely needed</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Why teams write custom partitioners</h3>
+  <div class="cards">
+    <div class="card"><h4>One file per group</h4><p>All items of counter A in <code>part-r-00000</code>, B in <code>00001</code>: downstream readers pick their file.</p><span class="tag">layout</span></div>
+    <div class="card"><h4>Known heavy keys</h4><p>Put the biggest keys on separate reducers instead of trusting the hash.</p><span class="tag">balance</span></div>
+    <div class="card"><h4>Composite keys</h4><p>Partition by the natural key only, so a secondary sort works (Lesson 9.7).</p><span class="tag">correctness</span></div>
+    <div class="card"><h4>Range output</h4><p>Dates or IDs in ranges, so every reducer's file covers one range and the files concatenate in order.</p><span class="tag">sorting</span></div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>Before writing a partitioner, look at the reduce tasks of a real run. Our <code>reduce_tasks.sh</code> reads each reduce task's <code>REDUCE_INPUT_RECORDS</code> from the JobHistory Server; the same numbers are on its web UI (port 19888) under each task's counters.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Hash vs counter partitioner on 5 lakh orders</h2>
+  <p>Run on the Module 8 lab cluster with <code>partitioner_lab.sh</code> (in “Run it on your PC”). The input is <code>student_orders.csv</code> (Lesson 9.1), stored in 3 blocks.</p>
+  <ol class="stepper">
+    <li><h4>Run with the default partitioner</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr9.jar ItemPartition -D part.mode=hash student_orders.csv /out/part_hash</code></pre><div class="output">part-r-00000:
+part-r-00001: coffee(40364) idli(44774) poha(45336) thali(30292)
+part-r-00002: chai(149669) dosa(49927) vada pav(69754)
+part-r-00003: samosa(69884)</div></div>
+      <span class="behind">The job asked for 4 reducers and got 4 files, but the hash of no item came out as 0. Reducer 0 started a container, fetched nothing and wrote an empty file.</span></li>
+    <li><h4>Measure each reducer</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>bash reduce_tasks.sh job_1792643020992_…</code></pre><div class="output">r_000000  reduce input records         0  groups 0
+r_000001  reduce input records    160766  groups 4
+r_000002  reduce input records    269350  groups 3
+r_000003  reduce input records     69884  groups 1</div></div>
+      <span class="behind">Reducer 2 gets chai (149,669 orders on its own) plus two more items: 54% of all records. In a big job, this reducer alone would decide how long you wait.</span></li>
+    <li><h4>Write the counter partitioner</h4>
+      <div class="code" data-lang="java" data-file="ItemPartition.java (part)"><pre><code>public static class CounterPartitioner extends Partitioner&lt;Text, IntWritable&gt; {
+  // A: chai, coffee  B: samosa, vada pav  C: poha, idli  D: dosa, thali
+  public int getPartition(Text item, IntWritable amount, int numReduceTasks) {
+    Integer c = COUNTER.get(item.toString());
+    if (c == null) return 0;                // unknown items go to the first reducer
+    return c % numReduceTasks;              // always 0 .. numReduceTasks-1
+  }
+}
+job.setPartitionerClass(CounterPartitioner.class);</code></pre></div>
+      <span class="behind">Two safety habits: a fixed answer for unexpected keys, and <code>% numReduceTasks</code> so the same code still works if someone runs it with 2 or 3 reducers.</span></li>
+    <li><h4>Run with the counter partitioner</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hadoop jar mr9.jar ItemPartition -D part.mode=counter student_orders.csv /out/part_counter</code></pre><div class="output">part-r-00000: chai(149669) coffee(40364)
+part-r-00001: samosa(69884) vada pav(69754)
+part-r-00002: idli(44774) poha(45336)
+part-r-00003: dosa(49927) thali(30292)
+r_000000  reduce input records    190033  groups 2
+r_000001  reduce input records    139638  groups 2
+r_000002  reduce input records     90110  groups 2
+r_000003  reduce input records     80219  groups 2</div></div>
+      <span class="behind">One file per counter, every reducer busy. Still not perfectly even: counter A carries chai. The partitioner can choose where chai goes, but never split it.</span></li>
+    <li><h4>Return a partition that doesn't exist</h4>
+      <div class="code" data-lang="java" data-file="BadPartitioner.java"><pre><code>return item.toString().length();   // "vada pav" -&gt; 8, but there are only 4 reducers</code></pre><div class="output">Error: java.io.IOException: Illegal partition for chai (4)
+Error: java.io.IOException: Illegal partition for dosa (4)
+Error: java.io.IOException: Illegal partition for idli (4)
+		Failed map tasks=10
+Job … failed with state FAILED due to: Task failed task_…_m_000001</div></div>
+      <span class="behind">The check happens in the map task, on the first bad record. Every attempt failed, Hadoop retried each map up to 4 times, then gave up: 10 failed attempts before the job was killed. Even 4 (“chai”) is illegal: valid numbers are 0 to 3.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Changing the number of reducers changes where every key goes with HashPartitioner. Don't build anything that assumes “samosa is always in part-r-00003”; read the files by content, or use a partitioner that defines the layout.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Stamping a reducer number on every pair</h2>
+  <p>Six steps: one map task's output passing through the default partitioner, then the custom one.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Which reducer? <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Output files and reducer counters">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@namenode : /tmp/mr9</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop jar mr9.jar ItemPartition</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#7F8C86">    -D part.mode=hash …</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#9FD3B8">number of splits:3</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">map 100% reduce 0%</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#7F8C86">(each map wrote 4 partitions)</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#F5C77E">part-r-00000:</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#9FD3B8">part-r-00001: coffee idli poha thali</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#9FD3B8">part-r-00002: chai dosa vada pav</text><text x="26" y="104" font-size="8.2" class="mono" style="fill:#9FD3B8">part-r-00003: samosa</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ … -D part.mode=counter …</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">part-r-00000: chai coffee</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">part-r-00001: samosa vada pav</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#9FD3B8">part-r-00002: idli poha</text><text x="26" y="122" font-size="8.2" class="mono" style="fill:#9FD3B8">part-r-00003: dosa thali</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">r_000000  190033  groups 2</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#9FD3B8">r_000001  139638  groups 2</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#9FD3B8">r_000002   90110  groups 2</text><text x="26" y="104" font-size="8.2" class="mono" style="fill:#9FD3B8">r_000003   80219  groups 2</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ … -D part.mode=bad …</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">Illegal partition for chai (4)</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#F5C77E">Failed map tasks=10</text><text x="26" y="110" font-size="8.2" class="mono" style="fill:#F5C77E">failed with state FAILED</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The job starts with 3 map tasks and 4 reducers, using the default partitioner.</li>
+          <li>Each map task sorts its output into 4 partitions, one per reducer.</li>
+          <li>The default result: one empty file and an uneven split.</li>
+          <li>With the counter partitioner, each file holds one canteen counter.</li>
+          <li>Every reducer now gets two items and real work.</li>
+          <li>A partitioner that returns 4 for 4 reducers fails every map task.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Map output pairs get a partition number and land in reducer buckets">
+          <g font-size="8">
+            <rect x="12" y="16" width="120" height="196" rx="6" class="s-card2"/><text x="72" y="30" text-anchor="middle" font-weight="700" class="s-ink">map task output</text>
+            <rect x="228" y="20" width="120" height="40" rx="6" class="s-card2"/><text x="240" y="34" class="s-ink" font-weight="700">reducer 0</text>
+            <rect x="228" y="66" width="120" height="40" rx="6" class="s-card2"/><text x="240" y="80" class="s-ink" font-weight="700">reducer 1</text>
+            <rect x="228" y="112" width="120" height="40" rx="6" class="s-card2"/><text x="240" y="126" class="s-ink" font-weight="700">reducer 2</text>
+            <rect x="228" y="158" width="120" height="40" rx="6" class="s-card2"/><text x="240" y="172" class="s-ink" font-weight="700">reducer 3</text>
+          </g>
+          <g data-on="1"><g font-size="7.8" class="mono s-ink"><text x="22" y="50">(chai, 15)</text><text x="22" y="66">(samosa, 18)</text><text x="22" y="82">(coffee, 20)</text><text x="22" y="98">(dosa, 45)</text><text x="22" y="114">(idli, 30)</text></g><text x="180" y="230" text-anchor="middle" font-size="8.4" class="s-ink2">every map output pair needs a reducer number</text></g>
+          <g data-on="2"><g font-size="7.8" class="mono s-ink"><text x="22" y="50">(chai, 15)    → 2</text><text x="22" y="66">(samosa, 18)  → 3</text><text x="22" y="82">(coffee, 20)  → 1</text><text x="22" y="98">(dosa, 45)    → 2</text><text x="22" y="114">(idli, 30)    → 1</text></g><text x="180" y="230" text-anchor="middle" font-size="8.4" class="s-ink2">(hash &amp; MAX_VALUE) % 4, computed in the map task</text></g>
+          <g data-on="3"><g font-size="7.8" class="s-ink"><text x="240" y="50" class="s-ink2">(nothing)</text><text x="240" y="96">coffee idli poha thali</text><text x="240" y="142">chai dosa vada pav</text><text x="240" y="188">samosa</text></g><rect x="300" y="120" width="44" height="8" rx="2" style="fill:var(--track)"/><text x="180" y="230" text-anchor="middle" font-size="8.4" class="s-ink2">8 keys, 4 buckets: no key hashed to 0</text></g>
+          <g data-on="4"><g font-size="7.8" class="mono s-ink"><text x="22" y="50">(chai, 15)    → 0</text><text x="22" y="66">(samosa, 18)  → 1</text><text x="22" y="82">(coffee, 20)  → 0</text><text x="22" y="98">(dosa, 45)    → 3</text><text x="22" y="114">(idli, 30)    → 2</text></g><g font-size="7.8" class="s-ink"><text x="240" y="50">A: chai coffee</text><text x="240" y="96">B: samosa vada pav</text><text x="240" y="142">C: idli poha</text><text x="240" y="188">D: dosa thali</text></g><text x="180" y="230" text-anchor="middle" font-size="8.4" class="s-ink2">CounterPartitioner: a lookup table, % numReduceTasks</text></g>
+          <g data-on="5"><g style="opacity:.85"><rect x="240" y="44" width="100" height="10" rx="2" style="fill:var(--track)"/><rect x="240" y="90" width="73" height="10" rx="2" style="fill:var(--blue)"/><rect x="240" y="136" width="47" height="10" rx="2" style="fill:var(--green)"/><rect x="240" y="182" width="42" height="10" rx="2" style="fill:var(--blue)"/></g><text x="72" y="110" text-anchor="middle" font-size="8.4" class="s-ink">chai is 30% of</text><text x="72" y="124" text-anchor="middle" font-size="8.4" class="s-ink">all orders</text><text x="180" y="230" text-anchor="middle" font-size="8.4" class="s-ink2">balanced by counter, but a hot key stays in one place</text></g>
+          <g data-on="6"><g font-size="7.8" class="mono s-red"><text x="22" y="50">(chai, 15)    → 4 ✗</text><text x="22" y="66">(samosa, 18)  → 6 ✗</text><text x="22" y="82">(vada pav,20) → 8 ✗</text></g><text x="72" y="120" text-anchor="middle" font-size="8.4" class="s-red">IOException</text><text x="72" y="134" text-anchor="middle" font-size="8.4" class="s-red">map attempt fails</text><text x="180" y="230" text-anchor="middle" font-size="8.4" class="s-ink2">valid numbers are 0 … 3; retried, then the job fails</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The map task produces (item, amount) pairs. Each one must be given a reducer number.</li>
+          <li>HashPartitioner computes the number from the key's hash: chai 2, samosa 3, coffee 1, dosa 2, idli 1.</li>
+          <li>All 8 items land in buckets 1, 2 and 3. Reducer 0 receives nothing.</li>
+          <li>The custom partitioner looks up each item's counter instead.</li>
+          <li>Every reducer gets work, but counter A with chai is still the biggest.</li>
+          <li>A partitioner returning numbers 4 and above crashes the map task with “Illegal partition”.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Partitioners at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="20" width="40" height="50" rx="5" class="s-soft-acc" style="stroke:var(--track)"/><text x="36" y="49" text-anchor="middle" font-size="8.4" class="s-acc">a–m</text><rect x="64" y="20" width="40" height="50" rx="5" class="s-soft-blue" style="stroke:var(--blue)"/><text x="84" y="49" text-anchor="middle" font-size="8.4" class="s-blue">n–z</text></svg></div>
+    <div><h4>1. Globally sorted output (TeraSort)</h4>
+      <p>The famous TeraSort benchmark samples the input and uses a total-order partitioner, so reducer 0 gets the smallest keys and the part files read in order form one sorted data set.</p>
+      <div class="uc-flow"><span>Sample keys</span><i>→</i><span class="java">Range partitioner</span><i>→</i><span>Sorted part files</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="22" y="22" width="76" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="8.4" class="s-ink">region=north</text><text x="60" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">part-r-00002</text></svg></div>
+    <div><h4>2. One output file per business unit</h4>
+      <p>Reports split by region, store or product line: a custom partitioner sends each unit's keys to a fixed reducer so each team reads only its own file.</p>
+      <div class="uc-flow"><span>Sales records</span><i>→</i><span class="java">Partition by region</span><i>→</i><span>File per region</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="56" width="18" height="14" style="fill:var(--green)"/><rect x="40" y="20" width="18" height="50" style="fill:var(--track)"/><rect x="62" y="50" width="18" height="20" style="fill:var(--green)"/><rect x="84" y="54" width="18" height="16" style="fill:var(--green)"/></svg></div>
+    <div><h4>3. Taming hot keys</h4>
+      <p>Click logs where one page or one big customer dominates: teams salt the hot key into several sub-keys, spread them with the partitioner, then merge the partial results.</p>
+      <div class="uc-flow"><span>Hot key</span><i>→</i><span class="java">key#0 … key#9</span><i>→</i><span>Merge partials</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="20" y="24" width="80" height="42" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="44" text-anchor="middle" font-size="8.4" class="s-green">bucket = hash % 32</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">same in Hive, Spark</text></svg></div>
+    <div><h4>4. Bucketed tables</h4>
+      <p>Hive and Spark bucketing is the same idea made permanent: rows are written into a fixed number of files by hash of a column, so later joins on that column can skip a shuffle.</p>
+      <div class="uc-flow"><span>CLUSTERED BY (student)</span><i>→</i><span class="java">hash % buckets</span><i>→</i><span>Bucket files</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Reproduce Hadoop's HashPartitioner</h2>
+  <p>This is exactly what <code>Text.hashCode()</code> and <code>HashPartitioner</code> compute, written in Python with 32-bit arithmetic. Run it and compare with the real files from the lab: chai, dosa and vada pav in <code>part-r-00002</code>, samosa alone in <code>part-r-00003</code>, nothing in <code>part-r-00000</code>.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>def text_hash(s):                        # org.apache.hadoop.io.Text.hashCode()
+    h = 1
+    for b in s.encode(&quot;utf-8&quot;):
+        h = (31 * h + (b if b &lt; 128 else b - 256)) &amp; 0xFFFFFFFF   # Java int: wraps at 32 bits
+    return h - (1 &lt;&lt; 32) if h &gt;= (1 &lt;&lt; 31) else h              # back to a signed int
+
+def hash_partition(key, n):              # HashPartitioner.getPartition()
+    return (text_hash(key) &amp; 0x7FFFFFFF) % n
+
+items = [&quot;chai&quot;, &quot;coffee&quot;, &quot;dosa&quot;, &quot;idli&quot;, &quot;poha&quot;, &quot;samosa&quot;, &quot;thali&quot;, &quot;vada pav&quot;]
+n = 4
+files = {p: [] for p in range(n)}
+for item in items:
+    files[hash_partition(item, n)].append(item)
+for p in range(n):
+    print(f&quot;part-r-0000{p}: {files[p]}&quot;)</code></pre><div class="output">part-r-00000: []
+part-r-00001: [&#x27;coffee&#x27;, &#x27;idli&#x27;, &#x27;poha&#x27;, &#x27;thali&#x27;]
+part-r-00002: [&#x27;chai&#x27;, &#x27;dosa&#x27;, &#x27;vada pav&#x27;]
+part-r-00003: [&#x27;samosa&#x27;]</div></div>
+  <ul class="anno"><li><code>        h = (31 * h + (b if b &lt; 128 else b - 256)) &amp; 0xFFFFFFFF   # Java int: wraps at 32 bits</code><span>Java bytes are signed and ints overflow at 32 bits; Python integers don't, so we mask.</span></li><li><code>    return (text_hash(key) &amp; 0x7FFFFFFF) % n</code><span>& Integer.MAX_VALUE clears the sign bit, so the result of % is never negative.</span></li><li><code>    files[hash_partition(item, n)].append(item)</code><span>This call happens in the map task, once for every map output record (5 lakh times in our job).</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Hash partitions",
+   "hint": "Press <b>Run<\/b>. Does it match the lab's four files exactly?",
+   "code": "def text_hash(s):                        # org.apache.hadoop.io.Text.hashCode()\n    h = 1\n    for b in s.encode(\"utf-8\"):\n        h = (31 * h + (b if b < 128 else b - 256)) & 0xFFFFFFFF   # Java int: wraps at 32 bits\n    return h - (1 << 32) if h >= (1 << 31) else h              # back to a signed int\n\ndef hash_partition(key, n):              # HashPartitioner.getPartition()\n    return (text_hash(key) & 0x7FFFFFFF) % n\n\nitems = [\"chai\", \"coffee\", \"dosa\", \"idli\", \"poha\", \"samosa\", \"thali\", \"vada pav\"]\nn = 4\nfiles = {p: [] for p in range(n)}\nfor item in items:\n    files[hash_partition(item, n)].append(item)\nfor p in range(n):\n    print(f\"part-r-0000{p}: {files[p]}\")\n"
+  },
+  {
+   "label": "2 · More reducers",
+   "hint": "<b>Predict first:<\/b> with 3, 5 and 8 reducers, will any file be empty? Notice how every key moves when the number of reducers changes.",
+   "code": "def text_hash(s):\n    h = 1\n    for b in s.encode():\n        h = (31 * h + b) & 0xFFFFFFFF\n    return h\n\nitems = [\"chai\", \"coffee\", \"dosa\", \"idli\", \"poha\", \"samosa\", \"thali\", \"vada pav\"]\nfor n in [3, 5, 8]:\n    parts = [(text_hash(i) & 0x7FFFFFFF) % n for i in items]\n    print(n, \"reducers:\", dict(zip(items, parts)), \"empty:\", sorted(set(range(n)) - set(parts)))\n"
+  },
+  {
+   "label": "3 · Counter partitioner",
+   "hint": "Write the custom rule: A chai, coffee · B samosa, vada pav · C poha, idli · D dosa, thali. Add up the orders per reducer using the lab counts.",
+   "code": "counter = {\"chai\": 0, \"coffee\": 0, \"samosa\": 1, \"vada pav\": 1, \"poha\": 2, \"idli\": 2, \"dosa\": 3, \"thali\": 3}\norders = {\"chai\": 149669, \"coffee\": 40364, \"samosa\": 69884, \"vada pav\": 69754,\n          \"poha\": 45336, \"idli\": 44774, \"dosa\": 49927, \"thali\": 30292}\n\ndef get_partition(item, n):\n    return counter.get(item, 0) % n\n\nload = [0] * 4\nfor item, count in orders.items():\n    load[get_partition(item, 4)] += count\nprint(load, \"busiest / average =\", round(max(load) / (sum(load) / 4), 2))\n"
+  },
+  {
+   "label": "4 · Salt the hot key",
+   "hint": "Chai is 30% of all orders. Split it into chai#0 … chai#3 (by order number) and spread those sub-keys over 4 reducers. What is the busiest reducer now?",
+   "code": "orders = {\"chai\": 149669, \"coffee\": 40364, \"samosa\": 69884, \"vada pav\": 69754,\n          \"poha\": 45336, \"idli\": 44774, \"dosa\": 49927, \"thali\": 30292}\nkeys = {f\"chai#{i}\": orders[\"chai\"] / 4 for i in range(4)}\nkeys.update({k: v for k, v in orders.items() if k != \"chai\"})\nload = [0] * 4\nfor k, v in sorted(keys.items(), key=lambda x: -x[1]):    # biggest first, onto the emptiest reducer\n    load[load.index(min(load))] += v\nprint([round(x) for x in load])\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This partitioner returns the length of the item name. Run it with 4 reducers. Hadoop would throw “Illegal partition”. Make it always return 0 … n−1.",
+   "code": "def get_partition(item, n):\n    p = len(item)\n    if not 0 <= p < n:\n        raise ValueError(f\"Illegal partition for {item} ({p})\")\n    return p\n\nfor item in [\"chai\", \"samosa\", \"vada pav\"]:\n    print(item, get_partition(item, 4))\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: hash vs custom partitioner</h3>
+  <p>Use the Module 8 lab cluster (Lesson 8.1). Copy the files below and <code>student_orders.csv</code> (made by <code>make_student_orders.py</code> in Lesson 9.1) into the namenode container's <code>/tmp/mr9</code> folder, compile and run the lab script. It runs three jobs, about 2 minutes in total.</p>
+  <div class="pcrun"><h4>Item revenue with a choice of partitioner</h4>
+  <div class="code" data-lang="bash" data-file="ItemPartition.java"><pre><code>// ItemPartition.java: orders and revenue per item with 4 reducers.
+// -D part.mode=hash      default HashPartitioner
+// -D part.mode=counter   CounterPartitioner: every item of one canteen counter (A–D) goes to the same reducer
+// -D part.mode=bad       BadPartitioner (BadPartitioner.java): returns an invalid partition number
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Partitioner;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+
+public class ItemPartition {
+  public static class M extends Mapper&lt;LongWritable, Text, Text, IntWritable&gt; {
+    private final Text item = new Text();
+    private final IntWritable amount = new IntWritable();
+    @Override
+    protected void map(LongWritable k, Text line, Context ctx) throws IOException, InterruptedException {
+      String[] f = line.toString().split(&quot;,&quot;);          // order_id,student_id,time,item,amount
+      item.set(f[3]); amount.set(Integer.parseInt(f[4]));
+      ctx.write(item, amount);
+    }
+  }
+
+  // Counter A: chai, coffee   B: samosa, vada pav   C: poha, idli   D: dosa, thali
+  public static class CounterPartitioner extends Partitioner&lt;Text, IntWritable&gt; {
+    private static final Map&lt;String, Integer&gt; COUNTER = new HashMap&lt;&gt;();
+    static {
+      COUNTER.put(&quot;chai&quot;, 0); COUNTER.put(&quot;coffee&quot;, 0); COUNTER.put(&quot;samosa&quot;, 1); COUNTER.put(&quot;vada pav&quot;, 1);
+      COUNTER.put(&quot;poha&quot;, 2); COUNTER.put(&quot;idli&quot;, 2); COUNTER.put(&quot;dosa&quot;, 3); COUNTER.put(&quot;thali&quot;, 3);
+    }
+    @Override
+    public int getPartition(Text item, IntWritable amount, int numReduceTasks) {
+      Integer c = COUNTER.get(item.toString());
+      if (c == null) return 0;                           // unknown items go to the first reducer
+      return c % numReduceTasks;                         // must always be in 0 .. numReduceTasks-1
+    }
+  }
+
+  public static class R extends Reducer&lt;Text, IntWritable, Text, Text&gt; {
+    @Override
+    protected void reduce(Text item, Iterable&lt;IntWritable&gt; amounts, Context ctx) throws IOException, InterruptedException {
+      long n = 0, sum = 0;
+      for (IntWritable a : amounts) { n++; sum += a.get(); }
+      ctx.write(item, new Text(n + &quot;\t&quot; + sum));
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] rest = new GenericOptionsParser(conf, args).getRemainingArgs();
+    String mode = conf.get(&quot;part.mode&quot;, &quot;hash&quot;);
+    Job job = Job.getInstance(conf, &quot;item partition &quot; + mode);
+    job.setJarByClass(ItemPartition.class);
+    job.setMapperClass(M.class);
+    job.setReducerClass(R.class);
+    if (mode.equals(&quot;counter&quot;)) job.setPartitionerClass(CounterPartitioner.class);
+    if (mode.equals(&quot;bad&quot;)) job.setPartitionerClass(BadPartitioner.class);
+    job.setNumReduceTasks(conf.getInt(&quot;part.reducers&quot;, 4));           // -D part.reducers=N to change
+    job.setMapOutputKeyClass(Text.class);
+    job.setMapOutputValueClass(IntWritable.class);
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(Text.class);
+    FileInputFormat.addInputPath(job, new Path(rest[0]));
+    FileOutputFormat.setOutputPath(job, new Path(rest[1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+
+// In the mr-lab folder:
+//   docker exec lab8-namenode-1 mkdir -p /tmp/mr9
+//   docker cp ItemPartition.java lab8-namenode-1:/tmp/mr9/
+//   docker cp BadPartitioner.java lab8-namenode-1:/tmp/mr9/
+//   docker exec -it lab8-namenode-1 bash
+// Inside the container:
+//   cd /tmp/mr9 &amp;&amp; mkdir -p classes
+//   javac -cp $(hadoop classpath) -d classes *.java &amp;&amp; jar cf mr9.jar -C classes .</code></pre><div class="output">(compiles silently; the jobs are run by partitioner_lab.sh below)</div></div>
+  <p class="muted">The partitioner runs in the map task, so its class must be inside the job jar like the Mapper and Reducer.</p></div>
+  <div class="pcrun"><h4>A partitioner that breaks the job</h4>
+  <div class="code" data-lang="bash" data-file="BadPartitioner.java"><pre><code>// BadPartitioner.java: a partitioner that returns a number outside 0..numReduceTasks-1 for one item
+import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Partitioner;
+
+public class BadPartitioner extends Partitioner&lt;Text, IntWritable&gt; {
+  @Override
+  public int getPartition(Text item, IntWritable amount, int numReduceTasks) {
+    return item.toString().length();                     // &quot;vada pav&quot; -&gt; 8, but there are only 4 reducers
+  }
+}</code></pre><div class="output">(used by ItemPartition with -D part.mode=bad)</div></div>
+  <p class="muted">Every item name is at least 4 characters long, so every record gets an illegal partition.</p></div>
+  <div class="pcrun"><h4>Per-reduce-task records from the JobHistory Server</h4>
+  <div class="code" data-lang="bash" data-file="reduce_tasks.sh"><pre><code># reduce_tasks.sh JOB_ID : for each reduce task, where it ran, how long it took and how many records it got
+J=$1; ID=${J#job_}; H=http://historyserver:19888/ws/v1/history/mapreduce/jobs/$J/tasks
+for t in $(curl -s $H | grep -o &quot;task_${ID}_r_[0-9]*&quot; | sort -u); do
+  curl -s $H/$t/counters | python3 -c &#x27;
+import sys, json
+t = sys.argv[1]
+groups = json.load(sys.stdin)[&quot;jobTaskCounters&quot;][&quot;taskCounterGroup&quot;]
+groups = groups if isinstance(groups, list) else [groups]
+c = {}
+for g in groups:
+    cs = g[&quot;counter&quot;] if isinstance(g[&quot;counter&quot;], list) else [g[&quot;counter&quot;]]
+    c.update({x[&quot;name&quot;]: x[&quot;value&quot;] for x in cs})
+print(&quot;%s  reduce input records %9d  groups %d&quot; % (t[-8:], c[&quot;REDUCE_INPUT_RECORDS&quot;], c[&quot;REDUCE_INPUT_GROUPS&quot;]))&#x27; $t
+done
+
+# Inside the namenode container:
+#   bash reduce_tasks.sh job_&lt;your job id&gt;</code></pre><div class="output">r_000000  reduce input records         0  groups 0
+r_000001  reduce input records    160766  groups 4
+r_000002  reduce input records    269350  groups 3
+r_000003  reduce input records     69884  groups 1</div></div>
+  <p class="muted">Real output for the hash run. The same counters are on the JobHistory web UI, under each reduce task.</p></div>
+  <div class="pcrun"><h4>The whole lab</h4>
+  <div class="code" data-lang="bash" data-file="partitioner_lab.sh"><pre><code># partitioner_lab.sh: who decides which reducer gets which key? Default hash vs a custom partitioner.
+cd /tmp/mr9
+D=/user/hadoop/data/student_orders.csv
+for mode in hash counter; do
+  hdfs dfs -rm -r -f -skipTrash /out/part_$mode &gt; /dev/null 2&gt;&amp;1
+  hadoop jar mr9.jar ItemPartition -D part.mode=$mode $D /out/part_$mode &gt; /tmp/part_$mode.log 2&gt;&amp;1
+  echo &quot;== part.mode=$mode, 4 reducers&quot;
+  for f in $(hdfs dfs -ls /out/part_$mode | grep part-r | awk &#x27;{print $8}&#x27;); do
+    echo &quot;$(basename $f): $(hdfs dfs -cat $f | awk -F&#x27;\t&#x27; &#x27;{printf &quot;%s(%s) &quot;, $1, $2}&#x27;)&quot;
+  done
+  sleep 3
+  bash reduce_tasks.sh $(grep -o &quot;job_[0-9_]*&quot; /tmp/part_$mode.log | head -1)
+done
+echo &quot;== a partitioner that returns 8 for 4 reducers&quot;
+hdfs dfs -rm -r -f -skipTrash /out/part_bad &gt; /dev/null 2&gt;&amp;1
+hadoop jar mr9.jar ItemPartition -D part.mode=bad $D /out/part_bad 2&gt;&amp;1 | grep -E &quot;Illegal partition|Task Id|failed with state|Job .* failed|Failed map tasks&quot; | sed -E &#x27;s/^[0-9-]+ [0-9:]+ INFO  //&#x27; | cut -c1-160 | sort -u | head -6
+
+# Inside the namenode container:
+#   bash /tmp/mr9/partitioner_lab.sh</code></pre><div class="output">== part.mode=hash, 4 reducers
+part-r-00000: 
+part-r-00001: coffee(40364) idli(44774) poha(45336) thali(30292) 
+part-r-00002: chai(149669) dosa(49927) vada pav(69754) 
+part-r-00003: samosa(69884) 
+r_000000  reduce input records         0  groups 0
+r_000001  reduce input records    160766  groups 4
+r_000002  reduce input records    269350  groups 3
+r_000003  reduce input records     69884  groups 1
+== part.mode=counter, 4 reducers
+part-r-00000: chai(149669) coffee(40364) 
+part-r-00001: samosa(69884) vada pav(69754) 
+part-r-00002: idli(44774) poha(45336) 
+part-r-00003: dosa(49927) thali(30292) 
+r_000000  reduce input records    190033  groups 2
+r_000001  reduce input records    139638  groups 2
+r_000002  reduce input records     90110  groups 2
+r_000003  reduce input records     80219  groups 2
+== a partitioner that returns 8 for 4 reducers
+Error: java.io.IOException: Illegal partition for chai (4)
+Error: java.io.IOException: Illegal partition for dosa (4)
+Error: java.io.IOException: Illegal partition for idli (4)
+		Failed map tasks=10
+Job:1767 - Job job_1792643020992_0030 failed with state FAILED due to: Task failed task_1792643020992_0030_m_000001
+Job:1793 - Task Id : attempt_1792643020992_0030_m_000000_0, Status : FAILED</div></div>
+  <p class="muted">Real output, unedited. Your job IDs will differ; the record counts are the same because the data is generated with a fixed seed.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Text.hashCode() for one key, byte by byte</h2>
+  <p>Follow how “chai” becomes reducer 2. Watch <code>h</code> grow by ×31 plus each byte.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "key = \"chai\"",
+  "h = 1",
+  "for b in key.encode():",
+  "    h = 31 * h + b",
+  "p = (h & 0x7FFFFFFF) % 4",
+  "print(h, p)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>key<\/code> is created: &#x27;chai&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "key"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>h<\/code> is created: 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "h"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>b<\/code> is created: 99.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "1"
+      ],
+      [
+       "b",
+       "99"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "b"
+  },
+  {
+   "line": 4,
+   "phase": "Hash",
+   "note": "c=99, h=130; h=104 → 4134; a=97 → 128251; i=105 → 3975886. <code>h<\/code> changes to 130.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "130"
+      ],
+      [
+       "b",
+       "99"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "h"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>b<\/code> changes to 104.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "130"
+      ],
+      [
+       "b",
+       "104"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "b"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>h<\/code> changes to 4134.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "4134"
+      ],
+      [
+       "b",
+       "104"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "h"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>b<\/code> changes to 97.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "4134"
+      ],
+      [
+       "b",
+       "97"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "b"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>h<\/code> changes to 128251.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "128251"
+      ],
+      [
+       "b",
+       "97"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "h"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>b<\/code> changes to 105.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "128251"
+      ],
+      [
+       "b",
+       "105"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "b"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>h<\/code> changes to 3975886.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "3975886"
+      ],
+      [
+       "b",
+       "105"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "h"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "3975886"
+      ],
+      [
+       "b",
+       "105"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 5,
+   "phase": "Partition",
+   "note": "3975886 % 4 = 2, so chai goes to part-r-00002. <code>p<\/code> is created: 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "3975886"
+      ],
+      [
+       "b",
+       "105"
+      ],
+      [
+       "p",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "p"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "key",
+       "'chai'"
+      ],
+      [
+       "h",
+       "3975886"
+      ],
+      [
+       "b",
+       "105"
+      ],
+      [
+       "p",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "3975886 2\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three partitioner problems: an empty reducer, a balanced design, and a hot key that no partitioner can fix.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Concept · empty reducer</span></div>
+    <h4>Why did one reducer get nothing?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A job has 6 distinct keys and 6 reducers. Assume the hash spreads keys at random. What is the chance that at least one reducer gets no key at all?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>6 keys · 6 reducers</pre></div><div><small>Expected output</small><pre>every reducer busy: 1.5%, at least one empty: 98.5%</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>The only way every reducer gets a key is a perfect one-to-one spread.</li><li>Count those arrangements: 6! out of 6⁶.</li><li>Subtract from 1.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "With few keys, more reducers than keys only wastes containers. Choose reducers by data volume, and expect hashing to be uneven when keys are few.",
+   "code": "import math\nperfect = math.factorial(6) / 6 ** 6\nprint(f\"every reducer busy: {perfect:.1%}, at least one empty: {1 - perfect:.1%}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import math",
+  "perfect = math.factorial(6) / 6 ** 6",
+  "print(f\"every reducer busy: {perfect:.1%}, at least one empty: {1 - perfect:.1%}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Odds",
+   "note": "Only 720 of 46,656 ways put exactly one key on every reducer. <code>perfect<\/code> is created: 0.0154.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "perfect",
+       "0.0154"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "perfect"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "perfect",
+       "0.0154"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "every reducer busy: 1.5%, at least one empty: 98.5%\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Design · balance</span></div>
+    <h4>Pack known key sizes onto reducers</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>You know the order counts per item from last month. Assign the 8 items to 4 reducers so the busiest one is as light as possible, using “biggest item first, onto the emptiest reducer”.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>8 items with lab counts</pre></div><div><small>Expected output</small><pre>{&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2, &#x27;coffee&#x27;: 1, &#x27;thali&#x27;: 3}
+[149669, 110248, 114528, 125555]</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Sort items by size, biggest first.</li><li>Give each to the reducer with the least work so far.</li><li>Turn the result into a lookup table for getPartition().</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The busiest reducer still has chai's 149,669 orders: no table can split one key. Compare with hash (269,350) and counter (190,033).",
+   "code": "orders = {\"chai\": 149669, \"samosa\": 69884, \"vada pav\": 69754, \"dosa\": 49927,\n          \"poha\": 45336, \"idli\": 44774, \"coffee\": 40364, \"thali\": 30292}\nload, table = [0] * 4, {}\nfor item, n in sorted(orders.items(), key=lambda x: -x[1]):\n    r = load.index(min(load))\n    table[item], load[r] = r, load[r] + n\nprint(table)\nprint(load)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "orders = {\"chai\": 149669, \"samosa\": 69884, \"vada pav\": 69754, \"dosa\": 49927,",
+  "          \"poha\": 45336, \"idli\": 44774, \"coffee\": 40364, \"thali\": 30292}",
+  "load, table = [0] * 4, {}",
+  "for item, n in sorted(orders.items(), key=lambda x: -x[1]):",
+  "    r = load.index(min(load))",
+  "    table[item], load[r] = r, load[r] + n",
+  "print(table)",
+  "print(load)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>orders<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…"
+   ],
+   "newVar": "orders"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>load<\/code> is created: → list #2. <code>table<\/code> is created: → dict #3. A new list object (#2) is created: [0, 0, 0, 0] A new dict object (#3) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [0, 0, 0, 0]",
+    "<b>#3 dict (0)<\/b> {}"
+   ],
+   "newVar": "table"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> is created: &#x27;chai&#x27;. <code>n<\/code> is created: 149669.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'chai'"
+      ],
+      [
+       "n",
+       "149669"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [0, 0, 0, 0]",
+    "<b>#3 dict (0)<\/b> {}"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 5,
+   "phase": "Greedy",
+   "note": "Put the next-biggest item where there is most room. <code>r<\/code> is created: 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'chai'"
+      ],
+      [
+       "n",
+       "149669"
+      ],
+      [
+       "r",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [0, 0, 0, 0]",
+    "<b>#3 dict (0)<\/b> {}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [149669, 0, 0, 0] Object #3 dict now holds {&#x27;chai&#x27;: 0}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'chai'"
+      ],
+      [
+       "n",
+       "149669"
+      ],
+      [
+       "r",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 0, 0, 0]",
+    "<b>#3 dict (1)<\/b> {&#x27;chai&#x27;: 0}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;samosa&#x27;. <code>n<\/code> changes to 69884.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'samosa'"
+      ],
+      [
+       "n",
+       "69884"
+      ],
+      [
+       "r",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 0, 0, 0]",
+    "<b>#3 dict (1)<\/b> {&#x27;chai&#x27;: 0}"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'samosa'"
+      ],
+      [
+       "n",
+       "69884"
+      ],
+      [
+       "r",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 0, 0, 0]",
+    "<b>#3 dict (1)<\/b> {&#x27;chai&#x27;: 0}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [149669, 69884, 0, 0] Object #3 dict now holds {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'samosa'"
+      ],
+      [
+       "n",
+       "69884"
+      ],
+      [
+       "r",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 0, 0]",
+    "<b>#3 dict (2)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;vada pav&#x27;. <code>n<\/code> changes to 69754.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "n",
+       "69754"
+      ],
+      [
+       "r",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 0, 0]",
+    "<b>#3 dict (2)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1}"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "n",
+       "69754"
+      ],
+      [
+       "r",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 0, 0]",
+    "<b>#3 dict (2)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [149669, 69884, 69754, 0] Object #3 dict now holds {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'vada pav'"
+      ],
+      [
+       "n",
+       "69754"
+      ],
+      [
+       "r",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 69754, 0]",
+    "<b>#3 dict (3)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;dosa&#x27;. <code>n<\/code> changes to 49927.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "n",
+       "49927"
+      ],
+      [
+       "r",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 69754, 0]",
+    "<b>#3 dict (3)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2}"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "n",
+       "49927"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 69754, 0]",
+    "<b>#3 dict (3)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [149669, 69884, 69754, 49927] Object #3 dict now holds {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'dosa'"
+      ],
+      [
+       "n",
+       "49927"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 69754, 49927]",
+    "<b>#3 dict (4)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;poha&#x27;. <code>n<\/code> changes to 45336.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'poha'"
+      ],
+      [
+       "n",
+       "45336"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 69754, 49927]",
+    "<b>#3 dict (4)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3}"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'poha'"
+      ],
+      [
+       "n",
+       "45336"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 69754, 49927]",
+    "<b>#3 dict (4)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [149669, 69884, 69754, 95263] Object #3 dict now holds {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'poha'"
+      ],
+      [
+       "n",
+       "45336"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 69754, 95263]",
+    "<b>#3 dict (5)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;idli&#x27;. <code>n<\/code> changes to 44774.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'idli'"
+      ],
+      [
+       "n",
+       "44774"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 69754, 95263]",
+    "<b>#3 dict (5)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3}"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'idli'"
+      ],
+      [
+       "n",
+       "44774"
+      ],
+      [
+       "r",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 69754, 95263]",
+    "<b>#3 dict (5)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [149669, 69884, 114528, 95263] Object #3 dict now holds {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'idli'"
+      ],
+      [
+       "n",
+       "44774"
+      ],
+      [
+       "r",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 114528, 95263]",
+    "<b>#3 dict (6)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;coffee&#x27;. <code>n<\/code> changes to 40364.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'coffee'"
+      ],
+      [
+       "n",
+       "40364"
+      ],
+      [
+       "r",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 114528, 95263]",
+    "<b>#3 dict (6)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2}"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'coffee'"
+      ],
+      [
+       "n",
+       "40364"
+      ],
+      [
+       "r",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 69884, 114528, 95263]",
+    "<b>#3 dict (6)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [149669, 110248, 114528, 95263] Object #3 dict now holds {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2, &#x27;coffee&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'coffee'"
+      ],
+      [
+       "n",
+       "40364"
+      ],
+      [
+       "r",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 110248, 114528, 95263]",
+    "<b>#3 dict (7)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2, &#x27;coffee&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>item<\/code> changes to &#x27;thali&#x27;. <code>n<\/code> changes to 30292.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'thali'"
+      ],
+      [
+       "n",
+       "30292"
+      ],
+      [
+       "r",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 110248, 114528, 95263]",
+    "<b>#3 dict (7)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2, &#x27;coffee&#x27;: 1}"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'thali'"
+      ],
+      [
+       "n",
+       "30292"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 110248, 114528, 95263]",
+    "<b>#3 dict (7)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2, &#x27;coffee&#x27;: 1}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [149669, 110248, 114528, 125555] Object #3 dict now holds {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2, &#x27;coffee&#x27;: 1, &#x27;th…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'thali'"
+      ],
+      [
+       "n",
+       "30292"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 110248, 114528, 125555]",
+    "<b>#3 dict (8)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2, &#x27;coffee&#x27;: 1, &#x27;th…"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'thali'"
+      ],
+      [
+       "n",
+       "30292"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 110248, 114528, 125555]",
+    "<b>#3 dict (8)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2, &#x27;coffee&#x27;: 1, &#x27;th…"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'thali'"
+      ],
+      [
+       "n",
+       "30292"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 110248, 114528, 125555]",
+    "<b>#3 dict (8)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2, &#x27;coffee&#x27;: 1, &#x27;th…"
+   ],
+   "out": "{'chai': 0, 'samosa': 1, 'vada pav': 2, 'dosa': 3, 'poha': 3, 'idli': 2, 'coffee': 1, 'thali': 3}\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "load",
+       "→ list #2"
+      ],
+      [
+       "table",
+       "→ dict #3"
+      ],
+      [
+       "item",
+       "'thali'"
+      ],
+      [
+       "n",
+       "30292"
+      ],
+      [
+       "r",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (8)<\/b> {&#x27;chai&#x27;: 149669, &#x27;samosa&#x27;: 69884, &#x27;vada pav&#x27;: 69754, &#x27;dosa&#x27;: 49927, &#x27;poha&#x27;: 45336, &#x27;idli&#x27;…",
+    "<b>#2 list (4)<\/b> [149669, 110248, 114528, 125555]",
+    "<b>#3 dict (8)<\/b> {&#x27;chai&#x27;: 0, &#x27;samosa&#x27;: 1, &#x27;vada pav&#x27;: 2, &#x27;dosa&#x27;: 3, &#x27;poha&#x27;: 3, &#x27;idli&#x27;: 2, &#x27;coffee&#x27;: 1, &#x27;th…"
+   ],
+   "out": "[149669, 110248, 114528, 125555]\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Skew · salting</span></div>
+    <h4>Count chai orders on 4 reducers at once</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Chai has 149,669 orders. Show the two-step salting plan: step 1 uses keys <code>chai#0 … chai#3</code> (order number mod 4) and computes partial counts on 4 reducers; step 2 adds the partials under the key <code>chai</code>.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>20 sample chai order numbers</pre></div><div><small>Expected output</small><pre>step 1: {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 5, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 6}
+step 2: {&#x27;chai&#x27;: 20}</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Salt: key = item + "#" + (order_id % 4).</li><li>Step 1 counts each salted key separately.</li><li>Step 2 strips the salt and adds.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Salting only works for things you can combine in pieces (counts, sums, max). Lesson 9.1's rule for combiners applies here too.",
+   "code": "order_ids = [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]\nstep1 = {}\nfor oid in order_ids:\n    key = f\"chai#{oid % 4}\"\n    step1[key] = step1.get(key, 0) + 1\nprint(\"step 1:\", step1)\nprint(\"step 2:\", {\"chai\": sum(step1.values())})\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "order_ids = [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+  "step1 = {}",
+  "for oid in order_ids:",
+  "    key = f\"chai#{oid % 4}\"",
+  "    step1[key] = step1.get(key, 0) + 1",
+  "print(\"step 1:\", step1)",
+  "print(\"step 2:\", {\"chai\": sum(step1.values())})"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>order_ids<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]"
+   ],
+   "newVar": "order_ids"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>step1<\/code> is created: → dict #2. A new dict object (#2) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "step1"
+  },
+  {
+   "line": 3,
+   "phase": "Salt",
+   "note": "The same item now has 4 different keys, so 4 reducers can share it. <code>oid<\/code> is created: 5.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> is created: &#x27;chai#1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "5"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "5"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (1)<\/b> {&#x27;chai#1&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 12.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "12"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (1)<\/b> {&#x27;chai#1&#x27;: 1}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#0&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "12"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (1)<\/b> {&#x27;chai#1&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 1, &#x27;chai#0&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "12"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai#1&#x27;: 1, &#x27;chai#0&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 17.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "17"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai#1&#x27;: 1, &#x27;chai#0&#x27;: 1}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "17"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai#1&#x27;: 1, &#x27;chai#0&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "17"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 22.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "22"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "22"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (2)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1, &#x27;chai#2&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "22"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (3)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1, &#x27;chai#2&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 31.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "31"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (3)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1, &#x27;chai#2&#x27;: 1}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#3&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "31"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (3)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1, &#x27;chai#2&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "31"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 40.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "40"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#0&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "40"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 1, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "40"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 41.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "41"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "41"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 2, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "41"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 58.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "58"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "58"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 1, &#x27;chai#3&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "58"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 63.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "63"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 1}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#3&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "63"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "63"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 77.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "77"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "77"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 3, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "77"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 80.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "80"
+      ],
+      [
+       "key",
+       "'chai#1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#0&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "80"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 2, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "80"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 91.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "91"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#3&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "91"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 2}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 3}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "91"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 3}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 99.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "99"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 3}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "99"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 3}"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 4}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "99"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 4}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 104.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "104"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 4}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#0&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "104"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 3, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 4}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 4}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "104"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 4}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 118.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "118"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 4}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "118"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 2, &#x27;chai#3&#x27;: 4}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 3, &#x27;chai#3&#x27;: 4}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "118"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 3, &#x27;chai#3&#x27;: 4}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 123.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "123"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 3, &#x27;chai#3&#x27;: 4}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#3&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "123"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 3, &#x27;chai#3&#x27;: 4}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 3, &#x27;chai#3&#x27;: 5}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "123"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 3, &#x27;chai#3&#x27;: 5}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 130.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "130"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 3, &#x27;chai#3&#x27;: 5}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "130"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 3, &#x27;chai#3&#x27;: 5}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 4, &#x27;chai#3&#x27;: 5}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "130"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 4, &#x27;chai#3&#x27;: 5}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 142.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "142"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 4, &#x27;chai#3&#x27;: 5}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "142"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 4, &#x27;chai#3&#x27;: 5}"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 5}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "142"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 5}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 151.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "151"
+      ],
+      [
+       "key",
+       "'chai#2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 5}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#3&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "151"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 5}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 6}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "151"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 6}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>oid<\/code> changes to 160.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "160"
+      ],
+      [
+       "key",
+       "'chai#3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 6}"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;chai#0&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "160"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 4, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 6}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 5, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 6}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "160"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 5, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 6}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "160"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 5, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 6}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "160"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 5, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 6}"
+   ],
+   "out": "step 1: {'chai#1': 4, 'chai#0': 5, 'chai#2': 5, 'chai#3': 6}\n"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "order_ids",
+       "→ list #1"
+      ],
+      [
+       "step1",
+       "→ dict #2"
+      ],
+      [
+       "oid",
+       "160"
+      ],
+      [
+       "key",
+       "'chai#0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (20)<\/b> [5, 12, 17, 22, 31, 40, 41, 58, 63, 77, 80, 91, 99, 104, 118, 123, 130, 142, 151, 160]",
+    "<b>#2 dict (4)<\/b> {&#x27;chai#1&#x27;: 4, &#x27;chai#0&#x27;: 5, &#x27;chai#2&#x27;: 5, &#x27;chai#3&#x27;: 6}"
+   ],
+   "out": "step 2: {'chai': 20}\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "What does a Partitioner decide?",
+  "options": [
+   "How input is split",
+   "The sort order of keys",
+   "Which reduce task receives each map output key-value pair",
+   "Where output files are stored"
+  ],
+  "answer": 2,
+  "why": "getPartition(key, value, numReduceTasks) returns the reducer number."
+ },
+ {
+  "q": "What is the default partitioner's formula?",
+  "options": [
+   "key.length() % n",
+   "(key.hashCode() & Integer.MAX_VALUE) % numReduceTasks",
+   "random() % n",
+   "the map task number % n"
+  ],
+  "answer": 1,
+  "why": "& Integer.MAX_VALUE keeps the result non-negative."
+ },
+ {
+  "q": "Where does the partitioner run?",
+  "options": [
+   "In the map task, for every map output record",
+   "In the reduce task",
+   "In the ResourceManager",
+   "In the client before submission"
+  ],
+  "answer": 0,
+  "why": "Map output is written into per-partition sections of the sort buffer."
+ },
+ {
+  "q": "Why was part-r-00000 empty in the hash run?",
+  "options": [
+   "Reducer 0 crashed",
+   "The partitioner skips 0",
+   "Reducer 0 only writes _SUCCESS",
+   "None of the 8 item names hashed to partition 0"
+  ],
+  "answer": 3,
+  "why": "With few keys, hashing is uneven; here buckets 1, 2 and 3 got everything."
+ },
+ {
+  "q": "What happened when getPartition() returned 4 with 4 reducers?",
+  "options": [
+   "The record went to reducer 0",
+   "Hadoop added a fifth reducer",
+   "“Illegal partition for chai (4)”: map attempts failed and the job failed",
+   "The record was skipped"
+  ],
+  "answer": 2,
+  "why": "Valid numbers are 0 to 3; 10 failed map attempts, job FAILED."
+ },
+ {
+  "q": "Chai is 30% of all orders. Can a partitioner split chai over several reducers in one job?",
+  "options": [
+   "Yes, with a round-robin partitioner",
+   "No, all values of one key must go to one reducer; change the key (salting) instead",
+   "Yes, by using more reducers",
+   "Yes, with TotalOrderPartitioner"
+  ],
+  "answer": 1,
+  "why": "Equal keys must always get the same partition."
+ },
+ {
+  "q": "When is the partitioner NOT called?",
+  "options": [
+   "When the job has only one reducer",
+   "When there is a combiner",
+   "When keys are Text",
+   "When the input is small"
+  ],
+  "answer": 0,
+  "why": "With one reducer every pair is partition 0."
+ },
+ {
+  "q": "Which partitioner gives globally sorted output across all part files?",
+  "options": [
+   "HashPartitioner",
+   "KeyFieldBasedPartitioner",
+   "BinaryPartitioner",
+   "TotalOrderPartitioner (with a sampled partition file)"
+  ],
+  "answer": 3,
+  "why": "Reducer 0 gets the lowest key range, reducer 1 the next, and so on."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 9.2 in one screen</h3>
+    <ul><li><b>getPartition(key, value, numReduceTasks)</b> → a number 0 … n−1; equal keys must always get the same number.</li><li>Runs in the <b>map task</b> on every output record; skipped when there is 1 reducer.</li><li>Default <b>HashPartitioner</b>: <code>(hashCode &amp; Integer.MAX_VALUE) % n</code>; Text hash: h = 1, h = 31h + byte.</li><li>Lab, 8 items on 4 reducers: hash → 0 / 160,766 / 269,350 / 69,884 (one empty); counter partitioner → 190,033 / 139,638 / 90,110 / 80,219.</li><li>Out-of-range number → <b>“Illegal partition”</b>, map attempts fail, job fails (10 failed attempts in our run).</li><li>A partitioner can't split a hot key; <b>salt</b> the key and combine partials in a second step.</li><li>Others: KeyFieldBasedPartitioner (fields of text keys), TotalOrderPartitioner + InputSampler (global sort).</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What is a Partitioner in MapReduce?</summary><p>A Partitioner decides which reduce task receives each intermediate key-value pair. Its getPartition(key, value, numReduceTasks) method returns a number between 0 and numReduceTasks - 1, and must return the same number for equal keys so that all values of a key are processed by one reducer. The default is HashPartitioner.</p></details>
+    <details><summary>How does HashPartitioner work?</summary><p>It computes (key.hashCode() &amp; Integer.MAX_VALUE) % numReduceTasks. The bitwise AND removes the sign so the result is never negative. For Text keys the hash is computed over the UTF-8 bytes as h = 31 * h + byte, starting from 1.</p></details>
+    <details><summary>When should I write a custom partitioner?</summary><p>When the default layout or balance is wrong for you: to send related keys to the same reducer (for example one output file per region), to balance known key sizes, to partition a composite key by its natural part for a secondary sort, or to produce range-partitioned, globally sorted output.</p></details>
+    <details><summary>What happens if getPartition returns an invalid number?</summary><p>The map task throws java.io.IOException: Illegal partition for &lt;key&gt; (&lt;number&gt;). The attempt fails, is retried, and after the maximum number of attempts the job fails. Always return a value modulo numReduceTasks and handle unexpected keys.</p></details>
+    <details><summary>How do I handle data skew in MapReduce?</summary><p>Find it first with per-reduce-task counters. If several keys share an overloaded reducer, a custom partitioner can spread them. If a single key is too big, change the key: add a salt (key#0 … key#n) so it spreads across reducers, then merge the partial results in a second step, and use a combiner to shrink what is shuffled.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Partitioner exercises using the real loads from the lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Share of the busiest reducer</h4></div>
+      <p>Hash run: reducer loads 0, 160,766, 269,350 and 69,884. What share of all records did the busiest reducer get?</p>
+      <div class="prob__io"><div><small>Input</small><pre>4 loads</pre></div><div><small>Expected output</small><pre>53.9%</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>loads = [0, 160766, 269350, 69884]
+print(f&quot;{max(loads) / sum(loads):.1%}&quot;)</code></pre><div class="output">53.9%</div></div>
+        <p><b>How it works:</b> 53.9%: more than half the reduce work on one of four reducers.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Skew factor</h4></div>
+      <p>Compute busiest ÷ average for the hash and the counter runs.</p>
+      <div class="prob__io"><div><small>Input</small><pre>two sets of loads</pre></div><div><small>Expected output</small><pre>hash 2.15
+counter 1.52</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for name, loads in [(&quot;hash&quot;, [0, 160766, 269350, 69884]), (&quot;counter&quot;, [190033, 139638, 90110, 80219])]:
+    print(name, round(max(loads) / (sum(loads) / len(loads)), 2))</code></pre><div class="output">hash 2.15
+counter 1.52</div></div>
+        <p><b>How it works:</b> 2.15 vs 1.52. 1.0 would be perfectly even.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Valid partition numbers</h4></div>
+      <p>Which of these return values are legal with 4 reducers: -1, 0, 3, 4?</p>
+      <div class="prob__io"><div><small>Input</small><pre>4 values</pre></div><div><small>Expected output</small><pre>[0, 3]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print([p for p in [-1, 0, 3, 4] if 0 &lt;= p &lt; 4])</code></pre><div class="output">[0, 3]</div></div>
+        <p><b>How it works:</b> Only 0 and 3. Java's % can give -1 for a negative hash, which is why HashPartitioner masks the sign bit.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Java's negative modulo</h4></div>
+      <p>Java computes -7 % 4 as -3. Show why (h & 0x7FFFFFFF) % 4 is needed for a negative 32-bit hash.</p>
+      <div class="prob__io"><div><small>Input</small><pre>h = -7</pre></div><div><small>Expected output</small><pre>java % : -3  masked: 1</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+h = -7
+java_mod = int(math.fmod(h, 4))            # Java&#x27;s % keeps the sign of h
+masked = ((h &amp; 0xFFFFFFFF) &amp; 0x7FFFFFFF) % 4
+print(&quot;java % :&quot;, java_mod, &quot; masked:&quot;, masked)</code></pre><div class="output">java % : -3  masked: 1</div></div>
+        <p><b>How it works:</b> -3 would be an illegal partition; masking gives a valid 1.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Partition by first letter</h4></div>
+      <p>Write a partitioner for 3 reducers: items starting a–h → 0, i–p → 1, others → 2. Where does each item go?</p>
+      <div class="prob__io"><div><small>Input</small><pre>8 items</pre></div><div><small>Expected output</small><pre>chai 0
+coffee 0
+dosa 0
+idli 1
+poha 1
+samosa 2
+thali 2
+vada pav 2</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>def get_partition(item, n=3):
+    c = item[0]
+    return 0 if c &lt;= &quot;h&quot; else 1 if c &lt;= &quot;p&quot; else 2
+for i in [&quot;chai&quot;, &quot;coffee&quot;, &quot;dosa&quot;, &quot;idli&quot;, &quot;poha&quot;, &quot;samosa&quot;, &quot;thali&quot;, &quot;vada pav&quot;]:
+    print(i, get_partition(i))</code></pre><div class="output">chai 0
+coffee 0
+dosa 0
+idli 1
+poha 1
+samosa 2
+thali 2
+vada pav 2</div></div>
+        <p><b>How it works:</b> A range partitioner: the 3 files, read in order, are sorted by item. That is the idea behind TotalOrderPartitioner.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Composite key, natural partition</h4></div>
+      <p>Keys are (student, time). Show that hashing the whole key scatters one student over reducers, but hashing only the student keeps them together.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 orders of S0001</pre></div><div><small>Expected output</small><pre>whole key : [0, 3, 1]
+student   : [3, 3, 3]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>def h(s):
+    x = 1
+    for b in s.encode():
+        x = (31 * x + b) &amp; 0xFFFFFFFF
+    return (x &amp; 0x7FFFFFFF) % 4
+keys = [(&quot;S0001&quot;, &quot;08:09&quot;), (&quot;S0001&quot;, &quot;08:15&quot;), (&quot;S0001&quot;, &quot;13:40&quot;)]
+print(&quot;whole key :&quot;, [h(s + t) for s, t in keys])
+print(&quot;student   :&quot;, [h(s) for s, t in keys])</code></pre><div class="output">whole key : [0, 3, 1]
+student   : [3, 3, 3]</div></div>
+        <p><b>How it works:</b> The whole-key hash sends one student's orders to different reducers; partitioning on the student keeps them in one place, which secondary sort needs (Lesson 9.7).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Is the custom partitioner worth it?</h4></div>
+      <p>A nightly job's reduce phase takes as long as its busiest reducer. Reduce time is proportional to records; the hash layout's busiest reducer takes 40 minutes. How long would the counter layout take, and how many minutes a year are saved?</p>
+      <div class="prob__io"><div><small>Input</small><pre>269,350 vs 190,033 records</pre></div><div><small>Expected output</small><pre>28 min, saves 72 hours a year</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>hash_min = 40
+counter_min = 40 * 190033 / 269350
+print(f&quot;{counter_min:.0f} min, saves {(hash_min - counter_min) * 365 / 60:.0f} hours a year&quot;)</code></pre><div class="output">28 min, saves 72 hours a year</div></div>
+        <p><b>How it works:</b> About 28 minutes, saving roughly 72 hours of waiting a year, for a 10-line class (illustrative).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>Sample-based range partitioner</h4></div>
+      <p>Like InputSampler + TotalOrderPartitioner: sample student IDs, pick cut points for 4 reducers, then route keys by range.</p>
+      <div class="prob__io"><div><small>Input</small><pre>a sample of 12 student IDs</pre></div><div><small>Expected output</small><pre>cut points: [&#x27;S0450&#x27;, &#x27;S0999&#x27;, &#x27;S1500&#x27;]
+S0001 -&gt; reducer 0
+S0500 -&gt; reducer 1
+S1413 -&gt; reducer 2
+S2000 -&gt; reducer 3</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import bisect
+sample = sorted([&quot;S0004&quot;, &quot;S0150&quot;, &quot;S0333&quot;, &quot;S0450&quot;, &quot;S0701&quot;, &quot;S0802&quot;, &quot;S0999&quot;,
+                 &quot;S1105&quot;, &quot;S1260&quot;, &quot;S1500&quot;, &quot;S1777&quot;, &quot;S1990&quot;])
+cuts = [sample[len(sample) * i // 4] for i in range(1, 4)]
+print(&quot;cut points:&quot;, cuts)
+for s in [&quot;S0001&quot;, &quot;S0500&quot;, &quot;S1413&quot;, &quot;S2000&quot;]:
+    print(s, &quot;-&gt; reducer&quot;, bisect.bisect_right(cuts, s))</code></pre><div class="output">cut points: [&#x27;S0450&#x27;, &#x27;S0999&#x27;, &#x27;S1500&#x27;]
+S0001 -&gt; reducer 0
+S0500 -&gt; reducer 1
+S1413 -&gt; reducer 2
+S2000 -&gt; reducer 3</div></div>
+        <p><b>How it works:</b> Each reducer gets one ID range, so part-r-00000 … 00003 concatenated are in order. A bad sample gives uneven ranges, so sample enough keys.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Partitioner questions test whether you understand where keys go and how to fix skew.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Concepts · basics</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is a partitioner and what is the default?”</h4>
+      <p class="scn__situation">Asked right after the shuffle question.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> where it runs and the formula.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>It assigns each map output pair to a reduce task: getPartition(key, value, numReduceTasks) returns 0 … n−1.</li>
+          <li>It runs in the map task; the default HashPartitioner uses (hashCode &amp; Integer.MAX_VALUE) % n.</li>
+          <li>Same key, same partition, so all values of a key meet in one reducer.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Performance · skew</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>“99 reducers finish in 2 minutes, one takes 50 minutes”</h4>
+      <p class="scn__situation">A daily job keeps missing its deadline.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> diagnosing and fixing skew.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Check that reducer's input records and groups: one huge key, or many big keys on one partition?</li>
+          <li>Many keys: a custom partitioner (or more reducers) spreads them. One key: salt it (key#0..key#n), aggregate, then merge partials.</li>
+          <li>Add a combiner to cut shuffled records, and filter useless keys (nulls, “unknown”) in the map.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Design · output</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“We need one output file per region”</h4>
+      <p class="scn__situation">Five regions, and each regional team wants only its own file.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> custom partitioner vs MultipleOutputs.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Set 5 reducers and a partitioner mapping each region to 0–4; each part-r file then holds one region.</li>
+          <li>Handle unknown regions explicitly and use % numReduceTasks to stay in range.</li>
+          <li>Alternative: MultipleOutputs to write named files per region from any reducer, without tying layout to reducer count.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Sorting · design</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>“Sort 1 TB of records by key across 200 reducers”</h4>
+      <p class="scn__situation">The output must be one sorted data set when the files are read in order.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> TotalOrderPartitioner.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Each reducer's output is sorted, but HashPartitioner mixes ranges, so the files aren't globally ordered.</li>
+          <li>Use InputSampler to sample keys and write a partition file of 199 cut points; TotalOrderPartitioner routes key ranges.</li>
+          <li>Sample enough keys to avoid uneven ranges; this is how TeraSort works.</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

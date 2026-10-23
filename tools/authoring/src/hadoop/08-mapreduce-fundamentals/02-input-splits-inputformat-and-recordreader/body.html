@@ -1,0 +1,266 @@
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>A line cut in half</h2>
+  <div class="story">
+    <p class="narration">Riya stores the canteen file again, this time with tiny 1 MB blocks, so her job gets five map tasks instead of one. Then a doubt hits her. HDFS cuts blocks at exactly 1,048,576 bytes; it has no idea where a line ends. She looks at the bytes around the cut: the order <code>71484,poha,25</code> starts at byte 1,048,564 and ends at byte 1,048,578. Fourteen bytes, twelve in block 1 and two in block 2. Will map task 1 see <code>71484,poha,2</code> and map task 2 see a lonely <code>5</code>?</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="Block 1 ends in the middle of the line 71484,poha,25. Map task 1 reads past the end of its split to finish the line; map task 2 skips the partial line and starts at the next full line, 71485.">
+        <g font-size="10">
+          <rect x="30" y="40" width="300" height="40" rx="4" class="s-soft-green" style="stroke:var(--green)"/>
+          <text x="180" y="32" text-anchor="middle" font-weight="700" class="s-ink">block 1 / split 0: bytes 0 … 1,048,575</text>
+          <rect x="330" y="40" width="280" height="40" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/>
+          <text x="470" y="32" text-anchor="middle" font-weight="700" class="s-ink">block 2 / split 1: from byte 1,048,576</text>
+          <text x="250" y="65" text-anchor="middle" font-size="9" class="s-ink">… 71483,… | 71484,poha,2</text>
+          <text x="370" y="65" text-anchor="middle" font-size="9" class="s-ink">5 |</text>
+          <text x="480" y="65" text-anchor="middle" font-size="9" class="s-ink">71485,… | 71486,… | …</text>
+          <path d="M330 34v56" style="fill:none;stroke:var(--red);stroke-width:2;stroke-dasharray:4 3"/>
+          <text x="330" y="102" text-anchor="middle" font-size="8.6" class="s-red">HDFS cut: byte 1,048,576</text>
+          <path d="M196 118h190" style="fill:none;stroke:var(--green);stroke-width:2.5"/>
+          <text x="180" y="138" text-anchor="middle" font-size="9" class="s-green">map 0 reads past its end: last record “71484,poha,25”</text>
+          <path d="M400 152h120" style="fill:none;stroke:var(--blue);stroke-width:2.5"/>
+          <text x="470" y="172" text-anchor="middle" font-size="9" class="s-blue">map 1 skips “5” and starts at byte 1,048,578</text>
+        </g>
+        <text x="632" y="194" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+A> Good doubt, and the answer is no. Blocks are cut by bytes; <b>records</b> are not. The piece of code that reads a split, the <b>RecordReader</b>, follows one rule: finish the line you started, even if it means reading a few bytes from the next block, and skip the half line you start in, because the previous reader already took it.
+R> So the split boundary is just a suggestion?
+K> It's a byte range. The records are decided by the reader. We checked it on the cluster: map 0's last line was <code>71484,poha,25</code>, complete, and map 1's first record started at byte 1,048,578. Five maps, 300,001 records in total, not one lost or doubled.
+A> Today: who decides how many splits a job gets (the <b>InputFormat</b>), how big they are, why a 2-block file got only 1 map task, and how each record is read.
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Input splits, InputFormat and RecordReader</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>An <b>InputFormat</b> describes how a MapReduce job reads its input. It has two responsibilities: <code>getSplits()</code>, run by the client at job submission, divides the input into <b>InputSplits</b>, logical byte ranges (for files, a <code>FileSplit</code> of path, start offset, length and the hosts that store the data), each processed by exactly one map task; and <code>createRecordReader()</code>, run inside each map task, returns a <b>RecordReader</b> that turns the bytes of one split into key-value records for the mapper. For <code>FileInputFormat</code> the split size is <code>max(minSize, min(maxSize, blockSize))</code>, and a final piece of up to 10% extra (the split slop, 1.1) is merged into the previous split. The default <code>TextInputFormat</code> uses a <code>LineRecordReader</code> that yields the byte offset of each line as key (<code>LongWritable</code>) and the line as value (<code>Text</code>); it completes a line that crosses the end of the split and skips the partial first line of a split that does not start at offset 0, so every line is read exactly once.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Before the job starts, Hadoop divides the input into pieces (splits), one per map task, usually one per block. Inside each map task a reader cuts its piece into records, carefully handling lines that cross the edges.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>InputSplit</b><span>A logical chunk of input for one map task. A byte range, not a copy of data.</span></div>
+    <div class="term"><b>FileSplit</b><span>The split for files: path, start, length, hosts.</span></div>
+    <div class="term"><b>InputFormat</b><span>Decides the splits and creates the record reader.</span></div>
+    <div class="term"><b>RecordReader</b><span>Turns a split's bytes into (key, value) records.</span></div>
+    <div class="term"><b>TextInputFormat</b><span>The default: key = byte offset, value = the line.</span></div>
+    <div class="term"><b>Split size</b><span><code>max(minSize, min(maxSize, blockSize))</code>; normally the block size.</span></div>
+    <div class="term"><b>Split slop</b><span>A last piece up to 10% of a split is joined to the one before (1.1 rule).</span></div>
+    <div class="term"><b>Splittable</b><span>A file a reader can start in the middle of. Plain text yes, gzip no.</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, SplitPeek job)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>canteen_orders.csv, 4.7 MB</th><td>1 block → 1 split, 300,001 records</td></tr>
+    <tr><th>Same file, 1 MB blocks</th><td>5 blocks → 5 splits: 70,485 + 67,321 + 65,498 + 65,574 + 31,123 = 300,001 records</td></tr>
+    <tr><th>1 block, split.maxsize = 1 MB</th><td>The same 5 splits and identical record counts: splits are logical</td></tr>
+    <tr><th>orders_x30.csv, 2 blocks</th><td>Blocks of 134,217,728 + 6,541,912 bytes → only <b>1</b> split (the slop rule), 9,000,000 records</td></tr>
+    <tr><th>orders_x90.csv, 422 MB</th><td>4 splits; with split.minsize = 256 MB: 2 splits</td></tr>
+    <tr><th>Boundary line</th><td>Split 0 ends at byte 1,048,576 but its last record starts at 1,048,564 (<code>71484,poha,25</code>); split 1's first record starts at 1,048,578</td></tr>
+  </table>
+
+LEVELS> Splits and readers at three levels
+L1> Cutting a notebook for five friends
+      <ul>
+        <li>You tear a 100-page register into five bundles by page number: that's the <b>split</b>. You didn't read it, you just counted pages.</li>
+        <li>A sentence can run from page 20 onto page 21. Friend 1 reads on until the sentence ends; friend 2 ignores the half sentence at the top of page 21 and starts at the next full one: that's the <b>RecordReader</b>.</li>
+        <li>Nobody misses a sentence and nobody reads one twice.</li>
+      </ul>
+L2> What the client and the task each do
+      <ul>
+        <li><b>Client, at submit time:</b> <code>InputFormat.getSplits()</code> lists files, asks the NameNode for block locations and builds FileSplits. Our log: “Total input files to process : 1”, “number of splits:5”. The split list is uploaded with the job, and the MRAppMaster requests one container per split, preferring its hosts.</li>
+        <li><b>Map task:</b> <code>createRecordReader()</code> opens the file, seeks to the split's start and calls <code>map()</code> once per record.</li>
+        <li><b>TextInputFormat records:</b> key = byte offset of the line (<code>LongWritable</code>), value = the line without the newline (<code>Text</code>). The offsets in our SplitPeek output are exactly these keys.</li>
+        <li><b>Size:</b> <code>splitSize = max(minSize, min(maxSize, blockSize))</code>. Default minSize 1 byte, maxSize unlimited, so splitSize = block size.</li>
+      </ul>
+L3> Edge rules that explain odd counts
+      <ul>
+        <li><b>Slop 1.1:</b> while the remaining bytes are more than 1.1 × splitSize, cut a full split; the rest becomes the last split. 140,759,640 / 134,217,728 = 1.049, so orders_x30's two blocks gave one split, reading 6.2 MB of block 2 remotely or locally wherever the split ran.</li>
+        <li><b>maxsize smaller than a block</b> gives more maps than blocks (more parallelism, more overhead). <b>minsize bigger than a block</b> gives fewer, bigger maps that span blocks and lose some locality.</li>
+        <li><b>LineRecordReader:</b> a split not starting at 0 throws away everything up to the first newline; every reader keeps reading while the line it is about to start begins at or before its end offset. Together this assigns each line to exactly one split.</li>
+        <li><b>Non-splittable input</b> (gzip, or <code>isSplitable()</code> returning false): one split per file, whatever its size. Module 10 compares codecs and splittability.</li>
+        <li>Splits are computed per file: 10,000 small files give at least 10,000 splits (Lesson 7.5), unless you use <code>CombineTextInputFormat</code>.</li>
+      </ul>
+/LEVELS
+EXAM> For “Difference between a block and an input split”, write: a block is the physical unit HDFS stores (128 MB, replicated); a split is the logical unit one map task processes, computed by the InputFormat, usually equal to a block but adjustable by min/max split size, and records that cross a block boundary are read whole by the RecordReader of the split where they start.
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>InputFormats you will meet</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>InputFormat</th><th>Key</th><th>Value</th><th>Splits</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td><b>TextInputFormat</b> (default)</td><td>byte offset (LongWritable)</td><td>line (Text)</td><td>per block</td><td>CSV, logs, any text</td></tr>
+      <tr><td><b>KeyValueTextInputFormat</b></td><td>text before the first tab</td><td>rest of the line</td><td>per block</td><td>Output of an earlier job (key TAB value)</td></tr>
+      <tr><td><b>NLineInputFormat</b></td><td>byte offset</td><td>line</td><td>every N lines</td><td>Each line is a heavy task (e.g. a URL to fetch)</td></tr>
+      <tr><td><b>SequenceFileInputFormat</b></td><td>stored key</td><td>stored value</td><td>per block (sync markers)</td><td>Binary key-value files between jobs</td></tr>
+      <tr><td><b>CombineTextInputFormat</b></td><td>offset</td><td>line</td><td>many files per split</td><td>Lots of small files</td></tr>
+      <tr><td><b>DBInputFormat</b></td><td>row number</td><td>a DBWritable row</td><td>row ranges</td><td>Reading a small database table</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>The settings that change the number of maps</h3>
+  <div class="cards">
+    <div class="card"><h4>Block size</h4><p>Decided when the file is written (<code>-D dfs.blocksize=…</code>). Our 1 MB-block copy gave 5 maps.</p><span class="tag">physical</span></div>
+    <div class="card"><h4>split.maxsize</h4><p><code>mapreduce.input.fileinputformat.split.maxsize</code>: cap below the block size for more maps. 1 MB gave the same 5 splits.</p><span class="tag">more maps</span></div>
+    <div class="card"><h4>split.minsize</h4><p><code>mapreduce.input.fileinputformat.split.minsize</code>: raise above the block size for fewer maps. 256 MB turned 4 splits into 2.</p><span class="tag">fewer maps</span></div>
+    <div class="card"><h4>Compression</h4><p>A gzip file can't be entered in the middle: always 1 split per file. bzip2 and container formats can be split.</p><span class="tag">splittable?</span></div>
+  </div>
+TIP> You cannot set the number of map tasks directly in the new API: it follows the splits. To change it, change the split size or the block size. The number of <i>reduce</i> tasks, on the other hand, is simply <code>mapreduce.job.reduces</code> (Lesson 8.5).
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Watching splits with SplitPeek</h2>
+  <p><code>SplitPeek.java</code> is a map-only job whose mapper counts the records it gets and, in <code>cleanup()</code>, writes one line per split: its start and length, the first and last record offsets, the last line and the host it ran on. Run with <code>splits_lab.sh</code> on the Module 8 lab (in “Run it on your PC”).</p>
+  <ol class="stepper">
+    <li><h4>One small file, one split</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr.jar SplitPeek /user/hadoop/data/canteen_orders.csv /out/peek_a
+hdfs dfs -cat /out/peek_a/part-m-*</code></pre><div class="output">number of splits:1
+split start=0 length=4692009 | records=300001 first_offset=0 last_offset=4691994 last_line=301000,idli,30 | ran_on=worker2</div></div>
+      <span class="behind">4.7 MB is less than one 128 MB block, so one split covers the whole file. The last line starts at byte 4,691,994: <code>301000,idli,30</code> plus the newline is 15 bytes, ending exactly at 4,692,009.</span></li>
+    <li><h4>Same data, 1 MB blocks</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hdfs dfs -D dfs.blocksize=1048576 -put -f canteen_orders.csv /user/hadoop/data/orders_1mb_blocks.csv
+hadoop jar mr.jar SplitPeek /user/hadoop/data/orders_1mb_blocks.csv /out/peek_b</code></pre><div class="output"> Total blocks (validated):	5 (avg. block size 938401 B)
+number of splits:5
+split start=0 length=1048576 | records=70485 first_offset=0 last_offset=1048564 last_line=71484,poha,25 | ran_on=worker2
+split start=1048576 length=1048576 | records=67321 first_offset=1048578 last_offset=2097145 last_line=138805,idli,30 | ran_on=worker3
+split start=2097152 length=1048576 | records=65498 first_offset=2097160 last_offset=3145721 last_line=204303,chai,15 | ran_on=worker1
+split start=3145728 length=1048576 | records=65574 first_offset=3145736 last_offset=4194301 last_line=269877,samosa,18 | ran_on=worker2
+split start=4194304 length=497705 | records=31123 first_offset=4194318 last_offset=4691994 last_line=301000,idli,30 | ran_on=worker1</div></div>
+      <span class="behind">Five blocks, five splits, five maps on all three workers. No split's first record starts exactly at its start: each began by skipping a partial line. The record counts add up to 300,001.</span></li>
+    <li><h4>Read the boundary</h4>
+      <div class="code" data-lang="text" data-file="arithmetic"><pre><code>split 0 ends at        1,048,576
+its last line starts   1,048,564   "71484,poha,25\n" = 14 bytes
+so that line ends at   1,048,578   (2 bytes inside block 2)
+split 1 first record   1,048,578</code></pre></div>
+      <span class="behind">Map 0 read 2 bytes past its split to finish the line; map 1 threw away those 2 bytes (“5” and the newline) and started at the next line. The same happens at every boundary: 2,097,145 + 15 = 2,097,160, the first record of split 2.</span></li>
+    <li><h4>Splits without changing blocks</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr.jar SplitPeek -D mapreduce.input.fileinputformat.split.maxsize=1048576 \
+    /user/hadoop/data/canteen_orders.csv /out/peek_c</code></pre><div class="output">number of splits:5
+split start=0 length=1048576 | records=70485 first_offset=0 last_offset=1048564 last_line=71484,poha,25 | ran_on=worker3
+…
+split start=4194304 length=497705 | records=31123 first_offset=4194318 last_offset=4691994 last_line=301000,idli,30 | ran_on=worker3</div></div>
+      <span class="behind">The file is still one 4.7 MB block, yet the job got the same 5 splits with identical record counts. A split is only a byte range; it does not need to match a block.</span></li>
+    <li><h4>Two blocks, one split</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hdfs fsck /user/hadoop/data/orders_x30.csv -files -blocks
+hadoop jar mr.jar SplitPeek /user/hadoop/data/orders_x30.csv /out/peek_d</code></pre><div class="output">0. …blk_1073741827_1003 len=134217728 Live_repl=3
+1. …blk_1073741828_1004 len=6541912 Live_repl=3
+number of splits:1
+split start=0 length=140759640 | records=9000000 first_offset=0 last_offset=140759625 last_line=301000,idli,30 | ran_on=worker1</div></div>
+      <span class="behind">140,759,640 bytes is only 1.049 times the 128 MB split size, below the 1.1 slop, so FileInputFormat makes one split instead of a 128 MB split plus a 6.2 MB one. A tiny second map task would cost more than it saves.</span></li>
+    <li><h4>Fewer, bigger splits</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr.jar SplitPeek /user/hadoop/data/orders_x90.csv /out/peek_e
+hadoop jar mr.jar SplitPeek -D mapreduce.input.fileinputformat.split.minsize=268435456 \
+    /user/hadoop/data/orders_x90.csv /out/peek_f</code></pre><div class="output">number of splits:4
+number of splits:2</div></div>
+      <span class="behind">With minSize 256 MB, splitSize = max(256 MB, min(∞, 128 MB)) = 256 MB: two map tasks, each reading two blocks. Fewer task start-ups, but part of each split may be read from another node.</span></li>
+  </ol>
+WARN> Don't “fix” a slow job by setting split.maxsize very low. Our 4.7 MB file in five 1 MB splits started five JVMs for work one map does in seconds. Smaller splits help only when each map does heavy work per record.
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>From a file to records</h2>
+  <p>Six steps: the client computes splits, two map tasks read across the boundary at byte 1,048,576.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Splits and the boundary line <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Terminal output of SplitPeek">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@namenode : /tmp/mr</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop jar mr.jar SplitPeek orders_1mb…</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">Total input files to process : 1</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#F5C77E">number of splits:5</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">map 0% reduce 0%</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#7F8C86">(5 map tasks on worker1, 2, 3)</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">split 0: start=0 length=1048576</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">first_offset=0</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#9FD3B8">records=70485</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">split 0:</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">last_offset=1048564</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#F5C77E">last_line=71484,poha,25</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">split 1: start=1048576</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">first_offset=1048578</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#9FD3B8">records=67321</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#9FD3B8">70485 + 67321 + 65498</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">+ 65574 + 31123</text><text x="26" y="92" font-size="8.2" class="mono" style="fill:#F5C77E">= 300001 records</text><text x="26" y="110" font-size="8.2" class="mono" style="fill:#7F8C86">(the whole file, once)</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The client lists the input and computes 5 splits before anything runs.</li>
+          <li>YARN starts 5 map tasks, one per split.</li>
+          <li>Map 0 starts at byte 0, so its first record is at offset 0.</li>
+          <li>Map 0's last record starts 12 bytes before the end of its split.</li>
+          <li>Map 1 starts 2 bytes after its split's start.</li>
+          <li>Every line was read exactly once: 300,001 records in total.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Bytes around the split boundary">
+          <g font-size="8">
+            <rect x="12" y="16" width="336" height="30" rx="5" class="s-card2"/>
+            <text x="180" y="35" text-anchor="middle" class="s-ink">orders_1mb_blocks.csv · 4,692,009 bytes · 5 blocks</text>
+          </g>
+          <g data-on="1"><g font-size="7.6"><rect x="12" y="60" width="76" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="50" y="75" text-anchor="middle" class="s-green">split 0</text><rect x="88" y="60" width="76" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="126" y="75" text-anchor="middle" class="s-blue">split 1</text><rect x="164" y="60" width="76" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="202" y="75" text-anchor="middle" class="s-green">split 2</text><rect x="240" y="60" width="76" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="278" y="75" text-anchor="middle" class="s-blue">split 3</text><rect x="316" y="60" width="32" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="332" y="75" text-anchor="middle" class="s-green">4</text></g><text x="180" y="120" text-anchor="middle" font-size="8.6" class="s-ink">getSplits(): byte ranges + hosts, on the client</text><text x="180" y="134" text-anchor="middle" font-size="8.6" class="s-ink">no data is read yet</text></g>
+          <g data-on="2"><g font-size="7.6"><rect x="12" y="60" width="76" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="50" y="75" text-anchor="middle" class="s-green">map 0</text><rect x="88" y="60" width="76" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="126" y="75" text-anchor="middle" class="s-blue">map 1</text><rect x="164" y="60" width="76" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="202" y="75" text-anchor="middle" class="s-green">map 2</text><rect x="240" y="60" width="76" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="278" y="75" text-anchor="middle" class="s-blue">map 3</text><rect x="316" y="60" width="32" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="332" y="75" text-anchor="middle" class="s-green">4</text></g><text x="180" y="120" text-anchor="middle" font-size="8.6" class="s-ink">each map: createRecordReader(split)</text><text x="180" y="134" text-anchor="middle" font-size="8.6" class="s-ink">→ LineRecordReader</text></g>
+          <g data-on="3"><rect x="12" y="70" width="210" height="34" rx="4" class="s-soft-green" style="stroke:var(--green)"/><rect x="222" y="70" width="126" height="34" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><path d="M222 62v52" style="fill:none;stroke:var(--red);stroke-width:2;stroke-dasharray:3 3"/><text x="222" y="128" text-anchor="middle" font-size="8" class="s-red">byte 1,048,576</text><text x="60" y="91" text-anchor="middle" font-size="8" class="mono s-ink">1001,samosa,18</text><text x="180" y="160" text-anchor="middle" font-size="8.6" class="s-ink">map 0: key 0 → “order_id,item,amount”, key 21 → …</text></g>
+          <g data-on="4"><rect x="12" y="70" width="210" height="34" rx="4" class="s-soft-green" style="stroke:var(--green)"/><rect x="222" y="70" width="126" height="34" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><path d="M222 62v52" style="fill:none;stroke:var(--red);stroke-width:2;stroke-dasharray:3 3"/><text x="170" y="91" text-anchor="middle" font-size="8" class="mono s-ink">71484,poha,2</text><text x="232" y="91" text-anchor="middle" font-size="8" class="mono s-ink">5</text><path d="M128 110h112" style="fill:none;stroke:var(--green);stroke-width:2.5"/><text x="180" y="140" text-anchor="middle" font-size="8.6" class="s-ink">line starts at 1,048,564 (before the end):</text><text x="180" y="154" text-anchor="middle" font-size="8.6" class="s-ink">map 0 reads on, 2 bytes into block 2</text></g>
+          <g data-on="5"><rect x="12" y="70" width="210" height="34" rx="4" class="s-soft-green" style="stroke:var(--green)"/><rect x="222" y="70" width="126" height="34" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><path d="M222 62v52" style="fill:none;stroke:var(--red);stroke-width:2;stroke-dasharray:3 3"/><text x="232" y="91" text-anchor="middle" font-size="8" class="mono s-ink2" style="text-decoration:line-through">5</text><text x="292" y="91" text-anchor="middle" font-size="8" class="mono s-ink">71485,…</text><text x="232" y="64" text-anchor="middle" font-size="7.6" class="s-red">skipped</text><path d="M246 110h96" style="fill:none;stroke:var(--blue);stroke-width:2.5"/><text x="180" y="140" text-anchor="middle" font-size="8.6" class="s-ink">map 1 skips to the first newline,</text><text x="180" y="154" text-anchor="middle" font-size="8.6" class="s-ink">first key = 1,048,578</text></g>
+          <g data-on="6"><text x="180" y="100" text-anchor="middle" font-size="8.6" class="s-ink">a line belongs to the split</text><text x="180" y="114" text-anchor="middle" font-size="8.6" class="s-ink">in which it STARTS</text><text x="180" y="140" text-anchor="middle" font-size="8.6" class="s-green">no line lost, no line doubled</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>getSplits() turns the file into byte ranges with their hosts. Nothing is read yet.</li>
+          <li>Each map task creates a LineRecordReader for its own split.</li>
+          <li>Map 0 starts at byte 0. Keys are byte offsets: the header at 0, the first order at 21.</li>
+          <li>The line 71484,poha,25 starts inside split 0, so map 0 reads it fully, crossing into block 2.</li>
+          <li>Map 1 discards the partial line before its first newline and starts with 71485.</li>
+          <li>The rule: a line is read by the split in which it starts.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Splits at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="20" y="26" width="80" height="38" rx="6" class="s-soft-acc" style="stroke:var(--red)"/><text x="60" y="49" text-anchor="middle" font-size="8.6" class="s-red">.gz = 1 map</text></svg></div>
+    <div><h4>1. The single giant gzip file</h4>
+      <p>A vendor sends a 40 GB <code>.gz</code> file daily. The job gets one map task that runs for hours while the rest of the cluster sits idle. Teams recompress to a splittable format (bzip2, or Parquet/ORC with block compression) or ask for many smaller files.</p>
+      <div class="uc-flow"><span>40 GB .gz</span><i>→</i><span class="java">1 split</span><i>→</i><span>Recompress</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="22" width="84" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="8.6" class="s-ink">1 line =</text><text x="60" y="56" text-anchor="middle" font-size="8.6" class="s-acc">1 heavy task</text></svg></div>
+    <div><h4>2. NLineInputFormat for heavy rows</h4>
+      <p>A file of 5,000 lines, each naming a large image or a model to score. As one 50 KB split it would be one map; NLineInputFormat with N = 50 gives 100 maps working in parallel.</p>
+      <div class="uc-flow"><span>5,000 lines</span><i>→</i><span class="java">N = 50</span><i>→</i><span>100 maps</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="30" width="14" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="34" y="30" width="14" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="52" y="30" width="14" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><path d="M70 45h12" style="fill:none;stroke:var(--track);stroke-width:2"/><rect x="86" y="24" width="20" height="42" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/></svg></div>
+    <div><h4>3. Combining small files</h4>
+      <p>Daily folders with thousands of small log files are read with CombineTextInputFormat and a max split size of 256 MB, so a job runs a few dozen maps instead of thousands.</p>
+      <div class="uc-flow"><span>8,000 files</span><i>→</i><span class="java">CombineTextInputFormat</span><i>→</i><span>~40 maps</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><path d="M20 62l22-20 18 10 20-24 20 12" style="fill:none;stroke:var(--blue);stroke-width:2.5"/></svg></div>
+    <div><h4>4. Tuning map count for CPU-heavy jobs</h4>
+      <p>A parsing job spends 90% of its time on CPU. Lowering split.maxsize to 64 MB doubles the number of maps and uses every core; for an I/O-bound job the same change only adds overhead.</p>
+      <div class="uc-flow"><span>128 MB splits</span><i>→</i><span class="java">maxsize 64 MB</span><i>→</i><span>2× maps</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>

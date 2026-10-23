@@ -1,0 +1,2549 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory and CPU tuning | MyPhatshala</title>
+<meta name="description" content="YARN memory and CPU tuning measured on a real Hadoop 3.5.0 cluster: requests rounded up to the minimum allocation (300 → 512, 600 → 768, 1100 → 1280 MB), 12 containers of 512 MB vs 6 of 1024 MB, the DefaultResourceCalculator handing out 12 vcores on 6, the DominantResourceCalculator limiting by CPU, a real ResourceManager crash from a partial capacity-scheduler.xml, and a map task failing with “Java heap space” at -Xmx64m but succeeding at 300 MB. The memory stack, key properties, sizing a 128 GB worker, Spark executor overhead, Python calculators, quiz and interview scenarios.">
+<meta name="mp:minutes" content="30">
+<link rel="canonical" href="https://myphatshala.in/courses/hadoop/11-yarn/04-memory-and-cpu-tuning/">
+<meta property="og:title" content="Memory and CPU tuning · MyPhatshala">
+<meta property="og:description" content="Ask YARN for 384 MB and get 512. Watch 12 containers become 6, CPU get ignored, and a 64 MB heap kill a job on a real cluster.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Memory and CPU tuning", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hadoop", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="11-yarn/04-memory-and-cpu-tuning" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hadoop syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hadoop</a><span>›</span><b>Lesson 11.4</b></nav>
+    <h1>Memory and CPU tuning</h1>
+    <p class="lead">YARN hands out memory and CPU in containers of fixed steps, and inside each container a JVM has its own, smaller heap. This lesson measures both on our three-worker cluster: how requests are rounded, how many containers fit, when CPU counts, and how a heap that is too small fails a job. Then it sizes a real production server with the same rules.</p>
+    <div class="lesson-meta"><span>Module 11 · YARN</span><span>⏱ 30 min</span><span>Intermediate</span><span>Rounding and packing measured</span><span>Real heap failure and fix</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Why did 384 MB become 512?</h2>
+  <div class="story">
+    <p class="narration">Riya asked YARN for map containers of 384 MB. The ResourceManager's numbers say every map is holding 512 MB. Kabir has the opposite problem: his job keeps every order line in a list, and with a 64 MB heap it died with “Java heap space” ten times before Hadoop gave up. Arjun Sir pulls up one worker's memory on the whiteboard.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="A 2048 MB NodeManager pool holds four 512 MB containers. A 384 MB request is rounded up to 512 MB. Inside a container, the Java heap is smaller than the container.">
+        <g font-size="10">
+          <text x="150" y="20" text-anchor="middle" font-weight="700" class="s-ink">One worker: NodeManager pool 2048 MB</text>
+          <rect x="30" y="32" width="240" height="44" rx="6" class="s-card2"/>
+          <rect x="34" y="36" width="56" height="36" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="62" y="58" text-anchor="middle" font-size="8.6" class="s-green">512</text>
+          <rect x="94" y="36" width="56" height="36" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="122" y="58" text-anchor="middle" font-size="8.6" class="s-green">512</text>
+          <rect x="154" y="36" width="56" height="36" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="182" y="58" text-anchor="middle" font-size="8.6" class="s-green">512</text>
+          <rect x="214" y="36" width="52" height="36" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="240" y="58" text-anchor="middle" font-size="8.6" class="s-green">512</text>
+          <text x="150" y="94" text-anchor="middle" font-size="8.8" class="s-ink2">4 containers fit; a 5th must wait for another node</text>
+
+          <rect x="30" y="110" width="240" height="56" rx="8" class="s-board"/>
+          <text x="150" y="132" text-anchor="middle" font-size="9" style="fill:#F5C77E">asked 384 MB → granted 512 MB</text>
+          <text x="150" y="150" text-anchor="middle" font-size="9" style="fill:#9FD3B8">(rounded up to a multiple of 256 MB)</text>
+
+          <text x="470" y="20" text-anchor="middle" font-weight="700" class="s-ink">Inside one 512 MB container</text>
+          <rect x="360" y="32" width="220" height="132" rx="8" class="s-card2"/>
+          <rect x="372" y="42" width="196" height="76" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/>
+          <text x="470" y="74" text-anchor="middle" font-size="9.2" class="s-blue">JVM heap: -Xmx300m</text>
+          <text x="470" y="90" text-anchor="middle" font-size="8.4" class="s-ink">your objects live here</text>
+          <rect x="372" y="124" width="196" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/>
+          <text x="470" y="143" text-anchor="middle" font-size="8.6" class="s-acc">off-heap: code, threads, buffers</text>
+          <text x="470" y="186" text-anchor="middle" font-size="8.8" class="s-red">-Xmx64m: “Error: Java heap space”, 10 failed attempts</text>
+        </g>
+        <text x="632" y="196" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Two different limits are at work. YARN hands out <b>containers</b>: slices of a node's memory and CPU, in fixed steps. Inside each container runs a JVM with its own <b>heap</b> limit, which must be smaller than the container.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So my 384 MB was rounded up by YARN, and Kabir's job ran out of heap inside the JVM?</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>And I can't just set the heap to 2 GB, because then it won't fit in the container, or the container won't fit on the node.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Exactly. Today we measure both on our cluster: how requests are rounded, how many containers fit, what happens to CPU, and how a heap that is too small kills a job. Then we size a real 128 GB server the same way.</p></div></div>
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>YARN memory and CPU tuning</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Memory and CPU tuning</b> in YARN is the configuration of how much of each node's resources YARN may allocate and how large each container and its process may be. Each NodeManager advertises a capacity (<code>yarn.nodemanager.resource.memory-mb</code>, <code>yarn.nodemanager.resource.cpu-vcores</code>), which must leave room for the operating system and co-located daemons. Applications request containers of a given memory and number of virtual cores; the scheduler normalizes each request up to a multiple of <code>yarn.scheduler.minimum-allocation-mb</code> and rejects requests above the maximum allocation. A <b>resource calculator</b> decides which dimensions are compared: the <code>DefaultResourceCalculator</code> uses memory only, while the <code>DominantResourceCalculator</code> uses memory and CPU (Dominant Resource Fairness). Inside a container, the JVM heap (<code>-Xmx</code>, set via <code>mapreduce.map.java.opts</code> or a heap-to-container ratio) must be smaller than the container, leaving room for off-heap memory; exceeding the heap raises an <code>OutOfMemoryError</code>, while exceeding the container's physical memory causes the NodeManager to kill it when memory checks are enabled.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Decide how much of each machine YARN may hand out, what size the pieces are, and how big the Java program inside each piece may grow. Pieces too big: few tasks run at once. Pieces too small: tasks crash.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>NodeManager capacity</b><span>Memory and vcores a node offers to YARN (ours: 2048 MB, 2 vcores).</span></div>
+    <div class="term"><b>Minimum allocation</b><span>The step size: every request is rounded up to a multiple of it (ours: 256 MB).</span></div>
+    <div class="term"><b>Maximum allocation</b><span>The largest container allowed; never bigger than the largest node.</span></div>
+    <div class="term"><b>vcore</b><span>A virtual CPU share; usually one per physical core or hyper-thread.</span></div>
+    <div class="term"><b>Resource calculator</b><span>Default: compares memory only. Dominant: memory and CPU.</span></div>
+    <div class="term"><b>Heap (-Xmx)</b><span>The JVM's object memory, set inside the container; about 75–80% of it.</span></div>
+    <div class="term"><b>Off-heap</b><span>JVM memory outside the heap: code, thread stacks, buffers, metaspace.</span></div>
+    <div class="term"><b>Wave</b><span>One round of tasks when there are more tasks than containers.</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, 3 workers × 2048 MB / 2 vcores)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>Rounding</th><td>Map asks 300 → 512 MB, 384 → 512, 600 → 768, 1100 → 1280 MB (multiples of 256)</td></tr>
+    <tr><th>Packing</th><td>24 maps of 384 MB: 12 containers running, 6144 of 6144 MB. Maps of 1024 MB: 6 containers, 5632 MB</td></tr>
+    <tr><th>CPU</th><td>Default calculator: 12 containers holding 12 vcores on 6 real vcores. DominantResourceCalculator: 6 containers, 3072 MB, 6 of 6 vcores</td></tr>
+    <tr><th>Heap</th><td>A map that keeps every line: <code>-Xmx64m</code> → FAILED, “Error: Java heap space”, Failed map tasks=10. <code>-Xmx300m</code> → succeeded, 169–235 MB used per map</td></tr>
+  </table>
+
+  <h3 id="architecture">Architecture at a glance: the memory stack of one worker</h3>
+  <p>Every number in a YARN cluster is one layer of this stack. Left: a typical production worker. Right: our lab worker.</p>
+  <div class="scene">
+    <svg viewBox="0 0 640 260" role="img" aria-label="Memory stack: physical RAM, reserved for OS and daemons, NodeManager pool, containers, and inside a container the JVM heap and off-heap memory.">
+      <g font-size="9">
+        <text x="160" y="18" text-anchor="middle" font-weight="700" class="s-ink">Production worker: 128 GB, 32 cores</text>
+        <rect x="40" y="28" width="240" height="26" rx="5" class="s-card2"/><text x="160" y="45" text-anchor="middle" class="s-ink">1. physical RAM 128 GB</text>
+        <rect x="40" y="62" width="44" height="26" rx="5" class="s-soft-acc" style="stroke:var(--track)"/><text x="62" y="79" text-anchor="middle" font-size="8" class="s-acc">16 GB</text>
+        <rect x="88" y="62" width="192" height="26" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="184" y="79" text-anchor="middle" class="s-green">2. NodeManager pool 112 GB</text>
+        <text x="62" y="102" text-anchor="middle" font-size="7.8" class="s-ink2">OS, DataNode,</text>
+        <text x="62" y="112" text-anchor="middle" font-size="7.8" class="s-ink2">NM daemons</text>
+        <g class="s-soft-blue" style="stroke:var(--blue)">
+          <rect x="88" y="96" width="44" height="22" rx="4"/><rect x="136" y="96" width="44" height="22" rx="4"/><rect x="184" y="96" width="44" height="22" rx="4"/><rect x="232" y="96" width="48" height="22" rx="4"/>
+        </g>
+        <text x="110" y="111" text-anchor="middle" font-size="7.8" class="s-blue">4 GB</text><text x="158" y="111" text-anchor="middle" font-size="7.8" class="s-blue">4 GB</text><text x="206" y="111" text-anchor="middle" font-size="7.8" class="s-blue">4 GB</text><text x="256" y="111" text-anchor="middle" font-size="7.8" class="s-blue">… ×28</text>
+        <text x="184" y="134" text-anchor="middle" class="s-ink">3. containers: 28 × 4 GB (1 vcore each)</text>
+        <rect x="88" y="144" width="160" height="26" rx="5" class="s-board"/><text x="168" y="161" text-anchor="middle" font-size="8.6" style="fill:#9FD3B8">4. heap -Xmx3276m (80%)</text>
+        <rect x="248" y="144" width="32" height="26" rx="5" class="s-soft-acc" style="stroke:var(--track)"/><text x="264" y="161" text-anchor="middle" font-size="7.6" class="s-acc">off</text>
+        <text x="160" y="190" text-anchor="middle" font-size="8.6" class="s-ink2">ratio set by mapreduce.job.heap.memory-mb.ratio (0.8)</text>
+
+        <text x="480" y="18" text-anchor="middle" font-weight="700" class="s-ink">Our lab worker (shared laptop)</text>
+        <rect x="360" y="28" width="240" height="26" rx="5" class="s-card2"/><text x="480" y="45" text-anchor="middle" class="s-ink">1. a share of an 8 GB machine</text>
+        <rect x="360" y="62" width="240" height="26" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="480" y="79" text-anchor="middle" class="s-green">2. NodeManager pool 2048 MB, 2 vcores</text>
+        <g class="s-soft-blue" style="stroke:var(--blue)">
+          <rect x="360" y="96" width="57" height="22" rx="4"/><rect x="421" y="96" width="57" height="22" rx="4"/><rect x="482" y="96" width="57" height="22" rx="4"/><rect x="543" y="96" width="57" height="22" rx="4"/>
+        </g>
+        <text x="388" y="111" text-anchor="middle" font-size="7.8" class="s-blue">512</text><text x="449" y="111" text-anchor="middle" font-size="7.8" class="s-blue">512</text><text x="510" y="111" text-anchor="middle" font-size="7.8" class="s-blue">512</text><text x="571" y="111" text-anchor="middle" font-size="7.8" class="s-blue">512</text>
+        <text x="480" y="134" text-anchor="middle" class="s-ink">3. containers: asked 384 MB, granted 512 MB</text>
+        <rect x="360" y="144" width="188" height="26" rx="5" class="s-board"/><text x="454" y="161" text-anchor="middle" font-size="8.6" style="fill:#9FD3B8">4. heap -Xmx300m</text>
+        <rect x="548" y="144" width="52" height="26" rx="5" class="s-soft-acc" style="stroke:var(--track)"/><text x="574" y="161" text-anchor="middle" font-size="7.6" class="s-acc">off-heap</text>
+        <text x="480" y="190" text-anchor="middle" font-size="8.6" class="s-ink2">pmem/vmem checks off in this lab</text>
+      </g>
+      <rect x="40" y="206" width="560" height="34" rx="8" class="s-soft-violet" style="stroke:var(--violet)"/>
+      <text x="320" y="221" text-anchor="middle" font-size="8.8" class="s-violet">Rule: heap &lt; container ≤ maximum allocation ≤ NodeManager pool &lt; physical RAM</text>
+      <text x="320" y="234" text-anchor="middle" font-size="8.4" class="s-ink">Break the first “&lt;” → Java heap space. Break the second → container killed (when checks are on).</text>
+      <text x="632" y="254" text-anchor="end" class="s-wm">myphatshala.in</text>
+    </svg>
+  </div>
+
+  <h3 id="levels">Tuning at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A hostel's rooms and beds</h4>
+      <ul>
+        <li>A hostel building (node) has 2048 sq ft that the warden (YARN) may rent out; the rest is corridors and the warden's office (OS and daemons).</li>
+        <li>Rooms come only in fixed sizes of 256 sq ft. Ask for 384 and you get 512: the room size is rounded up.</li>
+        <li>Inside your room, your cupboard (heap) is smaller than the room. If you stuff more clothes than the cupboard holds, it bursts (Java heap space), even if the room has space.</li>
+        <li>Bigger rooms mean fewer students fit in the building: 12 rooms of 512 vs 6 of 1024 in our cluster.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The settings and how they connect</h4>
+      <ul>
+        <li><b>Node:</b> <code>yarn.nodemanager.resource.memory-mb</code> and <code>…cpu-vcores</code> say what a NodeManager offers. Ours: 2048 MB, 2 vcores.</li>
+        <li><b>Scheduler:</b> <code>yarn.scheduler.minimum-allocation-mb</code> (step) and <code>…maximum-allocation-mb</code> (cap). A 1100 MB request became 1280 MB.</li>
+        <li><b>Job:</b> <code>mapreduce.map.memory.mb</code> (container) and <code>mapreduce.map.java.opts=-Xmx…</code> (heap). Rule of thumb: heap ≈ 80% of the container. Since Hadoop 3 you may set only the container and let <code>mapreduce.job.heap.memory-mb.ratio</code> (0.8) derive the heap.</li>
+        <li><b>AM:</b> <code>yarn.app.mapreduce.am.resource.mb</code> (ours 512) is a container too, and counts against the cluster.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> CPU, fairness and safety nets</h4>
+      <ul>
+        <li>With the <b>DefaultResourceCalculator</b> (the default for the Capacity Scheduler), vcores are recorded but not enforced in placement: our nodes got 12 containers with 1 vcore each on 6 real vcores.</li>
+        <li>The <b>DominantResourceCalculator</b> compares each request on its dominant share (memory or CPU). Our cluster then ran only 6 containers and left half the memory free: CPU had become the limit.</li>
+        <li>Placement is only half the story: to stop a process from using more than its share, NodeManagers use memory checks (<code>yarn.nodemanager.pmem-check-enabled</code>) or Linux cgroups for memory and CPU. Our lab has the memory checks switched off.</li>
+        <li>Tiny jobs can run in <b>uber mode</b> (<code>mapreduce.job.ubertask.enable</code>): all tasks inside the AM's container, saving container start-ups.</li>
+      </ul>
+
+    </div>
+  </div>
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> For “How do you configure memory for MapReduce on YARN?”, draw the stack (node RAM → <code>yarn.nodemanager.resource.memory-mb</code> → container <code>mapreduce.map.memory.mb</code> → heap <code>-Xmx</code> ≈ 80%), mention rounding to <code>minimum-allocation-mb</code>, and give the two failure modes: Java heap space (heap too small) and container killed for exceeding physical memory (heap or off-heap too big for the container).</p></div>
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>The properties, and the two resource calculators</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:700px">
+    <thead><tr><th>Property</th><th>Where</th><th>Means</th><th>Our lab</th><th>Default</th></tr></thead>
+    <tbody>
+      <tr><td><code>yarn.nodemanager.resource.memory-mb</code></td><td>yarn-site</td><td>Memory a node offers to YARN</td><td>2048</td><td>8192 (or detected)</td></tr>
+      <tr><td><code>yarn.nodemanager.resource.cpu-vcores</code></td><td>yarn-site</td><td>vcores a node offers</td><td>2</td><td>8</td></tr>
+      <tr><td><code>yarn.scheduler.minimum-allocation-mb</code></td><td>yarn-site</td><td>Step size of every request</td><td>256</td><td>1024</td></tr>
+      <tr><td><code>yarn.scheduler.maximum-allocation-mb</code></td><td>yarn-site</td><td>Largest container</td><td>8192 (capped by the 2048 MB nodes)</td><td>8192</td></tr>
+      <tr><td><code>mapreduce.map.memory.mb</code> / <code>reduce</code></td><td>mapred-site or -D</td><td>Container size per task</td><td>384 (→ 512)</td><td>-1 (derived)</td></tr>
+      <tr><td><code>mapreduce.map.java.opts</code> / <code>reduce</code></td><td>mapred-site or -D</td><td>JVM options, e.g. -Xmx</td><td>-Xmx300m</td><td>from ratio</td></tr>
+      <tr><td><code>mapreduce.job.heap.memory-mb.ratio</code></td><td>mapred-site</td><td>Heap = ratio × container, if -Xmx not set</td><td>(not used)</td><td>0.8</td></tr>
+      <tr><td><code>yarn.app.mapreduce.am.resource.mb</code></td><td>mapred-site</td><td>ApplicationMaster container</td><td>512</td><td>1536</td></tr>
+      <tr><td><code>mapreduce.map.cpu.vcores</code></td><td>mapred-site or -D</td><td>vcores per map</td><td>1</td><td>1</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Default vs Dominant resource calculator</h3>
+  <div class="cards">
+    <div class="card"><h4>DefaultResourceCalculator</h4><p>Compares memory only. Simple, and fine when all jobs have similar CPU needs. Our lab: 12 containers on 6 vcores, CPUs oversubscribed 2×.</p><span class="tag">memory only</span></div>
+    <div class="card"><h4>DominantResourceCalculator</h4><p>Each request is judged by its largest share of the cluster. Mixes of CPU-heavy and memory-heavy jobs are shared fairly. Our lab: 6 containers, CPU full, memory half used.</p><span class="tag">memory + CPU</span></div>
+    <div class="card"><h4>Fewer, bigger containers</h4><p>Room for big heaps (joins, sorts, caches) but fewer tasks at once and more waste if tasks are small.</p><span class="tag">trade-off</span></div>
+    <div class="card"><h4>More, smaller containers</h4><p>More parallelism and better packing, but each JVM has fixed overhead and heap-hungry tasks fail.</p><span class="tag">trade-off</span></div>
+  </div>
+
+  <h3>Animated example: sizing a telecom billing job</h3>
+  <p>A telecom operator processes call detail records (CDRs) every night on 20 workers with 96 GB each for YARN. Follow one wrong guess and its fix.</p>
+  <div class="anim anim--one" data-frames="6" data-delay="4800">
+    <div class="anim__title">From request to running containers <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A container request is rounded, packed onto nodes, fails with heap errors, and is fixed">
+          <rect x="8" y="10" width="344" height="24" rx="6" class="s-card2"/>
+          <text x="180" y="26" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">CDR job · 20 workers × 96 GB YARN · min allocation 1024 MB</text>
+          <g data-on="1"><rect x="20" y="50" width="320" height="56" rx="8" class="s-board"/><text x="32" y="70" font-size="8.4" class="mono" style="fill:#7F8C86">-D mapreduce.map.memory.mb=3000</text><text x="32" y="86" font-size="8.4" class="mono" style="fill:#9FD3B8">-D mapreduce.map.java.opts=-Xmx2400m</text>
+            <text x="180" y="140" text-anchor="middle" font-size="9" class="s-ink">The developer asks for 3000 MB containers.</text></g>
+          <g data-on="2"><rect x="60" y="50" width="100" height="50" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="110" y="79" text-anchor="middle" font-size="9" class="s-acc">asked 3000</text>
+            <path d="M162 75h36" style="fill:none;stroke:var(--track);stroke-width:2"/><rect x="200" y="50" width="100" height="50" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="250" y="79" text-anchor="middle" font-size="9" class="s-green">granted 3072</text>
+            <text x="180" y="140" text-anchor="middle" font-size="9" class="s-ink">Rounded up to 3 × 1024 MB.</text></g>
+          <g data-on="3"><rect x="20" y="46" width="320" height="30" rx="6" class="s-card2"/>
+            <g class="s-soft-blue" style="stroke:var(--blue)"><rect x="24" y="50" width="30" height="22" rx="3"/><rect x="58" y="50" width="30" height="22" rx="3"/><rect x="92" y="50" width="30" height="22" rx="3"/><rect x="126" y="50" width="30" height="22" rx="3"/><rect x="160" y="50" width="30" height="22" rx="3"/><rect x="194" y="50" width="30" height="22" rx="3"/></g>
+            <text x="280" y="65" text-anchor="middle" font-size="8.4" class="s-ink">… 32 per node</text>
+            <text x="180" y="100" text-anchor="middle" font-size="9" class="s-ink">96 GB ÷ 3 GB = 32 containers per node,</text><text x="180" y="116" text-anchor="middle" font-size="9" class="s-ink">640 maps at once on 20 nodes.</text></g>
+          <g data-on="4"><rect x="20" y="50" width="320" height="64" rx="8" class="s-soft-acc" style="stroke:#D64545"/><text x="180" y="72" text-anchor="middle" font-size="9" font-weight="700" class="s-red">night 1: maps fail</text><text x="180" y="90" text-anchor="middle" font-size="8.6" class="mono s-ink">Error: Java heap space</text><text x="180" y="106" text-anchor="middle" font-size="8.4" class="s-ink2">a lookup of 12 lakh tower IDs needs ~3 GB of heap</text>
+            <text x="180" y="140" text-anchor="middle" font-size="9" class="s-ink">The heap (2400 MB) is too small for the data.</text></g>
+          <g data-on="5"><rect x="20" y="50" width="320" height="56" rx="8" class="s-board"/><text x="32" y="70" font-size="8.4" class="mono" style="fill:#9FD3B8">-D mapreduce.map.memory.mb=4096</text><text x="32" y="86" font-size="8.4" class="mono" style="fill:#9FD3B8">-D mapreduce.map.java.opts=-Xmx3276m</text>
+            <text x="180" y="140" text-anchor="middle" font-size="9" class="s-ink">Fix: bigger container AND heap at 80% of it.</text></g>
+          <g data-on="6"><rect x="20" y="50" width="320" height="64" rx="8" class="s-soft-green" style="stroke:var(--green)"/><text x="180" y="72" text-anchor="middle" font-size="9" font-weight="700" class="s-green">night 2: succeeds</text><text x="180" y="90" text-anchor="middle" font-size="8.6" class="s-ink">24 containers per node, 480 maps at once</text><text x="180" y="106" text-anchor="middle" font-size="8.4" class="s-ink2">fewer at once, but none fail and retry</text>
+            <text x="180" y="140" text-anchor="middle" font-size="9" class="s-ink">Bigger containers cost parallelism. Measure, then size.</text></g>
+          <text x="180" y="190" text-anchor="middle" font-size="8.2" class="s-ink2">Illustrative example; numbers chosen to show the arithmetic.</text>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The developer asks for 3000 MB map containers with a 2400 MB heap.</li>
+          <li>With a 1024 MB minimum allocation, YARN rounds 3000 up to 3072 MB.</li>
+          <li>Each 96 GB node fits 32 such containers: 640 maps run at once on 20 nodes.</li>
+          <li>The maps load a big lookup table and fail with “Java heap space”: the heap, not the container, is too small.</li>
+          <li>The fix raises the container to 4096 MB and the heap to 80% of it.</li>
+          <li>The job succeeds with 24 containers per node. Bigger containers mean fewer at once.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+  <div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p>Size containers from the task's real needs, not from the node. Look at “Peak Map Physical memory” and GC time in the job counters (Lesson 8.1 showed about 290 MB for a 4.7 MB file), add headroom, and round to your minimum allocation.</p></div>
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Measuring containers, CPU and heap on our cluster</h2>
+  <p>All of these use the Module 8 lab. Parts 1–3 use Hadoop's built-in sleep job (tasks that only sleep), so the only thing that changes is the request. The full script, <code>tuning_lab.sh</code>, is in “Run it on your PC”.</p>
+  <ol class="stepper">
+    <li><h4>Ask for odd sizes and see what YARN grants</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>yarn org.apache.hadoop.mapreduce.SleepJob -D mapreduce.map.memory.mb=300 -m 1 -mt 20000 -r 1 -rt 1000
+curl -s http://resourcemanager:8088/ws/v1/cluster/apps/&lt;app&gt;     # allocatedMB while it runs</code></pre><div class="output">map asks  300 MB -> app holds 1024 MB = AM 512 + map 512 MB
+map asks  384 MB -> app holds 1024 MB = AM 512 + map 512 MB
+map asks  600 MB -> app holds 1280 MB = AM 512 + map 768 MB
+map asks 1100 MB -> app holds 1792 MB = AM 512 + map 1280 MB</div></div>
+      <span class="behind">Every request is normalized up to a multiple of <code>yarn.scheduler.minimum-allocation-mb</code> (256 MB here). 300 and 384 both become 512. With the common production minimum of 1024 MB, all four would have become 1024, 1024, 1024 and 2048.</span></li>
+    <li><h4>Count how many maps fit at once</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code># 24 maps of 30 s each, first with 384 MB maps, then with 1024 MB maps
+yarn org.apache.hadoop.mapreduce.SleepJob -D mapreduce.map.memory.mb=384  -m 24 -mt 30000 -r 1 -rt 1000
+yarn org.apache.hadoop.mapreduce.SleepJob -D mapreduce.map.memory.mb=1024 -m 24 -mt 30000 -r 1 -rt 1000</code></pre><div class="output"> maps of 384 MB:
+   running containers 12 | memory 6144 of 6144 MB | vcores 12 of 12
+ maps of 1024 MB:
+   running containers  6 | memory 5632 of 6144 MB | vcores 6 of 6</div></div>
+      <span class="behind">6144 MB ÷ 512 = 12 containers (1 AM + 11 maps). At 1024 MB: one node holds the 512 MB AM plus one map (1536 MB, 512 MB left unused), the other two hold 2 maps each: 6 containers, 5632 MB. 24 maps then need about 5 waves instead of 3.</span></li>
+    <li><h4>Notice CPU being ignored</h4>
+      <div class="code" data-lang="text" data-file="first run above"><pre><code>12 containers × 1 vcore = 12 vcores
+3 nodes × 2 vcores = 6 vcores offered</code></pre></div>
+      <span class="behind">With the DefaultResourceCalculator only memory decides placement, so 12 one-vcore containers ran on 6 vcores. (The metric's total is allocated + available, which is why it shows “of 12”.) Lesson 11.1 saw the same thing per node: “3 vcores used” on a 2-vcore worker.</span></li>
+    <li><h4>Switch to the DominantResourceCalculator (and crash the RM first)</h4>
+      <div class="code" data-lang="bash" data-file="sched-drf.env (first try)"><pre><code>CAPACITY-SCHEDULER.XML_yarn.scheduler.capacity.resource-calculator=org.apache.hadoop.yarn.util.resource.DominantResourceCalculator</code></pre><div class="output">Caused by: java.lang.IllegalStateException: Queue configuration missing child queue names for root</div></div>
+      <span class="behind">The apache/hadoop image writes <code>capacity-scheduler.xml</code> from the env keys you give it, so the file contained only our one key and no queues: the ResourceManager refused to start. The fix repeats <code>root.queues=default</code> and <code>root.default.capacity=100</code> in the same file.</span></li>
+    <li><h4>Run the same 24 maps under DRF</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>bash rm.sh drf
+yarn org.apache.hadoop.mapreduce.SleepJob -D mapreduce.map.memory.mb=384 -m 24 -mt 30000 -r 1 -rt 1000</code></pre><div class="output"> calculator default:
+   running containers 12 | memory 6144 of 6144 MB | vcores 12 of 12
+ calculator drf:
+   running containers  6 | memory 3072 of 6144 MB | vcores 6 of 6</div></div>
+      <span class="behind">Now every container's dominant share is CPU (1 of 2 vcores is 50% of a node, 512 of 2048 MB only 25%). Each node takes 2 containers, half the memory stays free. Safer for CPU-heavy work, but half as many tasks at once here.</span></li>
+    <li><h4>Make a map run out of heap, then fix it</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hadoop jar mr11.jar HeapHog -D mapreduce.map.java.opts=-Xmx64m \
+  -D mapreduce.input.fileinputformat.split.maxsize=33554432 /user/hadoop/data/orders_x30.csv /out/hog64
+hadoop jar mr11.jar HeapHog -D mapreduce.map.java.opts=-Xmx300m \
+  -D mapreduce.input.fileinputformat.split.maxsize=33554432 /user/hadoop/data/orders_x30.csv /out/hog300</code></pre><div class="output"> -Xmx64m: failed with state FAILED
+      7 Error: Java heap space
+   Failed map tasks=10
+   Launched map tasks=15
+   kept 415,675 lines; heap used 54 MB of max 64 MB
+ -Xmx300m: completed successfully
+   Launched map tasks=5
+   kept 2,147,952 lines; heap used 222 MB of max 300 MB</div></div>
+      <span class="behind">HeapHog keeps every line in a list (a common bug: collecting instead of streaming). A 32 MB split holds about 21 lakh lines, roughly 100 bytes each once they are Java objects. With 64 MB of heap only the small last split survived; each big split failed 4 times and the job was failed. 300 MB was enough: the container (512 MB) had room for it.</span></li>
+  </ol>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Raising <code>-Xmx</code> without raising the container is a trap. In our lab the memory checks are off, so a too-big heap would simply eat into other containers' memory. On a production cluster with <code>pmem-check</code> or cgroups, the NodeManager kills the container (“is running beyond physical memory limits … Killing container”, exit code 143). We did not reproduce that message here.</p></div>
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Requests, rounding, packing and heap</h2>
+  <p>Six steps from our lab: what the terminal shows, and what YARN and the JVM do.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Containers and heap <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Terminal output of the tuning lab">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@namenode : /tmp/mr</text>
+          <g data-on="1"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ … SleepJob -D mapreduce.map.memory.mb=600</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#F5C77E">map asks 600 MB -> app holds 1280 MB</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">= AM 512 + map 768 MB</text></g>
+          <g data-on="2"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">maps of 384 MB:</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#9FD3B8">running containers 12</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#9FD3B8">memory 6144 of 6144 MB</text></g>
+          <g data-on="3"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">maps of 1024 MB:</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#F5C77E">running containers 6</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#9FD3B8">memory 5632 of 6144 MB</text></g>
+          <g data-on="4"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">calculator drf:</text><text x="26" y="72" font-size="8.2" class="mono" style="fill:#F5C77E">running containers 6</text><text x="26" y="88" font-size="8.2" class="mono" style="fill:#9FD3B8">memory 3072 of 6144 MB</text><text x="26" y="104" font-size="8.2" class="mono" style="fill:#F5C77E">vcores 6 of 6</text></g>
+          <g data-on="5"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ hadoop jar mr11.jar HeapHog -Xmx64m …</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#FF8A80">Error: Java heap space</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#FF8A80">Failed map tasks=10</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#FF8A80">failed with state FAILED</text></g>
+          <g data-on="6"><text x="26" y="56" font-size="8.2" class="mono" style="fill:#7F8C86">$ … HeapHog -Xmx300m …</text><text x="26" y="74" font-size="8.2" class="mono" style="fill:#9FD3B8">completed successfully</text><text x="26" y="90" font-size="8.2" class="mono" style="fill:#9FD3B8">kept 2,147,952 lines;</text><text x="26" y="106" font-size="8.2" class="mono" style="fill:#9FD3B8">heap used 222 MB of max 300 MB</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A 600 MB map request comes back as 768 MB.</li>
+          <li>With 384 MB maps, 12 containers run and all 6144 MB are used.</li>
+          <li>With 1024 MB maps, only 6 run and 512 MB is stranded.</li>
+          <li>Under DRF the same 384 MB maps run 6 at a time: CPU is the limit.</li>
+          <li>A map that keeps every line fails with a 64 MB heap.</li>
+          <li>With a 300 MB heap the same job succeeds.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Three nodes with containers packed by memory or CPU; inside a container the heap">
+          <g font-size="8">
+            <text x="62" y="20" text-anchor="middle" font-weight="700" class="s-ink">worker1</text><text x="180" y="20" text-anchor="middle" font-weight="700" class="s-ink">worker2</text><text x="298" y="20" text-anchor="middle" font-weight="700" class="s-ink">worker3</text>
+            <rect x="12" y="26" width="100" height="120" rx="6" class="s-card2"/><rect x="130" y="26" width="100" height="120" rx="6" class="s-card2"/><rect x="248" y="26" width="100" height="120" rx="6" class="s-card2"/>
+            <text x="62" y="140" text-anchor="middle" class="s-ink2">2048 MB · 2 vcores</text><text x="180" y="140" text-anchor="middle" class="s-ink2">2048 MB · 2 vcores</text><text x="298" y="140" text-anchor="middle" class="s-ink2">2048 MB · 2 vcores</text>
+          </g>
+          <g data-on="1"><rect x="20" y="32" width="84" height="28" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="62" y="50" text-anchor="middle" font-size="8" class="s-acc">AM 512</text><rect x="20" y="64" width="84" height="40" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="62" y="88" text-anchor="middle" font-size="8" class="s-green">map 768</text>
+            <text x="180" y="176" text-anchor="middle" font-size="8.6" class="s-ink">600 → next multiple of 256 = 768</text></g>
+          <g data-on="2"><g class="s-soft-green" style="stroke:var(--green)">
+            <rect x="20" y="32" width="84" height="22" rx="3"/><rect x="20" y="58" width="84" height="22" rx="3"/><rect x="20" y="84" width="84" height="22" rx="3"/><rect x="20" y="110" width="84" height="22" rx="3"/>
+            <rect x="138" y="32" width="84" height="22" rx="3"/><rect x="138" y="58" width="84" height="22" rx="3"/><rect x="138" y="84" width="84" height="22" rx="3"/><rect x="138" y="110" width="84" height="22" rx="3"/>
+            <rect x="256" y="32" width="84" height="22" rx="3"/><rect x="256" y="58" width="84" height="22" rx="3"/><rect x="256" y="84" width="84" height="22" rx="3"/><rect x="256" y="110" width="84" height="22" rx="3"/></g>
+            <text x="180" y="176" text-anchor="middle" font-size="8.6" class="s-ink">4 × 512 MB per node = 12 containers</text><text x="180" y="190" text-anchor="middle" font-size="8.6" class="s-red">but 4 vcores used on a 2-vcore node</text></g>
+          <g data-on="3"><rect x="20" y="32" width="84" height="22" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="62" y="47" text-anchor="middle" font-size="7.6" class="s-acc">AM 512</text>
+            <g class="s-soft-blue" style="stroke:var(--blue)"><rect x="20" y="58" width="84" height="44" rx="3"/><rect x="138" y="32" width="84" height="44" rx="3"/><rect x="138" y="80" width="84" height="44" rx="3"/><rect x="256" y="32" width="84" height="44" rx="3"/><rect x="256" y="80" width="84" height="44" rx="3"/></g>
+            <text x="62" y="84" text-anchor="middle" font-size="7.6" class="s-blue">1024</text><text x="180" y="58" text-anchor="middle" font-size="7.6" class="s-blue">1024</text><text x="180" y="106" text-anchor="middle" font-size="7.6" class="s-blue">1024</text><text x="298" y="58" text-anchor="middle" font-size="7.6" class="s-blue">1024</text><text x="298" y="106" text-anchor="middle" font-size="7.6" class="s-blue">1024</text>
+            <text x="62" y="120" text-anchor="middle" font-size="7.6" class="s-red">512 free</text>
+            <text x="180" y="176" text-anchor="middle" font-size="8.6" class="s-ink">6 containers; 512 MB stranded on worker1</text></g>
+          <g data-on="4"><g class="s-soft-green" style="stroke:var(--green)"><rect x="20" y="32" width="84" height="22" rx="3"/><rect x="20" y="58" width="84" height="22" rx="3"/><rect x="138" y="32" width="84" height="22" rx="3"/><rect x="138" y="58" width="84" height="22" rx="3"/><rect x="256" y="32" width="84" height="22" rx="3"/><rect x="256" y="58" width="84" height="22" rx="3"/></g>
+            <text x="62" y="104" text-anchor="middle" font-size="7.6" class="s-ink2">2 vcores full</text><text x="180" y="104" text-anchor="middle" font-size="7.6" class="s-ink2">2 vcores full</text><text x="298" y="104" text-anchor="middle" font-size="7.6" class="s-ink2">2 vcores full</text>
+            <text x="180" y="176" text-anchor="middle" font-size="8.6" class="s-ink">DRF: dominant share is CPU (50% per container)</text><text x="180" y="190" text-anchor="middle" font-size="8.6" class="s-ink">→ 2 per node, half the memory free</text></g>
+          <g data-on="5"><rect x="130" y="26" width="100" height="120" rx="6" class="s-soft-acc" style="stroke:#D64545"/><rect x="140" y="40" width="80" height="60" rx="4" class="s-soft-blue" style="stroke:#D64545"/><text x="180" y="66" text-anchor="middle" font-size="8" class="s-red">heap 64 MB</text><text x="180" y="80" text-anchor="middle" font-size="7.6" class="s-red">FULL</text>
+            <text x="180" y="176" text-anchor="middle" font-size="8.6" class="s-ink">~21 lakh line objects need ~200 MB;</text><text x="180" y="190" text-anchor="middle" font-size="8.6" class="s-red">OutOfMemoryError, 4 attempts per task</text></g>
+          <g data-on="6"><rect x="130" y="26" width="100" height="120" rx="6" class="s-soft-green" style="stroke:var(--green)"/><rect x="140" y="34" width="80" height="78" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180" y="70" text-anchor="middle" font-size="8" class="s-blue">heap 300 MB</text><text x="180" y="84" text-anchor="middle" font-size="7.6" class="s-blue">222 used</text><text x="180" y="126" text-anchor="middle" font-size="7.6" class="s-acc">off-heap</text>
+            <text x="180" y="176" text-anchor="middle" font-size="8.6" class="s-ink">300 MB heap inside a 512 MB container:</text><text x="180" y="190" text-anchor="middle" font-size="8.6" class="s-green">fits, with room for off-heap</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The scheduler normalizes the 600 MB map to 768 MB and places it next to the 512 MB AM.</li>
+          <li>Memory-only packing puts four 512 MB containers on each node, though each node has only 2 vcores.</li>
+          <li>1024 MB containers leave 512 MB unusable on the node that hosts the AM.</li>
+          <li>The DominantResourceCalculator sees CPU as the bigger share and stops at 2 containers per node.</li>
+          <li>Inside a map container the 64 MB heap fills up and the JVM throws OutOfMemoryError.</li>
+          <li>A 300 MB heap holds the data and still leaves off-heap room inside the 512 MB container.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Tuning at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="20" width="84" height="50" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="8.6" class="s-blue">CDRs</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">4 GB maps</text></svg></div>
+    <div><h4>1. Telecom: nightly billing on fixed-size containers</h4>
+      <p>Billing jobs join call records with tariff tables. Platform teams set a standard map size (e.g. 4 GB, heap 80%) and let only a few approved jobs ask for more, so the cluster packs predictably.</p>
+      <div class="uc-flow"><span>Job profile</span><i>→</i><span class="java">Standard container size</span><i>→</i><span>Predictable waves</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="22" y="22" width="76" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="44" text-anchor="middle" font-size="8.6" class="s-green">records</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">DRF on</text></svg></div>
+    <div><h4>2. Hospital analytics: CPU-heavy and memory-heavy jobs together</h4>
+      <p>Image-feature extraction burns CPU; patient-record joins need memory. With the DominantResourceCalculator neither kind can starve the other by grabbing only one resource.</p>
+      <div class="uc-flow"><span>Mixed workloads</span><i>→</i><span class="java">DominantResourceCalculator</span><i>→</i><span>Fair CPU + memory</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><path d="M20 66l20-30 18 14 22-28 20 18" style="fill:none;stroke:var(--track);stroke-width:2.5"/><text x="60" y="80" text-anchor="middle" font-size="8" class="s-ink">GC time</text></svg></div>
+    <div><h4>3. E-commerce sale day: watching GC before it hurts</h4>
+      <p>Before a big sale, data teams replay a day of clickstream and check “GC time elapsed” and peak memory counters. Jobs spending more than about 10% of task time in GC get bigger heaps or smaller splits.</p>
+      <div class="uc-flow"><span>Rehearsal run</span><i>→</i><span class="java">Counters: GC, peak memory</span><i>→</i><span>Resize before the sale</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="24" y="22" width="34" height="46" rx="5" class="s-card2"/><rect x="62" y="22" width="34" height="46" rx="5" class="s-soft-acc" style="stroke:var(--track)"/><text x="41" y="49" text-anchor="middle" font-size="8" class="s-ink">exec</text><text x="79" y="49" text-anchor="middle" font-size="7.4" class="s-acc">+10%</text></svg></div>
+    <div><h4>4. Spark on YARN: executor memory plus overhead</h4>
+      <p>A Spark executor asks YARN for <code>spark.executor.memory</code> plus <code>spark.executor.memoryOverhead</code> (by default 10%, at least 384 MB), then rounded up. An 8 GB executor becomes about a 9 GB container: forget the overhead and the sizing math is off.</p>
+      <div class="uc-flow"><span>executor 8g</span><i>→</i><span class="java">+ overhead 819 MB</span><i>→</i><span>container 9216 MB</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="30" y="24" width="60" height="42" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="49" text-anchor="middle" font-size="8.6" class="s-violet">uber</text></svg></div>
+    <div><h4>5. Banking reports: many tiny jobs</h4>
+      <p>Hundreds of small reconciliation jobs each read a few MB. Uber mode, or moving them out of MapReduce entirely, avoids paying a container start-up per task.</p>
+      <div class="uc-flow"><span>Tiny job</span><i>→</i><span class="java">ubertask: tasks in the AM</span><i>→</i><span>Seconds saved per job</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>A container sizing calculator</h2>
+  <p>This reproduces our lab: round each request up to the minimum allocation, then pack containers onto nodes by memory only (DefaultResourceCalculator) or by memory and CPU (DominantResourceCalculator). The AM goes first, as in YARN.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+MIN_MB = 256
+NODES = [{&quot;mb&quot;: 2048, &quot;vc&quot;: 2} for _ in range(3)]
+
+def normalize(mb):
+    return math.ceil(mb / MIN_MB) * MIN_MB          # always rounded UP
+
+def pack(map_mb, n_maps, am_mb=512, use_cpu=False):
+    free = [dict(n) for n in NODES]
+    asks = [normalize(am_mb)] + [normalize(map_mb)] * n_maps
+    placed = 0
+    for ask in asks:
+        for n in free:
+            if n[&quot;mb&quot;] &gt;= ask and (not use_cpu or n[&quot;vc&quot;] &gt;= 1):
+                n[&quot;mb&quot;] -= ask
+                n[&quot;vc&quot;] -= 1
+                placed += 1
+                break
+    used = sum(2048 - n[&quot;mb&quot;] for n in free)
+    return placed, used
+
+for mb in [300, 384, 600, 1100]:
+    print(f&quot;map asks {mb:4} MB -&gt; granted {normalize(mb)} MB&quot;)
+print(&quot;384 MB maps, memory only:&quot;, pack(384, 24))
+print(&quot;1024 MB maps, memory only:&quot;, pack(1024, 24))
+print(&quot;384 MB maps, DRF (CPU too):&quot;, pack(384, 24, use_cpu=True))</code></pre><div class="output">map asks  300 MB -&gt; granted 512 MB
+map asks  384 MB -&gt; granted 512 MB
+map asks  600 MB -&gt; granted 768 MB
+map asks 1100 MB -&gt; granted 1280 MB
+384 MB maps, memory only: (12, 6144)
+1024 MB maps, memory only: (6, 5632)
+384 MB maps, DRF (CPU too): (6, 3072)</div></div>
+  <ul class="anno"><li><code>    return math.ceil(mb / MIN_MB) * MIN_MB          # always rounded UP</code><span>yarn.scheduler.minimum-allocation-mb is a step size: 300 and 384 both become 512.</span></li><li><code>            if n[&quot;mb&quot;] &gt;= ask and (not use_cpu or n[&quot;vc&quot;] &gt;= 1):</code><span>The DefaultResourceCalculator only checks memory; the DominantResourceCalculator also needs a free vcore.</span></li><li><code>print(&quot;384 MB maps, DRF (CPU too):&quot;, pack(384, 24, use_cpu=True))</code><span>Lab: 6 containers and 3072 MB under DRF, against 12 containers and 6144 MB with memory only.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Rounding and packing",
+   "hint": "Press <b>Run<\/b>. Compare with the lab: 512/512/768/1280, then (12, 6144), (6, 5632) and (6, 3072).",
+   "code": "import math\nMIN_MB = 256\nNODES = [{\"mb\": 2048, \"vc\": 2} for _ in range(3)]\n\ndef normalize(mb):\n    return math.ceil(mb / MIN_MB) * MIN_MB          # always rounded UP\n\ndef pack(map_mb, n_maps, am_mb=512, use_cpu=False):\n    free = [dict(n) for n in NODES]\n    asks = [normalize(am_mb)] + [normalize(map_mb)] * n_maps\n    placed = 0\n    for ask in asks:\n        for n in free:\n            if n[\"mb\"] >= ask and (not use_cpu or n[\"vc\"] >= 1):\n                n[\"mb\"] -= ask\n                n[\"vc\"] -= 1\n                placed += 1\n                break\n    used = sum(2048 - n[\"mb\"] for n in free)\n    return placed, used\n\nfor mb in [300, 384, 600, 1100]:\n    print(f\"map asks {mb:4} MB -> granted {normalize(mb)} MB\")\nprint(\"384 MB maps, memory only:\", pack(384, 24))\nprint(\"1024 MB maps, memory only:\", pack(1024, 24))\nprint(\"384 MB maps, DRF (CPU too):\", pack(384, 24, use_cpu=True))\n"
+  },
+  {
+   "label": "2 · Production minimum",
+   "hint": "<b>Predict first:<\/b> with the common production minimum of 1024 MB, what do 300, 384, 600 and 1100 become?",
+   "code": "import math\nfor mb in [300, 384, 600, 1100]:\n    print(mb, \"->\", math.ceil(mb / 1024) * 1024)\n"
+  },
+  {
+   "label": "3 · Waves",
+   "hint": "How many waves do 24 maps need when 11 or when 5 run at once (the AM takes one container)? Each wave of sleep maps took 30 s.",
+   "code": "import math\nfor at_once in [11, 5]:\n    w = math.ceil(24 / at_once)\n    print(f\"{at_once} maps at once -> {w} waves, about {w * 30} s of map time\")\n"
+  },
+  {
+   "label": "4 · Heap per line",
+   "hint": "HeapHog kept 2,147,952 lines in 222 MB of heap. Estimate the bytes per line and the heap needed for a 128 MB split of the same data.",
+   "code": "lines, used_mb = 2_147_952, 222\nper_line = used_mb * 1024 * 1024 / lines\nlines_128 = lines * 4                                  # a 128 MB split holds about 4x a 32 MB split\nprint(f\"about {per_line:.0f} bytes per line; a 128 MB split needs ~{lines_128 * per_line / 1024**2:.0f} MB of heap\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This check is meant to reject a heap that does not fit in the container, but it divides the wrong way round and crashes on a zero. Fix it so it prints the heap as a percentage of the container.",
+   "code": "container_mb, heap_mb = 512, 0\nprint(\"heap is\", container_mb / heap_mb * 100, \"% of the container\")\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run it on your PC: containers, CPU and heap</h3>
+  <p>This uses the Module 8 lab (<code>mr-lab</code> folder). <code>rm.sh</code> (from Lesson 11.3) recreates only the ResourceManager with another configuration; HDFS and the NodeManagers keep running. Parts 1–3 use Hadoop's built-in sleep job from the MapReduce tests jar. Each part runs for a minute or two, so the whole script takes about 10 minutes.</p>
+  <div class="pcrun"><h4>Rounding, packing and the CPU calculator</h4>
+  <div class="code" data-lang="bash" data-file="tuning_lab.sh"><pre><code># tuning_lab.sh: how YARN sizes containers, how many fit, and what happens when the heap is too small
+# Run on your PC in the mr-lab folder (it switches the ResourceManager&#x27;s calculator in part 3).
+T=/opt/hadoop/share/hadoop/mapreduce/hadoop-mapreduce-client-jobclient-3.5.0-tests.jar
+sleepjob() {  # extra args...
+  docker exec -d lab8-namenode-1 bash -c &quot;export HADOOP_CLASSPATH=$T; yarn org.apache.hadoop.mapreduce.SleepJob -libjars $T $* -r 1 -rt 1000 &gt; /tmp/tune.log 2&gt;&amp;1&quot;
+}
+metrics() { docker exec lab8-namenode-1 curl -s http://resourcemanager:8088/ws/v1/cluster/metrics | python3 -c &#x27;
+import sys, json; m = json.load(sys.stdin)[&quot;clusterMetrics&quot;]
+print(&quot;   running containers %2d | memory %4d of %d MB | vcores %d of %d&quot; % (m[&quot;containersAllocated&quot;], m[&quot;allocatedMB&quot;], m[&quot;totalMB&quot;], m[&quot;allocatedVirtualCores&quot;], m[&quot;totalVirtualCores&quot;]))&#x27;; }
+wait_job() { until docker exec lab8-namenode-1 grep -qE &quot;completed successfully|failed with state&quot; /tmp/tune.log 2&gt;/dev/null; do sleep 3; done; }
+bash rm.sh default &gt; /dev/null 2&gt;&amp;1
+echo &quot;== 1. a request is rounded UP to a multiple of the minimum allocation (256 MB here)&quot;
+for mb in 300 384 600 1100; do
+  sleepjob -D mapreduce.map.memory.mb=$mb -m 1 -mt 20000
+  sleep 14
+  app=$(docker exec lab8-namenode-1 grep -o &quot;application_[0-9_]*&quot; /tmp/tune.log | head -1)
+  docker exec lab8-namenode-1 curl -s http://resourcemanager:8088/ws/v1/cluster/apps/$app | python3 -c &#x27;
+import sys, json; a = json.load(sys.stdin)[&quot;app&quot;]
+print(&quot;map asks %4s MB -&gt; app holds %4d MB = AM 512 + map %d MB&quot; % (sys.argv[1], a[&quot;allocatedMB&quot;], a[&quot;allocatedMB&quot;] - 512))&#x27; $mb
+  docker exec lab8-resourcemanager-1 yarn application -kill $app &gt; /dev/null 2&gt;&amp;1; sleep 3
+done
+echo &quot;== 2. how many maps run at once: 384 MB maps vs 1024 MB maps (24 maps of 30 s each)&quot;
+for mb in 384 1024; do
+  sleepjob -D mapreduce.map.memory.mb=$mb -m 24 -mt 30000
+  sleep 25; echo &quot; maps of $mb MB:&quot;; metrics
+  app=$(docker exec lab8-namenode-1 grep -o &quot;application_[0-9_]*&quot; /tmp/tune.log | head -1)
+  docker exec lab8-resourcemanager-1 yarn application -kill $app &gt; /dev/null 2&gt;&amp;1; sleep 3
+done
+echo &quot;== 3. CPU: the default calculator ignores vcores; DominantResourceCalculator counts them&quot;
+for calc in default drf; do
+  bash rm.sh $calc &gt; /dev/null 2&gt;&amp;1
+  sleepjob -D mapreduce.map.memory.mb=384 -m 24 -mt 30000
+  sleep 25; echo &quot; calculator $calc:&quot;; metrics
+  app=$(docker exec lab8-namenode-1 grep -o &quot;application_[0-9_]*&quot; /tmp/tune.log | head -1)
+  docker exec lab8-resourcemanager-1 yarn application -kill $app &gt; /dev/null 2&gt;&amp;1; sleep 3
+done
+bash rm.sh default &gt; /dev/null 2&gt;&amp;1
+
+# rm.sh (same folder) switches the ResourceManager configuration:
+# # rm.sh fifo|capacity|capacity-preempt|capacity-ulf|capacity-ulf-preempt|fair|drf|default : recreate ONLY the ResourceManager with another scheduler
+# # (run in the mr-lab folder; HDFS and the NodeManagers keep running)
+# mode=$1
+# envs=&quot;./config&quot;
+# case $mode in
+#   fifo) envs=&quot;$envs, ./sched-fifo.env&quot; ;;
+#   capacity) envs=&quot;$envs, ./sched-capacity.env&quot; ;;
+#   capacity-preempt) envs=&quot;$envs, ./sched-capacity.env, ./sched-capacity-preempt.env&quot; ;;
+#   capacity-ulf) envs=&quot;$envs, ./sched-capacity.env, ./sched-capacity-ulf.env&quot; ;;
+#   capacity-ulf-preempt) envs=&quot;$envs, ./sched-capacity.env, ./sched-capacity-ulf.env, ./sched-capacity-preempt.env&quot; ;;
+#   fair) envs=&quot;$envs, ./sched-fair.env&quot; ;;
+#   drf) envs=&quot;$envs, ./sched-drf.env&quot; ;;
+#   default) ;;
+# esac
+# cat &gt; rm-override.yaml &lt;&lt;Y
+# services:
+#   resourcemanager:
+#     env_file: [$envs]
+#     volumes: [./fair-scheduler.xml:/opt/fair-scheduler.xml:ro]
+# Y
+# docker compose -p lab8 -f docker-compose.yaml -f rm-override.yaml up -d resourcemanager 2&gt;&amp;1 | tail -1
+# until [ &quot;$(docker exec lab8-resourcemanager-1 yarn node -list 2&gt;/dev/null | grep -c RUNNING)&quot; = 3 ]; do sleep 3; done
+# docker exec lab8-resourcemanager-1 bash -c &#x27;echo &quot;scheduler: $(grep -o &quot;scheduler\.[a-z]*\.[A-Za-z]*Scheduler&quot; /opt/hadoop/etc/hadoop/yarn-site.xml | tail -1)&quot;; mapred queue -list 2&gt;/dev/null | grep -E &quot;Queue Name|Scheduling Info&quot; | paste - - | sed &quot;s/Scheduling Info : //&quot;&#x27;
+
+# Run, in the mr-lab folder:
+#   bash tuning_lab.sh</code></pre><div class="output">== 1. a request is rounded UP to a multiple of the minimum allocation (256 MB here)
+map asks  300 MB -&gt; app holds 1024 MB = AM 512 + map 512 MB
+map asks  384 MB -&gt; app holds 1024 MB = AM 512 + map 512 MB
+map asks  600 MB -&gt; app holds 1280 MB = AM 512 + map 768 MB
+map asks 1100 MB -&gt; app holds 1792 MB = AM 512 + map 1280 MB
+== 2. how many maps run at once: 384 MB maps vs 1024 MB maps (24 maps of 30 s each)
+ maps of 384 MB:
+   running containers 12 | memory 6144 of 6144 MB | vcores 12 of 12
+ maps of 1024 MB:
+   running containers  6 | memory 5632 of 6144 MB | vcores 6 of 6
+== 3. CPU: the default calculator ignores vcores; DominantResourceCalculator counts them
+ calculator default:
+   running containers 12 | memory 6144 of 6144 MB | vcores 12 of 12
+ calculator drf:
+   running containers  6 | memory 3072 of 6144 MB | vcores 6 of 6</div></div>
+  <p class="muted">Real output. The vcore metric adds allocated and available vcores, so with the memory-only calculator it reports “of 12” although the three nodes offer 6.</p></div>
+  <div class="pcrun"><h4>DominantResourceCalculator: the configuration that works</h4>
+  <div class="code" data-lang="bash" data-file="sched-drf.env"><pre><code># Setting ANY capacity-scheduler key through env makes the image write a capacity-scheduler.xml
+# with only those keys, so the queue list must be repeated here (without it the RM fails to start:
+# &quot;Queue configuration missing child queue names for root&quot;).
+CAPACITY-SCHEDULER.XML_yarn.scheduler.capacity.root.queues=default
+CAPACITY-SCHEDULER.XML_yarn.scheduler.capacity.root.default.capacity=100
+CAPACITY-SCHEDULER.XML_yarn.scheduler.capacity.resource-calculator=org.apache.hadoop.yarn.util.resource.DominantResourceCalculator
+
+# Our first version had only the last line. The ResourceManager did not start:
+#   docker logs lab8-resourcemanager-1 | grep &quot;missing child queue&quot;</code></pre><div class="output">Caused by: java.lang.IllegalStateException: Queue configuration missing child queue names for root</div></div>
+  <p class="muted">Real log line from the failed first attempt. Setting any CAPACITY-SCHEDULER.XML_ key makes the apache/hadoop image write capacity-scheduler.xml with only those keys, so the queue list must be repeated.</p></div>
+  <div class="pcrun"><h4>A map that keeps every line in memory</h4>
+  <div class="code" data-lang="bash" data-file="HeapHog.java"><pre><code>// HeapHog.java: a deliberately memory-hungry map-only job. Each map task keeps EVERY line it reads
+// in a list (a common real-world bug: collecting instead of streaming), then writes how many it kept.
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+
+public class HeapHog {
+  public static class M extends Mapper&lt;LongWritable, Text, NullWritable, Text&gt; {
+    private final List&lt;String&gt; kept = new ArrayList&lt;&gt;();
+    @Override
+    protected void map(LongWritable k, Text line, Context ctx) { kept.add(line.toString()); }
+    @Override
+    protected void cleanup(Context ctx) throws IOException, InterruptedException {
+      Runtime r = Runtime.getRuntime();
+      String msg = String.format(&quot;kept %,d lines; heap used %d MB of max %d MB&quot;, kept.size(),
+          (r.totalMemory() - r.freeMemory()) &gt;&gt; 20, r.maxMemory() &gt;&gt; 20);
+      System.err.println(msg);
+      ctx.write(NullWritable.get(), new Text(msg));
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] rest = new GenericOptionsParser(conf, args).getRemainingArgs();
+    Job job = Job.getInstance(conf, &quot;heap hog&quot;);
+    job.setJarByClass(HeapHog.class);
+    job.setMapperClass(M.class);
+    job.setNumReduceTasks(0);
+    job.setOutputKeyClass(NullWritable.class);
+    job.setOutputValueClass(Text.class);
+    FileInputFormat.addInputPath(job, new Path(rest[0]));
+    FileOutputFormat.setOutputPath(job, new Path(rest[1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+
+// In the mr-lab folder:
+//   docker exec lab8-namenode-1 mkdir -p /tmp/mr11
+//   docker cp HeapHog.java lab8-namenode-1:/tmp/mr11/
+//   docker exec lab8-namenode-1 bash -c &quot;cd /tmp/mr11 &amp;&amp; mkdir -p c &amp;&amp; javac -cp \$(hadoop classpath) -d c HeapHog.java &amp;&amp; jar cf mr11.jar -C c .&quot;
+// Then run hog.sh below.</code></pre><div class="output">== 4. a map that keeps every line in memory: heap 64 MB vs 300 MB (orders_x30.csv cut into 32 MB splits)
+ -Xmx64m: failed with state FAILED
+      7 Error: Java heap space
+   Failed map tasks=10
+   Launched map tasks=15
+   kept 415,675 lines; heap used 54 MB of max 64 MB
+ -Xmx300m: completed successfully
+   Launched map tasks=5
+   kept 2,147,952 lines; heap used 222 MB of max 300 MB
+   kept 2,147,373 lines; heap used 235 MB of max 300 MB
+   kept 2,144,628 lines; heap used 169 MB of max 300 MB
+   kept 2,144,372 lines; heap used 209 MB of max 300 MB
+   kept 415,675 lines; heap used 68 MB of max 300 MB</div></div>
+  <p class="muted">Real output of hog.sh. With 64 MB of heap only the small last split (415,675 lines) survived; every 32 MB split failed 4 times and the job failed. The “7” counts distinct error lines the client printed, not attempts.</p></div>
+  <div class="pcrun"><h4>The heap experiment script</h4>
+  <div class="code" data-lang="bash" data-file="hog.sh"><pre><code>echo &quot;== 4. a map that keeps every line in memory: heap 64 MB vs 300 MB (orders_x30.csv cut into 32 MB splits)&quot;
+for heap in 64 300; do
+  docker exec lab8-namenode-1 bash -c &quot;cd /tmp/mr11; hdfs dfs -rm -r -f -skipTrash /out/hog$heap &gt; /dev/null 2&gt;&amp;1
+    hadoop jar mr11.jar HeapHog -D mapreduce.map.java.opts=-Xmx${heap}m -D mapreduce.input.fileinputformat.split.maxsize=33554432 /user/hadoop/data/orders_x30.csv /out/hog$heap &gt; /tmp/hog.log 2&gt;&amp;1
+    echo \&quot; -Xmx${heap}m: \$(grep -oE &#x27;completed successfully|failed with state [A-Z]+&#x27; /tmp/hog.log)\&quot;
+    grep -oE &#x27;Error: Java heap space|OutOfMemoryError: [A-Za-z ]+|GC overhead limit exceeded&#x27; /tmp/hog.log | sort | uniq -c | head -2
+    grep -E &#x27;Failed map tasks|Launched map tasks&#x27; /tmp/hog.log | sed &#x27;s/^\s*/   /&#x27;
+    hdfs dfs -cat /out/hog$heap/part-m-* 2&gt;/dev/null | sed &#x27;s/^/   /&#x27;&quot;
+done
+
+# Run, in the mr-lab folder:  bash hog.sh</code></pre><div class="output">== 4. a map that keeps every line in memory: heap 64 MB vs 300 MB (orders_x30.csv cut into 32 MB splits)
+ -Xmx64m: failed with state FAILED
+      7 Error: Java heap space
+   Failed map tasks=10
+   Launched map tasks=15
+   kept 415,675 lines; heap used 54 MB of max 64 MB
+ -Xmx300m: completed successfully
+   Launched map tasks=5
+   kept 2,147,952 lines; heap used 222 MB of max 300 MB
+   kept 2,147,373 lines; heap used 235 MB of max 300 MB
+   kept 2,144,628 lines; heap used 169 MB of max 300 MB
+   kept 2,144,372 lines; heap used 209 MB of max 300 MB
+   kept 415,675 lines; heap used 68 MB of max 300 MB</div></div>
+  <p class="muted">Real output (same run as above). orders_x30.csv is the 140 MB file from Lesson 8.1.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Normalizing three requests</h2>
+  <p>Watch each request being rounded up to the next multiple of the minimum allocation.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "MIN = 256",
+  "requests = [300, 600, 1100]",
+  "granted = []",
+  "for ask in requests:",
+  "    steps = -(-ask // MIN)",
+  "    granted.append(steps * MIN)",
+  "print(granted)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>MIN<\/code> is created: 256.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "MIN"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>requests<\/code> is created: → list #1. A new list object (#1) is created: [300, 600, 1100]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]"
+   ],
+   "newVar": "requests"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>granted<\/code> is created: → list #2. A new list object (#2) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "granted"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>ask<\/code> is created: 300.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ],
+      [
+       "ask",
+       "300"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "ask"
+  },
+  {
+   "line": 5,
+   "phase": "Ceiling",
+   "note": "-(-a // b) is integer ceiling division: 300 needs 2 steps of 256. <code>steps<\/code> is created: 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ],
+      [
+       "ask",
+       "300"
+      ],
+      [
+       "steps",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "steps"
+  },
+  {
+   "line": 6,
+   "phase": "Granted",
+   "note": "The scheduler grants whole steps only. Object #2 list now holds [512]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ],
+      [
+       "ask",
+       "300"
+      ],
+      [
+       "steps",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (1)<\/b> [512]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>ask<\/code> changes to 600.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ],
+      [
+       "ask",
+       "600"
+      ],
+      [
+       "steps",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (1)<\/b> [512]"
+   ],
+   "newVar": "ask"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>steps<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ],
+      [
+       "ask",
+       "600"
+      ],
+      [
+       "steps",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (1)<\/b> [512]"
+   ],
+   "newVar": "steps"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [512, 768]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ],
+      [
+       "ask",
+       "600"
+      ],
+      [
+       "steps",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (2)<\/b> [512, 768]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>ask<\/code> changes to 1100.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ],
+      [
+       "ask",
+       "1100"
+      ],
+      [
+       "steps",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (2)<\/b> [512, 768]"
+   ],
+   "newVar": "ask"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>steps<\/code> changes to 5.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ],
+      [
+       "ask",
+       "1100"
+      ],
+      [
+       "steps",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (2)<\/b> [512, 768]"
+   ],
+   "newVar": "steps"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [512, 768, 1280]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ],
+      [
+       "ask",
+       "1100"
+      ],
+      [
+       "steps",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (3)<\/b> [512, 768, 1280]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ],
+      [
+       "ask",
+       "1100"
+      ],
+      [
+       "steps",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (3)<\/b> [512, 768, 1280]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "MIN",
+       "256"
+      ],
+      [
+       "requests",
+       "→ list #1"
+      ],
+      [
+       "granted",
+       "→ list #2"
+      ],
+      [
+       "ask",
+       "1100"
+      ],
+      [
+       "steps",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [300, 600, 1100]",
+    "<b>#2 list (3)<\/b> [512, 768, 1280]"
+   ],
+   "out": "[512, 768, 1280]\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Four sizing problems from different industries, each solved with the same memory-stack rules.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Banking · capacity</span></div>
+    <h4>How many containers does a bank's worker give?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A bank's Hadoop worker has 128 GB RAM and 32 cores. Reserve 16 GB for the OS, the DataNode and the NodeManager. Map containers are 4 GB with 1 vcore. How many maps run at once per node, and on a 25-node cluster?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>128 GB − 16 GB · 4 GB maps · 32 cores (keep 2)</pre></div><div><small>Expected output</small><pre>by memory 28, by CPU 30 -&gt; 28 per node, 700 on 25 nodes</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>YARN memory = RAM − reserve.</li><li>By memory: pool ÷ container size.</li><li>By CPU: usable vcores. The smaller number wins (with DRF).</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Change maps to 3 GB. Memory now allows 37, so CPU (30) becomes the limit: a sign the cluster is CPU-bound.",
+   "code": "pool_gb = 128 - 16\nby_mem = pool_gb // 4\nby_cpu = 32 - 2\nper_node = min(by_mem, by_cpu)\nprint(f\"by memory {by_mem}, by CPU {by_cpu} -> {per_node} per node, {per_node * 25} on 25 nodes\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "pool_gb = 128 - 16",
+  "by_mem = pool_gb // 4",
+  "by_cpu = 32 - 2",
+  "per_node = min(by_mem, by_cpu)",
+  "print(f\"by memory {by_mem}, by CPU {by_cpu} -> {per_node} per node, {per_node * 25} on 25 nodes\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>pool_gb<\/code> is created: 112.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pool_gb",
+       "112"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "pool_gb"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>by_mem<\/code> is created: 28.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pool_gb",
+       "112"
+      ],
+      [
+       "by_mem",
+       "28"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "by_mem"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>by_cpu<\/code> is created: 30.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pool_gb",
+       "112"
+      ],
+      [
+       "by_mem",
+       "28"
+      ],
+      [
+       "by_cpu",
+       "30"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "by_cpu"
+  },
+  {
+   "line": 4,
+   "phase": "Limit",
+   "note": "With DRF the tighter resource decides; with the memory-only calculator only by_mem counts. <code>per_node<\/code> is created: 28.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pool_gb",
+       "112"
+      ],
+      [
+       "by_mem",
+       "28"
+      ],
+      [
+       "by_cpu",
+       "30"
+      ],
+      [
+       "per_node",
+       "28"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "per_node"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pool_gb",
+       "112"
+      ],
+      [
+       "by_mem",
+       "28"
+      ],
+      [
+       "by_cpu",
+       "30"
+      ],
+      [
+       "per_node",
+       "28"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "by memory 28, by CPU 30 -> 28 per node, 700 on 25 nodes\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Telecom · rounding</span></div>
+    <h4>What does a 3000 MB request really cost?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A telecom job asks for 3000 MB maps on a cluster whose minimum allocation is 1024 MB and whose NodeManagers offer 96 GB. How much memory does each map really hold, and how much is wasted per node compared with asking for exactly 3072 MB?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>ask 3000 · min 1024 · 96 GB pool</pre></div><div><small>Expected output</small><pre>granted 3072 MB, 32 per node, 2304 MB per node granted but never asked for</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Round up to a multiple of 1024.</li><li>Containers per node = pool ÷ granted.</li><li>Waste = granted − asked, per container.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Ask for 2049 MB instead. It costs 3072 too: just above a step boundary is the worst place to be.",
+   "code": "import math\nask, step, pool = 3000, 1024, 96 * 1024\ngranted = math.ceil(ask / step) * step\nper_node = pool // granted\nprint(f\"granted {granted} MB, {per_node} per node, {(granted - ask) * per_node} MB per node granted but never asked for\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import math",
+  "ask, step, pool = 3000, 1024, 96 * 1024",
+  "granted = math.ceil(ask / step) * step",
+  "per_node = pool // granted",
+  "print(f\"granted {granted} MB, {per_node} per node, {(granted - ask) * per_node} MB per node granted but never asked for\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>ask<\/code> is created: 3000. <code>step<\/code> is created: 1024. <code>pool<\/code> is created: 98304.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "ask",
+       "3000"
+      ],
+      [
+       "step",
+       "1024"
+      ],
+      [
+       "pool",
+       "98304"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "pool"
+  },
+  {
+   "line": 3,
+   "phase": "Rounding",
+   "note": "3000 needs 3 steps of 1024: 3072. <code>granted<\/code> is created: 3072.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "ask",
+       "3000"
+      ],
+      [
+       "step",
+       "1024"
+      ],
+      [
+       "pool",
+       "98304"
+      ],
+      [
+       "granted",
+       "3072"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "granted"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>per_node<\/code> is created: 32.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "ask",
+       "3000"
+      ],
+      [
+       "step",
+       "1024"
+      ],
+      [
+       "pool",
+       "98304"
+      ],
+      [
+       "granted",
+       "3072"
+      ],
+      [
+       "per_node",
+       "32"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "per_node"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "ask",
+       "3000"
+      ],
+      [
+       "step",
+       "1024"
+      ],
+      [
+       "pool",
+       "98304"
+      ],
+      [
+       "granted",
+       "3072"
+      ],
+      [
+       "per_node",
+       "32"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "granted 3072 MB, 32 per node, 2304 MB per node granted but never asked for\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">E-commerce · Spark</span></div>
+    <h4>Sizing Spark executors on YARN</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A sale-day Spark job uses executors with <code>spark.executor.memory=8g</code>. Overhead is 10% of that, at least 384 MB. The YARN minimum allocation is 1024 MB, and nodes offer 112 GB. What container does each executor get, and how many fit per node?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>8 GB heap + max(384 MB, 10%) · step 1024 · 112 GB</pre></div><div><small>Expected output</small><pre>overhead 819 MB -&gt; container 9216 MB, 12 executors per node</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Overhead = max(384, 0.10 × 8192).</li><li>Request = heap + overhead, rounded up to 1024.</li><li>Executors per node = pool ÷ container.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Set the executor to 7.5g (7680 MB). The container drops to 9216 MB? Check: 7680 + 768 = 8448 → 9216. Same container: the rounding hides the saving.",
+   "code": "import math\nheap = 8192\noverhead = max(384, int(0.10 * heap))\ncontainer = math.ceil((heap + overhead) / 1024) * 1024\nprint(f\"overhead {overhead} MB -> container {container} MB, {112 * 1024 // container} executors per node\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import math",
+  "heap = 8192",
+  "overhead = max(384, int(0.10 * heap))",
+  "container = math.ceil((heap + overhead) / 1024) * 1024",
+  "print(f\"overhead {overhead} MB -> container {container} MB, {112 * 1024 // container} executors per node\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>heap<\/code> is created: 8192.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "heap",
+       "8192"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "heap"
+  },
+  {
+   "line": 3,
+   "phase": "Overhead",
+   "note": "Off-heap memory Spark needs beside the JVM heap; YARN must hold room for it. <code>overhead<\/code> is created: 819.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "heap",
+       "8192"
+      ],
+      [
+       "overhead",
+       "819"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "overhead"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>container<\/code> is created: 9216.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "heap",
+       "8192"
+      ],
+      [
+       "overhead",
+       "819"
+      ],
+      [
+       "container",
+       "9216"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "container"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "heap",
+       "8192"
+      ],
+      [
+       "overhead",
+       "819"
+      ],
+      [
+       "container",
+       "9216"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "overhead 819 MB -> container 9216 MB, 12 executors per node\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 4</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Healthcare · DRF</span></div>
+    <h4>Which resource limits a hospital cluster?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A hospital's 10-node cluster offers 64 GB and 16 vcores per node to YARN. Job A (image features) uses containers of 2 GB / 2 vcores; job B (record joins) uses 8 GB / 1 vcore. With the DominantResourceCalculator, what is each container's dominant share of one node, and how many of each fit on an empty node?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>node 64 GB / 16 vcores · A 2 GB/2 · B 8 GB/1</pre></div><div><small>Expected output</small><pre>A: memory 3.1%, CPU 12.5% -&gt; dominant CPU, 8 per node
+B: memory 12.5%, CPU 6.2% -&gt; dominant memory, 8 per node</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Share of memory and share of CPU per container.</li><li>Dominant share = the larger of the two.</li><li>Fit = min(memory fit, CPU fit).</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Under the memory-only calculator job A would fit 32 per node and need 64 vcores on a 16-vcore machine: CPU oversubscribed 4×.",
+   "code": "node_gb, node_vc = 64, 16\nfor name, gb, vc in [(\"A\", 2, 2), (\"B\", 8, 1)]:\n    mem_share, cpu_share = gb / node_gb, vc / node_vc\n    dominant = \"CPU\" if cpu_share > mem_share else \"memory\"\n    fit = min(node_gb // gb, node_vc // vc)\n    print(f\"{name}: memory {mem_share:.1%}, CPU {cpu_share:.1%} -> dominant {dominant}, {fit} per node\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "node_gb, node_vc = 64, 16",
+  "for name, gb, vc in [(\"A\", 2, 2), (\"B\", 8, 1)]:",
+  "    mem_share, cpu_share = gb / node_gb, vc / node_vc",
+  "    dominant = \"CPU\" if cpu_share > mem_share else \"memory\"",
+  "    fit = min(node_gb // gb, node_vc // vc)",
+  "    print(f\"{name}: memory {mem_share:.1%}, CPU {cpu_share:.1%} -> dominant {dominant}, {fit} per node\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>node_gb<\/code> is created: 64. <code>node_vc<\/code> is created: 16.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "node_vc"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>name<\/code> is created: &#x27;A&#x27;. <code>gb<\/code> is created: 2. <code>vc<\/code> is created: 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ],
+      [
+       "name",
+       "'A'"
+      ],
+      [
+       "gb",
+       "2"
+      ],
+      [
+       "vc",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "vc"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>mem_share<\/code> is created: 0.0312. <code>cpu_share<\/code> is created: 0.125.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ],
+      [
+       "name",
+       "'A'"
+      ],
+      [
+       "gb",
+       "2"
+      ],
+      [
+       "vc",
+       "2"
+      ],
+      [
+       "mem_share",
+       "0.0312"
+      ],
+      [
+       "cpu_share",
+       "0.125"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "cpu_share"
+  },
+  {
+   "line": 4,
+   "phase": "Dominant",
+   "note": "DRF compares users and queues on this larger share. <code>dominant<\/code> is created: &#x27;CPU&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ],
+      [
+       "name",
+       "'A'"
+      ],
+      [
+       "gb",
+       "2"
+      ],
+      [
+       "vc",
+       "2"
+      ],
+      [
+       "mem_share",
+       "0.0312"
+      ],
+      [
+       "cpu_share",
+       "0.125"
+      ],
+      [
+       "dominant",
+       "'CPU'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "dominant"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>fit<\/code> is created: 8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ],
+      [
+       "name",
+       "'A'"
+      ],
+      [
+       "gb",
+       "2"
+      ],
+      [
+       "vc",
+       "2"
+      ],
+      [
+       "mem_share",
+       "0.0312"
+      ],
+      [
+       "cpu_share",
+       "0.125"
+      ],
+      [
+       "dominant",
+       "'CPU'"
+      ],
+      [
+       "fit",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "fit"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ],
+      [
+       "name",
+       "'A'"
+      ],
+      [
+       "gb",
+       "2"
+      ],
+      [
+       "vc",
+       "2"
+      ],
+      [
+       "mem_share",
+       "0.0312"
+      ],
+      [
+       "cpu_share",
+       "0.125"
+      ],
+      [
+       "dominant",
+       "'CPU'"
+      ],
+      [
+       "fit",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "A: memory 3.1%, CPU 12.5% -> dominant CPU, 8 per node\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;B&#x27;. <code>gb<\/code> changes to 8. <code>vc<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ],
+      [
+       "name",
+       "'B'"
+      ],
+      [
+       "gb",
+       "8"
+      ],
+      [
+       "vc",
+       "1"
+      ],
+      [
+       "mem_share",
+       "0.0312"
+      ],
+      [
+       "cpu_share",
+       "0.125"
+      ],
+      [
+       "dominant",
+       "'CPU'"
+      ],
+      [
+       "fit",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "vc"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>mem_share<\/code> changes to 0.125. <code>cpu_share<\/code> changes to 0.0625.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ],
+      [
+       "name",
+       "'B'"
+      ],
+      [
+       "gb",
+       "8"
+      ],
+      [
+       "vc",
+       "1"
+      ],
+      [
+       "mem_share",
+       "0.125"
+      ],
+      [
+       "cpu_share",
+       "0.0625"
+      ],
+      [
+       "dominant",
+       "'CPU'"
+      ],
+      [
+       "fit",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "cpu_share"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>dominant<\/code> changes to &#x27;memory&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ],
+      [
+       "name",
+       "'B'"
+      ],
+      [
+       "gb",
+       "8"
+      ],
+      [
+       "vc",
+       "1"
+      ],
+      [
+       "mem_share",
+       "0.125"
+      ],
+      [
+       "cpu_share",
+       "0.0625"
+      ],
+      [
+       "dominant",
+       "'memory'"
+      ],
+      [
+       "fit",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "dominant"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ],
+      [
+       "name",
+       "'B'"
+      ],
+      [
+       "gb",
+       "8"
+      ],
+      [
+       "vc",
+       "1"
+      ],
+      [
+       "mem_share",
+       "0.125"
+      ],
+      [
+       "cpu_share",
+       "0.0625"
+      ],
+      [
+       "dominant",
+       "'memory'"
+      ],
+      [
+       "fit",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ],
+      [
+       "name",
+       "'B'"
+      ],
+      [
+       "gb",
+       "8"
+      ],
+      [
+       "vc",
+       "1"
+      ],
+      [
+       "mem_share",
+       "0.125"
+      ],
+      [
+       "cpu_share",
+       "0.0625"
+      ],
+      [
+       "dominant",
+       "'memory'"
+      ],
+      [
+       "fit",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "B: memory 12.5%, CPU 6.2% -> dominant memory, 8 per node\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node_gb",
+       "64"
+      ],
+      [
+       "node_vc",
+       "16"
+      ],
+      [
+       "name",
+       "'B'"
+      ],
+      [
+       "gb",
+       "8"
+      ],
+      [
+       "vc",
+       "1"
+      ],
+      [
+       "mem_share",
+       "0.125"
+      ],
+      [
+       "cpu_share",
+       "0.0625"
+      ],
+      [
+       "dominant",
+       "'memory'"
+      ],
+      [
+       "fit",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "A map asks for 600 MB on our cluster (minimum allocation 256 MB). What does it get?",
+  "options": [
+   "600 MB",
+   "512 MB",
+   "768 MB",
+   "1024 MB"
+  ],
+  "answer": 2,
+  "why": "Requests are rounded up to a multiple of the minimum allocation: real output “map asks 600 MB -> … map 768 MB”."
+ },
+ {
+  "q": "Why did only 6 containers run with 1024 MB maps, using 5632 of 6144 MB?",
+  "options": [
+   "A bug in YARN",
+   "The 512 MB AM and one 1024 MB map left 512 MB on one node that no map could use",
+   "Maps need 2 vcores",
+   "HDFS was full"
+  ],
+  "answer": 1,
+  "why": "Fragmentation: 2048 − 512 − 1024 = 512 MB, too small for another 1024 MB map."
+ },
+ {
+  "q": "With the DefaultResourceCalculator, 12 one-vcore containers ran on nodes that offer 6 vcores in total. Why?",
+  "options": [
+   "It compares memory only, so CPU is not checked when placing containers",
+   "vcores are doubled automatically",
+   "The sleep job uses no CPU",
+   "YARN counts hyper-threads"
+  ],
+  "answer": 0,
+  "why": "Use the DominantResourceCalculator (or cgroups) to make CPU count."
+ },
+ {
+  "q": "What changed when we switched to the DominantResourceCalculator?",
+  "options": [
+   "Nothing",
+   "Containers became bigger",
+   "Maps ran faster",
+   "Only 6 containers ran and half the memory stayed free: CPU became the limit"
+  ],
+  "answer": 3,
+  "why": "Each container took 50% of a node's CPU but only 25% of its memory."
+ },
+ {
+  "q": "A map fails with “Error: Java heap space”. What is too small?",
+  "options": [
+   "The NodeManager pool",
+   "The HDFS block",
+   "The JVM heap (-Xmx) inside the container",
+   "The minimum allocation"
+  ],
+  "answer": 2,
+  "why": "HeapHog failed at -Xmx64m and succeeded at -Xmx300m in the same 512 MB container."
+ },
+ {
+  "q": "Which relation must always hold?",
+  "options": [
+   "heap > container",
+   "heap < container ≤ NodeManager pool",
+   "container > NodeManager pool",
+   "heap = container"
+  ],
+  "answer": 1,
+  "why": "The heap needs room for off-heap memory inside the container; the container must fit on a node."
+ },
+ {
+  "q": "Our ResourceManager refused to start after we set only the resource-calculator key. Why?",
+  "options": [
+   "The image wrote a capacity-scheduler.xml containing no queues",
+   "DRF is not supported",
+   "The NodeManagers were down",
+   "Port 8088 was busy"
+  ],
+  "answer": 0,
+  "why": "“Queue configuration missing child queue names for root”: we had to repeat root.queues=default."
+ },
+ {
+  "q": "In production, a container is killed with “is running beyond physical memory limits”. What is the usual fix?",
+  "options": [
+   "Lower the minimum allocation",
+   "Add more DataNodes",
+   "Disable speculative execution",
+   "Raise mapreduce.map.memory.mb, or lower -Xmx so heap + off-heap fit"
+  ],
+  "answer": 3,
+  "why": "The process (heap plus off-heap) grew past its container. Not reproduced in our lab, where memory checks are off."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 11.4 in one screen</h3>
+    <ul><li>Stack: physical RAM → reserve for OS/daemons → <code>yarn.nodemanager.resource.memory-mb</code> → containers → JVM heap (<code>-Xmx</code> ≈ 80%) + off-heap.</li><li>Requests round UP to <code>yarn.scheduler.minimum-allocation-mb</code>: lab 300/384 → 512, 600 → 768, 1100 → 1280 MB.</li><li>Packing: 384 MB maps → 12 containers (6144 MB); 1024 MB maps → 6 (5632 MB, 512 MB stranded).</li><li>DefaultResourceCalculator = memory only (12 vcores handed out on 6); DominantResourceCalculator = memory + CPU (6 containers).</li><li>“Java heap space” → raise -Xmx (and the container) or stop collecting data in memory; “beyond physical memory” → bigger container or smaller heap.</li><li>Setting any CAPACITY-SCHEDULER.XML_ key in the apache/hadoop image rewrites the whole file: repeat the queues.</li><li>Spark on YARN: container = executor memory + overhead (max 384 MB, 10%), rounded up.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>How do you calculate the number of containers per node in YARN?</summary><p>Take the memory the NodeManager offers (yarn.nodemanager.resource.memory-mb) and divide by the container size after rounding it up to a multiple of yarn.scheduler.minimum-allocation-mb. If the DominantResourceCalculator is used, also divide the node's vcores by the vcores per container and take the smaller number. Remember the ApplicationMaster also occupies a container.</p></details>
+    <details><summary>What is the difference between mapreduce.map.memory.mb and mapreduce.map.java.opts?</summary><p>mapreduce.map.memory.mb is the size of the YARN container for a map task: what YARN reserves and enforces. mapreduce.map.java.opts sets JVM options such as -Xmx, the maximum heap inside that container. The heap must be smaller than the container, typically about 80% of it, to leave room for off-heap memory.</p></details>
+    <details><summary>What is the DominantResourceCalculator in YARN?</summary><p>A resource calculator for the Capacity Scheduler that considers both memory and CPU. Each request is compared on its dominant share, the larger of its memory and CPU fractions, following Dominant Resource Fairness. The default DefaultResourceCalculator compares memory only, so CPU can be oversubscribed.</p></details>
+    <details><summary>Why does YARN give a container more memory than requested?</summary><p>The scheduler normalizes every request up to a multiple of yarn.scheduler.minimum-allocation-mb (and a similar increment for the Fair Scheduler). In our lab, with a 256 MB minimum, a 384 MB request became 512 MB and 600 MB became 768 MB.</p></details>
+    <details><summary>How do you fix “Container is running beyond physical memory limits”?</summary><p>The task process (heap plus off-heap) used more memory than its container. Either increase the container size (mapreduce.map.memory.mb or mapreduce.reduce.memory.mb) while keeping the heap around 80% of it, or reduce the heap or off-heap use (smaller buffers, less data held in memory). For Spark, raise spark.executor.memoryOverhead.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Sizing and tuning exercises using the real numbers from our lab.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Round it</h4></div>
+      <p>Round 384, 513 and 1025 MB up to multiples of 256 MB.</p>
+      <div class="prob__io"><div><small>Input</small><pre>three requests</pre></div><div><small>Expected output</small><pre>[512, 768, 1280]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+print([math.ceil(x / 256) * 256 for x in (384, 513, 1025)])</code></pre><div class="output">[512, 768, 1280]</div></div>
+        <p><b>How it works:</b> [512, 768, 1280]: one MB over a boundary costs a whole extra step.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Lab cluster total</h4></div>
+      <p>Three NodeManagers offer 2048 MB each. How many 512 MB containers fit, and how many maps run once the 512 MB AM is placed?</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 × 2048 MB</pre></div><div><small>Expected output</small><pre>12 containers, 11 maps at once</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>total = 3 * 2048 // 512
+print(total, &quot;containers,&quot;, total - 1, &quot;maps at once&quot;)</code></pre><div class="output">12 containers, 11 maps at once</div></div>
+        <p><b>How it works:</b> 12 containers, 11 maps: exactly what the lab measured (running containers 12).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Heap ratio</h4></div>
+      <p>Our maps asked for 384 MB with -Xmx300m but were granted 512 MB. What fraction of the request and of the grant is the heap?</p>
+      <div class="prob__io"><div><small>Input</small><pre>300 / 384 · 300 / 512</pre></div><div><small>Expected output</small><pre>78% of the request, 59% of the grant</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{300 / 384:.0%} of the request, {300 / 512:.0%} of the grant&quot;)</code></pre><div class="output">78% of the request, 59% of the grant</div></div>
+        <p><b>How it works:</b> 78% of what we asked, 59% of what we got: rounding left extra off-heap room.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Stranded memory</h4></div>
+      <p>Each node has 2048 MB. With a 512 MB AM on one node and 1024 MB maps, how much memory can no map use?</p>
+      <div class="prob__io"><div><small>Input</small><pre>AM 512 · maps 1024</pre></div><div><small>Expected output</small><pre>512 MB stranded</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>node = 2048
+left_on_am_node = node - 512 - (node - 512) // 1024 * 1024
+print(left_on_am_node, &quot;MB stranded&quot;)</code></pre><div class="output">512 MB stranded</div></div>
+        <p><b>How it works:</b> 512 MB, which is why the lab used 5632 of 6144 MB.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Pick a container size</h4></div>
+      <p>A worker offers 96 GB to YARN. Compare 2, 3, 4 and 6 GB maps: maps per node and leftover memory.</p>
+      <div class="prob__io"><div><small>Input</small><pre>96 GB pool</pre></div><div><small>Expected output</small><pre>2 GB maps: 48 per node, 0 MB left
+3 GB maps: 32 per node, 0 MB left
+4 GB maps: 24 per node, 0 MB left
+6 GB maps: 16 per node, 0 MB left</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>pool = 96 * 1024
+for gb in (2, 3, 4, 6):
+    c = gb * 1024
+    print(f&quot;{gb} GB maps: {pool // c:2d} per node, {pool % c} MB left&quot;)</code></pre><div class="output">2 GB maps: 48 per node, 0 MB left
+3 GB maps: 32 per node, 0 MB left
+4 GB maps: 24 per node, 0 MB left
+6 GB maps: 16 per node, 0 MB left</div></div>
+        <p><b>How it works:</b> All divide evenly here; on a 100 GB pool 3 GB would strand 1 GB. Choose sizes that divide the pool.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Heap for a lookup table</h4></div>
+      <p>A map loads a lookup of 12 lakh entries at about 250 bytes each, plus 200 MB for the framework and buffers. What heap and what container (heap = 80%, step 1024 MB)?</p>
+      <div class="prob__io"><div><small>Input</small><pre>12 lakh × 250 B + 200 MB</pre></div><div><small>Expected output</small><pre>heap 486 MB -&gt; container 1024 MB</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+heap = 1_200_000 * 250 / 1024**2 + 200
+container = math.ceil(heap / 0.8 / 1024) * 1024
+print(f&quot;heap {heap:.0f} MB -&gt; container {container} MB&quot;)</code></pre><div class="output">heap 486 MB -&gt; container 1024 MB</div></div>
+        <p><b>How it works:</b> About 486 MB of heap, so a 1024 MB container. Measure first; object overhead often doubles estimates.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Bigger containers or more nodes?</h4></div>
+      <p>A nightly job fails with heap errors at 2 GB maps. Option A: 4 GB maps (half as many at once, job 3 h instead of 2 h). Option B: add 10 nodes at ₹40,000 each per month to keep 2 h. Which is cheaper for a job that has a 4-hour window?</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 h vs 2 h · 10 × ₹40,000</pre></div><div><small>Expected output</small><pre>A fits the window: True | B costs Rs 400000 per month</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>window_h, a_hours = 4, 3
+print(&quot;A fits the window:&quot;, a_hours &lt;= window_h, &quot;| B costs Rs&quot;, 10 * 40000, &quot;per month&quot;)</code></pre><div class="output">A fits the window: True | B costs Rs 400000 per month</div></div>
+        <p><b>How it works:</b> A fits the 4-hour window at no extra cost (illustrative numbers); B only makes sense if the window shrinks or other jobs need the capacity.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--advanced">Advanced</span><h4>DRF on our lab</h4></div>
+      <p>Simulate DRF packing on our 3 nodes (2048 MB, 2 vcores) for an AM of 512 MB/1 vcore and 24 maps of 384 MB/1 vcore (rounded to 512). How many containers and how much memory are used?</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 nodes · 1 AM + 24 maps</pre></div><div><small>Expected output</small><pre>6 containers, 3072 MB</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>nodes = [[2048, 2] for _ in range(3)]
+placed = used = 0
+for mb in [512] + [512] * 24:
+    for n in nodes:
+        if n[0] &gt;= mb and n[1] &gt;= 1:
+            n[0] -= mb; n[1] -= 1; placed += 1; used += mb
+            break
+print(placed, &quot;containers,&quot;, used, &quot;MB&quot;)</code></pre><div class="output">6 containers, 3072 MB</div></div>
+        <p><b>How it works:</b> 6 containers, 3072 MB: exactly the lab's “running containers 6 | memory 3072 of 6144 MB”.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Memory and CPU sizing questions come up in every Hadoop and Spark platform interview, usually with a failure story attached.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">YARN · basics</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is the difference between container memory and heap memory?”</h4>
+      <p class="scn__situation">A standard opening question for YARN.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> the two limits and how they relate.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Container memory (mapreduce.map.memory.mb) is what YARN reserves on a node and can enforce.</li>
+          <li>Heap (-Xmx in mapreduce.map.java.opts) is the JVM\'s object space inside that container, about 80% of it.</li>
+          <li>Heap too small → OutOfMemoryError; heap plus off-heap too big → the NodeManager kills the container.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Operations · failures</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>Jobs fail with “Java heap space” after a data volume increase</h4>
+      <p class="scn__situation">Nothing changed in the code; input doubled after a new region was added.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> diagnosis before throwing memory at it.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Find which tasks fail (map or reduce) and why: a reducer with a hot key, or code that collects values into a list.</li>
+          <li>Fix the code if it buffers data; reduce split size or add reducers to spread load.</li>
+          <li>If memory is really needed, raise the container and the heap together, keeping the 80% ratio.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Capacity · design</span><span class="scn__tag scn__tag--level">Experienced</span></div>
+      <h4>Size YARN for a new 40-node cluster of 256 GB / 48-core machines</h4>
+      <p class="scn__situation">Each node also runs a DataNode and an HBase RegionServer with a 32 GB heap.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> reserves, steps and CPU.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Reserve OS (~8 GB), DataNode (~4 GB), NodeManager (~2 GB) and RegionServer (32 GB + overhead): about 200 GB for YARN.</li>
+          <li>Pick a minimum allocation (e.g. 2 GB) and standard container sizes that divide the pool; keep 2–4 cores for daemons.</li>
+          <li>Use the DominantResourceCalculator if CPU-heavy jobs share the cluster; enable cgroups for isolation.</li>
+        </ul>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">YARN · CPU</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“The ResourceManager UI shows more vcores used than the cluster has. Is it broken?”</h4>
+      <p class="scn__situation">A junior admin sees 12 vcores in use on a 6-vcore cluster.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> resource calculators.</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Not broken: the Capacity Scheduler\'s DefaultResourceCalculator places containers by memory only, so vcores are recorded but not limited.</li>
+          <li>Switch to the DominantResourceCalculator so CPU is respected; in our lab that cut 12 containers to 6.</li>
+          <li>For real CPU isolation, enable the LinuxContainerExecutor with cgroups.</li>
+        </ul>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hadoop syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hadoop.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

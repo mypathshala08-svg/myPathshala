@@ -1,0 +1,420 @@
+<!-- ======================= PART 1: THE STORY ======================= -->
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Job failed.” Now what?</h2>
+  <div class="story">
+    <p class="narration">Kabir reruns the revenue job from Lesson 8.1, this time on the messy order file from Lesson 8.3. Ten seconds later the terminal says <code>failed with state FAILED</code>. Ten map attempts failed, spread over two workers, and each one left its own log on the machine where it ran. Kabir starts opening terminals on every worker. Riya stops him: “YARN already collected all of it. You just have to know where to look.”</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 200" role="img" aria-label="Four places to look, from the vague client error to the exact bad input line.">
+        <g font-size="9">
+          <rect x="14" y="30" width="140" height="96" rx="8" class="s-board"/>
+          <text x="84" y="22" text-anchor="middle" font-weight="700" class="s-ink">1. client</text>
+          <text x="22" y="50" font-size="8" class="mono" style="fill:#F5C77E">failed with state</text>
+          <text x="22" y="64" font-size="8" class="mono" style="fill:#F5C77E">FAILED</text>
+          <text x="22" y="84" font-size="8" class="mono" style="fill:#9FD3B8">Failed map tasks=10</text>
+          <text x="84" y="142" text-anchor="middle" font-size="8.4" class="s-ink2">something broke</text>
+
+          <rect x="170" y="30" width="140" height="96" rx="8" class="s-card2"/>
+          <text x="240" y="22" text-anchor="middle" font-weight="700" class="s-ink">2. ResourceManager</text>
+          <text x="178" y="52" font-size="8" class="mono s-ink">Final-State: FAILED</text>
+          <text x="178" y="68" font-size="8" class="mono s-ink">failedMaps:1</text>
+          <text x="178" y="84" font-size="8" class="mono s-ink">task …_m_000001</text>
+          <text x="240" y="142" text-anchor="middle" font-size="8.4" class="s-ink2">which task</text>
+
+          <rect x="326" y="30" width="140" height="96" rx="8" class="s-soft-acc" style="stroke:var(--track)"/>
+          <text x="396" y="22" text-anchor="middle" font-weight="700" class="s-ink">3. task syslog</text>
+          <text x="334" y="52" font-size="8" class="mono s-acc">NumberFormatException</text>
+          <text x="334" y="68" font-size="8" class="mono s-acc">"abc"</text>
+          <text x="334" y="84" font-size="8" class="mono s-acc">ItemRevenue.java:27</text>
+          <text x="396" y="142" text-anchor="middle" font-size="8.4" class="s-ink2">what and where in code</text>
+
+          <rect x="482" y="30" width="144" height="96" rx="8" class="s-soft-green" style="stroke:var(--green)"/>
+          <text x="554" y="22" text-anchor="middle" font-weight="700" class="s-ink">4. the data</text>
+          <text x="490" y="52" font-size="8" class="mono s-green">line 1715:</text>
+          <text x="490" y="68" font-size="8" class="mono s-green">901714,chai,abc</text>
+          <text x="554" y="142" text-anchor="middle" font-size="8.4" class="s-ink2">which record</text>
+
+          <path d="M154 78h16M310 78h16M466 78h16" style="fill:none;stroke:var(--track);stroke-width:2"/>
+        </g>
+        <text x="320" y="174" text-anchor="middle" font-size="9.6" class="s-ink2">From a vague error to the exact bad line in four steps. All four come from our lab run.</text>
+        <text x="632" y="194" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+K> But the error is right there: NumberFormatException. Why do we need anything else?
+R> Because the client shows a summary. It doesn't tell you which line of code, which input record, or whether every attempt failed for the same reason. On a real cluster, one job can have thousands of containers on hundreds of machines.
+A> Exactly. Today we learn where YARN keeps every log, how to pull just the one you need with <code>yarn logs</code>, and a step-by-step way to go from “FAILED” to the bad record. Every output in this lesson comes from one real failed job on our lab cluster.
+  </div>
+</section>
+
+<!-- ======================= PART 2: DEFINITION ======================= -->
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Logs and debugging on YARN</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A YARN cluster produces two kinds of logs. <b>Daemon logs</b> are written by the long-running services (ResourceManager, NodeManager, NameNode, DataNode, JobHistory Server) into <code>$HADOOP_LOG_DIR</code>. <b>Container logs</b> (<code>stdout</code>, <code>stderr</code> and <code>syslog</code>) are written by each application container into the NodeManager's local log directories (<code>yarn.nodemanager.log-dirs</code>) while it runs. With <b>log aggregation</b> enabled (<code>yarn.log-aggregation-enable</code>), each NodeManager uploads the container logs of a finished application into one file per node under <code>yarn.nodemanager.remote-app-log-dir</code> in HDFS (default <code>/tmp/logs/&lt;user&gt;/…</code>) and deletes the local copies; they are kept for <code>yarn.log-aggregation.retain-seconds</code>. The <code>yarn logs</code> command and the web UIs of the ResourceManager (port 8088), NodeManagers (8042) and the MapReduce JobHistory Server (19888) read them. <b>Debugging</b> a failed application means moving from the client's summary to the application diagnostics, then to the failed task attempt's log, its exception and source line, and finally to the input that caused it.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Every container writes a diary on the machine where it ran. When the job ends, YARN collects all those diaries into HDFS, so you can read any of them from one terminal with <code>yarn logs</code>. Debugging is reading them in the right order.</p></div>
+  </div>
+
+  <h3>Words you'll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Daemon log</b><span>Log of a long-running service, e.g. the ResourceManager.</span></div>
+    <div class="term"><b>Container log</b><span><code>stdout</code>, <code>stderr</code>, <code>syslog</code> of one task or AM container.</span></div>
+    <div class="term"><b>Log aggregation</b><span>NodeManagers copy finished apps' container logs into HDFS.</span></div>
+    <div class="term"><b>syslog</b><span>The Hadoop framework's log inside a container (log4j), with stack traces.</span></div>
+    <div class="term"><b>Diagnostics</b><span>The short reason an app or attempt failed, stored by the RM.</span></div>
+    <div class="term"><b>Tracking URL</b><span>Link to the app's page: AM UI while running, JobHistory after.</span></div>
+    <div class="term"><b>Stack trace</b><span>The chain of method calls at the moment of an exception.</span></div>
+    <div class="term"><b>Log level</b><span>How chatty a logger is: ERROR, WARN, INFO, DEBUG, TRACE.</span></div>
+  </div>
+
+  <h3>From our lab (Hadoop 3.5.0, one failed job)</h3>
+  <table class="facts" style="table-layout:fixed;overflow-wrap:anywhere">
+    <tr><th>Client</th><td><code>Error: java.lang.NumberFormatException: For input string: "abc"</code>, Failed map tasks=10, job FAILED due to task <code>…_m_000001</code></td></tr>
+    <tr><th>ResourceManager</th><td>State FINISHED, Final-State FAILED, Diagnostics “Job failed as tasks failed. failedMaps:1 failedReduces:0”</td></tr>
+    <tr><th>Aggregated logs</th><td><code>/tmp/logs/hadoop/bucket-logs-tfile/0006/application_…_0006/</code>: one file per node, worker1 108,540 bytes, worker2 142,851 bytes</td></tr>
+    <tr><th>Failed attempt syslog</th><td><code>at ItemRevenue$OrderMapper.map(ItemRevenue.java:27)</code>, the <code>Integer.parseInt</code> line</td></tr>
+    <tr><th>Bad input</th><td>line 1,715 of <code>dirty_orders.csv</code>: <code>901714,chai,abc</code></td></tr>
+    <tr><th>Log level</th><td>map syslog 82 lines at INFO, 2,134 lines at DEBUG</td></tr>
+  </table>
+
+LEVELS> Logs at three levels
+L1> A hospital file
+      <ul>
+        <li>Every patient (container) gets notes written by the nurse on their ward (NodeManager). The hospital's own registers (daemon logs) are separate.</li>
+        <li>When the patient is discharged, the notes go to the central records room (HDFS). Anyone with permission can ask for them by patient number (<code>yarn logs -applicationId</code>).</li>
+        <li>A doctor reads the summary first (diagnostics), then the detailed notes of the bad night (the failed attempt's syslog).</li>
+      </ul>
+L2> The commands you'll use
+      <ul>
+        <li><code>yarn application -status &lt;app&gt;</code>: final state and diagnostics.</li>
+        <li><code>yarn logs -applicationId &lt;app&gt; -show_application_log_info</code>: which containers left logs, on which node.</li>
+        <li><code>yarn logs -applicationId &lt;app&gt; -containerId &lt;c&gt; -log_files syslog</code>: one container, one file.</li>
+        <li><code>yarn logs -applicationId &lt;app&gt; -am 1</code>: the ApplicationMaster's log (first attempt).</li>
+        <li><code>-D mapreduce.map.log.level=DEBUG</code>: more detail from map tasks, for one run only.</li>
+      </ul>
+L3> Operating logs on a big cluster
+      <ul>
+        <li>Aggregation creates one HDFS file per node per app: a busy cluster can add lakhs of files a day. Retention (<code>retain-seconds</code>) and the newer IndexedFile format keep this under control (Lesson 7.5's small files problem again).</li>
+        <li><code>yarn.nodemanager.delete.debug-delay-sec</code> (600 in our lab) keeps local container directories for a while after an app ends, so you can inspect files a task left behind.</li>
+        <li>Daemon logs rotate by size (log4j); ship them to a central system (ELK, Loki, Splunk) so you can search across machines and over time.</li>
+        <li>Change a running daemon's log level without a restart: <code>yarn daemonlog -setlevel host:8088 &lt;logger&gt; DEBUG</code>, and set it back afterwards.</li>
+      </ul>
+/LEVELS
+EXAM> For “How do you debug a failed MapReduce job on YARN?”, list the order: client error → <code>yarn application -status</code> diagnostics → <code>yarn logs</code> of the failed attempt's container (syslog/stderr) → exception and line number → find the input record → fix and add a guard (counter). Mention log aggregation to HDFS and the JobHistory UI on port 19888.
+</section>
+
+<!-- ======================= PART 3: TYPES AND WAYS TO USE IT ======================= -->
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Where every log lives</h2>
+
+  <h3 id="arch">Architecture at a glance</h3>
+  <p>The picture shows both kinds of logs and the path a container log takes after the job ends. Paths are the ones in our lab (Hadoop 3.5.0 Docker image).</p>
+  <div class="scene">
+    <svg viewBox="0 0 640 330" role="img" aria-label="Container logs go from the task JVM to the NodeManager's local userlogs directory, then are aggregated into HDFS under /tmp/logs, where yarn logs and the JobHistory UI read them. Daemon logs stay on each machine.">
+      <g font-size="9">
+        <!-- worker -->
+        <rect x="12" y="14" width="300" height="196" rx="10" class="s-card2"/>
+        <text x="24" y="32" font-weight="700" class="s-ink">worker1 (NodeManager + DataNode)</text>
+        <rect x="26" y="44" width="120" height="66" rx="6" class="s-soft-acc" style="stroke:var(--track)"/>
+        <text x="86" y="60" text-anchor="middle" font-weight="700" class="s-acc">task container</text>
+        <text x="86" y="76" text-anchor="middle" font-size="8" class="s-ink">YarnChild JVM</text>
+        <text x="86" y="90" text-anchor="middle" font-size="8" class="mono s-ink">System.out / err</text>
+        <text x="86" y="102" text-anchor="middle" font-size="8" class="mono s-ink">log4j</text>
+        <rect x="166" y="44" width="132" height="66" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/>
+        <text x="232" y="60" text-anchor="middle" font-weight="700" class="s-blue">local userlogs</text>
+        <text x="232" y="76" text-anchor="middle" font-size="7.6" class="mono s-ink">…/userlogs/application_…/</text>
+        <text x="232" y="88" text-anchor="middle" font-size="7.6" class="mono s-ink">container_…/stdout</text>
+        <text x="232" y="100" text-anchor="middle" font-size="7.6" class="mono s-ink">stderr · syslog</text>
+        <path d="M146 77h20" style="fill:none;stroke:var(--track);stroke-width:2"/>
+        <rect x="26" y="126" width="272" height="34" rx="6" class="s-board"/>
+        <text x="162" y="141" text-anchor="middle" font-size="8.2" class="s-chalk">daemon logs: NodeManager, DataNode</text>
+        <text x="162" y="153" text-anchor="middle" font-size="7.6" class="mono" style="fill:#9FD3B8">$HADOOP_LOG_DIR (docker logs in our lab)</text>
+        <text x="162" y="182" text-anchor="middle" font-size="8" class="s-ink2">while the app runs: read via NM UI :8042</text>
+        <text x="162" y="196" text-anchor="middle" font-size="8" class="s-ink2">kept debug-delay-sec (600 s) after it ends</text>
+
+        <!-- hdfs -->
+        <path d="M298 77C350 77 360 110 388 110" style="fill:none;stroke:var(--green);stroke-width:2.2;stroke-dasharray:5 3"/>
+        <text x="344" y="70" text-anchor="middle" font-size="8" class="s-green">app ends:</text>
+        <text x="344" y="82" text-anchor="middle" font-size="8" class="s-green">aggregate</text>
+        <rect x="388" y="70" width="240" height="100" rx="10" class="s-soft-green" style="stroke:var(--green)"/>
+        <text x="508" y="88" text-anchor="middle" font-weight="700" class="s-green">HDFS</text>
+        <text x="398" y="106" font-size="7.6" class="mono s-ink">/tmp/logs/hadoop/bucket-logs-tfile/</text>
+        <text x="398" y="120" font-size="7.6" class="mono s-ink">  0006/application_…_0006/</text>
+        <text x="398" y="134" font-size="7.6" class="mono s-ink">    worker1_36427  108,540 B</text>
+        <text x="398" y="148" font-size="7.6" class="mono s-ink">    worker2_40977  142,851 B</text>
+        <text x="508" y="164" text-anchor="middle" font-size="7.6" class="s-ink2">kept retain-seconds, then deleted</text>
+
+        <!-- readers -->
+        <rect x="388" y="196" width="112" height="44" rx="8" class="s-board"/>
+        <text x="444" y="214" text-anchor="middle" font-size="8.4" class="s-chalk">yarn logs</text>
+        <text x="444" y="228" text-anchor="middle" font-size="7.4" class="mono" style="fill:#9FD3B8">-containerId -am</text>
+        <rect x="516" y="196" width="112" height="44" rx="8" class="s-board"/>
+        <text x="572" y="214" text-anchor="middle" font-size="8.4" class="s-chalk">JobHistory :19888</text>
+        <text x="572" y="228" text-anchor="middle" font-size="7.4" class="mono" style="fill:#9FD3B8">tasks · counters</text>
+        <path d="M444 170v26M572 170v26" style="fill:none;stroke:var(--green);stroke-width:2"/>
+
+        <!-- RM -->
+        <rect x="12" y="232" width="300" height="64" rx="10" class="s-soft-blue" style="stroke:var(--blue)"/>
+        <text x="24" y="250" font-weight="700" class="s-blue">ResourceManager :8088</text>
+        <text x="24" y="266" font-size="8" class="s-ink">app state, final status, diagnostics,</text>
+        <text x="24" y="280" font-size="8" class="s-ink">tracking URL → JobHistory after the job</text>
+        <path d="M312 262C350 262 360 240 388 228" style="fill:none;stroke:var(--blue);stroke-width:1.6;stroke-dasharray:3 3"/>
+        <text x="508" y="268" text-anchor="middle" font-size="8.4" class="s-ink">you, from any edge node</text>
+        <path d="M444 240v14M572 240v14" style="fill:none;stroke:var(--track);stroke-width:1.6"/>
+      </g>
+      <text x="632" y="322" text-anchor="end" class="s-wm">myphatshala.in</text>
+    </svg>
+  </div>
+
+  <h3>The three files every container writes</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>File</th><th>Who writes it</th><th>What you find there</th><th>Read it with</th></tr></thead>
+    <tbody>
+      <tr><td><b>syslog</b></td><td>Hadoop's log4j inside the task</td><td>Framework messages, spills, merges, the exception and full stack trace</td><td><code>-log_files syslog</code></td></tr>
+      <tr><td><b>stderr</b></td><td>Your <code>System.err</code>, Python's errors in Streaming, JVM crash messages</td><td>Your own debug prints (Lesson 8.3's setup()/cleanup() lines), Python tracebacks (9.8)</td><td><code>-log_files stderr</code></td></tr>
+      <tr><td><b>stdout</b></td><td>Your <code>System.out</code></td><td>Usually empty in MapReduce; never write data here</td><td><code>-log_files stdout</code></td></tr>
+      <tr><td><b>prelaunch.err / launch_container.sh</b></td><td>The NodeManager</td><td>Why a container could not even start (bad JVM option, missing jar)</td><td><code>-log_files prelaunch.err</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Symptom → where to look (failures we met in this course)</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:700px">
+    <thead><tr><th>What you saw</th><th>Where it showed up</th><th>Cause</th><th>Lesson</th></tr></thead>
+    <tbody>
+      <tr><td><code>FileAlreadyExistsException</code></td><td>client, before submit</td><td>Output folder exists</td><td>8.6</td></tr>
+      <tr><td><code>InvalidResourceRequestException</code></td><td>client, at submit</td><td>Container bigger than the max allocation</td><td>11.2</td></tr>
+      <tr><td>Exit code 137</td><td>attempt diagnostics</td><td>Container killed (kill -9 or memory)</td><td>8.6</td></tr>
+      <tr><td><code>Error: Java heap space</code></td><td>attempt diagnostics, syslog</td><td>Task heap (-Xmx) too small for what it keeps</td><td>11.4</td></tr>
+      <tr><td><code>Illegal partition for chai (4)</code></td><td>map syslog</td><td>Partitioner returned a wrong number</td><td>9.2</td></tr>
+      <tr><td><code>NoSuchMethodException … &lt;init&gt;()</code></td><td>map syslog</td><td>Writable without a no-argument constructor</td><td>9.3</td></tr>
+      <tr><td><code>Too many counters: 121 max=120</code></td><td>attempt diagnostics</td><td>Dynamic counters per key</td><td>9.4</td></tr>
+      <tr><td><code>PipeMapRed … subprocess failed with code 1</code></td><td>map syslog; the real error in <b>stderr</b></td><td>The Python script crashed</td><td>9.8</td></tr>
+      <tr><td><code>ClassNotFoundException</code> (zstd)</td><td>attempt diagnostics</td><td>Jar on the client but not on the task classpath</td><td>10.2</td></tr>
+      <tr><td>“Queue configuration missing child queue names for root”</td><td>ResourceManager daemon log (it stopped)</td><td>Broken capacity-scheduler.xml</td><td>11.4</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Animated example: 2 AM, the payments report is late</h3>
+  <div class="anim anim--one" data-frames="6" data-delay="4800">
+    <div class="anim__title">On call at a payments company <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="An on-call engineer debugs a failed nightly settlement job step by step">
+          <rect x="8" y="8" width="344" height="26" rx="6" class="s-board"/>
+          <text x="16" y="25" font-size="8.6" class="mono" style="fill:#9FD3B8">nightly_settlement  ·  UPI transactions  ·  1.2 TB</text>
+          <g data-on="1"><rect x="8" y="44" width="344" height="92" rx="8" class="s-soft-acc" style="stroke:#D64545"/>
+            <text x="180" y="66" text-anchor="middle" font-size="9.4" font-weight="700" class="s-red">02:07 · alert: settlement job FAILED</text>
+            <text x="180" y="86" text-anchor="middle" font-size="8.6" class="s-ink">Banks need the file by 06:00.</text>
+            <text x="180" y="102" text-anchor="middle" font-size="8.6" class="s-ink">Meera, on call, opens the runbook.</text>
+            <text x="180" y="122" text-anchor="middle" font-size="8.2" class="s-ink2">Rule 1: don't just rerun. Find out why.</text></g>
+          <g data-on="2"><rect x="8" y="44" width="344" height="92" rx="8" class="s-card2"/>
+            <g font-size="8" class="mono s-ink"><text x="16" y="62">$ yarn application -status application_…_4411</text><text x="16" y="80">Final-State : FAILED</text><text x="16" y="96">Diagnostics : Task failed task_…_m_003127</text><text x="16" y="112">Job failed as tasks failed. failedMaps:1</text></g>
+            <text x="180" y="130" text-anchor="middle" font-size="8.2" class="s-ink2">02:10 · one map out of 9,600, failed 4 times</text></g>
+          <g data-on="3"><rect x="8" y="44" width="344" height="92" rx="8" class="s-card2"/>
+            <g font-size="8" class="mono s-ink"><text x="16" y="62">$ yarn logs -applicationId application_…_4411 \</text><text x="16" y="76">    -containerId container_…_003131 -log_files syslog</text><text x="16" y="96" class="s-acc">ArrayIndexOutOfBoundsException: Index 7</text><text x="16" y="112" class="s-acc">  at SettleMapper.map(SettleMapper.java:58)</text></g>
+            <text x="180" y="130" text-anchor="middle" font-size="8.2" class="s-ink2">02:16 · the code expects 8 fields</text></g>
+          <g data-on="4"><rect x="8" y="44" width="344" height="92" rx="8" class="s-card2"/>
+            <g font-size="8" class="mono s-ink"><text x="16" y="62">syslog: Processing split: hdfs://…/upi/</text><text x="16" y="76">  dt=2026-10-21/part-0412.csv:0+134217728</text><text x="16" y="96">$ hdfs dfs -cat …part-0412.csv | awk -F, 'NF!=8' | head -1</text><text x="16" y="112" class="s-red">T88812,PAYER,PAYEE,120.00,INR,OK,02:00:01</text></g>
+            <text x="180" y="130" text-anchor="middle" font-size="8.2" class="s-ink2">02:24 · a partner sent 7 fields: no fee column</text></g>
+          <g data-on="5"><rect x="8" y="44" width="344" height="92" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/>
+            <text x="180" y="66" text-anchor="middle" font-size="9" font-weight="700" class="s-blue">02:40 · fix with a guard, not a crash</text>
+            <g font-size="8" class="mono s-ink"><text x="22" y="86">if (f.length != 8) {</text><text x="22" y="100">  ctx.getCounter(Bad.WRONG_FIELDS).increment(1);</text><text x="22" y="114">  return; }</text></g>
+            <text x="180" y="130" text-anchor="middle" font-size="8.2" class="s-ink2">tested on that one file in local mode first</text></g>
+          <g data-on="6"><rect x="8" y="44" width="344" height="92" rx="8" class="s-soft-green" style="stroke:var(--green)"/>
+            <text x="180" y="66" text-anchor="middle" font-size="9.4" font-weight="700" class="s-green">04:55 · job SUCCEEDED, file sent</text>
+            <text x="180" y="86" text-anchor="middle" font-size="8.6" class="s-ink">WRONG_FIELDS = 31,204 rows, all from one partner</text>
+            <text x="180" y="102" text-anchor="middle" font-size="8.6" class="s-ink">Morning: partner fixes its export; alert added</text>
+            <text x="180" y="118" text-anchor="middle" font-size="8.6" class="s-ink">when WRONG_FIELDS &gt; 0.</text></g>
+          <g data-on="1-"><rect x="8" y="146" width="344" height="58" rx="8" class="s-card"/>
+            <text x="18" y="162" font-size="8" font-weight="700" class="s-ink">Meera's path</text></g>
+          <g data-on="1-" font-size="7.8"><text x="18" y="178" class="s-red">alert</text></g>
+          <g data-on="2-" font-size="7.8"><text x="52" y="178" class="s-ink">→ diagnostics</text></g>
+          <g data-on="3-" font-size="7.8"><text x="120" y="178" class="s-ink">→ attempt syslog</text></g>
+          <g data-on="4-" font-size="7.8"><text x="200" y="178" class="s-ink">→ split → bad row</text></g>
+          <g data-on="5-" font-size="7.8"><text x="18" y="194" class="s-blue">→ guard + counter</text></g>
+          <g data-on="6-" font-size="7.8"><text x="112" y="194" class="s-green">→ success, alert on counter</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li><b>02:07:</b> the nightly settlement job fails. The first rule of on-call: understand before you rerun.</li>
+          <li><b>02:10:</b> <code>yarn application -status</code> names the one map task (of 9,600) that failed all its attempts.</li>
+          <li><b>02:16:</b> <code>yarn logs</code> for that container shows the exception and the exact source line.</li>
+          <li><b>02:24:</b> the syslog names the split's file and offset; a quick <code>awk</code> finds a row with 7 fields instead of 8.</li>
+          <li><b>02:40:</b> the fix counts and skips bad rows instead of crashing, and is tested on that one file first.</li>
+          <li><b>04:55:</b> the job succeeds; the counter shows 31,204 bad rows from one partner, and an alert now watches it. (Illustrative scenario.)</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+TIP> The syslog of every map task names its input at the start: <code>Processing split: hdfs://…/file:start+length</code>. That turns “some record somewhere in 1.2 TB” into “a record in this 128 MB range of this file”.
+</section>
+
+<!-- ======================= PART 4: STEP BY STEP ======================= -->
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>From FAILED to the bad record, on our cluster</h2>
+  <p>We run the revenue job from Lesson 8.1 on the messy file from Lesson 8.3. <code>ItemRevenue</code> skips lines with the wrong number of fields, but it has no check for a bad amount. The whole session is <code>logs_lab.sh</code> in “Run it on your PC”.</p>
+  <ol class="stepper">
+    <li><h4>Read what the client says</h4>
+      <div class="code" data-lang="bash" data-file="namenode container"><pre><code>hadoop jar mr.jar ItemRevenue /user/hadoop/data/dirty_orders.csv /out/dbg</code></pre><div class="output">Error: java.lang.NumberFormatException: For input string: "abc"
+		Failed map tasks=10
+Job job_1792655556966_0006 failed with state FAILED due to: Task failed task_1792655556966_0006_m_000001
+Task Id : attempt_1792655556966_0006_m_000000_0, Status : FAILED
+Task Id : attempt_1792655556966_0006_m_000000_1, Status : FAILED
+Task Id : attempt_1792655556966_0006_m_000000_2, Status : FAILED</div></div>
+      <span class="behind">Each failed attempt is retried (up to 4 per task). Ten failed attempts and one task that used up all its tries ended the job. The client prints only the first line of each error.</span></li>
+    <li><h4>Ask the ResourceManager</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>yarn application -status application_1792655556966_0006</code></pre><div class="output">State : FINISHED
+Final-State : FAILED
+Tracking-URL : http://historyserver:19888/jobhistory/job/job_1792655556966_0006
+Diagnostics : Task failed task_1792655556966_0006_m_000001
+Job failed as tasks failed. failedMaps:1 failedReduces:0 killedMaps:0 killedReduces: 0</div></div>
+      <span class="behind">State FINISHED but Final-State FAILED: YARN ran the application to its end; the application itself reports failure. The tracking URL now points to the JobHistory Server.</span></li>
+    <li><h4>See which containers left logs</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>yarn logs -applicationId application_1792655556966_0006 -show_application_log_info
+hdfs dfs -ls -R /tmp/logs/hadoop | grep application_1792655556966_0006</code></pre><div class="output">Application State: Completed.
+Container: container_1792655556966_0006_01_000006 on worker1_36427
+Container: container_1792655556966_0006_01_000010 on worker1_36427
+Container: container_1792655556966_0006_01_000005 on worker2_40977
+…
+108540 /tmp/logs/hadoop/bucket-logs-tfile/0006/application_1792655556966_0006/worker1_36427
+142851 /tmp/logs/hadoop/bucket-logs-tfile/0006/application_1792655556966_0006/worker2_40977</div></div>
+      <span class="behind">Log aggregation packed all containers of this app from one node into one HDFS file. No need to log in to any worker.</span></li>
+    <li><h4>Read the failed attempt's syslog</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>yarn logs -applicationId application_1792655556966_0006 \
+  -containerId container_1792655556966_0006_01_000002 -log_files syslog</code></pre><div class="output">WARN [main] org.apache.hadoop.mapred.YarnChild: Exception running child : java.lang.NumberFormatException: For input string: "abc"
+	at java.base/java.lang.NumberFormatException.forInputString(NumberFormatException.java:67)
+	at ItemRevenue$OrderMapper.map(ItemRevenue.java:27)
+	at ItemRevenue$OrderMapper.map(ItemRevenue.java:18)</div></div>
+      <span class="behind">Read the stack trace from the top and stop at the first line that is <i>your</i> code: <code>ItemRevenue.java:27</code>, the <code>Integer.parseInt(f[2])</code> line.</span></li>
+    <li><h4>Find the record</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hdfs dfs -cat /user/hadoop/data/dirty_orders.csv | grep -n -m3 ",abc$"</code></pre><div class="output">1715:901714,chai,abc
+6142:906141,chai,abc
+6433:906432,chai,abc</div></div>
+      <span class="behind">The exception message gave the bad value, so a search finds it. In a huge file, use the split range from the syslog to search only that part.</span></li>
+    <li><h4>Check the ApplicationMaster's view</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>yarn logs -applicationId application_1792655556966_0006 -am 1 -log_files syslog | grep -E "Job failed|JOB_FAILED|diagnostics"</code></pre><div class="output">JobImpl: Job failed as tasks failed. failedMaps:1 failedReduces:0 killedMaps:0 killedRedu…
+JobHistoryEventHandler: In stop, writing event JOB_FAILED
+RMCommunicator: Setting job diagnostics to Task failed task_1792655556966_0006_m_000001</div></div>
+      <span class="behind">The AM decided the job had failed, wrote the JOB_FAILED event for the JobHistory Server and sent the diagnostics we saw in step 2. If the AM itself crashes, this is the log to read.</span></li>
+    <li><h4>Turn up the detail when you need it</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hadoop jar mr.jar ItemRevenue -D mapreduce.map.log.level=DEBUG /user/hadoop/data/canteen_orders.csv /out/lvl</code></pre><div class="output">map.log.level=INFO: map container syslog has 82 lines
+map.log.level=DEBUG: map container syslog has 2134 lines</div></div>
+      <span class="behind">26 times more lines from one small map task. DEBUG is useful for one run; left on for a production job, it fills disks and the HDFS log directory.</span></li>
+  </ol>
+WARN> Don't fix a data failure by raising <code>mapreduce.map.maxattempts</code> or rerunning: a bad record fails every attempt the same way. Fix the code (validate, count, skip) or the data.
+</section>
+
+<!-- ======================= PART 5: SEE IT HAPPEN ======================= -->
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Following the logs of one failed job</h2>
+  <p>Six steps through our lab's failed job: what you type, and where YARN gets the answer from.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">From FAILED to the bad line <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Commands and their output">
+          <rect x="14" y="14" width="332" height="206" rx="8" class="s-board"/>
+          <text x="26" y="32" font-size="9" class="mono" style="fill:#7F8C86">hadoop@namenode : /tmp/mr</text>
+          <g data-on="1"><text x="26" y="54" font-size="8" class="mono" style="fill:#7F8C86">$ hadoop jar mr.jar ItemRevenue dirty_orders.csv …</text><text x="26" y="72" font-size="8" class="mono" style="fill:#F5C77E">Task Id : attempt_…_m_000000_0, FAILED</text><text x="26" y="88" font-size="8" class="mono" style="fill:#F5C77E">Task Id : attempt_…_m_000000_1, FAILED</text><text x="26" y="104" font-size="8" class="mono" style="fill:#FF8A80">failed with state FAILED</text></g>
+          <g data-on="2"><text x="26" y="54" font-size="8" class="mono" style="fill:#7F8C86">$ yarn application -status application_…_0006</text><text x="26" y="72" font-size="8" class="mono" style="fill:#9FD3B8">State : FINISHED</text><text x="26" y="88" font-size="8" class="mono" style="fill:#FF8A80">Final-State : FAILED</text><text x="26" y="104" font-size="8" class="mono" style="fill:#F5C77E">failedMaps:1</text></g>
+          <g data-on="3"><text x="26" y="54" font-size="8" class="mono" style="fill:#7F8C86">$ yarn logs … -show_application_log_info</text><text x="26" y="72" font-size="8" class="mono" style="fill:#9FD3B8">Container: …_000006 on worker1_36427</text><text x="26" y="88" font-size="8" class="mono" style="fill:#9FD3B8">Container: …_000005 on worker2_40977</text><text x="26" y="104" font-size="8" class="mono" style="fill:#9FD3B8">…</text></g>
+          <g data-on="4"><text x="26" y="54" font-size="8" class="mono" style="fill:#7F8C86">$ yarn logs … -containerId …_000002 -log_files syslog</text><text x="26" y="72" font-size="8" class="mono" style="fill:#FF8A80">NumberFormatException: "abc"</text><text x="26" y="88" font-size="8" class="mono" style="fill:#F5C77E">at ItemRevenue$OrderMapper.map</text><text x="26" y="104" font-size="8" class="mono" style="fill:#F5C77E">   (ItemRevenue.java:27)</text></g>
+          <g data-on="5"><text x="26" y="54" font-size="8" class="mono" style="fill:#7F8C86">$ hdfs dfs -cat dirty_orders.csv | grep -n ",abc$"</text><text x="26" y="72" font-size="8" class="mono" style="fill:#FF8A80">1715:901714,chai,abc</text><text x="26" y="88" font-size="8" class="mono" style="fill:#FF8A80">6142:906141,chai,abc</text></g>
+          <g data-on="6"><text x="26" y="54" font-size="8" class="mono" style="fill:#7F8C86">fix: validate the amount, count and skip</text><text x="26" y="72" font-size="8" class="mono" style="fill:#9FD3B8">(CleanOrders, Lesson 8.3:</text><text x="26" y="88" font-size="8" class="mono" style="fill:#9FD3B8"> BAD_AMOUNT=107, job SUCCEEDED)</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The client shows failed attempts and the job's FAILED state.</li>
+          <li>The ResourceManager's record names the task that ran out of attempts.</li>
+          <li><code>yarn logs</code> lists every container that left logs, per node.</li>
+          <li>The failed attempt's syslog has the exception and the line of our code.</li>
+          <li>The bad value from the message leads straight to the input lines.</li>
+          <li>The fix is in the code: Lesson 8.3's CleanOrders counted 107 bad amounts and finished.</li>
+        </ol>
+      </div>
+
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Where each answer comes from">
+          <g font-size="8">
+            <rect x="12" y="16" width="100" height="36" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="62" y="38" text-anchor="middle" font-weight="700" class="s-acc">client</text>
+            <rect x="130" y="16" width="100" height="36" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180" y="38" text-anchor="middle" font-weight="700" class="s-blue">ResourceManager</text>
+            <rect x="248" y="16" width="100" height="36" rx="6" class="s-board"/><text x="298" y="38" text-anchor="middle" font-weight="700" class="s-chalk">MRAppMaster</text>
+            <rect x="12" y="96" width="160" height="56" rx="6" class="s-card2"/><text x="92" y="112" text-anchor="middle" font-weight="700" class="s-ink">worker1 / worker2</text><text x="92" y="128" text-anchor="middle" class="s-ink2">task containers</text><text x="92" y="142" text-anchor="middle" class="mono s-ink2">userlogs/…/syslog</text>
+            <rect x="188" y="96" width="160" height="56" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="268" y="112" text-anchor="middle" font-weight="700" class="s-green">HDFS</text><text x="268" y="128" text-anchor="middle" class="mono s-ink2">/tmp/logs/hadoop/…</text><text x="268" y="142" text-anchor="middle" class="mono s-ink2">/user/hadoop/data/…</text>
+          </g>
+          <g data-on="1"><path d="M298 52C298 76 120 70 72 96" style="fill:none;stroke:#D64545;stroke-width:1.6;stroke-dasharray:3 3"/><text x="180" y="196" text-anchor="middle" font-size="8.6" class="s-ink">attempts fail in containers; the AM retries them</text><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink">and reports each failure to the client</text></g>
+          <g data-on="2"><path d="M112 34h18" style="fill:none;stroke:var(--blue);stroke-width:2"/><text x="180" y="196" text-anchor="middle" font-size="8.6" class="s-ink">the RM stores final status and diagnostics</text><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink">sent by the AM when it unregistered</text></g>
+          <g data-on="3"><path d="M172 124h16" style="fill:none;stroke:var(--green);stroke-width:2.4"/><text x="180" y="196" text-anchor="middle" font-size="8.6" class="s-ink">NodeManagers uploaded each node's container</text><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink">logs to HDFS when the app finished</text></g>
+          <g data-on="4"><rect x="188" y="96" width="160" height="56" rx="6" style="fill:none;stroke:var(--track);stroke-width:2.4"/><path d="M62 52C62 74 230 70 250 96" style="fill:none;stroke:var(--track);stroke-width:1.6"/><text x="180" y="196" text-anchor="middle" font-size="8.6" class="s-ink">yarn logs reads one container's syslog</text><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink">out of the aggregated file</text></g>
+          <g data-on="5"><path d="M62 52C62 80 280 76 300 96" style="fill:none;stroke:#D64545;stroke-width:1.6"/><text x="180" y="196" text-anchor="middle" font-size="8.6" class="s-ink">the data itself is in HDFS too:</text><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink">search it for the bad value</text></g>
+          <g data-on="6"><rect x="12" y="166" width="336" height="20" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="180" y="180" text-anchor="middle" font-size="8.4" class="s-green">client → RM → container log → code line → data → fix</text><text x="180" y="210" text-anchor="middle" font-size="8.6" class="s-ink">the order to follow every time</text></g>
+          <text x="352" y="246" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The failing code runs in task containers on the workers; the MRAppMaster retries each attempt and tells the client.</li>
+          <li>When the AM gives up, it unregisters from the ResourceManager with a final status and diagnostics.</li>
+          <li>Each NodeManager aggregates the app's container logs into one HDFS file per node.</li>
+          <li><code>yarn logs</code> reads just the container and file you ask for from those HDFS files.</li>
+          <li>The input file lives in HDFS as well, so the bad value can be searched from the same terminal.</li>
+          <li>Always the same order: client, ResourceManager, container log, code line, data, fix.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PART 6: REAL-WORLD USE ======================= -->
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Logs at work</h2>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="22" width="84" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="8.6" class="s-acc">02:07 FAILED</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">runbook</text></svg></div>
+    <div><h4>1. Bank and payments on-call</h4>
+      <p>Settlement and reconciliation jobs run overnight with hard deadlines. Runbooks list the exact <code>yarn logs</code> commands, and every data guard writes a counter that an alert watches.</p>
+      <div class="uc-flow"><span>Alert</span><i>→</i><span class="java">diagnostics → container log</span><i>→</i><span>Fix before 06:00</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="20" width="88" height="50" rx="6" class="s-card2"/><text x="60" y="40" text-anchor="middle" font-size="8.4" class="s-ink">Kibana / Loki</text><text x="60" y="56" text-anchor="middle" font-size="8" class="s-blue">search all nodes</text></svg></div>
+    <div><h4>2. E-commerce platform teams</h4>
+      <p>During a sale, hundreds of jobs run per hour. Daemon logs from every node are shipped to a central search system, so “which NodeManager went unhealthy at 21:04?” takes seconds.</p>
+      <div class="uc-flow"><span>Daemon logs</span><i>→</i><span class="java">log shipper</span><i>→</i><span>Central search</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><path d="M20 66l18-20 16 10 20-26 26 14" style="fill:none;stroke:var(--green);stroke-width:2.5"/><text x="60" y="80" text-anchor="middle" font-size="8" class="s-ink">HDFS /tmp/logs</text></svg></div>
+    <div><h4>3. Telecom cluster administrators</h4>
+      <p>Thousands of jobs a day mean lakhs of aggregated log files. Admins tune retention and use the indexed log format so the log directory doesn't become a small-files problem (Lesson 7.5).</p>
+      <div class="uc-flow"><span>Aggregated logs</span><i>→</i><span class="java">retain-seconds, IFile</span><i>→</i><span>Healthy NameNode</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="22" y="22" width="76" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="8.4" class="s-blue">counters</text><text x="60" y="58" text-anchor="middle" font-size="8" class="s-ink">BAD_ROWS 0.2%</text></svg></div>
+    <div><h4>4. Healthcare and insurance data feeds</h4>
+      <p>Hospital and claims files arrive from many partners in slightly different formats. Jobs log the file and offset of every rejected record and keep counts, so partners get exact error reports.</p>
+      <div class="uc-flow"><span>Partner files</span><i>→</i><span class="java">validate + log + count</span><i>→</i><span>Error report</span></div></div>
+  </div>
+
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="18" y="24" width="38" height="42" rx="6" class="s-board"/><text x="37" y="49" text-anchor="middle" font-size="8.4" class="s-chalk">:8088</text><rect x="64" y="24" width="38" height="42" rx="6" class="s-board"/><text x="83" y="49" text-anchor="middle" font-size="8.4" class="s-chalk">:19888</text></svg></div>
+    <div><h4>5. Data science teams on shared clusters</h4>
+      <p>Analysts running Hive, Spark and MapReduce jobs use the ResourceManager and history UIs (Spark has its own History Server) to see why their job is slow or killed, without asking the admin for shell access.</p>
+      <div class="uc-flow"><span>Slow job</span><i>→</i><span class="java">RM UI → attempt → logs</span><i>→</i><span>Self-service fix</span></div></div>
+  </div>
+  <p class="muted">Simplified; organisations differ in tools and policies. Scenario details are illustrative.</p>
+</section>
