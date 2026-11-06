@@ -1,0 +1,1079 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adaptive Query Execution | MyPhatshala</title>
+<meta name="description" content="Adaptive Query Execution measured with PySpark 4.3.0 on 5M orders: AQE off vs on for a groupBy (204 tasks, 1.74 s vs 5 tasks, 0.62 s) with AQEShuffleRead coalesced, a sort-merge join switched to a broadcast join at run time (0.89 s vs 0.05 s), and a join on a key holding 60% of rows (3.67 s off, 2.57 s with coalescing, 1.92 s with skew-join splitting and SortMergeJoin(skew=true)), plus the settings and thresholds that control it.">
+<meta name="mp:minutes" content="28">
+<link rel="canonical" href="https://myphatshala.in/courses/spark-pyspark/07-spark-sql/04-adaptive-query-execution/">
+<meta property="og:title" content="Adaptive Query Execution · MyPhatshala">
+<meta property="og:description" content="AQE cut a groupBy from 204 tasks to 5 and split a 60% hot key: three runtime optimizations in Spark, measured off vs on.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Adaptive Query Execution", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Spark and PySpark", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="07-spark-sql/04-adaptive-query-execution" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Spark and PySpark syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Spark and PySpark</a><span>›</span><b>Lesson 7.4</b></nav>
+    <h1>Adaptive Query Execution</h1>
+    <p class="lead">Catalyst plans with estimates; <b>Adaptive Query Execution</b> corrects the plan while the query runs, using real sizes. This lesson turns AQE off and on to measure partition coalescing, runtime join switching and skew-join handling, and shows how to read the final plan. <b>All outputs are real</b> (PySpark 4.3.0).</p>
+    <div class="lesson-meta"><span>Module 7 · Spark SQL</span><span>⏱ 28 min</span><span>Intermediate → Advanced</span><span>PySpark 4.3.0</span><span>AQE off vs on</span><span>Skew split shown</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“We tuned shuffle partitions for every job”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> shuffles in <a href="../../02-rdds/04-narrow-vs-wide-and-the-shuffle/">2.4</a>, join strategies in <a href="../../06-transformations/02-joins/">6.2</a>, plans in <a href="../03-catalyst-and-explain/">7.3</a>.</p></div>
+  <div class="story">
+    <p class="narration">Before Spark 3, TiffinGo’s platform team kept a spreadsheet of <code>spark.sql.shuffle.partitions</code> values per job: 200 was too many for small days and too few for festival days. One restaurant chain with most of the orders made a join run for an hour on a single task.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Adaptive Query Execution re-optimises a query while it runs, using real sizes measured after each shuffle. We ran the same queries with AQE off and on: shuffle partitions were merged, a join became a broadcast, and a skewed partition was split.">
+        <text x="14" y="34" font-size="7.2" font-weight="700" class="s-ink2">200 tiny partitions</text><rect x="14" y="96" width="12" height="4" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="30" y="97" width="12" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="46" y="95" width="12" height="5" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="62" y="98" width="12" height="2" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="78" y="96" width="12" height="4" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="94" y="97" width="12" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="110" y="98" width="12" height="2" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="126" y="95" width="12" height="5" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="142" y="97" width="12" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="158" y="96" width="12" height="4" rx="2" class="s-card2" style="stroke:var(--line)"/><path d="M180 70L210 70" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M203.7 73.0L210 70L203.7 67.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><text x="220" y="34" font-size="7.2" font-weight="700" class="s-ink2">AQE: 5</text><rect x="220" y="70" width="12" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="236" y="72" width="12" height="28" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="252" y="68" width="12" height="32" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="268" y="74" width="12" height="26" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="284" y="70" width="12" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="400" y="12" width="232" height="132" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="516" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured</text><text x="412" y="52" font-size="7.2" class="s-green mono">groupBy: 204 tasks → 5 tasks</text><text x="412" y="68" font-size="7.2" class="s-green mono">…1.74 s → 0.62 s</text><text x="412" y="84" font-size="7.2" class="s-green mono">SMJ → broadcast at run time</text><text x="412" y="100" font-size="7.2" class="s-green mono">…0.89 s → 0.05 s</text><text x="412" y="116" font-size="7.2" class="s-red mono">60% skewed key: 3.67 s (off)</text><text x="412" y="132" font-size="7.2" class="s-green mono">skew join split: 1.92 s</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">AQE fixes plans with <tspan font-weight="700" class="s-acc">real numbers</tspan>, not estimates.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, why can’t Spark choose the right number of partitions itself?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Before running, it can only estimate. <b>Adaptive Query Execution</b> waits until each shuffle has finished, looks at the real sizes, and re-plans the rest: it merges small partitions, switches joins to broadcast when a side turns out small, and splits skewed partitions.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Is it on by default?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Since Spark 3.2. Today we switch it off and on and measure all three features, and learn to read the final plan. All outputs are real (PySpark 4.3.0).</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Adaptive Query Execution</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Adaptive Query Execution (AQE)</b> re-optimises a query at run time using statistics collected from completed <b>query stages</b>, which are delimited by shuffles and broadcasts. After each stage materialises, Spark re-plans the remaining query with the actual output sizes. Its main optimisations are <b>coalescing post-shuffle partitions</b> into fewer partitions close to an advisory size, <b>switching join strategies</b> (sort-merge to broadcast hash join, or to shuffled hash join) when a side is found to be small, and <b>optimising skew joins</b> by splitting oversized partitions and replicating the matching partition of the other side. AQE is enabled by default since Spark 3.2 (<code>spark.sql.adaptive.enabled</code>).</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>AQE lets Spark change its plan while the query runs. After each shuffle it knows the real data sizes, so it can merge tiny partitions, use a broadcast join when a table turns out small, and split a partition that is much bigger than the rest.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Query stage</b><span>Part of a plan between shuffles/broadcasts.</span></div>
+    <div class="term"><b>Runtime statistics</b><span>Real sizes of shuffle outputs.</span></div>
+    <div class="term"><b>Coalescing</b><span>Merging small shuffle partitions.</span></div>
+    <div class="term"><b>Advisory partition size</b><span>Target size after coalescing (64 MB).</span></div>
+    <div class="term"><b>Join switching</b><span>SMJ → broadcast at run time.</span></div>
+    <div class="term"><b>Skew join</b><span>Split big partitions, replicate the other side.</span></div>
+    <div class="term"><b>AQEShuffleRead</b><span>Plan node reading coalesced/split partitions.</span></div>
+    <div class="term"><b>isFinalPlan</b><span>true once the query has run.</span></div>
+  </div>
+
+  <h3>The three main optimisations</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th>Feature</th><th>Problem it fixes</th><th>Lab (AQE off → on)</th></tr></thead>
+    <tbody><tr><td>Coalesce partitions</td><td>200 tiny tasks after a shuffle</td><td>204 → 5 tasks, 1.74 → 0.62 s</td></tr><tr><td>Switch to broadcast</td><td>Wrong size estimate before running</td><td>SMJ → BHJ, 0.89 → 0.05 s</td></tr><tr><td>Skew join</td><td>One huge partition holds a hot key</td><td>3.67 → 1.92 s, plan SortMergeJoin(skew=true)</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">AQE at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Packing parcels</h4>
+      <ul>
+        <li>You booked 200 trucks before knowing the parcels. When they turn out to be few, you send 5 full trucks instead (coalescing).</li>
+        <li>A parcel you expected to be heavy is light: hand-carry it instead of booking a truck (switch to broadcast).</li>
+        <li>One giant parcel: split it across several trucks (skew join).</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The API</h4>
+      <ul>
+        <li><code>spark.sql.adaptive.enabled</code> (true), <code>…coalescePartitions.enabled</code>, <code>…advisoryPartitionSizeInBytes</code> (64 MB).</li>
+        <li><code>spark.sql.adaptive.autoBroadcastJoinThreshold</code> (defaults to the normal threshold), <code>…skewJoin.enabled</code>, <code>…skewedPartitionFactor</code> (5), <code>…skewedPartitionThresholdInBytes</code> (256 MB).</li>
+        <li>Plans show <code>AdaptiveSparkPlan isFinalPlan=…</code>, <code>AQEShuffleRead coalesced</code>, <code>SortMergeJoin(skew=true)</code>.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>groupBy city: AQE off ran 204 tasks, on ran 5; 1.74 s → 0.62 s.</li>
+        <li>With static broadcast disabled, AQE still turned the join into a broadcast at run time: 0.89 s → 0.05 s.</li>
+        <li>A key with 60% of rows: 3.67 s without AQE, 2.57 s with coalescing only, 1.92 s with skew-join splitting.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “What does AQE do?” It re-optimises queries at run time using statistics from completed shuffle stages: it coalesces small shuffle partitions, converts sort-merge joins to broadcast joins when a side is small, and splits skewed partitions in joins. It is on by default since Spark 3.2; it reduces the need to hand-tune shuffle partitions but cannot fix every skew or bad data layout.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Settings worth knowing</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Setting</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody><tr><td><code>spark.sql.adaptive.enabled</code></td><td>true</td><td>Master switch</td></tr><tr><td><code>…coalescePartitions.enabled</code></td><td>true</td><td>Merge small partitions</td></tr><tr><td><code>…advisoryPartitionSizeInBytes</code></td><td>64 MB</td><td>Target size for coalescing and skew splits</td></tr><tr><td><code>…autoBroadcastJoinThreshold</code></td><td>same as static</td><td>Runtime broadcast limit (can differ from the static one)</td></tr><tr><td><code>…skewJoin.skewedPartitionFactor</code></td><td>5</td><td>Skewed if > factor × median …</td></tr><tr><td><code>…skewJoin.skewedPartitionThresholdInBytes</code></td><td>256 MB</td><td>… and larger than this</td></tr><tr><td><code>spark.sql.shuffle.partitions</code></td><td>200</td><td>Starting point before coalescing; set high enough</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>AQE’s skew handling only kicks in when a partition is both <b>5× the median</b> and over <b>256 MB</b> by default, and only for joins (sort-merge and shuffled hash), not for aggregations. Our small lab had to lower the thresholds to see it. On real clusters check the final plan for <code>skew=true</code>; if a hot key still dominates, salt it (Lesson 8.3).</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>AQE off and on</h2>
+  <p>All outputs are real: PySpark 4.3.0, local mode with 4 cores, 5,000,000 orders, default 200 shuffle partitions. Tasks and stages are counted from the Spark REST API; each timing is a warm run.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Coalescing shuffle partitions</h4>
+      <div class="code" data-lang="python" data-file="l74_aqe.py"><pre><code>for aqe in (&quot;false&quot;, &quot;true&quot;):
+    spark.conf.set(&quot;spark.sql.adaptive.enabled&quot;, aqe)
+    o.groupBy(&quot;city&quot;).agg(F.sum(&quot;amount&quot;)).collect()
+# then the final plan after running</code></pre><div class="output">== 1) coalescing shuffle partitions
+groupBy city, AQE false           :  2.00 s, stages 2, tasks 204
+groupBy city, AQE true            :  0.61 s, stages 2, tasks 5
+[&#x27;AdaptiveSparkPlan isFinalPlan=true&#x27;, &#x27;+- AQEShuffleRead coalesced&#x27;]</div></div>
+      <span class="behind">Without AQE the reduce stage ran all <b>200</b> tasks (plus 4 map tasks) for just 8 cities, most of them empty. With AQE, after the map stage Spark saw a few kilobytes of shuffle data and read it with <b>one</b> task: 5 tasks in total, about 3x faster. The final plan shows <code>isFinalPlan=true</code> and <code>AQEShuffleRead coalesced</code>.</span></li>
+    <li><h4>Step 2 · A join switched at run time</h4>
+      <div class="code" data-lang="python" data-file="l74_aqe.py"><pre><code>spark.conf.set(&quot;spark.sql.autoBroadcastJoinThreshold&quot;, -1)             # static planner: no broadcast
+spark.conf.set(&quot;spark.sql.adaptive.autoBroadcastJoinThreshold&quot;, &quot;10485760&quot;)
+j = o.join(c.where(&quot;plan = &#x27;Gold&#x27; AND state = &#x27;KA&#x27;&quot;), &quot;customer_id&quot;).groupBy(&quot;plan&quot;).count()</code></pre><div class="output">== 2) switching to a broadcast join at runtime
+AQE false: [&#x27;SortMergeJoin&#x27;], 0.97 s
+AQE true : [&#x27;BroadcastHashJoin&#x27;, &#x27;SortMergeJoin&#x27;], 0.06 s</div></div>
+      <span class="behind">The static planner was not allowed to broadcast, so both runs <b>started</b> as a sort-merge join. Without AQE it stayed that way: 0.89 s. With AQE, once the filtered customer side had been materialised and turned out tiny, Spark replaced the join with a <b>broadcast hash join</b> (the final plan contains both: initial and final): 0.05 s.</span></li>
+    <li><h4>Step 3 · A skewed join</h4>
+      <div class="code" data-lang="python" data-file="l74_aqe.py"><pre><code>skew = o.withColumn(&quot;rest_id&quot;, F.when(F.rand(7) &lt; 0.6, F.lit(1))
+                     .otherwise((F.rand(8) * 2000).cast(&quot;int&quot;) + 2).cast(&quot;long&quot;))
+rests = spark.range(1, 2002).withColumnRenamed(&quot;id&quot;, &quot;rest_id&quot;)…
+# small lab: thresholds lowered to 8 MB, factor 3; broadcast disabled
+skew.join(rests, &quot;rest_id&quot;).agg(F.sum(&quot;amount&quot;)).collect()</code></pre><div class="output">== 3) a skewed join
+top key share: 0.599838
+AQE off                           :  3.67 s, stages 4, tasks 209
+AQE on, skewJoin off              :  2.57 s, stages 4, tasks 15
+AQE on, skewJoin on               :  1.92 s, stages 4, tasks 18
+[&#x27;+- *(5) SortMergeJoin(skew=true) [rest_id], [rest_id], Inner&#x27;, &#x27;:  +- AQEShuffleRead coalesced and skewed&#x27;]</div></div>
+      <span class="behind">Restaurant 1 got <b>60%</b> of all orders, so one join partition held 3 million rows. Without AQE: 3.67 s. AQE with coalescing alone already helped (2.57 s), but the hot partition remained one task. With skew-join handling the final plan shows <code>SortMergeJoin(skew=true)</code> and <code>AQEShuffleRead coalesced and skewed</code>: the big partition was split into several tasks, each joined with a copy of restaurant 1: <b>1.92 s</b>.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Re-planning with real sizes</h2>
+  <p>Left: real outputs. Right: what AQE changes.</p>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">Re-planning with real sizes <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">AQE false: 204 tasks, 1.74 s</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">AQE true : 5 tasks, 0.62 s</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">AQEShuffleRead coalesced</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">AQE false: SortMergeJoin, 0.89 s</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">AQE true : BroadcastHashJoin, 0.05 s</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">top key share: 0.60</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">off 3.67 s | coalesce 2.57 s</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">skew join 1.92 s, skew=true</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">AdaptiveSparkPlan isFinalPlan=true</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">== Final Plan ==</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>204 tasks became 5.</li>
+          <li>Sort-merge became broadcast.</li>
+          <li>Skewed partition split.</li>
+          <li>The final plan.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What AQE changes">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Merge tiny partitions</text><text x="14" y="44" font-size="7.2" font-weight="700" class="s-ink2">200 planned</text><rect x="14" y="106" width="12" height="4" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="30" y="107" width="12" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="46" y="105" width="12" height="5" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="62" y="108" width="12" height="2" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="78" y="106" width="12" height="4" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="94" y="107" width="12" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="110" y="108" width="12" height="2" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="126" y="105" width="12" height="5" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="142" y="107" width="12" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="158" y="106" width="12" height="4" rx="2" class="s-card2" style="stroke:var(--line)"/><path d="M180 80L210 80" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M203.7 83.0L210 80L203.7 77.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><text x="240" y="44" font-size="7.2" font-weight="700" class="s-ink2">read as 1</text><rect x="240" y="70" width="12" height="40" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">After the map stage, sizes are known.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Switch the join</text><rect x="20" y="40" width="120" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="80.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">SortMergeJoin</text><text x="80.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">planned</text><path d="M140 55L210 55" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M203.7 58.0L210 55L203.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="214" y="40" width="130" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="279.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">BroadcastHashJoin</text><text x="279.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">at run time</text><text x="180" y="100" text-anchor="middle" font-size="7.4" class="s-ink2">filtered side measured: tiny</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Estimates replaced by real sizes.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Split the hot partition</text><text x="14" y="44" font-size="7.2" font-weight="700" class="s-ink2">before</text><rect x="14" y="106" width="12" height="4" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="30" y="50" width="12" height="60" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><rect x="46" y="105" width="12" height="5" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="62" y="106" width="12" height="4" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="78" y="107" width="12" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="94" y="105" width="12" height="5" rx="2" class="s-card2" style="stroke:var(--line)"/><path d="M120 80L160 80" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M153.7 83.0L160 80L153.7 77.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><text x="170" y="44" font-size="7.2" font-weight="700" class="s-ink2">after: 1 → 4 tasks</text><rect x="170" y="106" width="12" height="4" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="186" y="95" width="12" height="15" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="202" y="95" width="12" height="15" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="218" y="95" width="12" height="15" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="234" y="95" width="12" height="15" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="250" y="105" width="12" height="5" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="266" y="106" width="12" height="4" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="282" y="107" width="12" height="3" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="298" y="105" width="12" height="5" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Other side replicated per split.</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Stages, then re-plan</text><rect x="8" y="50" width="72" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="44.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">stage 1</text><text x="44.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">run</text><rect x="94" y="50" width="72" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="130.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">stats</text><text x="130.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">real sizes</text><path d="M80 65.0L94 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M87.7 68.0L94 65.0L87.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="180" y="50" width="72" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="216.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">re-plan</text><text x="216.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">rest</text><path d="M166 65.0L180 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M173.7 68.0L180 65.0L173.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="266" y="50" width="72" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="302.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">stage 2</text><text x="302.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">run</text><path d="M252 65.0L266 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M259.7 68.0L266 65.0L259.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Read the final plan after running.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Coalescing to an advisory size.</li>
+          <li>Runtime join switching.</li>
+          <li>Skew-join optimization.</li>
+          <li>Query stages and re-optimization.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: retiring manual partition tuning, an estimate 1,000x too big, and a hot key.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-coalesce">Retiring the partition spreadsheet</h3>
+  <p class="anim-intro">Partition coalescing. (Typical; numbers from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Coalescing <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Set shuffle partitions generously and let AQE coalesce them to an advisory size">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Spreadsheet of partition counts</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">one value per job and season</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Always out of date.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Small day: 200 empty tasks</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">festival day: huge tasks</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No single right number.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">AQE coalescing</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">set partitions generously, let AQE merge</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">204 → 5 tasks in our lab.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Tune the advisory size</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">advisoryPartitionSizeInBytes</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One knob per platform.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Delete the spreadsheet</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">check final plans in the UI</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Less manual tuning.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Manual.</li>
+          <li>Wrong both ways.</li>
+          <li>Coalesce.</li>
+          <li>One knob.</li>
+          <li>Done.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-switch">An estimate that was 1,000x too big</h3>
+  <p class="anim-intro">Runtime join switching. (Typical; timings from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Join switching <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="AQE replaces sort-merge joins with broadcast joins when a side is measured small at run time">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Join with a filtered dimension</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">dim 5 GB, filter keeps 0.1%</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Estimate says big.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Static plan: sort-merge</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">both sides shuffled</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Slow.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">AQE measures the filtered side</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">5 MB after the filter</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Below the threshold.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Switch to broadcast</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">big side no longer shuffled</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">0.89 → 0.05 s in our lab.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Check the final plan</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">Spark UI SQL tab</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Not the initial explain().</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Filtered dim.</li>
+          <li>SMJ.</li>
+          <li>Measured.</li>
+          <li>Broadcast.</li>
+          <li>Final plan.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-skew">One restaurant chain, one slow task</h3>
+  <p class="anim-intro">Skew joins with AQE. (Typical; behaviour from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Skew join <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="AQE splits skewed join partitions above its thresholds; check skew=true and fall back to salting">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One chain has 60% of orders</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">join on restaurant_id</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One task runs for an hour.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">AQE skew join</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">splits the big partition</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">If > 5x median and > 256 MB.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Final plan: skew=true</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">AQEShuffleRead … skewed</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Our Step 3.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Not for aggregations</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">groupBy on the hot key still skewed</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Partial agg helps sums.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Salting as a fallback</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">Lesson 8.3</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">When AQE is not enough.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Hot key.</li>
+          <li>Split.</li>
+          <li>Verify.</li>
+          <li>Limits.</li>
+          <li>Salting.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>AQE at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">varied</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">volumes</text></svg></div>
+    <div><h4>1. Jobs with changing volumes</h4>
+      <p>Daily jobs whose input varies 10x between normal and festival days run well without per-day tuning.</p>
+      <div class="uc-flow"><span>Any day</span><i>→</i><span class="java">AQE coalesce</span><i>→</i><span>Right task count</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-green">BI</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">ad hoc</text></svg></div>
+    <div><h4>2. Ad-hoc SQL</h4>
+      <p>Analyst queries with unpredictable filters get broadcast joins chosen from real sizes.</p>
+      <div class="uc-flow"><span>Ad-hoc query</span><i>→</i><span class="java">runtime switch</span><i>→</i><span>Fast join</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-violet">skew</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">joins</text></svg></div>
+    <div><h4>3. Marketplace data</h4>
+      <p>Big sellers or restaurants create hot keys; AQE splits their join partitions.</p>
+      <div class="uc-flow"><span>Hot key</span><i>→</i><span class="java">skew join</span><i>→</i><span>Balanced tasks</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">files</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">fewer</text></svg></div>
+    <div><h4>4. Fewer output files</h4>
+      <p>Coalesced shuffle partitions also mean fewer, larger output files.</p>
+      <div class="uc-flow"><span>Shuffle</span><i>→</i><span class="java">coalesce</span><i>→</i><span>Fewer files</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">UI</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">final plan</text></svg></div>
+    <div><h4>5. Performance reviews</h4>
+      <p>Engineers read final plans in the Spark UI to see which AQE rules fired.</p>
+      <div class="uc-flow"><span>Spark UI</span><i>→</i><span class="java">final plan</span><i>→</i><span>Insight</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: coalescing partitions</h2>
+  <p>A simplified model of Step 1. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># How AQE coalesces shuffle partitions (simplified)
+sizes_kb = [2, 0, 1, 3, 0, 0, 2, 1] * 25           # 200 tiny partitions after a shuffle
+target_kb = 64 * 1024                              # advisoryPartitionSizeInBytes = 64 MB
+
+groups, current = [], 0
+for s in sizes_kb:
+    if current + s &gt; target_kb and current:
+        groups.append(current); current = 0
+    current += s
+groups.append(current)
+print(&quot;planned partitions:&quot;, len(sizes_kb))
+print(&quot;after coalescing  :&quot;, len(groups), &quot;partition(s) of&quot;, groups, &quot;KB&quot;)</code></pre><div class="output">planned partitions: 200
+after coalescing  : 1 partition(s) of [225] KB</div></div>
+  <ul class="anno"><li><code>target_kb = 64 * 1024                              # advisoryPartitionSizeInBytes = 64 MB</code><span>Adjacent small partitions are merged up to this size.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Then make every partition 1 GB: how many groups?",
+   "code": "# How AQE coalesces shuffle partitions (simplified)\nsizes_kb = [2, 0, 1, 3, 0, 0, 2, 1] * 25           # 200 tiny partitions after a shuffle\ntarget_kb = 64 * 1024                              # advisoryPartitionSizeInBytes = 64 MB\n\ngroups, current = [], 0\nfor s in sizes_kb:\n    if current + s > target_kb and current:\n        groups.append(current); current = 0\n    current += s\ngroups.append(current)\nprint(\"planned partitions:\", len(sizes_kb))\nprint(\"after coalescing  :\", len(groups), \"partition(s) of\", groups, \"KB\")\n"
+  },
+  {
+   "label": "2 · Predict first: skew",
+   "hint": "<b>Predict first:<\/b> is a partition skewed? (5x median and over 256 MB)",
+   "code": "import statistics\nsizes_mb = [40, 35, 2000, 38, 42]\nmed = statistics.median(sizes_mb)\nprint([s for s in sizes_mb if s > 5 * med and s > 256])\n"
+  },
+  {
+   "label": "3 · Split it",
+   "hint": "Split a skewed partition into advisory-sized pieces.",
+   "code": "import math\nprint(math.ceil(2000 / 64), \"tasks instead of 1\")\n"
+  },
+  {
+   "label": "4 · Switch the join",
+   "hint": "Runtime size vs broadcast threshold.",
+   "code": "runtime_mb, threshold_mb = 0.2, 10\nprint(\"broadcast\" if runtime_mb <= threshold_mb else \"sort-merge\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This job turned AQE off to “make plans predictable”.",
+   "code": "conf = {\"spark.sql.adaptive.enabled\": \"false\"}\nassert conf[\"spark.sql.adaptive.enabled\"] == \"true\", \"AQE off: 204 tasks instead of 5, no runtime broadcast, no skew split\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: AQE</h3>
+  <p>In the <code>pyspark</code> shell. <b>Outputs are real</b> (PySpark 4.3.0).</p>
+  <div class="pcrun"><h4>1 · On by default</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>spark.conf.get(&quot;spark.sql.adaptive.enabled&quot;), spark.conf.get(&quot;spark.sql.shuffle.partitions&quot;)</code></pre><div class="output">(&#x27;true&#x27;, &#x27;200&#x27;)</div></div>
+  <p class="muted">200 is the starting point.</p></div>
+  <div class="pcrun"><h4>2 · Final plan</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>d = o.groupBy(&quot;city&quot;).agg(F.sum(&quot;amount&quot;)); d.collect()
+d._jdf.queryExecution().executedPlan().toString().splitlines()[0]</code></pre><div class="output">AdaptiveSparkPlan isFinalPlan=true</div></div>
+  <p class="muted">Contains AQEShuffleRead coalesced.</p></div>
+  <div class="pcrun"><h4>3 · Skew</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code># after the skewed join with lowered thresholds</code></pre><div class="output">+- *(5) SortMergeJoin(skew=true) [rest_id#131L], [rest_id#133L], Inner</div></div>
+  <p class="muted">Split partitions.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Stages, statistics, re-planning</h2>
+  <p>Follow AQE between two stages.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "stage1_output_mb = 0.01",
+  "threshold_mb = 64",
+  "plan = {\"reduce_partitions\": 200}",
+  "if stage1_output_mb < threshold_mb:",
+  "    plan[\"reduce_partitions\"] = 1",
+  "print(plan)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Runtime",
+   "note": "Size known only after the map stage ran. <code>stage1_output_mb<\/code> is created: 0.01.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stage1_output_mb",
+       "0.01"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "stage1_output_mb"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>threshold_mb<\/code> is created: 64.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stage1_output_mb",
+       "0.01"
+      ],
+      [
+       "threshold_mb",
+       "64"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "threshold_mb"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>plan<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;reduce_partitions&#x27;: 200}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stage1_output_mb",
+       "0.01"
+      ],
+      [
+       "threshold_mb",
+       "64"
+      ],
+      [
+       "plan",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;reduce_partitions&#x27;: 200}"
+   ],
+   "newVar": "plan"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stage1_output_mb",
+       "0.01"
+      ],
+      [
+       "threshold_mb",
+       "64"
+      ],
+      [
+       "plan",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;reduce_partitions&#x27;: 200}"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Re-plan",
+   "note": "The rest of the query uses the real number. Object #1 dict now holds {&#x27;reduce_partitions&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stage1_output_mb",
+       "0.01"
+      ],
+      [
+       "threshold_mb",
+       "64"
+      ],
+      [
+       "plan",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;reduce_partitions&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stage1_output_mb",
+       "0.01"
+      ],
+      [
+       "threshold_mb",
+       "64"
+      ],
+      [
+       "plan",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;reduce_partitions&#x27;: 1}"
+   ],
+   "out": "{'reduce_partitions': 1}\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three AQE decisions on the TiffinGo platform.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">AQE · basics</span></div>
+    <h4>Check AQE is working</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Confirm AQE coalesced a job’s shuffle.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>a groupBy job</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Run the action.</li><li>Look at the final plan.</li><li>Count reduce tasks in the UI.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 1.",
+   "code": "plan = \"AdaptiveSparkPlan isFinalPlan=true\\n+- AQEShuffleRead coalesced\"\nprint(\"coalesced\" in plan)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "plan = \"AdaptiveSparkPlan isFinalPlan=true\\n+- AQEShuffleRead coalesced\"",
+  "print(\"coalesced\" in plan)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Final",
+   "note": "Only after running. <code>plan<\/code> is created: &#x27;AdaptiveSparkPlan isFinalPlan=true\\n+- AQEShuffleRead coalesced&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "'AdaptiveSparkPlan isFinalPlan=true\\n+- AQEShuffleRead coalesced'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "plan"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "'AdaptiveSparkPlan isFinalPlan=true\\n+- AQEShuffleRead coalesced'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "True\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">AQE · tuning</span></div>
+    <h4>Pick shuffle partitions with AQE</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Set partitions for jobs between 1 GB and 1 TB of shuffle.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>variable volumes</pre></div><div><small>Expected output</small><pre>shuffle.partitions &gt;= 8000</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Partitions high enough for the largest day.</li><li>Advisory size ~64–256 MB.</li><li>Let AQE merge small days.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Scenario 1.",
+   "code": "largest_gb, advisory_mb = 1000, 128\nprint(\"shuffle.partitions >=\", int(largest_gb * 1024 / advisory_mb))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "largest_gb, advisory_mb = 1000, 128",
+  "print(\"shuffle.partitions >=\", int(largest_gb * 1024 / advisory_mb))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>largest_gb<\/code> is created: 1000. <code>advisory_mb<\/code> is created: 128.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "largest_gb",
+       "1000"
+      ],
+      [
+       "advisory_mb",
+       "128"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "advisory_mb"
+  },
+  {
+   "line": 2,
+   "phase": "Upper bound",
+   "note": "AQE can merge, not split (outside skew joins). The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "largest_gb",
+       "1000"
+      ],
+      [
+       "advisory_mb",
+       "128"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "shuffle.partitions >= 8000\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">AQE · skew</span></div>
+    <h4>Is the hot key handled?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A join is slow; one key dominates.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>Spark UI task times</pre></div><div><small>Expected output</small><pre>AQE splits it</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Look for skew=true in the final plan.</li><li>Check thresholds vs partition sizes.</li><li>Salt if still skewed.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 3.",
+   "code": "part_mb, median_mb = 900, 60\nprint(\"AQE splits it\" if part_mb > 5 * median_mb and part_mb > 256 else \"below thresholds: tune or salt\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "part_mb, median_mb = 900, 60",
+  "print(\"AQE splits it\" if part_mb > 5 * median_mb and part_mb > 256 else \"below thresholds: tune or salt\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Both conditions",
+   "note": "factor and absolute size. <code>part_mb<\/code> is created: 900. <code>median_mb<\/code> is created: 60.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "part_mb",
+       "900"
+      ],
+      [
+       "median_mb",
+       "60"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "median_mb"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "part_mb",
+       "900"
+      ],
+      [
+       "median_mb",
+       "60"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "AQE splits it\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: What does AQE use to re-plan?",
+  "options": [
+   "Guesses",
+   "User hints only",
+   "Real sizes from finished stages",
+   "Logs"
+  ],
+  "answer": 2,
+  "why": "Runtime statistics."
+ },
+ {
+  "q": "Beginner: Is AQE on by default in Spark 4?",
+  "options": [
+   "No",
+   "Yes, since 3.2",
+   "Only on Databricks",
+   "Only for SQL"
+  ],
+  "answer": 1,
+  "why": "spark.sql.adaptive.enabled = true."
+ },
+ {
+  "q": "Beginner: Coalescing does what?",
+  "options": [
+   "Merges small shuffle partitions",
+   "Splits partitions",
+   "Caches",
+   "Compresses"
+  ],
+  "answer": 0,
+  "why": "204 → 5 tasks."
+ },
+ {
+  "q": "Intermediate: Static broadcast disabled, small side after a filter. With AQE…",
+  "options": [
+   "Stays SMJ",
+   "Fails",
+   "Uses cross join",
+   "Switches to broadcast at run time"
+  ],
+  "answer": 3,
+  "why": "0.89 → 0.05 s."
+ },
+ {
+  "q": "Intermediate: Default skew conditions?",
+  "options": [
+   "2x median",
+   "> 1 GB",
+   "> 5x median and > 256 MB",
+   "Any key > 10%"
+  ],
+  "answer": 2,
+  "why": "We lowered them for the lab."
+ },
+ {
+  "q": "Intermediate: How do you see what AQE did?",
+  "options": [
+   "explain() before running",
+   "The final plan after running / Spark UI",
+   "Logs only",
+   "Not possible"
+  ],
+  "answer": 1,
+  "why": "isFinalPlan=true."
+ },
+ {
+  "q": "Advanced: Does AQE skew handling fix skewed aggregations?",
+  "options": [
+   "No, it targets joins",
+   "Yes",
+   "Only sums",
+   "Only with Python"
+  ],
+  "answer": 0,
+  "why": "Use partial aggregation or salting."
+ },
+ {
+  "q": "Advanced: Plan text for a split join?",
+  "options": [
+   "BroadcastHashJoin",
+   "CartesianProduct",
+   "HashAggregate",
+   "SortMergeJoin(skew=true)"
+  ],
+  "answer": 3,
+  "why": "With AQEShuffleRead … skewed."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 7.4 in one screen</h3>
+    <ul><li>AQE re-plans at run time from real stage sizes; on by default since 3.2.</li><li>Coalescing: 204 tasks → 5, 1.74 → 0.62 s; plan <code>AQEShuffleRead coalesced</code>.</li><li>Join switching: SMJ → broadcast when a side is measured small (0.89 → 0.05 s).</li><li>Skew join: split big partitions (3.67 → 1.92 s), <code>SortMergeJoin(skew=true)</code>.</li><li>Skew thresholds: 5× median and 256 MB by default; joins only.</li><li>Read the final plan (<code>isFinalPlan=true</code>) after running or in the Spark UI.</li><li>Set shuffle partitions high enough; tune the advisory size.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Should I still set spark.sql.shuffle.partitions?</summary><p>Yes, as an upper bound high enough for the biggest input; AQE merges partitions but does not create more (except when splitting skew).</p></details>
+    <details><summary>Does AQE work with caching?</summary><p>Yes, and cached data provides statistics; very complex plans may limit re-optimization.</p></details>
+    <details><summary>Does AQE work in Structured Streaming?</summary><p>Not for micro-batch streaming queries in general; it targets batch queries.</p></details>
+    <details><summary>Can AQE make things slower?</summary><p>Rarely; e.g. coalescing to too few partitions for a later heavy stage. Tune the advisory size or minPartitionNum.</p></details>
+    <details><summary>What about dynamic partition pruning?</summary><p>A separate optimization: filters from a dimension join prune partitions of a fact table at run time; it works together with AQE.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs about runtime re-optimization.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Tasks saved</h4></div>
+      <p>Tasks saved by coalescing.</p>
+      <div class="prob__io"><div><small>Input</small><pre>204 vs 5</pre></div><div><small>Expected output</small><pre>199</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(204 - 5)</code></pre><div class="output">199</div></div>
+        <p><b>How it works:</b> Empty tasks cost scheduling time.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Speed-up</h4></div>
+      <p>Skew join speed-up.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3.67 vs 1.92 s</pre></div><div><small>Expected output</small><pre>1.9</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(3.67 / 1.92, 1))</code></pre><div class="output">1.9</div></div>
+        <p><b>How it works:</b> About 1.9x.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Broadcast check</h4></div>
+      <p>Will AQE broadcast a 3 MB side?</p>
+      <div class="prob__io"><div><small>Input</small><pre>threshold 10 MB</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(3 &lt;= 10)</code></pre><div class="output">True</div></div>
+        <p><b>How it works:</b> Measured at run time.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Coalesce count</h4></div>
+      <p>Partitions after merging to 64 MB.</p>
+      <div class="prob__io"><div><small>Input</small><pre>shuffle 1,000 MB</pre></div><div><small>Expected output</small><pre>16</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+print(math.ceil(1000 / 64))</code></pre><div class="output">16</div></div>
+        <p><b>How it works:</b> About 16 tasks.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Skew test</h4></div>
+      <p>Find skewed partitions.</p>
+      <div class="prob__io"><div><small>Input</small><pre>sizes in MB</pre></div><div><small>Expected output</small><pre>[900]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import statistics
+s = [50, 60, 55, 900, 58]
+m = statistics.median(s)
+print([x for x in s if x &gt; 5 * m and x &gt; 256])</code></pre><div class="output">[900]</div></div>
+        <p><b>How it works:</b> Both conditions.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Split count</h4></div>
+      <p>Tasks after splitting 900 MB at 128 MB.</p>
+      <div class="prob__io"><div><small>Input</small><pre>advisory size</pre></div><div><small>Expected output</small><pre>8</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+print(math.ceil(900 / 128))</code></pre><div class="output">8</div></div>
+        <p><b>How it works:</b> Other side replicated per split.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Cluster minutes</h4></div>
+      <p>Minutes saved per day by AQE on 100 jobs.</p>
+      <div class="prob__io"><div><small>Input</small><pre>1.1 s saved per job, 24 runs</pre></div><div><small>Expected output</small><pre>44 minutes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(1.1 * 100 * 24 / 60), &quot;minutes&quot;)</code></pre><div class="output">44 minutes</div></div>
+        <p><b>How it works:</b> Small savings add up.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Festival day</h4></div>
+      <p>Partitions needed for 10x volume at 128 MB.</p>
+      <div class="prob__io"><div><small>Input</small><pre>normal 50 GB shuffle</pre></div><div><small>Expected output</small><pre>4000</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(int(500 * 1024 / 128))</code></pre><div class="output">4000</div></div>
+        <p><b>How it works:</b> Set as the upper bound; AQE merges on normal days.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">AQE questions are common for Spark 3+ roles.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Spark</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is AQE?”</h4>
+      <p class="scn__situation">Explain Adaptive Query Execution.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> the three features?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>AQE re-optimises a query at run time using statistics from completed shuffle stages: it coalesces small shuffle partitions, switches sort-merge joins to broadcast joins when a side is small, and splits skewed join partitions. It is on by default since Spark 3.2.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Confusing it with caching.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Too many tiny tasks</h4>
+      <p class="scn__situation">A small job runs 200 tasks per stage.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> coalescing?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Ensure AQE and coalescePartitions are enabled.</li>
+          <li>Check the final plan for AQEShuffleRead coalesced.</li>
+          <li>In my test 204 tasks became 5.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Hard-coding shuffle.partitions per job.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Slow skewed join</h4>
+      <p class="scn__situation">One task of a join takes most of the time.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> skew handling?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Check for SortMergeJoin(skew=true) in the final plan.</li>
+          <li>If absent, compare partition sizes with skew thresholds; tune them.</li>
+          <li>Fall back to salting or broadcasting the small side.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Adding executors.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Platform defaults</h4>
+      <p class="scn__situation">Set Spark SQL defaults for hundreds of jobs.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> tuning strategy?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>AQE on; shuffle partitions high; advisory size by cluster size.</li>
+          <li>Runtime broadcast threshold sized to executor memory.</li>
+          <li>Monitor final plans and task skew in the UI/history server.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Turning AQE off for predictability.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Spark and PySpark syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/spark-pyspark.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

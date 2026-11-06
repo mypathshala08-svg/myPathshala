@@ -30,10 +30,12 @@
   const KW = {
     java: "abstract assert boolean break byte case catch char class const continue default do double else enum extends final finally float for goto if implements import instanceof int interface long native new package private protected public return short static strictfp super switch synchronized this throw throws transient try void volatile while var record yield true false null",
     python: "and as assert async await break class continue def del elif else except False finally for from global if import in is lambda None nonlocal not or pass raise return True try while with yield print",
+    bash: "if then else elif fi for while until do done case esac in function return exit export local readonly select time break continue shift source alias unalias declare read echo printf cd pwd ls mkdir rmdir touch cp mv rm cat less head tail grep sed awk sort uniq cut tr wc find chmod chown sudo man whoami date uname ps kill",
     sql: "select from where and or not insert into values update set delete create table alter drop primary key foreign references join inner left right full outer on group by order having limit distinct as count sum avg min max union all case when then else end index view null is in between like",
   };
   function highlight(code, lang) {
     const kw = new Set((KW[lang] || KW.java).split(" ").map(k => lang === "sql" ? k.toLowerCase() : k));
+    if (lang === "bash") return highlightBash(code, kw);
     const re = /(\/\/[^\n]*|#[^\n]*|\/\*[\s\S]*?\*\/|--[^\n]*)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(\b\d+(?:\.\d+)?[lLfFdD]?\b)|([A-Za-z_]\w*)|([\s\S])/g;
     let out = "", m;
     while ((m = re.exec(code))) {
@@ -49,6 +51,21 @@
         else if (code[re.lastIndex] === "(") out += `<span class="tk-fn">${w}</span>`;
         else out += w;
       } else out += esc(m[5]);
+    }
+    return out;
+  }
+
+  /* Bash: # starts a comment only at the start of a word ($#, ${#x}, a#b are not comments); $VARS coloured as types. */
+  function highlightBash(code, kw) {
+    const re = /((?:^|(?<=[\s;|&(]))#[^\n]*)|("(?:\\.|[^"\\])*"|'[^']*')|(\$\{[^}]*\}|\$[A-Za-z_]\w*|\$[0-9?#$!@*-])|(\b\d+\b)|([A-Za-z_][\w-]*)|([\s\S])/gm;
+    let out = "", m;
+    while ((m = re.exec(code))) {
+      if (m[1]) out += `<span class="tk-com">${esc(m[1])}</span>`;
+      else if (m[2]) out += `<span class="tk-str">${esc(m[2])}</span>`;
+      else if (m[3]) out += `<span class="tk-type">${esc(m[3])}</span>`;
+      else if (m[4]) out += `<span class="tk-num">${m[4]}</span>`;
+      else if (m[5]) out += kw.has(m[5]) ? `<span class="tk-kw">${m[5]}</span>` : esc(m[5]);
+      else out += esc(m[6]);
     }
     return out;
   }
@@ -157,13 +174,15 @@
   $$(".tracer").forEach(tr => {
     const d = readJSON(tr); if (!d) return;
     const lang = d.lang || "java";
+    // optional "labels": {"stack":[title, sub], "heap":[title, sub], "emptyStack": text, "emptyHeap": text}
+    const L = Object.assign({ stack: ["Stack", "method calls + local variables"], heap: ["Heap", "objects"], emptyStack: "empty: no method is running", emptyHeap: "no objects yet" }, d.labels || {});
     tr.insertAdjacentHTML("beforeend", `
       <div class="tracer__grid">
         <div class="tracer__code">${d.code.map((l, i) => `<div class="tline" data-ln="${i + 1}"><span class="ln">${i + 1}</span><span>${highlight(l, lang) || " "}</span></div>`).join("")}</div>
         <div class="tracer__state">
           <div class="tracer__note"></div>
-          <div class="mem"><h5>Stack <em>method calls + local variables</em></h5><div class="mem__body" data-k="stack"></div></div>
-          <div class="mem"><h5>Heap <em>objects</em></h5><div class="mem__body" data-k="heap"></div></div>
+          <div class="mem"><h5>${esc(L.stack[0])} <em>${esc(L.stack[1])}</em></h5><div class="mem__body" data-k="stack"></div></div>
+          <div class="mem"><h5>${esc(L.heap[0])} <em>${esc(L.heap[1])}</em></h5><div class="mem__body" data-k="heap"></div></div>
           <div class="mem"><h5>Console <em>output</em></h5><div class="console" data-k="out"></div></div>
         </div>
       </div>`);
@@ -183,8 +202,8 @@
       note.innerHTML = (s.phase ? `<b>${esc(s.phase)} · </b>` : "") + (s.note || "");
       stackEl.innerHTML = (s.stack && s.stack.length)
         ? s.stack.slice().reverse().map(f => `<div class="frame"><b>${esc(f.frame)}</b>${(f.vars || []).map(v => `<div class="var${v[0] === s.newVar ? " new" : ""}"><span>${esc(v[0])}</span><span>${esc(v[1])}</span></div>`).join("") || '<span class="empty-note">no local variables yet</span>'}</div>`).join("")
-        : '<span class="empty-note">empty: no method is running</span>';
-      heapEl.innerHTML = (s.heap && s.heap.length) ? s.heap.map(h => `<span class="obj">${h}</span>`).join("") : '<span class="empty-note">no objects yet</span>';
+        : `<span class="empty-note">${esc(L.emptyStack)}</span>`;
+      heapEl.innerHTML = (s.heap && s.heap.length) ? s.heap.map(h => `<span class="obj">${h}</span>`).join("") : `<span class="empty-note">${esc(L.emptyHeap)}</span>`;
       outEl.textContent = d.steps.slice(0, i + 1).map(st => st.out || "").join("");
     }, { delay: 3200 });
     tr.appendChild(ctl.el);
@@ -203,7 +222,7 @@
         <div class="runner__gate">
           <div>
             <svg width="54" height="54" viewBox="0 0 24 24" fill="none" stroke="#F5C77E" stroke-width="1.6" style="margin:0 auto"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18"/><path d="M10 12l4 2.5-4 2.5z" fill="#F5C77E"/></svg>
-            <p>Loads a real ${esc((d.lang || "java").toUpperCase())} compiler. Edit the code, press <b>Run</b>, and see your own output. Your code is sent to OneCompiler only to run it.</p>
+            <p>${d.lang === "bash" ? "Loads a real Bash shell on a Linux machine." : `Loads a real ${esc((d.lang || "java").toUpperCase())} compiler.`} Edit the code, press <b>Run</b>, and see your own output. Your code is sent to OneCompiler only to run it.</p>
             <button class="btn btn--solid" type="button" data-load>Open the live editor</button>
           </div>
         </div>

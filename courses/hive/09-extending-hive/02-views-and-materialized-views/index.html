@@ -1,0 +1,1990 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Views and materialized views | MyPhatshala</title>
+<meta name="description" content="Hive views and materialized views with real Hive 4.2.1 outputs: what a view stores (expanded SQL, VIRTUAL_VIEW), SELECT * freezing columns, views broken by dropped tables, why materialized-view rewriting requires transactional sources, automatic query rewriting (240 rows read instead of 5,000,000), staleness and the rewriting time window, incremental rebuild after INSERT vs full rebuild after DELETE, DISABLE REWRITE and the Hive 4 query results cache.">
+<meta name="mp:minutes" content="40">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/09-extending-hive/02-views-and-materialized-views/">
+<meta property="og:title" content="Views and materialized views · MyPhatshala">
+<meta property="og:description" content="A materialized view answered a 5-million-row query from 240 rows, without changing the SQL. Views and MVs in Hive 4.2.1, with the staleness traps shown.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Views and materialized views", "learningResourceType": "Lesson", "educationalLevel": "Beginner → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="09-extending-hive/02-views-and-materialized-views" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 9.2</b></nav>
+    <h1>Views and materialized views</h1>
+    <p class="lead">Views let many reports share one definition; <b>materialized views</b> let them share one <b>result</b>, and Hive 4 can use that result automatically. This lesson builds both for TiffinGo, then makes the MV stale on purpose to see what Hive does: refuse it, use it inside a time window, and rebuild it incrementally or fully. <b>All outputs are real</b>, from Hive 4.2.1.</p>
+    <div class="lesson-meta"><span>Module 9 · Extending Hive</span><span>⏱ 40 min</span><span>Beginner → Advanced</span><span>Real Hive 4.2.1 outputs</span><span>Automatic query rewriting</span><span>Stale MV, wrong answer shown</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Twelve reports, one join, copied twelve times”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> ACID tables (<a href="../../07-acid-and-iceberg/01-acid-tables-update-delete/">7.1</a>), EXPLAIN CBO (<a href="../../08-optimisation/01-explain-in-depth/">8.1</a>) and the CBO (<a href="../../08-optimisation/02-cbo-and-statistics/">8.2</a>).</p></div>
+  <div class="story">
+    <p class="narration">Every TiffinGo report starts with the same join of orders and customers and the same daily totals by city. When the definition of a “Gold order” changed last month, Kabir had to fix twelve copies, and missed two.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="The same join and aggregation is copied into twelve reports. A view stores the definition once; a materialized view stores the result, and Hive can rewrite queries to read it automatically.">
+        <rect x="10" y="12" width="190" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="105" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">Same join in 12 reports</text><text x="22" y="52" font-size="7.2" class="s-ink2 mono">orders JOIN customers</text><text x="22" y="67" font-size="7.2" class="s-ink2 mono">WHERE plan = 'Gold'</text><text x="22" y="82" font-size="7.2" class="s-ink2 mono">GROUP BY city, day</text><text x="22" y="97" font-size="7.2" class="s-ink2 mono">… copied 12 times</text><text x="22" y="112" font-size="7.2" class="s-ink2 mono">5,000,000 rows each run</text><path d="M206 76L246 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M239.7 79.0L246 76L239.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="252" y="30" width="110" height="40" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="307" y="54" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">VIEW</text><rect x="252" y="82" width="110" height="40" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="307" y="106" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">MATERIALIZED VIEW</text><path d="M368 76L404 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M397.7 79.0L404 76L397.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="410" y="12" width="220" height="128" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="520" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-green">What each gives</text><rect x="422" y="42" width="196" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="520.0" y="53" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">View: one definition</text><text x="520.0" y="63" text-anchor="middle" font-size="6.4" class="s-ink2 mono">no data stored</text><rect x="422" y="76" width="196" height="26" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="520.0" y="87" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">MV: stored result</text><text x="520.0" y="97" text-anchor="middle" font-size="6.4" class="s-ink2 mono">240 rows instead of 5M</text><rect x="422" y="108" width="196" height="26" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="520.0" y="119" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Rewriting</text><text x="520.0" y="129" text-anchor="middle" font-size="6.4" class="s-ink2 mono">queries use the MV by themselves</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">A view saves <tspan font-weight="700" class="s-acc">typing</tspan>; a materialized view saves <tspan font-weight="700" class="s-acc">work</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, can I write the join once and let reports use it like a table?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>That is a <b>view</b>: a saved query with a name. It stores no data; Hive pastes its definition into every query that uses it. If the work itself is expensive, a <b>materialized view</b> stores the result as a real table, and Hive 4 can even <b>rewrite</b> queries on the base table to read it, without changing the reports.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>And when new orders arrive?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Then the materialized view is <b>stale</b>. We will see exactly what Hive does about that: refuse to use it, use it anyway inside a time window, and rebuild it incrementally or fully. All outputs are real, from Hive 4.2.1, including a few rules the tutorials leave out.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Views and materialized views</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A <b>view</b> is a named, stored query (<code>CREATE VIEW name AS SELECT …</code>) recorded in the metastore as a <code>VIRTUAL_VIEW</code>; it holds no data, and references to it are expanded into the underlying query at compile time. A <b>materialized view</b> (<code>CREATE MATERIALIZED VIEW</code>) stores the query result as a managed table and records the state of its source tables. When the sources are transactional, the cost-based optimiser can <b>automatically rewrite</b> queries to use an up-to-date materialized view (<code>hive.materializedview.rewriting</code>), and <code>ALTER MATERIALIZED VIEW … REBUILD</code> refreshes it, incrementally when only inserts occurred since the last rebuild.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>A view is a saved query you can select from like a table; it always shows current data. A materialized view saves the query’s result, so reading it is fast, but it must be rebuilt when the source data changes. Hive can use a materialized view automatically to speed up queries on the base tables.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>View</b><span>A stored query; no data; expanded at compile time.</span></div>
+    <div class="term"><b>Materialized view (MV)</b><span>A stored query result, kept as a table.</span></div>
+    <div class="term"><b>Query rewriting</b><span>The optimiser replaces part of a query with an MV.</span></div>
+    <div class="term"><b>Stale / outdated</b><span>Sources changed since the MV was last built.</span></div>
+    <div class="term"><b>Rebuild</b><span>ALTER MATERIALIZED VIEW … REBUILD: refresh the stored result.</span></div>
+    <div class="term"><b>Incremental rebuild</b><span>Merge only the new rows into the MV.</span></div>
+    <div class="term"><b>Time window</b><span>How long a stale MV may still be used for rewriting.</span></div>
+    <div class="term"><b>Results cache</b><span>Hive 4 reuses the result of an identical earlier query.</span></div>
+  </div>
+
+  <h3>View vs materialized view vs table</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:700px">
+    <thead><tr><th></th><th>View</th><th>Materialized view</th><th>Table (CTAS)</th></tr></thead>
+    <tbody><tr><td>Stores data</td><td>No</td><td>Yes</td><td>Yes</td></tr><tr><td>Always current</td><td>Yes</td><td>Only after REBUILD</td><td>Only after reload</td></tr><tr><td>Used automatically by other queries</td><td>No</td><td>Yes (rewriting)</td><td>No</td></tr><tr><td>Source requirements</td><td>Any</td><td>Transactional for rewriting</td><td>Any</td></tr><tr><td>Refresh</td><td>—</td><td>REBUILD (incremental or full)</td><td>INSERT OVERWRITE</td></tr><tr><td>Good for</td><td>Reuse, security, simplicity</td><td>Expensive repeated aggregates</td><td>Snapshots, ETL steps</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Views at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A saved recipe vs a cooked dish</h4>
+      <ul>
+        <li>A <b>view</b> is a saved recipe: every time you use it, Hive cooks the query again from the base tables.</li>
+        <li>A <b>materialized view</b> is a cooked dish kept in the fridge: fast to serve, but it gets old when new ingredients arrive.</li>
+        <li>Both let many reports share one definition.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How they behave</h4>
+      <ul>
+        <li><code>CREATE VIEW v AS SELECT …</code>: stored in the metastore as text (<code>VIRTUAL_VIEW</code>); queries on <code>v</code> are expanded into the base query. No data, always current.</li>
+        <li><code>CREATE MATERIALIZED VIEW mv AS SELECT …</code>: stores the result (ORC, transactional) and its source tables’ snapshot.</li>
+        <li><b>Rewriting:</b> with <code>hive.materializedview.rewriting=true</code>, Calcite replaces matching parts of a query with the MV.</li>
+        <li><b>Refresh:</b> <code>ALTER MATERIALIZED VIEW mv REBUILD</code>, incremental when possible.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li><code>SELECT *</code> views freeze the column list at creation; dropping the base table broke the view only when it was queried.</li>
+        <li>An MV with rewriting was refused on an external source (“cannot be enabled if the materialized view uses non-transactional tables”); <code>DISABLE REWRITE</code> worked.</li>
+        <li>Rewriting read 240 rows instead of 5,000,000. After an INSERT the stale MV was ignored; a 10-minute window made Hive use it and return an <b>outdated</b> total. Incremental rebuild after INSERT, full rebuild after DELETE.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “Difference between a view and a materialized view in Hive?” A view stores only the query and is expanded when used, so it is always current but saves no work. A materialized view stores the result, needs REBUILD after source changes, and with transactional sources can be used automatically by the optimiser through query rewriting.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Commands and settings</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Statement / setting</th><th>Purpose</th></tr></thead>
+    <tbody><tr><td><code>CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT …</code></td><td>Define a view</td></tr><tr><td><code>ALTER VIEW v AS SELECT …</code> · <code>DROP VIEW v</code></td><td>Change or remove it</td></tr><tr><td><code>SHOW VIEWS</code> · <code>SHOW CREATE TABLE v</code></td><td>List views; see the stored text</td></tr><tr><td><code>CREATE MATERIALIZED VIEW mv [DISABLE REWRITE] AS SELECT …</code></td><td>Store a result</td></tr><tr><td><code>ALTER MATERIALIZED VIEW mv REBUILD</code></td><td>Refresh</td></tr><tr><td><code>ALTER MATERIALIZED VIEW mv ENABLE | DISABLE REWRITE</code></td><td>Allow automatic use</td></tr><tr><td><code>SHOW MATERIALIZED VIEWS</code></td><td>Name, rewrite, mode, incremental</td></tr><tr><td><code>hive.materializedview.rewriting</code> (true)</td><td>Global switch for rewriting</td></tr><tr><td><code>hive.materializedview.rewriting.time.window</code> (0min)</td><td>Allowed staleness for rewriting</td></tr><tr><td><code>hive.materializedview.rebuild.incremental</code> (true)</td><td>Try incremental rebuilds</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Hive 4 also has a <b>query results cache</b> (<code>hive.query.results.cache.enabled=true</code>): an identical query on unchanged transactional tables returned in <b>0.0 s</b> in our lab. Turn it off when you measure, or every second run looks miraculous.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>From a view to a self-refreshing summary</h2>
+  <p>All outputs are real, from Hive 4.2.1. <code>orders_tx</code> is a transactional copy of the 5,000,000-row table from Lesson 8.4.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · A view for Gold orders</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE OR REPLACE VIEW v_gold_orders AS
+SELECT o.order_id, o.order_date, o.amount, c.city, c.customer_id
+FROM orders o JOIN customers c ON o.customer_id = c.customer_id
+WHERE c.plan = &#x27;Gold&#x27;;
+
+SELECT city, COUNT(*) AS n, SUM(amount) AS rev FROM v_gold_orders
+WHERE order_date = &#x27;2026-10-05&#x27; GROUP BY city ORDER BY rev DESC LIMIT 3;</code></pre><div class="output">+------------+------+-----------+
+|    city    |  n   |    rev    |
++------------+------+-----------+
+| Bengaluru  | 100  | 26600.00  |
+| Mumbai     | 71   | 19270.00  |
+| Pune       | 60   | 18090.00  |
++------------+------+-----------+</div></div>
+      <span class="behind">Exactly the answer of Lesson 8.1’s long query (Bengaluru 100, Mumbai 71, Pune 60), now with a two-line report. The definition of “Gold order” lives in one place.</span></li>
+    <li><h4>Step 2 · What Hive stored, and what it reads</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SHOW CREATE TABLE v_gold_orders;
+DESCRIBE FORMATTED v_gold_orders;   -- table type
+EXPLAIN DEPENDENCY SELECT COUNT(*) FROM v_gold_orders;</code></pre><div class="output">+----------------------------------------------------+
+|                   createtab_stmt                   |
++----------------------------------------------------+
+| CREATE VIEW `v_gold_orders` AS SELECT `o`.`order_id`, `o`.`order_date`, `o`.`amount`, `c`.`city`, `c`.`customer_id` |
+| FROM `tiffingo`.`orders` `o` JOIN `tiffingo`.`customers` `c` ON `o`.`customer_id` = `c`.`customer_id` |
+| WHERE `c`.`plan` = &#x27;Gold&#x27;                          |
++----------------------------------------------------+
+| Table Type:   | VIRTUAL_VIEW   | NULL   |
+
+{&quot;input_tables&quot;:[{&quot;tablename&quot;:&quot;tiffingo@v_gold_orders&quot;,&quot;tabletype&quot;:&quot;VIRTUAL_VIEW&quot;},{&quot;tablename&quot;:&quot;tiffingo@orders&quot;,&quot;tabletype&quot;:&quot;EXTERNAL_TABLE&quot;,&quot;tableParents&quot;:&quot;[tiffingo@v_gold_orders]&quot;},{&quot;tablename&quot;:&quot;tiffingo@customers&quot;,&quot;tabletype&quot;:&quot;EXTERNAL_TABLE&quot;,&quot;tableParents&quot;:&quot;[tiffingo@v_gold_orders]&quot;}],&quot;input_partitions&quot;:[]}</div></div>
+      <span class="behind">Hive stored the <b>expanded</b> text: every column qualified, the database added. The table type is <code>VIRTUAL_VIEW</code>. The query really reads <code>orders</code> and <code>customers</code>, listed with <code>tableParents: v_gold_orders</code>, which is handy for lineage and for granting access to the view without the base tables.</span></li>
+    <li><h4>Step 3 · Two view traps: SELECT * and dropped tables</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE cust_copy STORED AS ORC AS SELECT customer_id, name, city FROM customers;
+CREATE VIEW v_cust_all AS SELECT * FROM cust_copy;
+ALTER TABLE cust_copy ADD COLUMNS (plan STRING);
+DESCRIBE cust_copy;
+DESCRIBE v_cust_all;
+SHOW CREATE TABLE v_cust_all;
+
+DROP TABLE cust_copy;
+SELECT * FROM v_cust_all LIMIT 1;</code></pre><div class="output">+--------------+------------+----------+
+|   col_name   | data_type  | comment  |
++--------------+------------+----------+
+| customer_id  | int        |          |
+| name         | string     |          |
+| city         | string     |          |
+| plan         | string     |          |
++--------------+------------+----------+
++--------------+------------+----------+
+|   col_name   | data_type  | comment  |
++--------------+------------+----------+
+| customer_id  | int        |          |
+| name         | string     |          |
+| city         | string     |          |
++--------------+------------+----------+
++----------------------------------------------------+
+|                   createtab_stmt                   |
++----------------------------------------------------+
+| CREATE VIEW `v_cust_all` AS SELECT `cust_copy`.`customer_id`, `cust_copy`.`name`, `cust_copy`.`city` FROM `tiffingo`.`cust_copy` |
++----------------------------------------------------+
+
+Error: Error while compiling statement: FAILED: SemanticException Line 1:78 Table not found &#x27;cust_copy&#x27; in definition of VIEW v_cust_all [</div></div>
+      <span class="behind"><code>SELECT *</code> was expanded into three named columns at creation, so the new <code>plan</code> column never appears in the view. Dropping the base table succeeded silently; the view only failed when someone queried it. List columns explicitly in views, and check dependent views (EXPLAIN DEPENDENCY, lineage tools) before dropping tables.</span></li>
+    <li><h4>Step 4 · Materialized views need transactional sources</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE MATERIALIZED VIEW mv_ext AS SELECT city, COUNT(*) AS n FROM orders GROUP BY city;   -- orders is external
+
+CREATE MATERIALIZED VIEW mv_ext DISABLE REWRITE AS SELECT city, COUNT(*) AS n FROM orders GROUP BY city;
+SHOW MATERIALIZED VIEWS;</code></pre><div class="output">Error: Error while compiling statement: FAILED: SemanticException Automatic rewriting for materialized view cannot be enabled if the materialized view uses non-transactional tables
+
++----------+------------------+-----------------+----------------------+
+| mv_name  | rewrite_enabled  |      mode       | incremental_rebuild  |
++----------+------------------+-----------------+----------------------+
+| mv_ext   | No               | Manual refresh  | Not available        |
++----------+------------------+-----------------+----------------------+</div></div>
+      <span class="behind">Hive refused automatic rewriting on an external source: it cannot know when external files change, so it could never tell whether the MV is up to date. With <code>DISABLE REWRITE</code> the MV was created, but only as a stored result you query by name, with “Manual refresh” and incremental rebuild “Not available”.</span></li>
+    <li><h4>Step 5 · An MV on a transactional table, and rewriting</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE MATERIALIZED VIEW mv_city_day AS
+SELECT city, order_date, COUNT(*) AS n, SUM(amount) AS rev
+FROM orders_tx GROUP BY city, order_date;
+SHOW MATERIALIZED VIEWS;
+SELECT COUNT(*) AS mv_rows FROM mv_city_day;
+
+-- a report written against the BASE table:
+EXPLAIN CBO SELECT city, SUM(amount) AS rev, COUNT(*) AS n FROM orders_tx
+WHERE order_date BETWEEN &#x27;2026-10-01&#x27; AND &#x27;2026-10-07&#x27; GROUP BY city ORDER BY rev DESC LIMIT 3;</code></pre><div class="output">+--------------+------------------+-----------------+----------------------+
+|   mv_name    | rewrite_enabled  |      mode       | incremental_rebuild  |
++--------------+------------------+-----------------+----------------------+
+| mv_city_day  | Yes              | Manual refresh  | Available            |
++--------------+------------------+-----------------+----------------------+
++----------+
+| mv_rows  |
++----------+
+| 240      |
++----------+
+
+CBO PLAN:
+HiveSortLimit(sort0=[$1], dir0=[DESC], fetch=[3])
+  HiveProject(city=[$0], rev=[$1], n=[CAST(COALESCE($2, 0:BIGINT)):BIGINT])
+    HiveAggregate(group=[{0}], agg#0=[sum($3)], agg#1=[sum($2)])
+      HiveFilter(condition=[BETWEEN(false, $1, 2026-10-01:DATE, 2026-10-07:DATE)])
+        HiveTableScan(table=[[tiffingo, mv_city_day]], table:alias=[tiffingo.mv_city_day])</div></div>
+      <span class="behind">5,000,000 orders became <b>240 rows</b> (8 cities × 30 days). The report never mentions the MV, yet the plan scans <code>mv_city_day</code>: Calcite proved the query can be answered from it, rolled the daily totals up to cities, and turned <code>COUNT(*)</code> into <code>SUM(n)</code> (the <code>COALESCE(…, 0)</code> keeps empty groups at 0).</span></li>
+    <li><h4>Step 6 · Same answer, far fewer rows</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.query.results.cache.enabled=false;   -- measure honestly
+SET hive.tez.exec.print.summary=true;
+-- the same report with hive.materializedview.rewriting=true, then false</code></pre><div class="output">+------------+--------------+---------+
+|    city    |     rev      |    n    |
++------------+--------------+---------+
+| Mumbai     | 66960000.00  | 231900  |
+| Bengaluru  | 63740000.00  | 219300  |
+| Pune       | 52265000.00  | 176200  |
++------------+--------------+---------+
+
+rewriting=true  RECORDS_IN_Map_1: 240  Time taken: 1.074 seconds
+rewriting=false  RECORDS_IN_Map_1: 5000000  Time taken: 1.103 seconds
+
+run 1  rewriting=true   0.946 seconds
+run 1  rewriting=false   1.14 seconds
+run 2  rewriting=true   1.101 seconds
+run 2  rewriting=false   1.136 seconds
+run 3  rewriting=true   0.922 seconds
+run 3  rewriting=false   1.06 seconds</div></div>
+      <span class="behind">Identical results with and without the MV (we compared them). The MV run read <b>240</b> rows instead of <b>5,000,000</b>. On our single-node lab both ran in about 1 second, because 5 million ORC rows are cheap and start-up dominates; on billions of rows or with joins in the MV, the difference becomes minutes.</span></li>
+    <li><h4>Step 7 · Staleness: correct by default, stale by choice</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>INSERT INTO orders_tx VALUES (999000001, 7, &#x27;Pune&#x27;, 1000.00, DATE &#x27;2026-10-03&#x27;, &#x27;DELIVERED&#x27;);
+EXPLAIN CBO SELECT … ;                                -- same report
+DESCRIBE FORMATTED mv_city_day;                        -- after a second insert
+
+SET hive.materializedview.rewriting.time.window=10min;
+SELECT … ;                                             -- uses the MV
+SET hive.materializedview.rewriting.time.window=0min;
+SELECT … ;                                             -- base table</code></pre><div class="output">|         HiveTableScan(table=[[tiffingo, orders_tx]], table:alias=[orders_tx]) |
+| Outdated for Rewriting:   | Yes   | NULL   |
+
+-- with a 10-minute window:
+|         HiveTableScan(table=[[tiffingo, mv_city_day]], table:alias=[tiffingo.mv_city_day]) |
++------------+--------------+---------+
+|    city    |     rev      |    n    |
++------------+--------------+---------+
+| Mumbai     | 66960000.00  | 231900  |
+| Bengaluru  | 63740000.00  | 219300  |
+| Pune       | 52265000.00  | 176200  |
++------------+--------------+---------+
+
+-- fresh (base table):
++------------+--------------+---------+
+|    city    |     rev      |    n    |
++------------+--------------+---------+
+| Mumbai     | 66960000.00  | 231900  |
+| Bengaluru  | 63740000.00  | 219300  |
+| Pune       | 52266000.00  | 176201  |
++------------+--------------+---------+</div></div>
+      <span class="behind">After the insert, Hive marked the MV <b>Outdated for Rewriting</b> and quietly went back to <code>orders_tx</code>: correct, but slow again. With a 10-minute staleness window it used the MV anyway and returned Pune <b>176,200</b> orders and 52,265,000, while the truth was <b>176,201</b> and 52,266,000. A window is a deliberate trade of freshness for speed; agree on it with the report’s owners.</span></li>
+    <li><h4>Step 8 · Rebuild: incremental after INSERT, full after DELETE</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>EXPLAIN CBO ALTER MATERIALIZED VIEW mv_city_day REBUILD;     -- after the INSERT
+ALTER MATERIALIZED VIEW mv_city_day REBUILD;
+
+DELETE FROM orders_tx WHERE order_id = 999000001;
+EXPLAIN CBO ALTER MATERIALIZED VIEW mv_city_day REBUILD;     -- after the DELETE
+ALTER MATERIALIZED VIEW mv_city_day REBUILD;</code></pre><div class="output">-- after INSERT
+CBO PLAN:
+HiveProject(orders_tx.city=[$0], orders_tx.order_date=[$1], n=[CAST(COALESCE($2, 0:BIGINT)):BIGINT], rev=[$3])
+  HiveAggregate(group=[{0, 1}], agg#0=[sum($2)], agg#1=[sum($3)])
+    HiveProject(city=[$0], order_date=[$1], $f2=[$2], $f3=[$3])
+      HiveUnion(all=[true])
+        HiveProject(city=[$0], order_date=[$1], $f2=[$2], $f3=[$3])
+          HiveAggregate(group=[{2, 4}], agg#0=[count()], agg#1=[sum($3)])
+            HiveFilter(condition=[&lt;(1, $8.writeid)])
+              HiveTableScan(table=[[tiffingo, orders_tx]], table:alias=[orders_tx])
+        HiveProject(city=[$0], order_date=[$1], n=[$2], rev=[$3])
+          HiveTableScan(table=[[tiffingo, mv_city_day]], table:alias=[tiffingo.mv_city_day])
+
+-- after DELETE
+CBO PLAN:
+HiveProject(orders_tx.city=[$0], orders_tx.order_date=[$1], n=[$2], rev=[$3])
+  HiveAggregate(group=[{2, 4}], agg#0=[count()], agg#1=[sum($3)])
+    HiveTableScan(table=[[tiffingo, orders_tx]], table:alias=[orders_tx])
+
+incremental rebuild: RECORDS_IN_Map_1: 5000001 RECORDS_IN_Map_6: 240  Time taken: 2.143 seconds
+full rebuild (after DELETE): RECORDS_IN_Map_1: 5000000  Time taken: 2.147 seconds</div></div>
+      <span class="behind">After an INSERT, the rebuild plan is <b>incremental</b>: aggregate only rows with a newer <code>writeid</code> than the last build, UNION them with the existing MV rows and re-aggregate. After a DELETE it is a <b>full</b> recomputation. In our lab both still scanned all 5,000,000 rows of <code>orders_tx</code> (the writeid filter is applied after reading) and took about 2.1 s; the incremental one saved the aggregation work, not the scan.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Reusing queries and results</h2>
+  <p>Left: real outputs. Right: what Hive does.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Reuse a query, or reuse its result <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT … FROM v_gold_orders …</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Bengaluru  100  26600.00</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">Table Type: VIRTUAL_VIEW</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">input: orders, customers</text><text x="26" y="106" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  tableParents: v_gold_orders</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">ALTER TABLE cust_copy ADD COLUMNS (plan)</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">DESCRIBE v_cust_all: 3 columns</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">DROP TABLE cust_copy;   -- OK</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Table not found &#x27;cust_copy&#x27;</text><text x="26" y="106" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  in definition of VIEW v_cust_all</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">CREATE MATERIALIZED VIEW … FROM orders</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">cannot be enabled if the MV uses</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  non-transactional tables</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">mv_city_day  Yes  Manual refresh</text><text x="26" y="106" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">mv_rows 240</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">HiveTableScan(table=[[tiffingo, mv_city_day]])</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">rewriting=true   RECORDS_IN 240</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">rewriting=false  RECORDS_IN 5000000</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">same result</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">Outdated for Rewriting: Yes</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">window 10min → Pune 176200 (stale)</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">fresh        → Pune 176201</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">INSERT → incremental rebuild (UNION)</text><text x="26" y="106" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">DELETE → full rebuild</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A view gave the same answer as the long query.</li>
+          <li>A SELECT * view froze its columns, then broke when its table was dropped.</li>
+          <li>An MV on an external table was refused; on a transactional one it worked.</li>
+          <li>Rewriting read 240 rows instead of 5,000,000.</li>
+          <li>Stale MVs: ignored, used inside a window, rebuilt incrementally or fully.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What Hive does">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A view is expanded into the query</text><rect x="20" y="50" width="110" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="75.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">orders + customers</text><text x="75.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">base tables</text><rect x="230" y="50" width="110" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="285.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">report</text><text x="285.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">GROUP BY city</text><path d="M132 63L228 63" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M221.7 66.0L228 63L221.7 60.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><text x="180" y="56" text-anchor="middle" font-size="7" class="s-ink2">expand</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No data stored; always current.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Views store text, not data</text><rect x="40" y="56" width="120" height="26" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="100.0" y="67" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">metastore</text><text x="100.0" y="77" text-anchor="middle" font-size="6.4" class="s-ink2 mono">expanded SQL</text><rect x="200" y="56" width="120" height="26" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="260.0" y="67" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">base table</text><text x="260.0" y="77" text-anchor="middle" font-size="6.4" class="s-ink2 mono">dropped</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Errors appear only when the view is used.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MV: a stored, transactional result</text><rect x="20" y="50" width="110" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="75.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">orders_tx</text><text x="75.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">5,000,000 rows</text><rect x="230" y="50" width="110" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="285.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">report</text><text x="285.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">GROUP BY city</text><rect x="120" y="100" width="110" height="26" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="175.0" y="111" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">mv_city_day</text><text x="175.0" y="121" text-anchor="middle" font-size="6.4" class="s-ink2 mono">240 rows</text><path d="M75 76L120 108" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M113.1 106.8L120 108L116.6 101.9" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M232 113L285 76" style="fill:none;stroke:var(--green);stroke-width:1.8"/><path d="M281.6 82.1L285 76L278.1 77.1" style="fill:none;stroke:var(--green);stroke-width:1.8"/><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hive knows the source snapshot it was built from.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rewriting: the optimiser picks the MV</text><rect x="20" y="50" width="110" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="75.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">orders_tx</text><text x="75.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">5,000,000 rows</text><rect x="230" y="50" width="110" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="285.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">report</text><text x="285.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">GROUP BY city</text><rect x="120" y="100" width="110" height="26" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="175.0" y="111" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">mv_city_day</text><text x="175.0" y="121" text-anchor="middle" font-size="6.4" class="s-ink2 mono">240 rows</text><path d="M75 76L120 108" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M113.1 106.8L120 108L116.6 101.9" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M232 113L285 76" style="fill:none;stroke:var(--green);stroke-width:1.8"/><path d="M281.6 82.1L285 76L278.1 77.1" style="fill:none;stroke:var(--green);stroke-width:1.8"/><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Report unchanged; 240 rows read instead of 5M.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">New rows make the MV stale</text><rect x="20" y="50" width="110" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="75.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">orders_tx</text><text x="75.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">5,000,000 rows</text><rect x="230" y="50" width="110" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="285.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">report</text><text x="285.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">GROUP BY city</text><rect x="120" y="100" width="110" height="26" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="175.0" y="111" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">mv_city_day</text><text x="175.0" y="121" text-anchor="middle" font-size="6.4" class="s-ink2 mono">240 rows</text><path d="M75 76L120 108" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M113.1 106.8L120 108L116.6 101.9" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M232 113L285 76" style="fill:none;stroke:#D64545;stroke-width:1.8"/><path d="M281.6 82.1L285 76L278.1 77.1" style="fill:none;stroke:#D64545;stroke-width:1.8"/><rect x="10" y="140" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="160.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Ignored by default; REBUILD to refresh.</text><text x="180.0" y="175.0" text-anchor="middle" font-size="8.8" class="s-ink2">A time window allows stale answers.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>References to a view are replaced by its stored query.</li>
+          <li>Only the expanded SQL is stored; nothing tracks dependents.</li>
+          <li>The MV records which transactions of its sources it contains.</li>
+          <li>Calcite proves the query can be answered from the MV.</li>
+          <li>New write IDs in the sources mark the MV as outdated.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: dashboard acceleration, views for security, and an MV that is not used.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-dashboard">Accelerating a dashboard without touching it</h3>
+  <p class="anim-intro">A common use of MVs. (Sizes illustrative; behaviour as in our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">MV for dashboards <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="One materialized view at the finest grain serves many dashboard queries through rewriting, rebuilt after each load">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Daily sales dashboard: 40 tiles</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink2">all group a 2 TB orders table by city and day</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same aggregation, 40 times.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One MV at the finest grain needed</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">GROUP BY city, order_date, plan</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Coarser queries roll up from it.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Tiles keep their SQL</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">rewriting reads the MV automatically</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check with EXPLAIN CBO.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rebuild after each load</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">ALTER MATERIALIZED VIEW … REBUILD</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Insert-only loads → incremental.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Agree on freshness</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink2">window 0 = always correct · 15min = faster</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A business decision, not a default.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Many tiles share one aggregation.</li>
+          <li>Build an MV at the finest grain.</li>
+          <li>Rewriting needs no SQL changes.</li>
+          <li>Rebuild after loads.</li>
+          <li>Decide how stale answers may be.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-secure">Views as a security layer</h3>
+  <p class="anim-intro">Views hide columns and rows. (Typical practice; Lesson 10.2 covers authorization.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Secure views <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A view exposes only allowed columns and rows; analysts get access to the view, not the table">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Analysts must not see phone numbers</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">customers has name, phone, city, plan</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hide columns, keep the data useful.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A view without the sensitive column</text><text x="180" y="56" text-anchor="middle" font-size="7.2" class="s-ink mono">CREATE VIEW v_customers AS SELECT customer_id, city, plan …</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or mask it: mask(phone).</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Grant the view, not the table</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink mono">GRANT SELECT ON v_customers TO ROLE analyst</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Authorization in Lesson 10.2.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Name columns explicitly</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink2">SELECT * would freeze — and expose — columns</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lab: SELECT * froze the column list.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Larger platforms: Ranger</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink2">column masking and row filters as policies</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Policies instead of many views.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Some columns are sensitive.</li>
+          <li>Create a view without them.</li>
+          <li>Grant access to the view only.</li>
+          <li>Avoid SELECT * in views.</li>
+          <li>Ranger policies scale this up.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-notused">Why is my materialized view not used?</h3>
+  <p class="anim-intro">A checklist for rewriting problems. (The first two checks are from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">MV troubleshooting <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Check staleness, rewrite flags, whether the query is derivable from the MV, and non-deterministic functions">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">“The MV exists but queries are still slow”</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-red mono">EXPLAIN CBO shows the base table</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rewriting did not happen.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check 1: outdated?</text><text x="180" y="56" text-anchor="middle" font-size="7.6" class="s-ink mono">DESCRIBE FORMATTED mv → Outdated for Rewriting: Yes</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rebuild, or allow a window.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check 2: rewrite enabled?</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">SHOW MATERIALIZED VIEWS · global setting</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">DISABLE REWRITE MVs are never used.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check 3: can the query be derived?</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">needs columns / grain the MV dropped?</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">An MV by city cannot answer by customer.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Check 4: non-deterministic parts</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">current_date(), rand() in the query</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rewrite skipped for safety.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The plan shows the base table.</li>
+          <li>Is the MV outdated?</li>
+          <li>Is rewriting enabled for it?</li>
+          <li>Can the MV answer this query at all?</li>
+          <li>Non-deterministic functions block rewriting.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Views and MVs at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-green">semantic</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">layer</text></svg></div>
+    <div><h4>1. A semantic layer</h4>
+      <p>Views give business names and agreed definitions (“active customer”, “Gold order”) on top of raw tables.</p>
+      <div class="uc-flow"><span>Raw tables</span><i>→</i><span class="java">views</span><i>→</i><span>Shared metrics</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">secure</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">columns</text></svg></div>
+    <div><h4>2. Column and row restriction</h4>
+      <p>Views without personal columns, or filtered to one region, are granted to analysts instead of base tables.</p>
+      <div class="uc-flow"><span>Table</span><i>→</i><span class="java">restricted view</span><i>→</i><span>Safe access</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-violet mono">MV</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">BI speed</text></svg></div>
+    <div><h4>3. BI acceleration</h4>
+      <p>Materialized views pre-aggregate fact tables so dashboards get fast answers through automatic rewriting.</p>
+      <div class="uc-flow"><span>Fact table</span><i>→</i><span class="java">MV</span><i>→</i><span>Fast tiles</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">compat</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">migrations</text></svg></div>
+    <div><h4>4. Schema migrations</h4>
+      <p>When tables are renamed or split, views with the old names keep existing reports working during the transition.</p>
+      <div class="uc-flow"><span>Old name</span><i>→</i><span class="java">view</span><i>→</i><span>No broken reports</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">join</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">denormalise</text></svg></div>
+    <div><h4>5. Pre-joined datasets</h4>
+      <p>MVs that pre-join facts with dimensions save repeated joins for data science feature queries.</p>
+      <div class="uc-flow"><span>Facts + dims</span><i>→</i><span class="java">MV join</span><i>→</i><span>Fast features</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: build, use and rebuild an MV</h2>
+  <p>These programs model what Hive did in the lab: store an aggregate, roll it up, go stale and rebuild. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># A materialized view as a dictionary: (city, day) -&gt; (count, revenue)
+orders = [(&quot;Pune&quot;, &quot;10-03&quot;, 500), (&quot;Pune&quot;, &quot;10-03&quot;, 700), (&quot;Mumbai&quot;, &quot;10-03&quot;, 400),
+          (&quot;Pune&quot;, &quot;10-04&quot;, 300), (&quot;Mumbai&quot;, &quot;10-05&quot;, 900)]
+
+mv = {}
+for city, day, amt in orders:                       # CREATE MATERIALIZED VIEW ... GROUP BY city, day
+    n, rev = mv.get((city, day), (0, 0))
+    mv[(city, day)] = (n + 1, rev + amt)
+
+# A query &quot;by city&quot; rewritten to roll up the MV: COUNT(*) becomes SUM(n)
+by_city = {}
+for (city, day), (n, rev) in mv.items():
+    c, r = by_city.get(city, (0, 0))
+    by_city[city] = (c + n, r + rev)
+print(&quot;MV rows:&quot;, len(mv), &quot;  base rows:&quot;, len(orders))
+print(by_city)</code></pre><div class="output">MV rows: 4   base rows: 5
+{&#x27;Pune&#x27;: (3, 1500), &#x27;Mumbai&#x27;: (2, 1300)}</div></div>
+  <ul class="anno"><li><code>    mv[(city, day)] = (n + 1, rev + amt)</code><span>The MV keeps one row per (city, day): our real MV turned 5,000,000 orders into 240 rows.</span></li><li><code>    by_city[city] = (c + n, r + rev)</code><span>Rewriting rolls daily rows up to cities. COUNT(*) on the base table becomes SUM(n) on the MV, as the real plan showed.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Roll-up",
+   "hint": "Press <b>Run<\/b>. 5 orders became 4 MV rows; the city totals are the same as aggregating the orders directly.",
+   "code": "# A materialized view as a dictionary: (city, day) -> (count, revenue)\norders = [(\"Pune\", \"10-03\", 500), (\"Pune\", \"10-03\", 700), (\"Mumbai\", \"10-03\", 400),\n          (\"Pune\", \"10-04\", 300), (\"Mumbai\", \"10-05\", 900)]\n\nmv = {}\nfor city, day, amt in orders:                       # CREATE MATERIALIZED VIEW ... GROUP BY city, day\n    n, rev = mv.get((city, day), (0, 0))\n    mv[(city, day)] = (n + 1, rev + amt)\n\n# A query \"by city\" rewritten to roll up the MV: COUNT(*) becomes SUM(n)\nby_city = {}\nfor (city, day), (n, rev) in mv.items():\n    c, r = by_city.get(city, (0, 0))\n    by_city[city] = (c + n, r + rev)\nprint(\"MV rows:\", len(mv), \"  base rows:\", len(orders))\nprint(by_city)\n"
+  },
+  {
+   "label": "2 · Predict first: stale answer",
+   "hint": "<b>Predict first:<\/b> a new Pune order of 1,000 arrives after the MV was built. What does a stale MV report for Pune?",
+   "code": "mv_pune = (176200, 52265000)          # real MV values in the lab\nnew = (1, 1000)\nprint(\"stale MV:\", mv_pune)\nprint(\"truth   :\", (mv_pune[0] + new[0], mv_pune[1] + new[1]))\n"
+  },
+  {
+   "label": "3 · Incremental rebuild",
+   "hint": "After INSERTs only, Hive aggregates the new rows and merges them with the MV (the UNION plan).",
+   "code": "mv = {(\"Pune\", \"10-03\"): (2, 1200)}\nnew_rows = [(\"Pune\", \"10-03\", 1000), (\"Thane\", \"10-03\", 250)]\ndelta = {}\nfor city, day, amt in new_rows:\n    n, r = delta.get((city, day), (0, 0)); delta[(city, day)] = (n + 1, r + amt)\nfor k, (n, r) in delta.items():\n    a, b = mv.get(k, (0, 0)); mv[k] = (a + n, b + r)\nprint(mv)\n"
+  },
+  {
+   "label": "4 · Why DELETE forces a full rebuild",
+   "hint": "A deleted row has to be subtracted. With only (count, sum) stored, MIN/MAX could not be fixed without recomputing; Hive recomputed everything in our lab.",
+   "code": "mv = {(\"Pune\", \"10-03\"): (3, 2200)}     # count, sum\ndeleted = (\"Pune\", \"10-03\", 1000)\nn, r = mv[deleted[:2]]\nprint(\"subtract works for COUNT/SUM:\", (n - 1, r - deleted[2]))\nprint(\"but a stored MAX of 1000 could not be corrected without rescanning\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This check decides whether the MV may be used. It ignores staleness. Fix it.",
+   "code": "mv_built_at, last_source_write, window_min = 10.00, 10.05, 0\nusable = True                               # bug\nassert usable == (last_source_write <= mv_built_at or window_min > 0), \"a stale MV must not be used when the window is 0\"\nprint(\"use MV\")\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: MV metadata, disabling rewriting and the results cache</h3>
+  <p>More statements on the lab MV. <b>Outputs are real</b>, from Hive 4.2.1.</p>
+  <div class="pcrun"><h4>1 · Describe the materialized view</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>DESCRIBE FORMATTED mv_city_day;   -- selected lines</code></pre><div class="output">| Table Type:   | MATERIALIZED_VIEW   | NULL   |
+|   | numRows   | 240   |
+| Original Query:   | SELECT city, order_date, COUNT(*) AS n, SUM(amount) AS rev | NULL   |
+| Rewrite Enabled:   | Yes   | NULL   |
+| Outdated for Rewriting:   | No   | NULL   |
+| # Materialized View Source table information  | NULL   | NULL   |</div></div>
+  <p class="muted">Table type MATERIALIZED_VIEW, 240 rows, rewrite enabled and not outdated (after the last rebuild). The section “Source table information” lists the tables and transaction state it was built from.</p></div>
+  <div class="pcrun"><h4>2 · Switch rewriting off for one MV</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>ALTER MATERIALIZED VIEW mv_city_day DISABLE REWRITE;
+SHOW MATERIALIZED VIEWS;
+EXPLAIN CBO SELECT city, SUM(amount) AS rev FROM orders_tx GROUP BY city;
+ALTER MATERIALIZED VIEW mv_city_day ENABLE REWRITE;</code></pre><div class="output">+--------------+------------------+-----------------+----------------------+
+|   mv_name    | rewrite_enabled  |      mode       | incremental_rebuild  |
++--------------+------------------+-----------------+----------------------+
+| mv_city_day  | No               | Manual refresh  | Not available        |
++--------------+------------------+-----------------+----------------------+
++----------------------------------------------------+
++----------------------------------------------------+
+|     HiveTableScan(table=[[tiffingo, orders_tx]], table:alias=[orders_tx]) |
++----------------------------------------------------+</div></div>
+  <p class="muted">With rewriting disabled, the query went back to orders_tx. Useful while you investigate a suspicious MV without dropping it.</p></div>
+  <div class="pcrun"><h4>3 · The query results cache</h4>
+  <div class="code" data-lang="bash" data-file="Beeline (INFO)"><pre><code>-- run the same report twice, cache enabled (the default)
+SELECT city, SUM(amount) AS rev, COUNT(*) AS n FROM orders_tx
+WHERE order_date BETWEEN &#x27;2026-10-01&#x27; AND &#x27;2026-10-07&#x27; GROUP BY city ORDER BY rev DESC LIMIT 3;</code></pre><div class="output">Completed executing command(queryId=…); Time taken: 0.0 seconds</div></div>
+  <p class="muted">The second run took 0.0 seconds: HiveServer2 returned the cached result of the identical query (hive.query.results.cache.enabled=true). It is invalidated when the transactional source changes. Different from an MV: it only helps identical queries.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Incremental rebuild after an INSERT</h2>
+  <p>Follow the plan Hive showed for <code>ALTER MATERIALIZED VIEW … REBUILD</code>: aggregate rows newer than the last build, union with the MV, aggregate again.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "mv = {\"Pune|10-03\": (176200, 52265000)}",
+  "last_build_writeid = 1",
+  "rows = [(\"Pune|10-03\", 1000, 1), (\"Pune|10-03\", 1000, 2)]       # (key, amount, writeid)",
+  "new = [r for r in rows if r[2] > last_build_writeid]",
+  "n, rev = mv[\"Pune|10-03\"]",
+  "for key, amt, w in new:",
+  "    n, rev = n + 1, rev + amt",
+  "print({\"Pune|10-03\": (n, rev)})"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>mv<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "mv",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;Pune|10-03&#x27;: → tuple #2}",
+    "<b>#2 tuple (2)<\/b> (176200, 52265000)"
+   ],
+   "newVar": "mv"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>last_build_writeid<\/code> is created: 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "mv",
+       "→ dict #1"
+      ],
+      [
+       "last_build_writeid",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;Pune|10-03&#x27;: → tuple #2}",
+    "<b>#2 tuple (2)<\/b> (176200, 52265000)"
+   ],
+   "newVar": "last_build_writeid"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>rows<\/code> is created: → list #3. A new list object (#3) is created: [→ tuple #4, → tuple #5] A new tuple object (#4) is created: (&#x27;Pune|10-03&#x27;, 1000, 1) A new tuple object (#5) is created: (&#x27;Pune|10-03&#x27;, 1000, 2)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "mv",
+       "→ dict #1"
+      ],
+      [
+       "last_build_writeid",
+       "1"
+      ],
+      [
+       "rows",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;Pune|10-03&#x27;: → tuple #2}",
+    "<b>#2 tuple (2)<\/b> (176200, 52265000)",
+    "<b>#3 list (2)<\/b> [→ tuple #4, → tuple #5]",
+    "<b>#4 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 1)",
+    "<b>#5 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 2)"
+   ],
+   "newVar": "rows"
+  },
+  {
+   "line": 4,
+   "phase": "Filter",
+   "note": "HiveFilter(condition=[<(1, $8.writeid)]) in the real plan.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "mv",
+       "→ dict #1"
+      ],
+      [
+       "last_build_writeid",
+       "1"
+      ],
+      [
+       "rows",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;Pune|10-03&#x27;: → tuple #2}",
+    "<b>#2 tuple (2)<\/b> (176200, 52265000)",
+    "<b>#3 list (2)<\/b> [→ tuple #4, → tuple #5]",
+    "<b>#4 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 1)",
+    "<b>#5 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 2)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "mv",
+       "→ dict #1"
+      ],
+      [
+       "last_build_writeid",
+       "1"
+      ],
+      [
+       "rows",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;Pune|10-03&#x27;: → tuple #2}",
+    "<b>#2 tuple (2)<\/b> (176200, 52265000)",
+    "<b>#3 list (2)<\/b> [→ tuple #4, → tuple #5]",
+    "<b>#4 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 1)",
+    "<b>#5 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 2)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>new<\/code> is created: → list #6. A new list object (#6) is created: [→ tuple #5]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "mv",
+       "→ dict #1"
+      ],
+      [
+       "last_build_writeid",
+       "1"
+      ],
+      [
+       "rows",
+       "→ list #3"
+      ],
+      [
+       "new",
+       "→ list #6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;Pune|10-03&#x27;: → tuple #2}",
+    "<b>#2 tuple (2)<\/b> (176200, 52265000)",
+    "<b>#3 list (2)<\/b> [→ tuple #4, → tuple #5]",
+    "<b>#4 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 1)",
+    "<b>#5 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 2)",
+    "<b>#6 list (1)<\/b> [→ tuple #5]"
+   ],
+   "newVar": "new"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>n<\/code> is created: 176200. <code>rev<\/code> is created: 52265000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "mv",
+       "→ dict #1"
+      ],
+      [
+       "last_build_writeid",
+       "1"
+      ],
+      [
+       "rows",
+       "→ list #3"
+      ],
+      [
+       "new",
+       "→ list #6"
+      ],
+      [
+       "n",
+       "176200"
+      ],
+      [
+       "rev",
+       "52265000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;Pune|10-03&#x27;: → tuple #2}",
+    "<b>#2 tuple (2)<\/b> (176200, 52265000)",
+    "<b>#3 list (2)<\/b> [→ tuple #4, → tuple #5]",
+    "<b>#4 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 1)",
+    "<b>#5 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 2)",
+    "<b>#6 list (1)<\/b> [→ tuple #5]"
+   ],
+   "newVar": "rev"
+  },
+  {
+   "line": 6,
+   "phase": "Merge",
+   "note": "UNION with the MV rows, then re-aggregate. <code>key<\/code> is created: &#x27;Pune|10-03&#x27;. <code>amt<\/code> is created: 1000. <code>w<\/code> is created: 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "mv",
+       "→ dict #1"
+      ],
+      [
+       "last_build_writeid",
+       "1"
+      ],
+      [
+       "rows",
+       "→ list #3"
+      ],
+      [
+       "new",
+       "→ list #6"
+      ],
+      [
+       "n",
+       "176200"
+      ],
+      [
+       "rev",
+       "52265000"
+      ],
+      [
+       "key",
+       "'Pune|10-03'"
+      ],
+      [
+       "amt",
+       "1000"
+      ],
+      [
+       "w",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;Pune|10-03&#x27;: → tuple #2}",
+    "<b>#2 tuple (2)<\/b> (176200, 52265000)",
+    "<b>#3 list (2)<\/b> [→ tuple #4, → tuple #5]",
+    "<b>#4 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 1)",
+    "<b>#5 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 2)",
+    "<b>#6 list (1)<\/b> [→ tuple #5]"
+   ],
+   "newVar": "w"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>n<\/code> changes to 176201. <code>rev<\/code> changes to 52266000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "mv",
+       "→ dict #1"
+      ],
+      [
+       "last_build_writeid",
+       "1"
+      ],
+      [
+       "rows",
+       "→ list #3"
+      ],
+      [
+       "new",
+       "→ list #6"
+      ],
+      [
+       "n",
+       "176201"
+      ],
+      [
+       "rev",
+       "52266000"
+      ],
+      [
+       "key",
+       "'Pune|10-03'"
+      ],
+      [
+       "amt",
+       "1000"
+      ],
+      [
+       "w",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;Pune|10-03&#x27;: → tuple #2}",
+    "<b>#2 tuple (2)<\/b> (176200, 52265000)",
+    "<b>#3 list (2)<\/b> [→ tuple #4, → tuple #5]",
+    "<b>#4 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 1)",
+    "<b>#5 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 2)",
+    "<b>#6 list (1)<\/b> [→ tuple #5]"
+   ],
+   "newVar": "rev"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "mv",
+       "→ dict #1"
+      ],
+      [
+       "last_build_writeid",
+       "1"
+      ],
+      [
+       "rows",
+       "→ list #3"
+      ],
+      [
+       "new",
+       "→ list #6"
+      ],
+      [
+       "n",
+       "176201"
+      ],
+      [
+       "rev",
+       "52266000"
+      ],
+      [
+       "key",
+       "'Pune|10-03'"
+      ],
+      [
+       "amt",
+       "1000"
+      ],
+      [
+       "w",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;Pune|10-03&#x27;: → tuple #2}",
+    "<b>#2 tuple (2)<\/b> (176200, 52265000)",
+    "<b>#3 list (2)<\/b> [→ tuple #4, → tuple #5]",
+    "<b>#4 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 1)",
+    "<b>#5 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 2)",
+    "<b>#6 list (1)<\/b> [→ tuple #5]"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Result",
+   "note": "176,201 orders, as the fresh query returned. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "mv",
+       "→ dict #1"
+      ],
+      [
+       "last_build_writeid",
+       "1"
+      ],
+      [
+       "rows",
+       "→ list #3"
+      ],
+      [
+       "new",
+       "→ list #6"
+      ],
+      [
+       "n",
+       "176201"
+      ],
+      [
+       "rev",
+       "52266000"
+      ],
+      [
+       "key",
+       "'Pune|10-03'"
+      ],
+      [
+       "amt",
+       "1000"
+      ],
+      [
+       "w",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;Pune|10-03&#x27;: → tuple #2}",
+    "<b>#2 tuple (2)<\/b> (176200, 52265000)",
+    "<b>#3 list (2)<\/b> [→ tuple #4, → tuple #5]",
+    "<b>#4 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 1)",
+    "<b>#5 tuple (3)<\/b> (&#x27;Pune|10-03&#x27;, 1000, 2)",
+    "<b>#6 list (1)<\/b> [→ tuple #5]"
+   ],
+   "out": "{'Pune|10-03': (176201, 52266000)}\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three decisions about views and materialized views.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Analytics · reuse</span></div>
+    <h4>View, MV or table?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Choose the right object for four needs.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>four requests from TiffinGo teams</pre></div><div><small>Expected output</small><pre>view               &lt;- one definition of &#x27;Gold order&#x27;
+materialized view  &lt;- daily city totals for 40 dashboard tiles
+table (CTAS)       &lt;- month-end snapshot for auditors
+view               &lt;- hide phone numbers from analysts</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Only reuse a definition → view.</li><li>Expensive aggregate, transactional source → MV.</li><li>A frozen snapshot → table.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "A month-end snapshot must not change when the source changes, so neither a view nor a rebuilt MV fits.",
+   "code": "needs = {\"one definition of 'Gold order'\": \"view\",\n         \"daily city totals for 40 dashboard tiles\": \"materialized view\",\n         \"month-end snapshot for auditors\": \"table (CTAS)\",\n         \"hide phone numbers from analysts\": \"view\"}\nfor k, v in needs.items():\n    print(f\"{v:18} <- {k}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "needs = {\"one definition of 'Gold order'\": \"view\",",
+  "         \"daily city totals for 40 dashboard tiles\": \"materialized view\",",
+  "         \"month-end snapshot for auditors\": \"table (CTAS)\",",
+  "         \"hide phone numbers from analysts\": \"view\"}",
+  "for k, v in needs.items():",
+  "    print(f\"{v:18} <- {k}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Source",
+   "note": "MV rewriting needs transactional sources, as Step 4 showed.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>needs<\/code> is created: → dict #1. A new dict object (#1) is created: {&quot;one definition of …: &#x27;view&#x27;, &#x27;daily city totals …: &#x27;materialized view&#x27;, &#x27;month-end snap…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "needs",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&quot;one definition of …: &#x27;view&#x27;, &#x27;daily city totals …: &#x27;materialized view&#x27;, &#x27;month-end snap…"
+   ],
+   "newVar": "needs"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>k<\/code> is created: &quot;one definition of &#x27;Gold order&#x27;&quot;. <code>v<\/code> is created: &#x27;view&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "needs",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "\"one definition of 'Gold order'\""
+      ],
+      [
+       "v",
+       "'view'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&quot;one definition of …: &#x27;view&#x27;, &#x27;daily city totals …: &#x27;materialized view&#x27;, &#x27;month-end snap…"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "needs",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "\"one definition of 'Gold order'\""
+      ],
+      [
+       "v",
+       "'view'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&quot;one definition of …: &#x27;view&#x27;, &#x27;daily city totals …: &#x27;materialized view&#x27;, &#x27;month-end snap…"
+   ],
+   "out": "view               <- one definition of 'Gold order'\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to &#x27;daily city totals for 40 dashboard tiles&#x27;. <code>v<\/code> changes to &#x27;materialized view&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "needs",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'daily city totals for 40 dashboard tiles'"
+      ],
+      [
+       "v",
+       "'materialized view'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&quot;one definition of …: &#x27;view&#x27;, &#x27;daily city totals …: &#x27;materialized view&#x27;, &#x27;month-end snap…"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "needs",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'daily city totals for 40 dashboard tiles'"
+      ],
+      [
+       "v",
+       "'materialized view'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&quot;one definition of …: &#x27;view&#x27;, &#x27;daily city totals …: &#x27;materialized view&#x27;, &#x27;month-end snap…"
+   ],
+   "out": "materialized view  <- daily city totals for 40 dashboard tiles\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to &#x27;month-end snapshot for auditors&#x27;. <code>v<\/code> changes to &#x27;table (CTAS)&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "needs",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'month-end snapshot for auditors'"
+      ],
+      [
+       "v",
+       "'table (CTAS)'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&quot;one definition of …: &#x27;view&#x27;, &#x27;daily city totals …: &#x27;materialized view&#x27;, &#x27;month-end snap…"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "needs",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'month-end snapshot for auditors'"
+      ],
+      [
+       "v",
+       "'table (CTAS)'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&quot;one definition of …: &#x27;view&#x27;, &#x27;daily city totals …: &#x27;materialized view&#x27;, &#x27;month-end snap…"
+   ],
+   "out": "table (CTAS)       <- month-end snapshot for auditors\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to &#x27;hide phone numbers from analysts&#x27;. <code>v<\/code> changes to &#x27;view&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "needs",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'hide phone numbers from analysts'"
+      ],
+      [
+       "v",
+       "'view'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&quot;one definition of …: &#x27;view&#x27;, &#x27;daily city totals …: &#x27;materialized view&#x27;, &#x27;month-end snap…"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "needs",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'hide phone numbers from analysts'"
+      ],
+      [
+       "v",
+       "'view'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&quot;one definition of …: &#x27;view&#x27;, &#x27;daily city totals …: &#x27;materialized view&#x27;, &#x27;month-end snap…"
+   ],
+   "out": "view               <- hide phone numbers from analysts\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "needs",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'hide phone numbers from analysts'"
+      ],
+      [
+       "v",
+       "'view'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&quot;one definition of …: &#x27;view&#x27;, &#x27;daily city totals …: &#x27;materialized view&#x27;, &#x27;month-end snap…"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Data engineering · grain</span></div>
+    <h4>Pick the MV grain</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Dashboards group by city, by day, and by city and day. One MV should serve all of them.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>queries: GROUP BY city · GROUP BY order_date · GROUP BY city, order_date</pre></div><div><small>Expected output</small><pre>MV GROUP BY: [&#x27;city&#x27;, &#x27;order_date&#x27;]
+store: COUNT(*) AS n, SUM(amount) AS rev   (AVG = rev / n)</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Union of all grouping columns.</li><li>Keep additive measures (COUNT, SUM).</li><li>Coarser queries roll up.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Exactly our mv_city_day: 240 rows serving all three dashboards.",
+   "code": "queries = [{\"city\"}, {\"order_date\"}, {\"city\", \"order_date\"}]\ngrain = set().union(*queries)\nprint(\"MV GROUP BY:\", sorted(grain))\nprint(\"store: COUNT(*) AS n, SUM(amount) AS rev   (AVG = rev / n)\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "queries = [{\"city\"}, {\"order_date\"}, {\"city\", \"order_date\"}]",
+  "grain = set().union(*queries)",
+  "print(\"MV GROUP BY:\", sorted(grain))",
+  "print(\"store: COUNT(*) AS n, SUM(amount) AS rev   (AVG = rev / n)\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>queries<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "queries",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ set #2, → set #3, → set #4]",
+    "<b>#2 set (1)<\/b> {&#x27;city&#x27;}",
+    "<b>#3 set (1)<\/b> {&#x27;order_date&#x27;}",
+    "<b>#4 set (2)<\/b> {&#x27;city&#x27;, &#x27;order_date&#x27;}"
+   ],
+   "newVar": "queries"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>grain<\/code> is created: → set #5. A new set object (#5) is created: {&#x27;city&#x27;, &#x27;order_date&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "queries",
+       "→ list #1"
+      ],
+      [
+       "grain",
+       "→ set #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ set #2, → set #3, → set #4]",
+    "<b>#2 set (1)<\/b> {&#x27;city&#x27;}",
+    "<b>#3 set (1)<\/b> {&#x27;order_date&#x27;}",
+    "<b>#4 set (2)<\/b> {&#x27;city&#x27;, &#x27;order_date&#x27;}",
+    "<b>#5 set (2)<\/b> {&#x27;city&#x27;, &#x27;order_date&#x27;}"
+   ],
+   "newVar": "grain"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "queries",
+       "→ list #1"
+      ],
+      [
+       "grain",
+       "→ set #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ set #2, → set #3, → set #4]",
+    "<b>#2 set (1)<\/b> {&#x27;city&#x27;}",
+    "<b>#3 set (1)<\/b> {&#x27;order_date&#x27;}",
+    "<b>#4 set (2)<\/b> {&#x27;city&#x27;, &#x27;order_date&#x27;}",
+    "<b>#5 set (2)<\/b> {&#x27;city&#x27;, &#x27;order_date&#x27;}"
+   ],
+   "out": "MV GROUP BY: ['city', 'order_date']\n"
+  },
+  {
+   "line": 4,
+   "phase": "Additive",
+   "note": "Averages cannot be rolled up; store sum and count instead. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "queries",
+       "→ list #1"
+      ],
+      [
+       "grain",
+       "→ set #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ set #2, → set #3, → set #4]",
+    "<b>#2 set (1)<\/b> {&#x27;city&#x27;}",
+    "<b>#3 set (1)<\/b> {&#x27;order_date&#x27;}",
+    "<b>#4 set (2)<\/b> {&#x27;city&#x27;, &#x27;order_date&#x27;}",
+    "<b>#5 set (2)<\/b> {&#x27;city&#x27;, &#x27;order_date&#x27;}"
+   ],
+   "out": "store: COUNT(*) AS n, SUM(amount) AS rev   (AVG = rev / n)\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Platform · freshness</span></div>
+    <h4>Set a staleness policy</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Loads arrive every 15 minutes; rebuild takes 2 minutes. Dashboards tolerate 20 minutes of delay. Choose the window and rebuild schedule.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>load every 15 min, rebuild 2 min, tolerance 20 min (illustrative)</pre></div><div><small>Expected output</small><pre>rebuild after every load; window = 17 min (OK)
+SET hive.materializedview.rewriting.time.window=17min;</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Rebuild after each load.</li><li>Window covers load + rebuild time.</li><li>Never exceed the tolerance.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "With a window of 0 (the lab default), every load makes Hive fall back to the base table until the rebuild finishes: always correct, sometimes slow.",
+   "code": "load_every, rebuild, tolerance = 15, 2, 20\nwindow = load_every + rebuild\nprint(\"rebuild after every load; window =\", window, \"min\", \"(OK)\" if window <= tolerance else \"(too stale)\")\nprint(f\"SET hive.materializedview.rewriting.time.window={window}min;\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "load_every, rebuild, tolerance = 15, 2, 20",
+  "window = load_every + rebuild",
+  "print(\"rebuild after every load; window =\", window, \"min\", \"(OK)\" if window <= tolerance else \"(too stale)\")",
+  "print(f\"SET hive.materializedview.rewriting.time.window={window}min;\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>load_every<\/code> is created: 15. <code>rebuild<\/code> is created: 2. <code>tolerance<\/code> is created: 20.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "load_every",
+       "15"
+      ],
+      [
+       "rebuild",
+       "2"
+      ],
+      [
+       "tolerance",
+       "20"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "tolerance"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>window<\/code> is created: 17.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "load_every",
+       "15"
+      ],
+      [
+       "rebuild",
+       "2"
+      ],
+      [
+       "tolerance",
+       "20"
+      ],
+      [
+       "window",
+       "17"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "window"
+  },
+  {
+   "line": 3,
+   "phase": "Window",
+   "note": "Covers the gap between a load and the next finished rebuild. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "load_every",
+       "15"
+      ],
+      [
+       "rebuild",
+       "2"
+      ],
+      [
+       "tolerance",
+       "20"
+      ],
+      [
+       "window",
+       "17"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "rebuild after every load; window = 17 min (OK)\n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "load_every",
+       "15"
+      ],
+      [
+       "rebuild",
+       "2"
+      ],
+      [
+       "tolerance",
+       "20"
+      ],
+      [
+       "window",
+       "17"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "SET hive.materializedview.rewriting.time.window=17min;\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: Does a Hive view store data?",
+  "options": [
+   "Yes, a copy",
+   "Only statistics",
+   "No, only the query text",
+   "Only on first use"
+  ],
+  "answer": 2,
+  "why": "Table type VIRTUAL_VIEW; the query is expanded when used."
+ },
+ {
+  "q": "Beginner: Which statement refreshes a materialized view?",
+  "options": [
+   "REFRESH mv",
+   "ALTER MATERIALIZED VIEW mv REBUILD",
+   "MSCK REPAIR",
+   "ANALYZE mv"
+  ],
+  "answer": 1,
+  "why": "Incremental when possible, otherwise full."
+ },
+ {
+  "q": "Beginner: A column was added to the base table of a SELECT * view. Does the view show it?",
+  "options": [
+   "No, the column list was fixed at creation",
+   "Yes",
+   "Only after REBUILD",
+   "Error"
+  ],
+  "answer": 0,
+  "why": "Hive stored the expanded column list."
+ },
+ {
+  "q": "Intermediate: Why was rewriting refused for an MV on orders?",
+  "options": [
+   "Too many rows",
+   "Missing statistics",
+   "GROUP BY not allowed",
+   "orders is non-transactional (external)"
+  ],
+  "answer": 3,
+  "why": "Hive cannot track changes to external files."
+ },
+ {
+  "q": "Intermediate: How many rows did the rewritten query read?",
+  "options": [
+   "5,000,000",
+   "8",
+   "240",
+   "0"
+  ],
+  "answer": 2,
+  "why": "240 MV rows instead of 5,000,000 base rows."
+ },
+ {
+  "q": "Intermediate: What happened after an INSERT into the source with the window at 0?",
+  "options": [
+   "The stale MV was used",
+   "Hive ignored the outdated MV and read the base table",
+   "Error",
+   "The MV rebuilt itself"
+  ],
+  "answer": 1,
+  "why": "Outdated for Rewriting: Yes."
+ },
+ {
+  "q": "Advanced: With a 10-minute window, what did the report return for Pune?",
+  "options": [
+   "The old count (176,200 instead of 176,201)",
+   "The correct new count",
+   "NULL",
+   "An error"
+  ],
+  "answer": 0,
+  "why": "Staleness traded for speed."
+ },
+ {
+  "q": "Advanced: Which rebuild did Hive plan after a DELETE?",
+  "options": [
+   "Incremental",
+   "None",
+   "Partial by partition",
+   "Full recomputation"
+  ],
+  "answer": 3,
+  "why": "After INSERT only it planned the incremental UNION."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 9.2 in one screen</h3>
+    <ul><li><b>View:</b> stored, expanded SQL (VIRTUAL_VIEW); no data; always current. Name columns, avoid SELECT *.</li><li>Dropping a base table does not drop views; they fail when queried. Check dependents first.</li><li><b>MV:</b> <code>CREATE MATERIALIZED VIEW mv AS SELECT …</code> stores the result; <code>SHOW MATERIALIZED VIEWS</code>.</li><li>Rewriting needs <b>transactional</b> sources; otherwise <code>DISABLE REWRITE</code>.</li><li>Rewriting is automatic (<code>hive.materializedview.rewriting=true</code>): lab 240 vs 5,000,000 rows; COUNT(*) → SUM(n).</li><li><b>Stale:</b> Outdated for Rewriting → ignored at window 0; <code>…rewriting.time.window</code> allows stale answers.</li><li><b>REBUILD:</b> incremental (UNION of new writeids) after INSERT; full after DELETE/UPDATE.</li><li>Hive 4 <b>results cache</b> returns identical queries instantly; disable it when measuring.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Can I INSERT into a view?</summary><p>No. Hive views are read-only. Load the base tables; the view shows the new data automatically.</p></details>
+    <details><summary>Can a materialized view use Iceberg tables?</summary><p>Yes, in Hive 4 Iceberg tables can be MV sources and MVs can be stored as Iceberg; Cloudera documents incremental rebuilds for Iceberg MVs. Check your version’s documentation and EXPLAIN the rebuild.</p></details>
+    <details><summary>Is there an automatic rebuild?</summary><p>Hive can schedule queries (<code>CREATE SCHEDULED QUERY … EXECUTED AS … AS ALTER MATERIALIZED VIEW mv REBUILD</code>) when the scheduled-query service is running. Many teams instead add the REBUILD as the last step of their load job.</p></details>
+    <details><summary>Do views slow queries down?</summary><p>No: a view is expanded into the query and optimised as a whole, so filters on the view are pushed into the base tables. Very deep stacks of views make plans hard to read, though.</p></details>
+    <details><summary>What about Spark and Trino?</summary><p>Both can read Hive views stored in the metastore with some limitations (the SQL dialect must be understood by the engine). Hive materialized views and their rewriting are specific to Hive; other engines just see a table.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs that model views and MVs, with the HiveQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>MV size</h4></div>
+      <p>How many rows does an MV grouped by 8 cities and 30 days have?</p>
+      <div class="prob__io"><div><small>Input</small><pre>8 × 30</pre></div><div><small>Expected output</small><pre>240</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(8 * 30)</code></pre><div class="output">240</div></div>
+        <p><b>How it works:</b> 240, the real row count of mv_city_day.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Reduction factor</h4></div>
+      <p>How many times fewer rows does the rewritten query read?</p>
+      <div class="prob__io"><div><small>Input</small><pre>5,000,000 vs 240</pre></div><div><small>Expected output</small><pre>20833</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(5_000_000 / 240))</code></pre><div class="output">20833</div></div>
+        <p><b>How it works:</b> About 20,833× fewer rows.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Stale difference</h4></div>
+      <p>How far off was the stale Pune revenue?</p>
+      <div class="prob__io"><div><small>Input</small><pre>52,265,000 vs 52,266,000</pre></div><div><small>Expected output</small><pre>1000</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(52_266_000 - 52_265_000)</code></pre><div class="output">1000</div></div>
+        <p><b>How it works:</b> Exactly the 1,000 inserted after the last rebuild.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Roll-up average</h4></div>
+      <p>Compute the average order value per city from MV rows (n, rev).</p>
+      <div class="prob__io"><div><small>Input</small><pre>two daily rows for Pune</pre></div><div><small>Expected output</small><pre>333.33</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>rows = [(100, 30000), (50, 20000)]
+n = sum(r[0] for r in rows); rev = sum(r[1] for r in rows)
+print(round(rev / n, 2))</code></pre><div class="output">333.33</div></div>
+        <p><b>How it works:</b> Never average the daily averages: 333.33, not 350.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Can the MV answer it?</h4></div>
+      <p>Decide if an MV grouped by (city, day) can answer each query.</p>
+      <div class="prob__io"><div><small>Input</small><pre>three GROUP BY lists</pre></div><div><small>Expected output</small><pre>[&#x27;city&#x27;] -&gt; MV
+[&#x27;order_date&#x27;] -&gt; MV
+[&#x27;customer_id&#x27;] -&gt; base table</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>mv = {&quot;city&quot;, &quot;order_date&quot;}
+for q in [{&quot;city&quot;}, {&quot;order_date&quot;}, {&quot;customer_id&quot;}]:
+    print(sorted(q), &quot;-&gt;&quot;, &quot;MV&quot; if q &lt;= mv else &quot;base table&quot;)</code></pre><div class="output">[&#x27;city&#x27;] -&gt; MV
+[&#x27;order_date&#x27;] -&gt; MV
+[&#x27;customer_id&#x27;] -&gt; base table</div></div>
+        <p><b>How it works:</b> customer_id is not in the MV, so Hive must read orders_tx.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Expand SELECT *</h4></div>
+      <p>Show the column list a SELECT * view stores.</p>
+      <div class="prob__io"><div><small>Input</small><pre>columns at creation</pre></div><div><small>Expected output</small><pre>SELECT `cust_copy`.`customer_id`, `cust_copy`.`name`, `cust_copy`.`city` FROM `tiffingo`.`cust_copy`</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>cols = [&quot;customer_id&quot;, &quot;name&quot;, &quot;city&quot;]
+print(&quot;SELECT &quot; + &quot;, &quot;.join(f&quot;`cust_copy`.`{c}`&quot; for c in cols) + &quot; FROM `tiffingo`.`cust_copy`&quot;)</code></pre><div class="output">SELECT `cust_copy`.`customer_id`, `cust_copy`.`name`, `cust_copy`.`city` FROM `tiffingo`.`cust_copy`</div></div>
+        <p><b>How it works:</b> Exactly what SHOW CREATE TABLE v_cust_all returned; later columns are not included.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Dashboard cost</h4></div>
+      <p>40 tiles each scan 2 TB daily. With one MV of 2 GB, how much is read?</p>
+      <div class="prob__io"><div><small>Input</small><pre>illustrative</pre></div><div><small>Expected output</small><pre>without MV: 80000 GB · with MV: 80 GB</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;without MV:&quot;, 40 * 2000, &quot;GB · with MV:&quot;, 40 * 2, &quot;GB&quot;)</code></pre><div class="output">without MV: 80000 GB · with MV: 80 GB</div></div>
+        <p><b>How it works:</b> 80,000 GB vs 80 GB a day, if all tiles can be rewritten.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Freshness trade-off</h4></div>
+      <p>With a 20-minute window, what share of the day can a dashboard be stale?</p>
+      <div class="prob__io"><div><small>Input</small><pre>loads every 15 min (illustrative)</pre></div><div><small>Expected output</small><pre>up to 100 % of refreshes may show data up to 20 minutes old</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;up to&quot;, 100, &quot;% of refreshes may show data up to 20 minutes old&quot;)</code></pre><div class="output">up to 100 % of refreshes may show data up to 20 minutes old</div></div>
+        <p><b>How it works:</b> Every refresh may be served from an MV that misses the latest load; agree that this is acceptable.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Views and MVs come up in both SQL rounds and design rounds.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Hive</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“View vs table?”</h4>
+      <p class="scn__situation">Explain what a view is and when to use one.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know views store no data?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>A view is a stored SELECT with a name. It holds no data; Hive expands it into the query each time, so it always shows current data. Views simplify repeated joins, give one definition of a business rule, and restrict columns for security. A table stores data and must be reloaded to change.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Saying views are faster than tables.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Materialized view not used</h4>
+      <p class="scn__situation">You created an MV but EXPLAIN shows queries still read the base table.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know the rewriting rules?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Check that the sources are transactional and rewriting is enabled (SHOW MATERIALIZED VIEWS).</li>
+          <li>Check “Outdated for Rewriting” in DESCRIBE FORMATTED; rebuild or set a window.</li>
+          <li>Check the query can be derived from the MV’s grain and columns.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> “Query the MV by name in every report.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Analytics</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Dashboard numbers lag behind</h4>
+      <p class="scn__situation">Finance says yesterday’s last orders are missing from a dashboard served by an MV.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you explain staleness?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>The MV was not rebuilt after the last load and the staleness window allowed it to be used.</li>
+          <li>Rebuild after each load; reduce or remove the window for finance-critical reports.</li>
+          <li>Document the freshness of each dashboard.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Blaming the source system first.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Architecture</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Speed up 200 dashboards</h4>
+      <p class="scn__situation">Design an acceleration layer for 200 dashboards on large transactional fact tables.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you design MVs as a layer?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Find common grains from query logs; build a few MVs at those grains with additive measures.</li>
+          <li>Rebuild in the load pipeline; set windows per business tolerance; monitor “Outdated” status.</li>
+          <li>Verify rewriting with EXPLAIN CBO in CI; keep views as the semantic layer on top.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> One MV per dashboard.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

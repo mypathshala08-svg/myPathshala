@@ -1,0 +1,323 @@
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>The hidden tax of moving Python objects</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> <a href="../02-broadcast-variables-and-accumulators/">3.2 Broadcast</a>.</p></div>
+  <div class="story">
+<div class="callout callout--exam" style="display:block"><p style="font-size:1.12rem;margin:0 0 6px"><b>🤔 A one-line lambda that looks up a price from a dict. Why did Spark send 2.8 MB with every single task?</b></p><p style="margin:0 0 6px">Because PySpark must <b>serialize</b> your function, and everything it captures, to send it to Python workers on the executors. The dict came along each time. With a <b>broadcast</b> the same function was 635 bytes. Serialization is the hidden tax in PySpark: code with cloudpickle, rows with pickle or Arrow. In our lab Arrow made <code>toPandas()</code> 6.5× faster (14.5 s → 2.2 s), while the old “use MarshalSerializer” advice made no measurable difference.</p><ul style="margin:0 0 0 18px"><li>What gets serialized in PySpark, and when.</li><li>pickle, cloudpickle, marshal and Arrow, measured.</li><li>Avoiding big closures and unpicklable objects.</li></ul></div>
+
+    <p class="narration">Kabir’s price lookup job is slow although the code is one line. An old tutorial suggests changing the serializer. Arjun Sir suggests measuring first.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Serialization path: on the driver your lambda is turned into bytes by cloudpickle, sent with each task to the executor JVM, and unpickled and run by a Python worker; rows move as pickle batches and DataFrame-to-pandas transfers use Arrow.">
+        <rect x="6" y="34" width="80" height="44" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="46" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">driver</text><text x="46" y="68" text-anchor="middle" font-size="6.6" class="s-ink">your lambda</text><path d="M86 56L94 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M87.7 59.0L94 56L87.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="94" y="34" width="80" height="44" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="134" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">cloudpickle</text><text x="134" y="68" text-anchor="middle" font-size="6.6" class="s-ink">bytes</text><path d="M174 56L182 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M175.7 59.0L182 56L175.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="182" y="34" width="80" height="44" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="222" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">executor JVM</text><text x="222" y="68" text-anchor="middle" font-size="6.6" class="s-ink">task</text><path d="M262 56L270 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M263.7 59.0L270 56L263.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="270" y="34" width="80" height="44" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="310" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">Python worker</text><text x="310" y="68" text-anchor="middle" font-size="6.6" class="s-ink">unpickle + run</text><text x="176" y="20" text-anchor="middle" font-size="7.2" class="s-ink">every task carries the function and what it captured</text><text x="176" y="100" text-anchor="middle" font-size="7.0" class="s-ink">rows: pickle batches · DataFrames↔pandas: Arrow</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Code and data cross process boundaries as <tspan font-weight="700" class="s-acc">bytes</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+K> Sir, the old tutorial says “use MarshalSerializer, it is faster than pickle”. Should we switch?
+A> Measure first. And check what is actually slow: often it is not the serializer but what you ask it to carry.
+R> Like what?
+A> Like a big dictionary hidden inside a lambda, or rows converted one by one instead of in Arrow columns. Let’s measure each.
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Serialization in PySpark</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Serialization</b> converts objects to bytes for transfer or storage. PySpark serializes user functions and their closures with <b>cloudpickle</b>, transfers RDD records between the JVM and Python workers using batched pickle (or marshal) serializers, and uses <b>Apache Arrow</b> columnar batches for pandas conversions and vectorized UDFs. JVM-side data uses Spark’s internal binary formats or the configured JVM serializer (Java or Kryo).</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>To run your Python code on many machines, Spark turns your function and data into bytes. What your function “carries” matters most; Arrow moves whole columns at once and is much faster than row by row.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Serialize</b><span>Object → bytes.</span></div>
+    <div class="term"><b>cloudpickle</b><span>Pickles functions/closures.</span></div>
+    <div class="term"><b>Closure</b><span>Function + captured variables.</span></div>
+    <div class="term"><b>MarshalSerializer</b><span>Fast, simple types only.</span></div>
+    <div class="term"><b>AutoBatchedSerializer</b><span>Batches records.</span></div>
+    <div class="term"><b>Arrow</b><span>Columnar format.</span></div>
+    <div class="term"><b>Kryo</b><span>JVM serializer.</span></div>
+    <div class="term"><b>PicklingError</b><span>Cannot serialize.</span></div>
+  </div>
+
+  <h3>Why, how, where</h3>
+  <div class="cards">
+    <div class="card"><h4>Why</h4><p>Python objects live in one process. To run your function on 100 executors, or move records between Python and the JVM, Spark must turn them into bytes and back. That costs CPU, memory and network, and some objects cannot be turned into bytes at all.</p><span class="tag">the problem it solves</span></div>
+    <div class="card"><h4>How</h4><p>Your functions (and captured variables) are serialized with <b>cloudpickle</b> and shipped with each task. RDD records move between the JVM and Python workers as batched pickled bytes (<code>AutoBatchedSerializer</code>). DataFrame↔pandas transfers and pandas/Arrow UDFs use <b>Apache Arrow</b> columnar batches. JVM-only data (DataFrames, shuffles) uses Spark’s own binary formats; Kryo is a JVM option.</p><span class="tag">the mechanism</span></div>
+    <div class="card"><h4>Where</h4><p>Every UDF, map/filter lambda, broadcast, collect/toPandas and createDataFrame from Python objects.</p><span class="tag">in real systems</span></div>
+    <div class="card"><h4>When not</h4><p>Large captured objects inflate every task; unpicklable objects (locks, DB connections, sockets) fail; pickle is Python-only and trusts its input.</p><span class="tag">know the limits</span></div>
+  </div>
+
+  <h3>Concept map: what depends on what</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 230" role="img" aria-label="Concept map. Beginner: objects to bytes, why it is needed. Intermediate: cloudpickle for functions, pickle/marshal for data, AutoBatchedSerializer, Arrow. Advanced: closure capture, broadcast, unpicklable objects, Kryo on the JVM side.">
+        <rect x="14" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="112" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-green">Beginner</text><a href="../../01-introduction/03-spark-architecture/"><rect x="28" y="36" width="168" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="112.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Python ↔ JVM</text><text x="112.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 1.3</text></a><rect x="28" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="112.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Why serialize</text><text x="112.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">network, disk, cache</text><rect x="224" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="322" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-blue">Intermediate</text><rect x="238" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">cloudpickle</text><text x="322.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">functions</text><rect x="238" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">pickle / marshal</text><text x="322.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">records</text><rect x="238" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">AutoBatched</text><text x="322.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">batches</text><a href="../../04-dataframes/06-collect-topandas-and-arrow/"><rect x="238" y="150" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="161" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Arrow</text><text x="322.0" y="171" text-anchor="middle" font-size="6.4" class="s-ink2 mono">columns</text></a><rect x="434" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="532" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-violet">Advanced</text><rect x="448" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Closure capture</text><text x="532.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">hidden size</text><a href="../../03-persistence-and-shared-variables/02-broadcast-variables-and-accumulators/"><rect x="448" y="74" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Broadcast</text><text x="532.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 3.2</text></a><rect x="448" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Unpicklable objects</text><text x="532.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">locks, connections</text><rect x="448" y="150" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="161" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Kryo (JVM)</text><text x="532.0" y="171" text-anchor="middle" font-size="6.4" class="s-ink2 mono">not for Python</text><path d="M112 66L112 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M109.0 67.7L112 74L115.0 67.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 89L238 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M235.4 57.5L238 51L231.3 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 89L238 89" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M231.7 92.0L238 89L231.7 86.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 104L322 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 105.7L322 112L325.0 105.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 89L238 165" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M232.3 161.0L238 165L237.6 158.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 51L448 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M441.7 54.0L448 51L441.7 48.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M532 66L532 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M529.0 67.7L532 74L535.0 67.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 51L448 127" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M442.3 123.0L448 127L447.6 120.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 89L448 165" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M442.3 161.0L448 165L447.6 158.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><text x="320" y="212" text-anchor="middle" font-size="8" class="s-ink2">Orange = this lesson · arrows = “you need this first” · click a box to jump</text>
+        
+        <text x="632" y="228" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>  <p class="muted"><b>Builds on:</b> <a href="../02-broadcast-variables-and-accumulators/">3.2 Broadcast</a>. <b>Next:</b> <a href="../../04-dataframes/01-sparksession-and-dataframes/">4.1 DataFrames</a>.</p>
+
+
+  <h3>See the hidden payload</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 110" role="img" aria-label="Size of one task closure: a lambda capturing a 300,000-entry dict is 2,804,549 bytes; the same lambda reading a broadcast variable is 635 bytes.">
+        <text x="16" y="22" font-size="8.6" font-weight="700" class="s-ink">Task closure sizes (real, cloudpickle)</text><rect x="16" y="40" width="600" height="22" rx="4" class="s-soft-acc" style="stroke:#D64545"/><text x="316" y="55" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">lambda x: big.get(x)  →  2,804,549 bytes per task</text><rect x="16" y="72" width="6" height="22" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="30" y="87" font-size="8" font-weight="700" class="s-ink">lambda x: bb.value.get(x)  →  635 bytes per task (+ data once per executor)</text>
+        <text x="320" y="100" text-anchor="middle" font-size="10.5" class="s-ink2">Bars to scale: broadcasting cut the task payload by ~4,400×.</text>
+        <text x="632" y="108" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+LEVELS> Serialization at three levels
+L1> Packing for a trip
+      <ul>
+        <li>Every worker needs your recipe (function). If you tape the whole pantry (big dict) to each recipe card, every card becomes heavy. Better: put the pantry in each kitchen once (broadcast) and keep the card light.</li>
+      </ul>
+L2> What PySpark uses
+      <ul>
+        <li><b>Functions</b>: cloudpickle (can serialize lambdas and closures that plain <code>pickle</code> cannot).</li>
+        <li><b>RDD records</b>: <code>SparkContext(serializer=…)</code>, default CloudPickle/Pickle wrapped in <code>AutoBatchedSerializer</code>; <code>MarshalSerializer</code> only for simple built-in types.</li>
+        <li><b>DataFrames</b>: stay in the JVM; Arrow is used for <code>toPandas()</code>, <code>createDataFrame(pandas)</code>, pandas/Arrow UDFs and (Spark 4) Arrow-optimized Python UDFs (<code>spark.sql.execution.arrow.pyspark.enabled</code>, <code>…pythonUDF.arrow.enabled</code>).</li>
+      </ul>
+L3> Pitfalls
+      <ul>
+        <li>Closures capture referenced variables (and sometimes <code>self</code>): check size with <code>pyspark.cloudpickle.dumps(f)</code>. Broadcast large read-only data.</li>
+        <li>Unpicklable objects (locks, connections, clients): create them inside <code>mapPartitions</code>/<code>foreachPartition</code>, once per partition.</li>
+        <li>Kryo (<code>spark.serializer=org.apache.spark.serializer.KryoSerializer</code>) affects JVM objects (RDDs of JVM types, shuffles in Scala jobs), not Python objects.</li>
+      </ul>
+/LEVELS
+<div class="callout callout--warn" style="display:block"><p style="margin:0 0 6px"><b>Myth vs reality: things many websites still say</b></p><ul style="margin:0 0 0 18px"><li><b>Myth:</b> MarshalSerializer makes PySpark fast.<br><b>Reality (Spark 4.3):</b> No clear gain in our fair test.<br><span class="muted">Proof: Step 3.</span></li><li><b>Myth:</b> Kryo speeds up PySpark UDFs.<br><b>Reality (Spark 4.3):</b> Kryo is JVM-side only.<br><span class="muted">Proof: Table.</span></li><li><b>Myth:</b> Small code = small tasks.<br><b>Reality (Spark 4.3):</b> Captured data rides along.<br><span class="muted">Proof: Step 2: 2.8 MB.</span></li></ul></div>
+
+EXAM> “Why are serializers needed in PySpark?” To ship functions (cloudpickle) and data between driver, JVM and Python workers; MarshalSerializer (fast, limited types) vs PickleSerializer (any object); batched; Arrow for pandas/vectorized UDFs; avoid big closures (broadcast); Kryo is for JVM objects.
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>What uses which serializer</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th>What</th><th>Serializer</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>Your functions, lambdas</td><td>cloudpickle</td><td>captures referenced variables</td></tr><tr><td>RDD records (Python)</td><td>Pickle/CloudPickle in AutoBatched</td><td>Marshal optional, simple types only</td></tr><tr><td>toPandas / createDataFrame(pandas)</td><td>Arrow (if enabled)</td><td>columnar, vectorized</td></tr><tr><td>pandas / Arrow UDFs</td><td>Arrow</td><td>batches of columns</td></tr><tr><td>Python UDFs (Spark 4 default)</td><td>Arrow-optimized</td><td>pythonUDF.arrow.enabled = true</td></tr><tr><td>DataFrame rows in the JVM</td><td>Spark binary (Tungsten)</td><td>no Python involved</td></tr><tr><td>JVM RDDs / shuffles (Scala)</td><td>Java or Kryo</td><td>spark.serializer</td></tr></tbody>
+  </table>
+  </div>
+WARN> Do not copy “switch to MarshalSerializer” advice blindly: in our lab it was not faster once the JVM was warm, and it fails on custom classes. The big wins are avoiding large closures (broadcast instead), keeping work in DataFrames, and enabling Arrow for pandas transfers.
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Measure every crossing</h2>
+  <p>All outputs are real: PySpark 4.3.0, local[2], Python 3.13.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · pickle vs marshal</h4>
+      <div class="code" data-lang="python" data-file="l34_serial.py"><pre><code>rows = [(i, &quot;idli&quot;, 45.0) for i in range(200000)]
+pickle.dumps(rows, 5); marshal.dumps(rows)
+marshal.dumps([Order(1)])</code></pre><div class="output">== 1) the same 200,000 Python tuples, two serializers (bytes / ms)
+  pickle    3,469,559 bytes  dump    41 ms  load    44 ms
+  marshal   3,400,010 bytes  dump     8 ms  load    21 ms
+  marshal on a custom class: ValueError - unmarshallable object</div></div>
+      <span class="behind">Similar size; marshal faster on plain tuples but cannot handle custom classes.</span></li>
+    <li><h4>Step 2 · Functions and closures</h4>
+      <div class="code" data-lang="python" data-file="l34_serial.py"><pre><code>tax = 1.05; f = lambda x: x * tax
+pickle.dumps(f)          # fails
+cloudpickle.dumps(f)     # works
+g = lambda x: big.get(x, 0)   # big = 300k-entry dict</code></pre><div class="output">== 2) functions: plain pickle vs cloudpickle (PySpark ships your code with cloudpickle)
+  pickle.dumps(lambda): PicklingError Can&#x27;t pickle &lt;function &lt;lambda&gt; at 0x7f44843d14e0&gt;: attribute lookup &lt;lambda&gt; failed
+  cloudpickle.dumps(lambda): 528 bytes (code + captured variable tax)
+  lambda capturing a 300k-entry dict: 2,804,549 bytes, shipped with EVERY task</div></div>
+      <span class="behind">Plain pickle cannot ship lambdas; cloudpickle can, and it ships everything they capture.</span></li>
+    <li><h4>Step 3 · RDD serializers, measured fairly</h4>
+      <div class="code" data-lang="python" data-file="l34_serial.py"><pre><code>SparkContext(conf=conf, serializer=MarshalSerializer())
+sc.parallelize(range(3_000_000), 8).map(lambda x: (x % 100, x)).reduceByKey(add).count()</code></pre><div class="output">== 3) RDD serializer: CloudPickleSerializer (default) vs MarshalSerializer, 3M records, after a JVM warm-up
+  Marshal                 1.66 s  (keys 100)  sc.serializer = AutoBatchedSerializer
+  CloudPickle (default)   1.22 s  (keys 100)  sc.serializer = AutoBatchedSerializer
+  Marshal (again)         1.02 s  (keys 100)  sc.serializer = AutoBatchedSerializer</div></div>
+      <span class="behind">After a JVM warm-up the three runs were 1.0–1.7 s with no clear winner: the first run is usually slowest whatever its serializer.</span></li>
+    <li><h4>Step 4 · Unpicklable objects</h4>
+      <div class="code" data-lang="python" data-file="l34_serial.py"><pre><code>lock = threading.Lock()
+sc.parallelize([1, 2]).map(lambda x: (x, lock)).collect()</code></pre><div class="output">== 4) a closure that cannot be serialized
+   Could not serialize object: TypeError: cannot pickle &#x27;_thread.lock&#x27; object
+  fix: create the object inside the task (mapPartitions) or broadcast plain data</div></div>
+      <span class="behind">Spark refuses before running anything.</span></li>
+    <li><h4>Step 5 · Broadcast instead</h4>
+      <div class="code" data-lang="python" data-file="l34_serial.py"><pre><code>bb = sc.broadcast(big)
+h = lambda x: bb.value.get(x, 0)</code></pre><div class="output">== 5) broadcast instead of capturing big data
+  lambda using a broadcast: 635 bytes per task; data sent once per executor
+  result: [2, 4, 6]</div></div>
+      <span class="behind">The task closure shrinks to 635 bytes; the dict travels once per executor.</span></li>
+    <li><h4>Step 6 · Arrow for pandas</h4>
+      <div class="code" data-lang="python" data-file="l34_serial.py"><pre><code>spark.conf.set(&quot;spark.sql.execution.arrow.pyspark.enabled&quot;, arrow)
+df.toPandas()   # 2,000,000 rows</code></pre><div class="output">== 6) DataFrame → pandas: pickled rows vs Arrow columns (2,000,000 rows)
+  arrow=false toPandas 14.31 s  rows 2,000,000
+  arrow=true  toPandas  2.53 s  rows 2,000,000</div></div>
+      <span class="behind">14.5 s with row pickling, 2.2 s with Arrow columns.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Two views of the same run</h2>
+  <p>Left: real lab output. Right: what happens inside.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Measure what crosses the boundary <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real outputs (local[2])">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="6.8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">pickle 3.47 MB 36/36 ms</text><text x="26" y="64" font-size="6.8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">marshal 3.40 MB 8/22 ms</text><text x="26" y="78" font-size="6.8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">marshal: custom class fails</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="6.8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">pickle lambda: PicklingError</text><text x="26" y="64" font-size="6.8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">closure with dict: 2.8 MB</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">Marshal 1.66 s</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">CloudPickle 1.22 s</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">Marshal again 1.02 s</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">cannot pickle &#x27;_thread.lock&#x27;</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">broadcast closure: 635 bytes</text></g><g data-on="6"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">arrow=false 14.54 s</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">arrow=true 2.22 s</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Data.</li>
+          <li>Code.</li>
+          <li>RDD.</li>
+          <li>Fail.</li>
+          <li>Broadcast.</li>
+          <li>Arrow.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="The byte path">
+          <g data-on="1"><rect x="6" y="34" width="80" height="44" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="46" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">driver</text><text x="46" y="68" text-anchor="middle" font-size="6.6" class="s-ink">your lambda</text><path d="M86 56L94 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M87.7 59.0L94 56L87.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="94" y="34" width="80" height="44" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="134" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">cloudpickle</text><text x="134" y="68" text-anchor="middle" font-size="6.6" class="s-ink">bytes</text><path d="M174 56L182 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M175.7 59.0L182 56L175.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="182" y="34" width="80" height="44" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="222" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">executor JVM</text><text x="222" y="68" text-anchor="middle" font-size="6.6" class="s-ink">task</text><path d="M262 56L270 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M263.7 59.0L270 56L263.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="270" y="34" width="80" height="44" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="310" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">Python worker</text><text x="310" y="68" text-anchor="middle" font-size="6.6" class="s-ink">unpickle + run</text><text x="176" y="20" text-anchor="middle" font-size="7.2" class="s-ink">every task carries the function and what it captured</text><text x="176" y="100" text-anchor="middle" font-size="7.0" class="s-ink">rows: pickle batches · DataFrames↔pandas: Arrow</text><rect x="10" y="118" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="136.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Data to bytes</text></g><g data-on="2"><rect x="6" y="34" width="80" height="44" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="46" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">driver</text><text x="46" y="68" text-anchor="middle" font-size="6.6" class="s-ink">your lambda</text><path d="M86 56L94 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M87.7 59.0L94 56L87.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="94" y="34" width="80" height="44" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="134" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">cloudpickle</text><text x="134" y="68" text-anchor="middle" font-size="6.6" class="s-ink">bytes</text><path d="M174 56L182 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M175.7 59.0L182 56L175.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="182" y="34" width="80" height="44" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="222" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">executor JVM</text><text x="222" y="68" text-anchor="middle" font-size="6.6" class="s-ink">task</text><path d="M262 56L270 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M263.7 59.0L270 56L263.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="270" y="34" width="80" height="44" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="310" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">Python worker</text><text x="310" y="68" text-anchor="middle" font-size="6.6" class="s-ink">unpickle + run</text><text x="176" y="20" text-anchor="middle" font-size="7.2" class="s-ink">every task carries the function and what it captured</text><text x="176" y="100" text-anchor="middle" font-size="7.0" class="s-ink">rows: pickle batches · DataFrames↔pandas: Arrow</text><rect x="10" y="118" width="340" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="136.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Code to bytes</text></g><g data-on="3"><rect x="6" y="34" width="80" height="44" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="46" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">driver</text><text x="46" y="68" text-anchor="middle" font-size="6.6" class="s-ink">your lambda</text><path d="M86 56L94 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M87.7 59.0L94 56L87.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="94" y="34" width="80" height="44" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="134" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">cloudpickle</text><text x="134" y="68" text-anchor="middle" font-size="6.6" class="s-ink">bytes</text><path d="M174 56L182 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M175.7 59.0L182 56L175.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="182" y="34" width="80" height="44" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="222" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">executor JVM</text><text x="222" y="68" text-anchor="middle" font-size="6.6" class="s-ink">task</text><path d="M262 56L270 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M263.7 59.0L270 56L263.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="270" y="34" width="80" height="44" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="310" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">Python worker</text><text x="310" y="68" text-anchor="middle" font-size="6.6" class="s-ink">unpickle + run</text><text x="176" y="20" text-anchor="middle" font-size="7.2" class="s-ink">every task carries the function and what it captured</text><text x="176" y="100" text-anchor="middle" font-size="7.0" class="s-ink">rows: pickle batches · DataFrames↔pandas: Arrow</text><rect x="10" y="118" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="136.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No clear winner</text></g><g data-on="4"><rect x="6" y="34" width="80" height="44" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="46" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">driver</text><text x="46" y="68" text-anchor="middle" font-size="6.6" class="s-ink">your lambda</text><path d="M86 56L94 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M87.7 59.0L94 56L87.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="94" y="34" width="80" height="44" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="134" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">cloudpickle</text><text x="134" y="68" text-anchor="middle" font-size="6.6" class="s-ink">bytes</text><path d="M174 56L182 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M175.7 59.0L182 56L175.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="182" y="34" width="80" height="44" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="222" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">executor JVM</text><text x="222" y="68" text-anchor="middle" font-size="6.6" class="s-ink">task</text><path d="M262 56L270 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M263.7 59.0L270 56L263.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="270" y="34" width="80" height="44" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="310" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">Python worker</text><text x="310" y="68" text-anchor="middle" font-size="6.6" class="s-ink">unpickle + run</text><text x="176" y="20" text-anchor="middle" font-size="7.2" class="s-ink">every task carries the function and what it captured</text><text x="176" y="100" text-anchor="middle" font-size="7.0" class="s-ink">rows: pickle batches · DataFrames↔pandas: Arrow</text><rect x="10" y="118" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="136.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Some objects cannot</text></g><g data-on="5"><rect x="6" y="34" width="80" height="44" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="46" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">driver</text><text x="46" y="68" text-anchor="middle" font-size="6.6" class="s-ink">your lambda</text><path d="M86 56L94 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M87.7 59.0L94 56L87.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="94" y="34" width="80" height="44" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="134" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">cloudpickle</text><text x="134" y="68" text-anchor="middle" font-size="6.6" class="s-ink">bytes</text><path d="M174 56L182 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M175.7 59.0L182 56L175.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="182" y="34" width="80" height="44" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="222" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">executor JVM</text><text x="222" y="68" text-anchor="middle" font-size="6.6" class="s-ink">task</text><path d="M262 56L270 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M263.7 59.0L270 56L263.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="270" y="34" width="80" height="44" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="310" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">Python worker</text><text x="310" y="68" text-anchor="middle" font-size="6.6" class="s-ink">unpickle + run</text><text x="176" y="20" text-anchor="middle" font-size="7.2" class="s-ink">every task carries the function and what it captured</text><text x="176" y="100" text-anchor="middle" font-size="7.0" class="s-ink">rows: pickle batches · DataFrames↔pandas: Arrow</text><rect x="10" y="118" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="136.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Ship data once</text></g><g data-on="6"><rect x="6" y="34" width="80" height="44" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="46" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">driver</text><text x="46" y="68" text-anchor="middle" font-size="6.6" class="s-ink">your lambda</text><path d="M86 56L94 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M87.7 59.0L94 56L87.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="94" y="34" width="80" height="44" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="134" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">cloudpickle</text><text x="134" y="68" text-anchor="middle" font-size="6.6" class="s-ink">bytes</text><path d="M174 56L182 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M175.7 59.0L182 56L175.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="182" y="34" width="80" height="44" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="222" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">executor JVM</text><text x="222" y="68" text-anchor="middle" font-size="6.6" class="s-ink">task</text><path d="M262 56L270 56" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M263.7 59.0L270 56L263.7 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="270" y="34" width="80" height="44" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="310" y="52" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">Python worker</text><text x="310" y="68" text-anchor="middle" font-size="6.6" class="s-ink">unpickle + run</text><text x="176" y="20" text-anchor="middle" font-size="7.2" class="s-ink">every task carries the function and what it captured</text><text x="176" y="100" text-anchor="middle" font-size="7.0" class="s-ink">rows: pickle batches · DataFrames↔pandas: Arrow</text><rect x="10" y="118" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="136.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Columns beat rows</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Size.</li>
+          <li>Closure.</li>
+          <li>Fair test.</li>
+          <li>Lock.</li>
+          <li>635 B.</li>
+          <li>6.5×.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Now peel one map() task.</p>
+
+  <span class="live">Layer by layer</span>
+  <h3 id="scenario-peel">One map() task, layer by layer</h3>
+  <p class="anim-intro">rdd.map(lambda x: big.get(x)). (Simplified.)</p>
+  <div class="anim anim--one" data-frames="6" data-delay="5000">
+    <div class="anim__title">Layers <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Each layer of the system, from your code down to the disk">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Capture</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Pickle</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Ship</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Worker</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Rows</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Return</text><rect x="134" y="26" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="35.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Capture</text><text x="184" y="53" font-size="7.4" class="s-ink2">lambda refers to big</text><text x="184" y="66" font-size="7.4" class="s-ink2">cloudpickle follows refs</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Capture</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Pickle</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Ship</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Worker</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Rows</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Return</text><rect x="134" y="48" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="57.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 40L149 48" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 41.7L149 48L152.0 41.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Pickle</text><text x="184" y="53" font-size="7.4" class="s-ink2">code + big dict</text><text x="184" y="66" font-size="7.4" class="s-ink2">2.8 MB</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Capture</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Pickle</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Ship</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Worker</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Rows</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Return</text><rect x="134" y="70" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="79.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 62L149 70" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 63.7L149 70L152.0 63.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Ship</text><text x="184" y="53" font-size="7.4" class="s-ink2">inside each task</text><text x="184" y="66" font-size="7.4" class="s-ink2">× number of tasks</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Capture</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Pickle</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Ship</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Worker</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Rows</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Return</text><rect x="134" y="92" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="101.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 84L149 92" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 85.7L149 92L152.0 85.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Worker</text><text x="184" y="53" font-size="7.4" class="s-ink2">Python worker</text><text x="184" y="66" font-size="7.4" class="s-ink2">unpickles function</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="5"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Capture</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Pickle</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Ship</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Worker</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Rows</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Return</text><rect x="134" y="114" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="123.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 106L149 114" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 107.7L149 114L152.0 107.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Rows</text><text x="184" y="53" font-size="7.4" class="s-ink2">JVM sends batches</text><text x="184" y="66" font-size="7.4" class="s-ink2">pickled records</text><text x="184" y="79" font-size="7.4" class="s-ink2">AutoBatched</text></g><g data-on="6"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Capture</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Pickle</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Ship</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Worker</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Rows</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Return</text><rect x="134" y="136" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="145.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 128L149 136" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 129.7L149 136L152.0 129.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Return</text><text x="184" y="53" font-size="7.4" class="s-ink2">results pickled</text><text x="184" y="66" font-size="7.4" class="s-ink2">back to JVM</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Capture.</li>
+          <li>Pickle.</li>
+          <li>Ship.</li>
+          <li>Unpack.</li>
+          <li>Stream.</li>
+          <li>Return.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios: a heavy closure, a DB client, and slow toPandas.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-closure">Slow job, tiny code</h3>
+  <p class="anim-intro">Task deserialization time high. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Closure size <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Broadcast it">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Spark UI: big task size warning</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">MB per task</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Clue.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">cloudpickle.dumps(f)</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">measure</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Find.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Captured lookup dict</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">50 MB</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cause.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">sc.broadcast(dict)</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">use .value</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Tasks start fast</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">less network</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Done.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Warn.</li>
+          <li>Measure.</li>
+          <li>Cause.</li>
+          <li>Broadcast.</li>
+          <li>Fast.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-db">PicklingError with a DB client</h3>
+  <p class="anim-intro">Writing rows to a database. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Per-partition resources <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Create inside the task">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">client = DB() on driver</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">used in map</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fail.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Not picklable</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">socket inside</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Why.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">foreachPartition</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">open client per partition</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Batch inserts</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">close at end</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Efficient.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Or a Spark connector</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">JDBC sink</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Better.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Fail.</li>
+          <li>Why.</li>
+          <li>Partition.</li>
+          <li>Batch.</li>
+          <li>Connector.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-arrow">toPandas takes minutes</h3>
+  <p class="anim-intro">Reporting notebook. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Arrow <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Columnar transfer">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">2M rows → pandas</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">14 s</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Slow.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Enable Arrow</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">arrow.pyspark.enabled</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">2.2 s</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">6.5× faster</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Win.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Unsupported type?</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">falls back unless fallback disabled</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Better: aggregate first</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">collect less</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Best.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Slow.</li>
+          <li>Arrow.</li>
+          <li>Fast.</li>
+          <li>Types.</li>
+          <li>Less data.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Serialization at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">udf</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">UDFs</text></svg></div>
+    <div><h4>1. UDFs</h4>
+      <p>Arrow vs pickle path.</p>
+      <div class="uc-flow"><span>Rows</span><i>→</i><span class="java">Arrow</span><i>→</i><span>Python</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green">look</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">lookups</text></svg></div>
+    <div><h4>2. Lookups</h4>
+      <p>Broadcast, not closures.</p>
+      <div class="uc-flow"><span>Dict</span><i>→</i><span class="java">broadcast</span><i>→</i><span>Tasks</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">pd</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">pandas</text></svg></div>
+    <div><h4>3. pandas handoff</h4>
+      <p>toPandas with Arrow.</p>
+      <div class="uc-flow"><span>DataFrame</span><i>→</i><span class="java">Arrow</span><i>→</i><span>pandas</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-amber" style="stroke:var(--amber)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">io</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">sinks</text></svg></div>
+    <div><h4>4. External sinks</h4>
+      <p>Clients per partition.</p>
+      <div class="uc-flow"><span>Rows</span><i>→</i><span class="java">foreachPartition</span><i>→</i><span>DB</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified descriptions of common practice.</p>
+</section>

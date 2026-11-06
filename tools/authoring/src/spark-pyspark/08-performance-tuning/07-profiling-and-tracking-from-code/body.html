@@ -1,0 +1,321 @@
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Finding the slow line of Python</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> <a href="../../06-transformations/06-udfs/">6.6 UDFs</a>.</p></div>
+  <div class="story">
+<div class="callout callout--exam" style="display:block"><p style="font-size:1.12rem;margin:0 0 6px"><b>🤔 The Spark UI says a stage spent 29 seconds “running Python”. Which line of your Python function burned the time?</b></p><p style="margin:0 0 6px">The Spark UI cannot see inside Python. A <b>profiler</b> can. With one setting, Spark 4’s <b>UDF profiler</b> showed our UDF made 10.2 million generator calls; replacing it with built-in functions took the job from <b>29.5 s to 0.85 s</b>. Then we watched a running job from code with the <b>StatusTracker</b>: tasks done per stage, live, without opening the UI.</p><ul style="margin:0 0 0 18px"><li>Profiling Python UDFs in Spark 4 (perf and memory).</li><li>The classic RDD profiler and its limits.</li><li>Tracking jobs and stages from code with StatusTracker and job groups.</li></ul></div>
+
+    <p class="narration">TiffinGo’s band-classification job spends most of its time in a Python UDF. The Spark UI shows one long stage and nothing more.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="UDF profiler output: the generator expression was called 10.2 million times, the UDF slow_band 400 thousand times, split 400 thousand times; after replacing the UDF with built-in functions the job went from 29.5 to 0.85 seconds.">
+        <text x="176" y="20" text-anchor="middle" font-size="7.4" class="s-ink">Profile of UDF: calls (millions) and tottime</text><text x="10" y="48" font-size="7.6" font-weight="700" class="s-ink">genexpr</text><rect x="80" y="36" width="220" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="10" y="74" font-size="7.6" font-weight="700" class="s-ink">slow_band</text><rect x="80" y="62" width="20" height="18" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="10" y="100" font-size="7.6" font-weight="700" class="s-ink">split</text><rect x="80" y="88" width="4" height="18" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="330" y="49" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">10.2 M</text><text x="176" y="120" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink">job 29.5 s → 0.85 s after the fix</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">The profiler points at the line: <tspan font-weight="700" class="s-acc">10.2 million calls</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+K> Sir, the band-classification UDF takes half a minute. The Spark UI just shows one long stage.
+A> The UI stops at the Python worker. Turn on the UDF profiler: it runs cProfile inside the workers and brings the numbers back to you.
+R> And our scheduler wants a progress bar for the nightly job. Do we scrape the UI?
+A> No, use the StatusTracker from code. Let’s do both.
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Profiling and tracking from code</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Profiling</b> measures where a program spends time or memory. PySpark provides a session-level <b>UDF profiler</b> (Spark 4.0+; <code>spark.sql.pyspark.<wbr>udf.profiler</code> = perf or memory) that runs cProfile or memory_profiler inside Python workers and aggregates results on the driver, and an older RDD profiler enabled with <code>spark.python.profile</code>. The <b>StatusTracker</b> is a low-level API exposing weakly consistent information about active jobs and stages.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>A profiler tells you which Python lines are slow inside Spark; the StatusTracker tells your program how far a running job has got.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Profiler</b><span>Measures time/memory per function.</span></div>
+    <div class="term"><b>cProfile</b><span>Python’s built-in profiler.</span></div>
+    <div class="term"><b>ncalls</b><span>Number of calls.</span></div>
+    <div class="term"><b>tottime</b><span>Time inside function.</span></div>
+    <div class="term"><b>cumtime</b><span>Including callees.</span></div>
+    <div class="term"><b>StatusTracker</b><span>Job/stage progress API.</span></div>
+    <div class="term"><b>Job group</b><span>Label for related jobs.</span></div>
+    <div class="term"><b>BasicProfiler</b><span>Default classic profiler.</span></div>
+  </div>
+
+  <h3>Why, how, where</h3>
+  <div class="cards">
+    <div class="card"><h4>Why</h4><p>The Spark UI shows stages and tasks, not which Python line is slow. Long jobs also need progress reporting in schedulers, notebooks or custom dashboards.</p><span class="tag">the problem it solves</span></div>
+    <div class="card"><h4>How</h4><p>Set <code>spark.sql.pyspark.<wbr>udf.profiler</code> to <code>perf</code> (cProfile) or <code>memory</code> (memory_profiler); run the query; read the results with <code>spark.profile.show()</code> or <code>dump()</code>. For RDD code, the older <code>spark.python.profile=true</code> + <code>sc.show_profiles()</code>. For progress, <code>sc.statusTracker()</code> returns job and stage info; <code>sc.setJobGroup</code> labels jobs.</p><span class="tag">the mechanism</span></div>
+    <div class="card"><h4>Where</h4><p>Slow UDF investigations, code reviews before production, notebook progress bars, orchestration that reports progress or cancels a job group.</p><span class="tag">in real systems</span></div>
+    <div class="card"><h4>When not</h4><p>Profiling adds overhead: use it on samples, not in production runs. StatusTracker is weakly consistent and keeps only recent jobs (spark.ui.retainedJobs).</p><span class="tag">know the limits</span></div>
+  </div>
+
+  <h3>Concept map: what depends on what</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 230" role="img" aria-label="Concept map. Beginner: slow job, where time goes. Intermediate: UDF profiler, cProfile output, Spark UI vs profiler. Advanced: memory profiler, classic RDD profiler, StatusTracker, job groups, custom progress.">
+        <rect x="14" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="112" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-green">Beginner</text><a href="../../08-performance-tuning/06-spark-ui-troubleshooting/"><rect x="28" y="36" width="168" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="112.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Spark UI</text><text x="112.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 8.6</text></a><a href="../../06-transformations/06-udfs/"><rect x="28" y="74" width="168" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="112.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Python UDFs</text><text x="112.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 6.6</text></a><rect x="224" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="322" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-blue">Intermediate</text><rect x="238" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">UDF profiler</text><text x="322.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">spark 4</text><rect x="238" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">cProfile stats</text><text x="322.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">ncalls, tottime</text><rect x="238" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Fix with built-ins</text><text x="322.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">35×</text><rect x="238" y="150" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="161" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD profiler</text><text x="322.0" y="171" text-anchor="middle" font-size="6.4" class="s-ink2 mono">classic</text><rect x="434" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="532" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-violet">Advanced</text><rect x="448" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Memory profiler</text><text x="532.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">memory_profiler</text><rect x="448" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">StatusTracker</text><text x="532.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">jobs, stages</text><rect x="448" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Job groups</text><text x="532.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">setJobGroup</text><a href="../../01-introduction/06-sparkcontext-sparkconf-and-sparkfiles/"><rect x="448" y="150" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="161" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">SparkContext</text><text x="532.0" y="171" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 1.6</text></a><path d="M196 51L238 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M231.7 54.0L238 51L231.7 48.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 89L238 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M235.4 57.5L238 51L231.3 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 66L322 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 67.7L322 74L325.0 67.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 104L322 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 105.7L322 112L325.0 105.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 66L322 150" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 143.7L322 150L325.0 143.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 51L448 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M441.7 54.0L448 51L441.7 48.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 51L448 89" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M441.3 91.1L448 89L442.2 85.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M532 104L532 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M529.0 105.7L532 112L535.0 105.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M532 180L532 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M535.0 80.3L532 74L529.0 80.3" style="fill:none;stroke:#8A94A0;stroke-width:1"/><text x="320" y="212" text-anchor="middle" font-size="8" class="s-ink2">Orange = this lesson · arrows = “you need this first” · click a box to jump</text>
+        
+        <text x="632" y="228" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>  <p class="muted"><b>Builds on:</b> <a href="../06-spark-ui-troubleshooting/">8.6 Spark UI</a>, <a href="../../06-transformations/06-udfs/">6.6 UDFs</a>. <b>Next:</b> <a href="../../09-structured-streaming/01-streaming-concepts/">Module 9</a>.</p>
+
+
+  <h3>Dissect a profile line</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 172" role="img" aria-label="Dissection of one cProfile line: 10200000 calls, 1.034 seconds total time in the function itself, 0.000 per call, 1.034 cumulative, located at l87_profile.py line 11 in a generator expression.">
+        <text x="16" y="22" font-size="8.6" font-weight="700" class="s-ink">One line of the UDF profile (real)</text><rect x="16" y="34" width="49.696" height="22" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="40.848" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">10200000</text><circle cx="18" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="18" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><rect x="69.696" y="34" width="35.56" height="22" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="87.476" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">1.034</text><circle cx="71.696" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="71.696" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><rect x="109.256" y="34" width="35.56" height="22" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="127.036" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">0.000</text><circle cx="111.256" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="111.256" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><rect x="148.816" y="34" width="35.56" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="166.596" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">1.034</text><circle cx="150.816" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="150.816" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><rect x="188.376" y="34" width="172.208" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="274.48" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">l87_profile.py:11(&lt;genexpr&gt;)</text><circle cx="190.376" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="190.376" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">5</text><circle cx="24" cy="81" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="84" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><text x="38" y="84" font-size="8" font-weight="700" class="s-ink">ncalls</text><text x="106" y="84" font-size="7.6" class="s-ink2">how many times it ran</text><circle cx="24" cy="96" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="99" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><text x="38" y="99" font-size="8" font-weight="700" class="s-ink">tottime</text><text x="106" y="99" font-size="7.6" class="s-ink2">seconds inside this function only</text><circle cx="24" cy="111" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="114" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><text x="38" y="114" font-size="8" font-weight="700" class="s-ink">percall</text><text x="106" y="114" font-size="7.6" class="s-ink2">tottime ÷ ncalls</text><circle cx="24" cy="126" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="129" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><text x="38" y="129" font-size="8" font-weight="700" class="s-ink">cumtime</text><text x="106" y="129" font-size="7.6" class="s-ink2">including everything it called</text><circle cx="24" cy="141" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="144" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">5</text><text x="38" y="144" font-size="8" font-weight="700" class="s-ink">where</text><text x="106" y="144" font-size="7.6" class="s-ink2">file:line(function)</text>
+        <text x="320" y="162" text-anchor="middle" font-size="10.5" class="s-ink2">Sum of squares in a generator, 400,000 times: the real culprit.</text>
+        <text x="632" y="170" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+LEVELS> Profiling and tracking at three levels
+L1> A stopwatch per cook
+      <ul>
+        <li>The restaurant board (Spark UI) shows which orders are late. To know why, you time each cook’s steps (profiler). The manager’s tablet shows live “4 of 8 dishes done” (StatusTracker).</li>
+      </ul>
+L2> The settings and calls
+      <ul>
+        <li><code>spark.conf.set("spark.sql.pyspark.udf.profiler", "perf")</code> (or <code>"memory"</code>, needs <code>memory_profiler</code>); run; <code>spark.profile.show(type="perf")</code>, <code>spark.profile.dump(path)</code>, <code>spark.profile.clear()</code>. Works for Python, pandas and Arrow UDFs, also with Spark Connect.</li>
+        <li>Classic: <code>spark.python.profile=true</code> at startup, then <code>sc.show_profiles()</code> / <code>sc.dump_profiles(path)</code>; custom classes via <code>SparkContext(profiler_cls=…)</code> (BasicProfiler by default).</li>
+        <li><code>st = sc.statusTracker()</code>: <code>getActiveJobsIds()</code>, <code>getActiveStageIds()</code>, <code>getJobIdsForGroup(g)</code>, <code>getJobInfo(id)</code> (status, stageIds), <code>getStageInfo(id)</code> (numTasks, numActiveTasks, numCompletedTasks, numFailedTasks).</li>
+      </ul>
+L3> Gotchas
+      <ul>
+        <li>On Python 3.12+ the classic profiler and the UDF profiler cannot run in the same session: we got <code>ValueError: tool 2 is already in use</code>. Use one at a time.</li>
+        <li>cProfile columns: <i>ncalls</i>, <i>tottime</i> (inside the function), <i>cumtime</i> (including callees). Look for huge call counts first.</li>
+        <li>Job groups also allow <code>sc.cancelJobGroup(g)</code>; <code>spark.addTag</code>/<code>interruptTag</code> do the same for Spark Connect.</li>
+      </ul>
+/LEVELS
+<div class="callout callout--warn" style="display:block"><p style="margin:0 0 6px"><b>Myth vs reality: things many websites still say</b></p><ul style="margin:0 0 0 18px"><li><b>Myth:</b> The Spark UI shows slow Python lines.<br><b>Reality (Spark 4.3):</b> It stops at the worker; use the profiler.<br><span class="muted">Proof: Step 1.</span></li><li><b>Myth:</b> UDFs are fine if they are short.<br><b>Reality (Spark 4.3):</b> 10.2 M hidden calls in one line.<br><span class="muted">Proof: Step 1.</span></li><li><b>Myth:</b> Progress needs the UI.<br><b>Reality (Spark 4.3):</b> StatusTracker from code.<br><span class="muted">Proof: Step 3.</span></li></ul></div>
+
+EXAM> “How do you profile PySpark?” Spark 4 UDF profiler (spark.sql.pyspark.<wbr>udf.profiler = perf or memory; spark.profile.show or dump); classic spark.python.profile with sc.show_profiles (BasicProfiler, cProfile); StatusTracker (getJobInfo, getStageInfo, getActiveJobsIds) and job groups; fix hot spots with built-in functions.
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Profiling and tracking tools</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Tool</th><th>Shows</th><th>Enable</th><th>Read</th></tr></thead>
+    <tbody><tr><td>UDF profiler (perf)</td><td>cProfile of Python/pandas/Arrow UDFs</td><td>spark.sql.pyspark.<wbr>udf.profiler=perf</td><td>spark.profile.show()</td></tr><tr><td>UDF profiler (memory)</td><td>line-by-line memory</td><td>…=memory (+ memory_profiler)</td><td>spark.profile.show(type="memory")</td></tr><tr><td>Classic RDD profiler</td><td>cProfile per RDD</td><td>spark.python.profile=true (startup)</td><td>sc.show_profiles()</td></tr><tr><td>StatusTracker</td><td>live job/stage progress</td><td>sc.statusTracker()</td><td>getJobInfo / getStageInfo</td></tr><tr><td>Spark UI / REST</td><td>stages, tasks, spill</td><td>always on</td><td>port 4040 / history server</td></tr></tbody>
+  </table>
+  </div>
+WARN> Profile on a sample, not the full production run: cProfile adds overhead per Python call. And remember StatusTracker answers can be empty for a moment (weak consistency) and old jobs disappear after spark.ui.retainedJobs.
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Profile, fix, track</h2>
+  <p>All outputs are real: PySpark 4.3.0, local[2], Python 3.13.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Profile a slow UDF</h4>
+      <div class="code" data-lang="python" data-file="l87_profile.py"><pre><code>spark.conf.set(&quot;spark.sql.pyspark.udf.profiler&quot;, &quot;perf&quot;)
+band = udf(slow_band, &quot;string&quot;)
+df.select(band(&quot;item&quot;)).groupBy(...).count().collect()
+spark.profile.show(type=&quot;perf&quot;)</code></pre><div class="output">== 1) Spark 4 UDF profiler: where does Python time go?
+  job took 29.49 s
+  Profile of UDF&lt;id=2&gt;
+  12600000 function calls in 11.592 seconds
+  ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+  10200000    1.034    0.000    1.034    0.000 l87_profile.py:11(&lt;genexpr&gt;)
+  400000    0.961    0.000    3.615    0.000 l87_profile.py:9(slow_band)
+  400000    0.125    0.000    0.125    0.000 {method &#x27;split&#x27; of &#x27;str&#x27; objects}</div></div>
+      <span class="behind">29.5 s for 400,000 rows. 12.6 million Python calls; 10.2 million of them are the generator on line 11.</span></li>
+    <li><h4>Step 2 · Fix with built-ins</h4>
+      <div class="code" data-lang="python" data-file="l87_profile.py"><pre><code>n = F.split(&quot;item&quot;, &quot;-&quot;).getItem(1).cast(&quot;int&quot;)
+F.when(((n - 1) * n * (2 * n - 1) / 6) % 3 == 0, &quot;hot&quot;).otherwise(&quot;cold&quot;)</code></pre><div class="output">== 2) after the fix: built-in functions, no Python UDF
+  job took 0.85 s (sum of squares 0..n-1 = (n-1)n(2n-1)/6)</div></div>
+      <span class="behind">A closed formula in Spark expressions: 0.85 s, about 35× faster, and no Python workers at all.</span></li>
+    <li><h4>Step 3 · Watch a job with StatusTracker</h4>
+      <div class="code" data-lang="python" data-file="l87_profile.py"><pre><code>st = sc.statusTracker()
+sc.setJobGroup(&quot;nightly-report&quot;, &quot;orders per item&quot;)   # in the worker thread
+for j in st.getActiveJobsIds(): st.getJobInfo(j); st.getStageInfo(s)</code></pre><div class="output">== 3) StatusTracker: watch a running job from another thread
+  job 4 [RUNNING] stage 6: 0/2 tasks done, 0 running
+  job 4 [RUNNING] stage 6: 1/2 tasks done, 1 running
+  job 5 [RUNNING] stage 7: 0/2 tasks done, 0 running
+  job 5 [RUNNING] stage 8: 0/8 tasks done, 0 running
+  job 5 [RUNNING] stage 8: 1/8 tasks done, 3 running
+  job 5 [RUNNING] stage 8: 4/8 tasks done, 3 running
+  jobs in group nightly-report: [6, 5, 4]
+  active jobs now: []</div></div>
+      <span class="behind">Live progress from code: stage 8 went 0 → 1 → 4 of 8 tasks. The group lists all its jobs.</span></li>
+    <li><h4>Step 4 · The classic RDD profiler</h4>
+      <div class="code" data-lang="python" data-file="l87_profile.py"><pre><code>SparkSession.builder.config(&quot;spark.python.profile&quot;, &quot;true&quot;)…
+sc.parallelize(range(200_000), 2).map(lambda x: sum(range(x % 300))).count()
+sc.show_profiles()</code></pre><div class="output">== 4) classic RDD profiler (new session with spark.python.profile=true)
+  note: it cannot run together with the UDF profiler in one session on Python 3.12+:
+        ValueError: tool 2 is already in use (both use cProfile/sys.monitoring)
+  Profile of RDD&lt;id=1&gt;
+  800098 function calls (600092 primitive calls) in 0.363 seconds
+  200004/4    0.204    0.000    0.363    0.091 {built-in method builtins.sum}
+  200000    0.057    0.000    0.236    0.000 l87_profile.py:54(&lt;lambda&gt;)
+  2    0.000    0.000    0.363    0.181 rdd.py:2179(&lt;lambda&gt;)
+  2    0.000    0.000    0.000    0.000 rdd.py:2154(&lt;lambda&gt;)</div></div>
+      <span class="behind">Per-RDD cProfile output. It must be enabled at startup and cannot share a session with the UDF profiler on modern Python.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Two views of the same run</h2>
+  <p>Left: real lab output. Right: what happens inside.</p>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">Find the line, watch the job <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real outputs (local[2])">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">job took 29.49 s</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">10200000 calls genexpr</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">job took 0.85 s</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">stage 8: 1/8 → 4/8 done</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">group: [6, 5, 4]</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">Profile of RDD&lt;id=1&gt;</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">builtins.sum 0.363 s</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Profile.</li>
+          <li>Fix.</li>
+          <li>Track.</li>
+          <li>Classic.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Inside the Python workers">
+          <g data-on="1"><text x="176" y="20" text-anchor="middle" font-size="7.4" class="s-ink">Profile of UDF: calls (millions) and tottime</text><text x="10" y="48" font-size="7.6" font-weight="700" class="s-ink">genexpr</text><rect x="80" y="36" width="220" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="10" y="74" font-size="7.6" font-weight="700" class="s-ink">slow_band</text><rect x="80" y="62" width="20" height="18" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="10" y="100" font-size="7.6" font-weight="700" class="s-ink">split</text><rect x="80" y="88" width="4" height="18" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="330" y="49" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">10.2 M</text><text x="176" y="120" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink">job 29.5 s → 0.85 s after the fix</text><rect x="10" y="130" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="148.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hot spot found</text></g><g data-on="2"><text x="176" y="20" text-anchor="middle" font-size="7.4" class="s-ink">Profile of UDF: calls (millions) and tottime</text><text x="10" y="48" font-size="7.6" font-weight="700" class="s-ink">genexpr</text><rect x="80" y="36" width="220" height="18" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="10" y="74" font-size="7.6" font-weight="700" class="s-ink">slow_band</text><rect x="80" y="62" width="20" height="18" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="10" y="100" font-size="7.6" font-weight="700" class="s-ink">split</text><rect x="80" y="88" width="4" height="18" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="330" y="49" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">10.2 M</text><text x="176" y="120" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink">job 29.5 s → 0.85 s after the fix</text><rect x="10" y="130" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="148.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">35× faster</text></g><g data-on="3"><text x="176" y="20" text-anchor="middle" font-size="7.4" class="s-ink">Profile of UDF: calls (millions) and tottime</text><text x="10" y="48" font-size="7.6" font-weight="700" class="s-ink">genexpr</text><rect x="80" y="36" width="220" height="18" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="10" y="74" font-size="7.6" font-weight="700" class="s-ink">slow_band</text><rect x="80" y="62" width="20" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="10" y="100" font-size="7.6" font-weight="700" class="s-ink">split</text><rect x="80" y="88" width="4" height="18" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="330" y="49" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">10.2 M</text><text x="176" y="120" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink">job 29.5 s → 0.85 s after the fix</text><rect x="10" y="130" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="148.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Live progress</text></g><g data-on="4"><text x="176" y="20" text-anchor="middle" font-size="7.4" class="s-ink">Profile of UDF: calls (millions) and tottime</text><text x="10" y="48" font-size="7.6" font-weight="700" class="s-ink">genexpr</text><rect x="80" y="36" width="220" height="18" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="10" y="74" font-size="7.6" font-weight="700" class="s-ink">slow_band</text><rect x="80" y="62" width="20" height="18" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="10" y="100" font-size="7.6" font-weight="700" class="s-ink">split</text><rect x="80" y="88" width="4" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="330" y="49" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">10.2 M</text><text x="176" y="120" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink">job 29.5 s → 0.85 s after the fix</text><rect x="10" y="130" width="340" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="148.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Classic profiler</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>10.2 M.</li>
+          <li>0.85 s.</li>
+          <li>4/8.</li>
+          <li>RDD.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Now peel a profiled UDF.</p>
+
+  <span class="live">Layer by layer</span>
+  <h3 id="scenario-peel">A profiled UDF, layer by layer</h3>
+  <p class="anim-intro">slow_band with the perf profiler. (Simplified.)</p>
+  <div class="anim anim--one" data-frames="6" data-delay="5000">
+    <div class="anim__title">Layers <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Each layer of the system, from your code down to the disk">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Config</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Worker</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. cProfile</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Accumulate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Collect</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Show</text><rect x="134" y="26" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="35.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Config</text><text x="184" y="53" font-size="7.4" class="s-ink2">udf.profiler = perf</text><text x="184" y="66" font-size="7.4" class="s-ink2">session setting</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Config</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Worker</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. cProfile</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Accumulate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Collect</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Show</text><rect x="134" y="48" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="57.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 40L149 48" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 41.7L149 48L152.0 41.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Worker</text><text x="184" y="53" font-size="7.4" class="s-ink2">Python worker runs UDF</text><text x="184" y="66" font-size="7.4" class="s-ink2">wrapped by profiler</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Config</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Worker</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. cProfile</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Accumulate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Collect</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Show</text><rect x="134" y="70" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="79.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 62L149 70" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 63.7L149 70L152.0 63.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">cProfile</text><text x="184" y="53" font-size="7.4" class="s-ink2">records every call</text><text x="184" y="66" font-size="7.4" class="s-ink2">ncalls, tottime</text><text x="184" y="79" font-size="7.4" class="s-ink2">overhead!</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Config</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Worker</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. cProfile</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Accumulate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Collect</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Show</text><rect x="134" y="92" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="101.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 84L149 92" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 85.7L149 92L152.0 85.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Accumulate</text><text x="184" y="53" font-size="7.4" class="s-ink2">stats per UDF id</text><text x="184" y="66" font-size="7.4" class="s-ink2">sent back with results</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="5"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Config</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Worker</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. cProfile</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Accumulate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Collect</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Show</text><rect x="134" y="114" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="123.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 106L149 114" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 107.7L149 114L152.0 107.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Collect</text><text x="184" y="53" font-size="7.4" class="s-ink2">driver merges</text><text x="184" y="66" font-size="7.4" class="s-ink2">all tasks</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="6"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Config</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Worker</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. cProfile</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Accumulate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Collect</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Show</text><rect x="134" y="136" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="145.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 128L149 136" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 129.7L149 136L152.0 129.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Show</text><text x="184" y="53" font-size="7.4" class="s-ink2">spark.profile.show()</text><text x="184" y="66" font-size="7.4" class="s-ink2">sorted table</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Set.</li>
+          <li>Wrap.</li>
+          <li>Count.</li>
+          <li>Return.</li>
+          <li>Merge.</li>
+          <li>Read.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios: a regression, a progress bar, and a memory blow-up.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-regress">UDF job doubled in time</h3>
+  <p class="anim-intro">After a code change. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">UDF profiler <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Compare profiles">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly job 10 → 20 min</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">new UDF version</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Regression.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Profile a 1% sample</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">perf</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Measure.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">json.loads called per row twice</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">hot spot</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cause.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Parse once / from_json</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">built-in</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Back to 9 min</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">profile in CI sample</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Guard.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Slow.</li>
+          <li>Sample.</li>
+          <li>Hot spot.</li>
+          <li>Fix.</li>
+          <li>Guard.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-progress">Scheduler needs progress</h3>
+  <p class="anim-intro">Airflow task shows nothing for an hour. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">StatusTracker <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Report from code">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Long Spark job</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">no visibility</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Problem.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">setJobGroup("nightly")</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">label work</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Tag.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Thread polls StatusTracker</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">done/total tasks</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Measure.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Log % every minute</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">scheduler shows it</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Visible.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">cancelJobGroup on timeout</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">clean stop</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Control.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Blind.</li>
+          <li>Tag.</li>
+          <li>Poll.</li>
+          <li>Log.</li>
+          <li>Cancel.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-mem">Executors run out of memory in a pandas UDF</h3>
+  <p class="anim-intro">OOM in Python worker. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Memory profiler <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Line-by-line">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Python worker killed</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">container memory</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fail.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">udf.profiler = memory</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">on a sample</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Measure.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Line 12: +900 MiB</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">copying a DataFrame</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cause.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Process in place / iterator UDF</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">smaller batches</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">maxRecordsPerBatch</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">tune</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Tune.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>OOM.</li>
+          <li>Profile.</li>
+          <li>Line.</li>
+          <li>Fix.</li>
+          <li>Tune.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Profiling at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-red" style="stroke:var(--red)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-red">udf</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">UDFs</text></svg></div>
+    <div><h4>1. Slow UDFs</h4>
+      <p>Find the hot line.</p>
+      <div class="uc-flow"><span>UDF</span><i>→</i><span class="java">perf</span><i>→</i><span>Fix</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-amber" style="stroke:var(--amber)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">mem</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">memory</text></svg></div>
+    <div><h4>2. Python OOMs</h4>
+      <p>Memory profiler.</p>
+      <div class="uc-flow"><span>pandas UDF</span><i>→</i><span class="java">memory</span><i>→</i><span>Fix</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">prog</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">progress</text></svg></div>
+    <div><h4>3. Progress reporting</h4>
+      <p>StatusTracker + job groups.</p>
+      <div class="uc-flow"><span>Job</span><i>→</i><span class="java">poll</span><i>→</i><span>Log</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green">ci</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">CI</text></svg></div>
+    <div><h4>4. Performance checks</h4>
+      <p>Profile samples in CI.</p>
+      <div class="uc-flow"><span>PR</span><i>→</i><span class="java">profile</span><i>→</i><span>Gate</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified descriptions of common practice.</p>
+</section>

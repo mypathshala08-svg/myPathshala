@@ -1,0 +1,46 @@
+"""13.3 Review the capstone pipeline like a senior engineer."""
+import sys, os, glob, time, shutil
+sys.path.insert(0, "/root/lab/spark/jobs/m13/tiffingo")
+from pyspark.sql import SparkSession, functions as F
+from transforms import ORDER_SCHEMA, clean_orders, daily_city_revenue
+spark = (SparkSession.builder.master("local[4]").config("spark.driver.memory", "2g")
+         .config("spark.ui.showConsoleProgress", "false").getOrCreate())
+spark.sparkContext.setLogLevel("ERROR")
+B = "/root/lab/spark/data/m13"; T = "/tmp/claude-0/m13review"; shutil.rmtree(T, ignore_errors=True)
+raw = spark.read.option("header", True).schema(ORDER_SCHEMA).csv(f"{B}/landing/orders")
+valid, _ = clean_orders(raw)
+print("== 1) output files: with and without repartition(order_date)")
+valid.write.partitionBy("order_date").parquet(f"{T}/no_repart")
+n1 = len(glob.glob(f"{T}/no_repart/*/*.parquet")); n2 = len(glob.glob(f"{B}/silver/orders/*/*.parquet"))
+print(f"without repartition: {n1} files for 14 days | pipeline (repartition first): {n2} files")
+print("== 2) the gold join plan")
+so = spark.read.parquet(f"{B}/silver/orders"); rest = spark.read.json(f"{B}/landing/restaurants")
+g = daily_city_revenue(so, rest); g.collect()
+plan = g._jdf.queryExecution().executedPlan().toString()
+print("BroadcastHashJoin:", "BroadcastHashJoin" in plan, "| SortMergeJoin:", "SortMergeJoin" in plan, "| AdaptiveSparkPlan isFinalPlan=true:", "isFinalPlan=true" in plan)
+pp = so.filter("order_date = '2026-11-01'")._jdf.queryExecution().executedPlan().toString()
+i = pp.find("PartitionFilters: ["); print("filter on order_date ->", pp[i:pp.find("]", i) + 1])
+print("files read for one day:", len(so.filter("order_date = '2026-11-01'").inputFiles()), "of", len(so.inputFiles()))
+print("== 3) what if the restaurant join were not broadcast? (rest_id 1 has 30% of orders)")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+def run(label, aqe):
+    spark.conf.set("spark.sql.adaptive.enabled", aqe)
+    j = so.join(rest.select("rest_id", "city"), "rest_id").groupBy("order_date", "city").agg(F.sum("amount"))
+    j.write.format("noop").mode("overwrite").save(); t = time.time(); j.write.format("noop").mode("overwrite").save()
+    p = j._jdf.queryExecution().executedPlan().toString()
+    tasks = j.rdd.getNumPartitions() if aqe == "false" else "AQE"
+    print(f"{label:28}: {time.time() - t:5.2f} s | SortMergeJoin {'SortMergeJoin' in p} | skew split {'skew=true' in p} | coalesced {'coalesced' in p}")
+run("sort-merge, AQE off", "false")
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "1m"); spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "2")
+run("sort-merge, AQE on (tuned)", "true")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "10MB")
+t = time.time(); daily_city_revenue(so, rest).write.format("noop").mode("overwrite").save(); print(f"{'broadcast (pipeline)':28}: {time.time() - t:5.2f} s")
+print("== 4) the quality gate stops a bad day")
+bad = f"{T}/landing_bad/orders"; os.makedirs(bad)
+shutil.copy(f"{B}/landing/orders/orders_2026-10-20.csv", bad)
+with open(f"{bad}/orders_2026-11-03.csv", "w") as f:
+    f.write("order_id,customer_id,rest_id,order_ts,amount,status\n")
+    for i in range(3000): f.write(f"{9000000 + i},5,2,2026-11-03 10:00:00,N/A,DELIVERED\n")   # upstream sent N/A for all amounts
+r2 = spark.read.option("header", True).schema(ORDER_SCHEMA).csv(bad); v2, q2 = clean_orders(r2)
+pct = round(q2.count() / r2.count() * 100, 2)
+print("quarantine_pct:", pct, "->", "STOP: too many bad rows (gate < 2%)" if pct >= 2 else "OK")

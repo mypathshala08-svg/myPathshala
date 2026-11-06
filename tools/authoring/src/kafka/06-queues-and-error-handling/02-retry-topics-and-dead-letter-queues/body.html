@@ -1,0 +1,325 @@
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>One bad order should not stop the kitchen</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> <a href="../01-share-groups-queues-for-kafka/">6.1 Share groups</a>.</p></div>
+  <div class="story">
+<div class="callout callout--exam" style="display:block"><p style="font-size:1.12rem;margin:0 0 6px"><b>🤔 One broken order arrives. Your consumer throws, restarts, reads the same order, throws again… and 10,000 good orders wait behind it. How do real teams stop this?</b></p><p style="margin:0 0 6px">They split failures into <b>transient</b> (retry later) and <b>permanent</b> (never works). Transient ones go to <b>retry topics</b> with growing delays; permanent ones and exhausted retries go to a <b>dead letter queue (DLQ)</b> with headers explaining why. In our lab, 8 orders: 6 succeeded, and 2 ended in the DLQ with their error, attempt count and original offset, while the main topic never stopped.</p><ul style="margin:0 0 0 18px"><li>Why a single bad record can block a whole partition.</li><li>The retry-topic ladder (5 s → 30 s → DLQ) and what to put in headers.</li><li>Where DLQs are built in: Kafka Connect, Spring Kafka, share groups.</li></ul></div>
+
+    <p class="narration">Yesterday TiffinGo’s payment gateway was down for two minutes and the order consumer got stuck. Kabir needs a design where failures step aside and good orders keep flowing.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="The retry ladder: the main topic orders-62 sends transient failures to retry-5s, then retry-30s, and finally the dead letter queue; permanent failures go straight to the dead letter queue.">
+        <rect x="14" y="50" width="130" height="44" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/><text x="79" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">orders-62</text><path d="M146 72L172 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M165.7 75.0L172 72L165.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="174" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#E0A100"/><text x="239" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">retry-5s</text><path d="M306 72L332 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M325.7 75.0L332 72L325.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="334" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#E0A100"/><text x="399" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">retry-30s</text><path d="M466 72L492 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M485.7 75.0L492 72L485.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="494" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#D64545"/><text x="559" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">dlq</text><text x="320" y="30" text-anchor="middle" font-size="7.6" class="s-ink">transient failure → next rung · permanent → straight to dlq</text><text x="79" y="118" text-anchor="middle" font-size="7.4" class="s-ink">✓ success: commit</text><text x="559" y="118" text-anchor="middle" font-size="7.4" class="s-ink">humans / replay</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Failures move <tspan font-weight="700" class="s-acc">sideways</tspan>, good orders keep flowing.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+K> Sir, the payment gateway was down for 2 minutes and our order consumer got stuck on one order, retrying forever. Everything behind it waited.
+A> Classic head-of-line blocking. Don’t retry inside the main loop forever. Move the failed order <b>aside</b> to a retry topic and continue.
+R> And a malformed JSON? Retrying won’t fix it.
+A> Right: that’s a <b>permanent</b> error, it goes straight to the dead letter queue. Let’s build the ladder and push 8 orders through.
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Retry topics and dead letter queues</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A <b>retry topic</b> holds records whose processing failed with a transient error, to be re-processed after a delay by a separate consumer; several retry topics with increasing delays form a <b>retry ladder</b>. A <b>dead letter queue (DLQ)</b> is a topic that stores records that cannot be processed (permanent errors or exhausted retries), with headers describing the failure, for inspection and replay. The pattern gives <b>non-blocking</b> error handling at the cost of per-key ordering.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>When an order fails, don’t keep hitting it. If the problem may pass, put it in a “try again later” topic. If it can never work, or still fails after a few tries, put it in a “problem” topic with a note. Everyone else keeps moving.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Poison message</b><span>Record that always fails.</span></div>
+    <div class="term"><b>Head-of-line blocking</b><span>One record stops those behind it.</span></div>
+    <div class="term"><b>Transient error</b><span>May pass; retry.</span></div>
+    <div class="term"><b>Permanent error</b><span>Will not pass; DLQ.</span></div>
+    <div class="term"><b>Retry topic</b><span>Delayed reprocessing.</span></div>
+    <div class="term"><b>DLQ</b><span>Parking topic for failures.</span></div>
+    <div class="term"><b>Replay</b><span>Re-publish after fix.</span></div>
+    <div class="term"><b>Backoff</b><span>Growing delay between tries.</span></div>
+  </div>
+
+  <h3>Why, how, where</h3>
+  <div class="cards">
+    <div class="card"><h4>Why</h4><p>Kafka has no built-in “retry this one record later” for consumer groups: offsets are per partition, so one failing record stops everything behind it (head-of-line blocking).</p><span class="tag">the problem it solves</span></div>
+    <div class="card"><h4>How</h4><p>Catch the error, classify it, and produce the record to the next topic in a ladder (retry-5s → retry-30s → dlq) with headers (attempt, error, original topic/offset, retry-at). Separate consumers read retry topics and wait until the record is due. Commit the original offset so the main flow continues.</p><span class="tag">the mechanism</span></div>
+    <div class="card"><h4>Where</h4><p>Payments, orders, webhooks, any consumer calling external APIs; Kafka Connect sinks (errors.deadletterqueue.topic.name); Spring Kafka @RetryableTopic; Uber’s and many fintechs’ published designs.</p><span class="tag">in real systems</span></div>
+    <div class="card"><h4>When not</h4><p>Retried records lose their original order relative to newer records with the same key. If order matters per key, block that key (or the partition) instead, or park all later records of that key too.</p><span class="tag">know the limits</span></div>
+  </div>
+
+  <h3>Concept map: what depends on what</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 230" role="img" aria-label="Concept map. Beginner: consumer, error, poison message. Intermediate: transient vs permanent errors, retry topics, DLQ, headers. Advanced: non-blocking retries, ordering trade-offs, replay from DLQ, Connect errors.tolerance, idempotency.">
+        <rect x="14" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="112" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-green">Beginner</text><a href="../../03-consumers/01-consumers-and-consumer-groups/"><rect x="28" y="36" width="168" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="112.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Consumer loop</text><text x="112.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 3.1</text></a><rect x="28" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="112.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Poison message</text><text x="112.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">blocks partition</text><rect x="224" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="322" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-blue">Intermediate</text><rect x="238" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Transient vs permanent</text><text x="322.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">classify</text><rect x="238" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Retry topics</text><text x="322.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">5 s, 30 s</text><rect x="238" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Dead letter queue</text><text x="322.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">park</text><rect x="238" y="150" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="161" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Headers</text><text x="322.0" y="171" text-anchor="middle" font-size="6.4" class="s-ink2 mono">why + where</text><rect x="434" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="532" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-violet">Advanced</text><rect x="448" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Non-blocking retries</text><text x="532.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">order trade-off</text><rect x="448" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Replay from DLQ</text><text x="532.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">after fix</text><rect x="448" y="112" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Connect DLQ</text><text x="532.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Module 7</text><a href="../../03-consumers/04-delivery-guarantees/"><rect x="448" y="150" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="161" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Idempotency</text><text x="532.0" y="171" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 3.4</text></a><path d="M112 66L112 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M109.0 67.7L112 74L115.0 67.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 89L238 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M235.4 57.5L238 51L231.3 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 66L322 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 67.7L322 74L325.0 67.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 66L322 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 105.7L322 112L325.0 105.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 104L322 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 105.7L322 112L325.0 105.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 142L322 150" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 143.7L322 150L325.0 143.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 89L448 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M445.4 57.5L448 51L441.3 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 127L448 89" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M445.4 95.5L448 89L441.3 91.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 127L448 127" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M441.7 130.0L448 127L441.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M532 104L532 150" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M529.0 143.7L532 150L535.0 143.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><text x="320" y="212" text-anchor="middle" font-size="8" class="s-ink2">Orange = this lesson · arrows = “you need this first” · click a box to jump</text>
+        
+        <text x="632" y="228" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>  <p class="muted"><b>Builds on:</b> <a href="../01-share-groups-queues-for-kafka/">6.1</a>, <a href="../../03-consumers/04-delivery-guarantees/">3.4</a>. <b>Next:</b> Module 7 Kafka Connect.</p>
+
+
+  <h3>Dissect a DLQ record</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 172" role="img" aria-label="Dissection of a DLQ record: key 7, the original value, and headers x-attempt 4, x-error Transient payment gateway 503, x-original-topic orders-62, x-original-offset 6.">
+        <text x="16" y="22" font-size="8.6" font-weight="700" class="s-ink">One record in orders-62-dlq</text><rect x="16" y="34" width="35.56" height="22" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="33.78" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">key=7</text><circle cx="18" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="18" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><rect x="55.56" y="34" width="87.392" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="99.256" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">value={"id":7,…}</text><circle cx="57.56" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="57.56" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><rect x="146.952" y="34" width="63.831999999999994" height="22" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="178.868" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">x-attempt=4</text><circle cx="148.952" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="148.952" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><rect x="214.784" y="34" width="63.831999999999994" height="22" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="246.7" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">x-error=503</text><circle cx="216.784" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="216.784" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><rect x="282.616" y="34" width="101.528" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="333.38" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">x-original-offset=6</text><circle cx="284.616" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="284.616" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">5</text><circle cx="24" cy="81" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="84" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><text x="38" y="84" font-size="8" font-weight="700" class="s-ink">Key</text><text x="106" y="84" font-size="7.6" class="s-ink2">same key as the original, keeps partitioning</text><circle cx="24" cy="96" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="99" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><text x="38" y="99" font-size="8" font-weight="700" class="s-ink">Value</text><text x="106" y="99" font-size="7.6" class="s-ink2">untouched bytes, so you can replay exactly</text><circle cx="24" cy="111" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="114" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><text x="38" y="114" font-size="8" font-weight="700" class="s-ink">Attempt</text><text x="106" y="114" font-size="7.6" class="s-ink2">1 original + 2 retries + this hop</text><circle cx="24" cy="126" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="129" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><text x="38" y="129" font-size="8" font-weight="700" class="s-ink">Error</text><text x="106" y="129" font-size="7.6" class="s-ink2">what broke, for triage</text><circle cx="24" cy="141" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="144" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">5</text><text x="38" y="144" font-size="8" font-weight="700" class="s-ink">Origin</text><text x="106" y="144" font-size="7.6" class="s-ink2">topic + offset: find it in the source</text>
+        <text x="320" y="162" text-anchor="middle" font-size="10.5" class="s-ink2">Real record from our lab.</text>
+        <text x="632" y="170" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+LEVELS> Error handling at three levels
+L1> The “problem tray”
+      <ul>
+        <li>A cashier with a cheque that won’t clear does not stop the queue. She puts it in a “try again at 3 pm” tray. If it fails again, it goes to the manager’s “problem” file with a note. Torn cheques go straight to the file.</li>
+      </ul>
+L2> The pattern
+      <ul>
+        <li><b>Classify</b>: transient (timeouts, 503, lock conflicts) vs permanent (bad JSON, schema mismatch, validation failure).</li>
+        <li><b>Retry topics</b> with increasing delays (e.g. 5 s, 30 s, 5 min). A retry consumer reads a record, and if <code>x-retry-at</code> is in the future it waits (pause/seek or sleep) before processing.</li>
+        <li><b>DLQ</b> gets permanent failures and exhausted retries. Always add headers: error class and message, attempt count, original topic, partition, offset, timestamp. Commit the original offset after producing to the next topic.</li>
+      </ul>
+L3> Production details
+      <ul>
+        <li>Producing the retry record and committing the offset are two actions: use transactions (Lesson 3.5) or make processing idempotent, or a crash between them can duplicate.</li>
+        <li>Ordering per key breaks with non-blocking retries. Options: blocking retries with backoff for strictly ordered streams, or park a key (route all its later records to retry while one is pending).</li>
+        <li>Built-in options: Kafka Connect <code>errors.tolerance=all</code> + <code>errors.deadletterqueue.topic.name</code> + <code>errors.deadletterqueue.context.headers.enable</code>; Spring Kafka <code>@RetryableTopic</code>/<code>DeadLetterPublishingRecoverer</code>; share groups (6.1) RELEASE with delivery-count limit. Monitor DLQ size and build a <b>replay</b> tool that re-publishes fixed records to the main topic.</li>
+      </ul>
+/LEVELS
+<div class="callout callout--warn" style="display:block"><p style="margin:0 0 6px"><b>Myth vs reality: things many websites still say</b></p><ul style="margin:0 0 0 18px"><li><b>Myth:</b> Kafka retries failed consumer records for you.<br><b>Reality (Kafka 4.4):</b> Producer retries yes; consumer processing no (except share groups).<br><span class="muted">Proof: You build the ladder.</span></li><li><b>Myth:</b> Retry everything.<br><b>Reality (Kafka 4.4):</b> Permanent errors never succeed; DLQ them now.<br><span class="muted">Proof: Order 3.</span></li><li><b>Myth:</b> A DLQ means the record is lost.<br><b>Reality (Kafka 4.4):</b> It is parked with context and can be replayed.<br><span class="muted">Proof: Step 3 headers.</span></li></ul></div>
+
+EXAM> “How do you handle failures in a Kafka consumer?” Classify transient vs permanent; non-blocking retry topics with backoff and headers; DLQ with error/origin headers; commit original offset; idempotent processing; monitor and replay DLQ; ordering trade-off; Connect errors.deadletterqueue.
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Strategies and error types</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th>Strategy</th><th>Blocks partition?</th><th>Order kept?</th><th>Use</th></tr></thead>
+    <tbody><tr><td>Retry in place (sleep + retry)</td><td>yes</td><td>yes</td><td>short blips, strictly ordered data</td></tr><tr><td>Skip and log</td><td>no</td><td>yes (minus lost)</td><td>metrics, non-critical</td></tr><tr><td>Retry topics + DLQ</td><td>no</td><td>no (for retried)</td><td>orders, webhooks, APIs</td></tr><tr><td>DLQ only</td><td>no</td><td>no</td><td>permanent errors</td></tr><tr><td>Share group RELEASE / REJECT</td><td>no</td><td>no</td><td>job queues (6.1)</td></tr></tbody>
+  </table>
+  </div>  <div class="table-wrap">
+  <table class="compare" style="min-width:520px">
+    <thead><tr><th>Error</th><th>Type</th><th>Route</th></tr></thead>
+    <tbody><tr><td>timeout, 503, 429</td><td>transient</td><td>retry ladder</td></tr><tr><td>bad JSON, missing field</td><td>permanent</td><td>DLQ now</td></tr><tr><td>schema / deserialization error</td><td>permanent</td><td>DLQ now</td></tr><tr><td>DB unique violation</td><td>often permanent</td><td>DLQ or ignore (already done)</td></tr></tbody>
+  </table>
+  </div>
+WARN> A DLQ nobody reads is a data-loss bin with extra steps. Alert when it grows, name an owner, and keep a replay script. Also never let a deserialization error crash the consumer: catch it and DLQ the raw bytes.
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Build the ladder</h2>
+  <p>All outputs are real: Kafka 4.4.0, Python confluent-kafka 2.16, 3 brokers.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Topics and orders</h4>
+      <div class="code" data-lang="python" data-file="l62.py"><pre><code>topics: orders-62, orders-62-retry-5s, orders-62-retry-30s, orders-62-dlq
+orders = [&#x27;ok&#x27;,&#x27;ok&#x27;,&#x27;bad-json&#x27;,&#x27;ok&#x27;,&#x27;flaky&#x27;,&#x27;ok&#x27;,&#x27;payment-down&#x27;,&#x27;ok&#x27;]</code></pre><div class="output">== 1) 8 orders: 5 ok, 1 malformed, 1 flaky (works on 2nd try), 1 payment-down (always fails)</div></div>
+      <span class="behind">Four topics form the ladder. In the lab the 5 s and 30 s delays are shrunk to 2 s and 4 s.</span></li>
+    <li><h4>Step 2 · Process with classification</h4>
+      <div class="code" data-lang="python" data-file="l62.py"><pre><code>try:
+    process(raw)
+except Transient: produce(NEXT[topic], value, headers=attempt+1, error, origin, retry_at)
+except Permanent: produce(&#x27;orders-62-dlq&#x27;, value, headers=...)
+consumer.commit(msg)</code></pre><div class="output">== 2) processing log (main topic never blocked by retries)
+  + 3.2s orders-62            order 1 OK (attempt 1)
+  + 3.2s orders-62            order 2 OK (attempt 1)
+  + 3.2s orders-62            key 3 Permanent (JSONDecodeError) -&gt; orders-62-dlq
+  + 3.2s orders-62            order 4 OK (attempt 1)
+  + 3.3s orders-62            key 5 Transient (timeout from kitchen API) -&gt; orders-62-retry-5s
+  + 3.3s orders-62            order 6 OK (attempt 1)
+  + 3.3s orders-62            key 7 Transient (payment gateway 503) -&gt; orders-62-retry-5s
+  + 3.3s orders-62            order 8 OK (attempt 1)
+  + 5.3s orders-62-retry-5s   order 5 OK (attempt 2)
+  + 5.3s orders-62-retry-5s   key 7 Transient (payment gateway 503) -&gt; orders-62-retry-30s
+  + 9.3s orders-62-retry-30s  key 7 Transient (payment gateway 503) -&gt; orders-62-dlq</div></div>
+      <span class="behind">Orders 1–8 on the main topic finished in 0.1 s: 5 OK, malformed order 3 straight to DLQ, 5 and 7 to retry-5s. At +5.3 s order 5 succeeded on attempt 2. Order 7 climbed to retry-30s and then the DLQ at +9.3 s.</span></li>
+    <li><h4>Step 3 · Read the DLQ</h4>
+      <div class="code" data-lang="python" data-file="dlq_reader.py"><pre><code>for m in consumer(&#x27;orders-62-dlq&#x27;):
+    print(m.key(), m.value(), m.headers())</code></pre><div class="output">== 3) the dead letter queue
+  key=3 value={id: 3, kind: bad
+     x-attempt = 2
+     x-error = Permanent: JSONDecodeError
+     x-original-topic = orders-62
+     x-original-offset = 2
+  key=7 value={&quot;id&quot;: 7, &quot;kind&quot;: &quot;payment-down&quot;}
+     x-attempt = 4
+     x-error = Transient: payment gateway 503
+     x-original-topic = orders-62
+     x-original-offset = 6</div></div>
+      <span class="behind">Each DLQ record carries the original bytes and the full story: error, attempt count, original topic and offset.</span></li>
+    <li><h4>Step 4 · Count</h4>
+      <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-get-offsets.sh --bootstrap-server k1:9092 --topic orders-62   # and the others</code></pre><div class="output">== 4) end offsets per topic
+  orders-62:0:8
+  orders-62-retry-5s:0:2
+  orders-62-retry-30s:0:1
+  orders-62-dlq:0:2</div></div>
+      <span class="behind">8 in, 2 retried once, 1 retried twice, 2 parked. Every order is accounted for.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Two views of the same run</h2>
+  <p>Left: real lab output. Right: what happens inside.</p>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">Ladder in action <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real outputs from the lab">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">8 orders</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">ok 5 · bad 1 · flaky 1 · down 1</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">3 -&gt; dlq (Permanent)</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">5 -&gt; retry-5s -&gt; OK</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">7 -&gt; 5s -&gt; 30s -&gt; dlq</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">key 7 x-attempt 4</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">x-error 503</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">x-original-offset 6</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">orders-62 8</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">retry-5s 2 · retry-30s 1</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">dlq 2</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Load.</li>
+          <li>Process.</li>
+          <li>DLQ.</li>
+          <li>Count.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Where each order went">
+          <g data-on="1"><rect x="14" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:var(--track)"/><text x="79" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">orders-62</text><path d="M146 72L172 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M165.7 75.0L172 72L165.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="174" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#E0A100"/><text x="239" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">retry-5s</text><path d="M306 72L332 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M325.7 75.0L332 72L325.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="334" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#E0A100"/><text x="399" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">retry-30s</text><path d="M466 72L492 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M485.7 75.0L492 72L485.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="494" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#D64545"/><text x="559" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">dlq</text><text x="320" y="30" text-anchor="middle" font-size="7.6" class="s-ink">transient failure → next rung · permanent → straight to dlq</text><text x="79" y="118" text-anchor="middle" font-size="7.4" class="s-ink">✓ success: commit</text><text x="559" y="118" text-anchor="middle" font-size="7.4" class="s-ink">humans / replay</text><rect x="10" y="134" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="152.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Main topic</text></g><g data-on="2"><rect x="14" y="50" width="130" height="44" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/><text x="79" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">orders-62</text><path d="M146 72L172 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M165.7 75.0L172 72L165.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="174" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:var(--track)"/><text x="239" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">retry-5s</text><path d="M306 72L332 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M325.7 75.0L332 72L325.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="334" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#E0A100"/><text x="399" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">retry-30s</text><path d="M466 72L492 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M485.7 75.0L492 72L485.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="494" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#D64545"/><text x="559" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">dlq</text><text x="320" y="30" text-anchor="middle" font-size="7.6" class="s-ink">transient failure → next rung · permanent → straight to dlq</text><text x="79" y="118" text-anchor="middle" font-size="7.4" class="s-ink">✓ success: commit</text><text x="559" y="118" text-anchor="middle" font-size="7.4" class="s-ink">humans / replay</text><rect x="10" y="134" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="152.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Retry rung</text></g><g data-on="3"><rect x="14" y="50" width="130" height="44" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/><text x="79" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">orders-62</text><path d="M146 72L172 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M165.7 75.0L172 72L165.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="174" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#E0A100"/><text x="239" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">retry-5s</text><path d="M306 72L332 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M325.7 75.0L332 72L325.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="334" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#E0A100"/><text x="399" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">retry-30s</text><path d="M466 72L492 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M485.7 75.0L492 72L485.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="494" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:var(--track)"/><text x="559" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">dlq</text><text x="320" y="30" text-anchor="middle" font-size="7.6" class="s-ink">transient failure → next rung · permanent → straight to dlq</text><text x="79" y="118" text-anchor="middle" font-size="7.4" class="s-ink">✓ success: commit</text><text x="559" y="118" text-anchor="middle" font-size="7.4" class="s-ink">humans / replay</text><rect x="10" y="134" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="152.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Dead letter queue</text></g><g data-on="4"><rect x="14" y="50" width="130" height="44" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/><text x="79" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">orders-62</text><path d="M146 72L172 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M165.7 75.0L172 72L165.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="174" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#E0A100"/><text x="239" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">retry-5s</text><path d="M306 72L332 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M325.7 75.0L332 72L325.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="334" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#E0A100"/><text x="399" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">retry-30s</text><path d="M466 72L492 72" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M485.7 75.0L492 72L485.7 69.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="494" y="50" width="130" height="44" rx="8" class="s-soft-acc" style="stroke:#D64545"/><text x="559" y="76" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink mono">dlq</text><text x="320" y="30" text-anchor="middle" font-size="7.6" class="s-ink">transient failure → next rung · permanent → straight to dlq</text><text x="79" y="118" text-anchor="middle" font-size="7.4" class="s-ink">✓ success: commit</text><text x="559" y="118" text-anchor="middle" font-size="7.4" class="s-ink">humans / replay</text><rect x="10" y="134" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="152.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Every order accounted</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Main.</li>
+          <li>Retry.</li>
+          <li>Park.</li>
+          <li>Balance.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Now follow order 7.</p>
+
+  <span class="live">Layer by layer</span>
+  <h3 id="scenario-peel">Order 7, layer by layer</h3>
+  <p class="anim-intro">Payment gateway down. (From the lab.)</p>
+  <div class="anim anim--one" data-frames="6" data-delay="5000">
+    <div class="anim__title">Layers <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Each layer of the system, from your code down to the disk">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Main</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Classify</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Retry 5 s</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Retry 30 s</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. DLQ</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Replay</text><rect x="134" y="26" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="35.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Main</text><text x="184" y="53" font-size="7.4" class="s-ink2">orders-62 offset 6</text><text x="184" y="66" font-size="7.4" class="s-ink2">process → 503</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Main</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Classify</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Retry 5 s</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Retry 30 s</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. DLQ</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Replay</text><rect x="134" y="48" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="57.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 40L149 48" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 41.7L149 48L152.0 41.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Classify</text><text x="184" y="53" font-size="7.4" class="s-ink2">Transient</text><text x="184" y="66" font-size="7.4" class="s-ink2">produce retry-5s</text><text x="184" y="79" font-size="7.4" class="s-ink2">commit offset 6</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Main</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Classify</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Retry 5 s</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Retry 30 s</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. DLQ</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Replay</text><rect x="134" y="70" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="79.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 62L149 70" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 63.7L149 70L152.0 63.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Retry 5 s</text><text x="184" y="53" font-size="7.4" class="s-ink2">wait until due</text><text x="184" y="66" font-size="7.4" class="s-ink2">still 503</text><text x="184" y="79" font-size="7.4" class="s-ink2">→ retry-30s</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Main</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Classify</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Retry 5 s</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Retry 30 s</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. DLQ</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Replay</text><rect x="134" y="92" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="101.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 84L149 92" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 85.7L149 92L152.0 85.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Retry 30 s</text><text x="184" y="53" font-size="7.4" class="s-ink2">wait until due</text><text x="184" y="66" font-size="7.4" class="s-ink2">still 503</text><text x="184" y="79" font-size="7.4" class="s-ink2">→ dlq</text></g><g data-on="5"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Main</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Classify</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Retry 5 s</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Retry 30 s</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. DLQ</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Replay</text><rect x="134" y="114" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="123.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 106L149 114" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 107.7L149 114L152.0 107.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">DLQ</text><text x="184" y="53" font-size="7.4" class="s-ink2">x-attempt 4</text><text x="184" y="66" font-size="7.4" class="s-ink2">x-error 503</text><text x="184" y="79" font-size="7.4" class="s-ink2">alert</text></g><g data-on="6"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Main</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Classify</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Retry 5 s</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Retry 30 s</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. DLQ</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Replay</text><rect x="134" y="136" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="145.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 128L149 136" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 129.7L149 136L152.0 129.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Replay</text><text x="184" y="53" font-size="7.4" class="s-ink2">gateway fixed</text><text x="184" y="66" font-size="7.4" class="s-ink2">re-publish to orders-62</text><text x="184" y="79" font-size="7.4" class="s-ink2">idempotent</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Fail.</li>
+          <li>Classify.</li>
+          <li>Retry.</li>
+          <li>Retry.</li>
+          <li>Park.</li>
+          <li>Replay.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios: an outage, a schema break, and reordering.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-outage">Gateway outage</h3>
+  <p class="anim-intro">Payment API down 2 minutes. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Retry topics <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Absorb transient failures">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">503s for 2 min</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">hundreds of orders</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Transient.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Retry-5s, retry-30s, retry-5m</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">ladder</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Waits.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Gateway back</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">retries succeed</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Recovered.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Main topic never blocked</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">new orders fine</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No backlog.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">DLQ empty</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">nothing lost</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Done.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Outage.</li>
+          <li>Ladder.</li>
+          <li>Recover.</li>
+          <li>Flow.</li>
+          <li>Clean.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-schema">Schema change breaks consumer</h3>
+  <p class="anim-intro">New field type. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Permanent errors <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="DLQ, not retry">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Producer deploys v2</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">price becomes string</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bad data.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Consumer fails parsing</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">every record</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Permanent.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">All to DLQ</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">alert fires</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Visible.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix consumer</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">handle both types</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Deploy.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Replay DLQ</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">to main topic</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Recovered.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Deploy.</li>
+          <li>Fail.</li>
+          <li>Park.</li>
+          <li>Fix.</li>
+          <li>Replay.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-order">Out-of-order cancellation</h3>
+  <p class="anim-intro">Retry reorders events. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Ordering trade-off <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Park the key">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Order 9 placed fails</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">goes to retry</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Pending.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Order 9 cancelled arrives</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">processed first</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Wrong order.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rule: key has pending retry?</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">park later events too</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Keep order.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Retry succeeds</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">then cancel applied</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Correct.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Or: blocking retry</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">for ordered streams</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Choose.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Fail.</li>
+          <li>Overtake.</li>
+          <li>Park.</li>
+          <li>Apply.</li>
+          <li>Choose.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>DLQs at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-red" style="stroke:var(--red)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-red">pay</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">payments</text></svg></div>
+    <div><h4>1. Payments</h4>
+      <p>Gateway timeouts retried with backoff.</p>
+      <div class="uc-flow"><span>Charge</span><i>→</i><span class="java">retry</span><i>→</i><span>Settle</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">hook</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">webhooks</text></svg></div>
+    <div><h4>2. Webhooks</h4>
+      <p>Partner endpoints down for hours.</p>
+      <div class="uc-flow"><span>Event</span><i>→</i><span class="java">ladder</span><i>→</i><span>Deliver</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">conn</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">Connect</text></svg></div>
+    <div><h4>3. Kafka Connect sinks</h4>
+      <p>errors.deadletterqueue.topic.name.</p>
+      <div class="uc-flow"><span>Record</span><i>→</i><span class="java">bad row</span><i>→</i><span>DLQ</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green">etl</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">ETL</text></svg></div>
+    <div><h4>4. Data pipelines</h4>
+      <p>Bad rows parked, good rows flow.</p>
+      <div class="uc-flow"><span>Rows</span><i>→</i><span class="java">validate</span><i>→</i><span>Warehouse</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified descriptions of common practice.</p>
+</section>

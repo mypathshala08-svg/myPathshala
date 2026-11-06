@@ -16,7 +16,8 @@ window.MP_CONFIG = {
     top: "",      // leaderboard below the hero
     mid: "",      // between sections
     side: "",     // sidebar (desktop)
-    bottom: ""    // end of page / end of lesson
+    bottom: "",   // end of page / end of lesson
+    inarticle: "" // in-article ads between lesson parts (create an "In-article" unit in AdSense)
   },
   watermark: true
 };

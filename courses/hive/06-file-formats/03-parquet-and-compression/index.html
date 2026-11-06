@@ -1,0 +1,3050 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parquet and compression codecs | MyPhatshala</title>
+<meta name="description" content="Parquet in Hive and compression codecs, with real Hive 4.2.1 results: Parquet structure (row groups, column chunks, pages, footer), Hive writing UNCOMPRESSED Parquet by default, dictionary vs PLAIN encodings, INT96 vs INT64 timestamps, real sizes for ORC and Parquet with NONE, SNAPPY, LZ4, ZLIB, GZIP and ZSTD, measured codec speeds, Parquet vs ORC statistics-based skipping, reading Parquet files from other engines by column name, and why toy-sized benchmarks mislead.">
+<meta name="mp:minutes" content="35">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/06-file-formats/03-parquet-and-compression/">
+<meta property="og:title" content="Parquet and compression codecs · MyPhatshala">
+<meta property="og:description" content="Hive wrote our Parquet table with no compression at all. Parquet internals, five codecs measured on real data, and ORC vs Parquet side by side.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Parquet and compression codecs", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="06-file-formats/03-parquet-and-compression" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 6.3</b></nav>
+    <h1>Parquet and compression codecs</h1>
+    <p class="lead">Parquet is the format every big data engine shares, and the codec inside it decides both your storage bill and your read speed. In this lesson Kabir discovers that Hive 4.2.1 wrote his Parquet table <b>uncompressed</b>, opens the file to see its encodings, measures five codecs on the same data, and compares Parquet with ORC on size, timestamps and skipping. <b>All outputs are real</b>, from Hive 4.2.1 and our own measurements.</p>
+    <div class="lesson-meta"><span>Module 6 · File formats and compression</span><span>⏱ 35 min</span><span>Intermediate → Advanced</span><span>Real Hive 4.2.1 outputs</span><span>Five codecs measured</span><span>ORC vs Parquet</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Give us Parquet, and make it smaller”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> read Lessons <a href="../01-text-sequence-and-avro/">6.1</a> and <a href="../02-orc-deep-dive/">6.2</a>.</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s data science team works in Spark and asks for the orders table in <b>Parquet</b>. Kabir runs one CTAS and sends it. The next day the platform team complains about storage: the Parquet copy is <b>2.5 times larger</b> than the ORC table. Kabir checks the file and finds it was written with no compression at all.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Hive writes Parquet uncompressed by default, about 1.09 MB for 50,000 orders. With Snappy, ZSTD or GZIP the same rows take 762, 583 or 537 KB; ORC with ZSTD takes 436 KB. The question is which codec to pick.">
+        <rect x="10" y="12" width="300" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="160" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">Data science team (Spark)</text><text x="22" y="54" font-size="7.8" class="s-ink">“We want Parquet. And compress it,</text><text x="22" y="70" font-size="7.8" class="s-ink"> storage costs too much.”</text><text x="22" y="96" font-size="7.6" class="s-ink2">Hive CTAS STORED AS PARQUET:</text><text x="22" y="114" font-size="8.4" font-weight="700" class="s-red mono">compression: UNCOMPRESSED</text><text x="22" y="130" font-size="7.6" class="s-ink2 mono">1,093,857 bytes</text><rect x="330" y="12" width="300" height="128" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="480" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-green">Same rows, codec chosen</text><text x="342" y="54" font-size="7.8" class="s-ink mono">PARQUET + SNAPPY   762 KB</text><text x="342" y="72" font-size="7.8" class="s-ink mono">PARQUET + ZSTD     583 KB</text><text x="342" y="90" font-size="7.8" class="s-ink mono">PARQUET + GZIP     537 KB</text><text x="342" y="108" font-size="7.8" class="s-ink mono">ORC + ZSTD         436 KB</text><text x="480" y="130" text-anchor="middle" font-size="7.6" font-weight="700" class="s-acc">which one? size vs speed</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Parquet is the shared language of Spark, Trino and the cloud. Pick its <tspan font-weight="700" class="s-acc">codec</tspan> on purpose.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, ORC compressed itself. Why didn’t Parquet?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Each format has its own codec setting. ORC defaults to ZLIB; in our Hive 4.2.1 the Parquet writer defaulted to <b>UNCOMPRESSED</b>. You set <code>parquet.compression</code> on the table or the session. The real question is which codec: Snappy and LZ4 are fast, ZLIB, GZIP and ZSTD are small, and bzip2 is very small and very slow.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>And is Parquet different from ORC inside?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Same idea, different details: row groups instead of stripes, pages inside column chunks, statistics in the footer. Today we open a real Parquet file, measure five codecs on our data, and find three things that differ from ORC in Hive 4.2.1: no compression by default, INT96 timestamps, and a range filter that ORC skipped but Parquet did not. All outputs are real.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Parquet and compression codecs</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Apache Parquet</b> is an open, self-describing columnar file format. A file is divided into <b>row groups</b>; each row group contains one <b>column chunk</b> per column, made of <b>pages</b> that are encoded (dictionary, plain, run-length/bit-packed) and compressed with a <b>codec</b>. The footer holds the schema and per-column-chunk statistics (min, max, null count) used for predicate pushdown. A <b>compression codec</b> is an algorithm applied to blocks of data: Snappy and LZ4 favour speed, GZIP/ZLIB and ZSTD favour compression ratio, and BZip2 gives the highest ratio at much lower speed. Codecs applied inside container formats keep files splittable.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Parquet is a columnar format like ORC, used by almost every big data tool. Inside both formats you choose a compression codec: fast ones (Snappy, LZ4) for data you read all the time, small ones (ZSTD, GZIP) for data you store long. In Hive you set it per table.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Row group</b><span>A horizontal slice of a Parquet file (like an ORC stripe).</span></div>
+    <div class="term"><b>Column chunk</b><span>All values of one column in one row group.</span></div>
+    <div class="term"><b>Page</b><span>The unit of encoding and compression inside a column chunk.</span></div>
+    <div class="term"><b>Codec</b><span>Compression algorithm: SNAPPY, LZ4, ZSTD, GZIP/ZLIB, BZIP2.</span></div>
+    <div class="term"><b>Compression ratio</b><span>Original size ÷ compressed size (5× means one fifth).</span></div>
+    <div class="term"><b>INT96 timestamp</b><span>Legacy 12-byte Parquet timestamp written by Hive by default.</span></div>
+    <div class="term"><b>parquet.compression</b><span>Table or session property choosing the Parquet codec.</span></div>
+    <div class="term"><b>orc.compress</b><span>Table property choosing the ORC codec (default ZLIB).</span></div>
+  </div>
+
+  <h3>ORC vs Parquet in our lab (same 50,000 orders)</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th></th><th>ORC</th><th>Parquet</th></tr></thead>
+    <tbody><tr><td>Default codec in Hive 4.2.1</td><td>ZLIB</td><td><b>UNCOMPRESSED</b></td></tr><tr><td>Size with default / SNAPPY / ZSTD</td><td>437 KB / 570 KB / 436 KB</td><td>1,094 KB / 762 KB / 583 KB</td></tr><tr><td>Sorted order_id column</td><td>161 bytes (RLE v2)</td><td>200,134 bytes (PLAIN)</td></tr><tr><td>Slices</td><td>Stripes (64 MB) → row groups of 10,000 rows</td><td>Row groups (128 MB) → pages (1 MB)</td></tr><tr><td>Skip by statistics</td><td>File, stripe, every 10,000 rows; bloom filters</td><td>Row group (and page indexes in newer readers)</td></tr><tr><td><code>amount &gt; 900</code> (above max)</td><td>0 splits, 0 rows</td><td>50,000 rows read</td></tr><tr><td>Best fit</td><td>Hive warehouses, Hive ACID tables</td><td>Data shared with Spark, Trino, cloud tools</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Parquet and codecs at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Zip files for columns</h4>
+      <ul>
+        <li>Parquet, like ORC, stores data <b>column by column</b> and keeps a summary of each column so tools can skip data.</li>
+        <li>A <b>codec</b> is the zip method used inside the file. Faster codecs save less space; stronger codecs save more space but cost more CPU.</li>
+        <li>Parquet is the most widely shared format: Spark, Trino, Impala, Athena, BigQuery and pandas all read it.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> Parquet’s structure and Hive settings</h4>
+      <ul>
+        <li><b>File</b> = row groups + footer. A <b>row group</b> (target size <code>parquet.block.size</code>, typically 128 MB) holds a <b>column chunk</b> per column; each chunk is split into <b>pages</b> (about 1 MB). The footer (schema, row group list, statistics) ends with the magic bytes <code>PAR1</code>, which also start the file.</li>
+        <li>Encodings: <b>dictionary</b> for repeated values, PLAIN otherwise, plus RLE / bit-packing for levels and dictionary ids.</li>
+        <li>Codec per table: <code>TBLPROPERTIES ('parquet.compression'='SNAPPY')</code> (UNCOMPRESSED, SNAPPY, GZIP, ZSTD, LZ4…). ORC: <code>'orc.compress'</code>.</li>
+        <li>Hive matches Parquet columns <b>by name</b> by default, so files written by other engines with a different column order still read correctly.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What Hive 4.2.1 did in our lab</h4>
+      <ul>
+        <li>CTAS <code>STORED AS PARQUET</code> wrote <b>UNCOMPRESSED</b> column chunks (1.09 MB); ORC used ZLIB (0.44 MB).</li>
+        <li>Hive wrote timestamps as legacy <b>INT96</b> (<code>hive.parquet.write.int64.timestamp=false</code>); with the setting on, INT64 microseconds, which newer readers prefer.</li>
+        <li>The Parquet writer stored sorted <code>order_id</code> PLAIN: 200 KB, against 161 bytes in ORC’s RLE.</li>
+        <li><code>amount &gt; 900</code> (above the file max) skipped the whole ORC file, but the Parquet table read all 50,000 rows. On a Parquet file sorted by customer with small row groups, a lookup read 1,458 rows: Parquet row-group statistics work, but test each data type.</li>
+        <li>On 50,000 rows every format answered a GROUP BY in about 3.1–3.4 s: fixed job overhead hides format differences on small data. Benchmark on realistic sizes.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “ORC vs Parquet” and “Which compression codec would you choose?” are frequent. For the codec, answer with the trade-off: Snappy/LZ4 for hot, frequently read data (fast); ZSTD or ZLIB/GZIP for warm and cold data (smaller); bzip2 only for archives of text. Always compress inside a container format so files stay splittable.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Choosing and setting a codec</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:760px">
+    <thead><tr><th>Codec</th><th>Strength</th><th>Typical use</th><th>Set it</th></tr></thead>
+    <tbody><tr><td>SNAPPY</td><td>Very fast, moderate ratio</td><td>Hot tables read all day, intermediate data</td><td><code>'parquet.compression'='SNAPPY'</code> / <code>'orc.compress'='SNAPPY'</code></td></tr><tr><td>LZ4</td><td>Fastest decompression</td><td>Interactive queries, shuffle data</td><td><code>'orc.compress'='LZ4'</code></td></tr><tr><td>ZSTD</td><td>Good ratio, fast decompression</td><td>A strong default for most tables today</td><td><code>'parquet.compression'='ZSTD'</code></td></tr><tr><td>ZLIB / GZIP</td><td>Good ratio, slower</td><td>ORC default (ZLIB); cold data</td><td><code>'orc.compress'='ZLIB'</code></td></tr><tr><td>BZIP2</td><td>Best ratio, very slow</td><td>Archives of text files (splittable)</td><td><code>BZip2Codec</code> for text output</td></tr><tr><td>NONE / UNCOMPRESSED</td><td>No CPU</td><td>Rare; already-compressed data</td><td>Parquet’s default in our lab</td></tr></tbody>
+  </table>
+  </div>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Where</th><th>Setting</th></tr></thead>
+    <tbody><tr><td>One table (recommended)</td><td><code>CREATE TABLE t … STORED AS PARQUET TBLPROPERTIES ('parquet.compression'='ZSTD');</code></td></tr><tr><td>A session (Parquet)</td><td><code>SET parquet.compression=SNAPPY;</code></td></tr><tr><td>ORC default for new tables</td><td><code>SET hive.exec.orc.default.compress=ZSTD;</code></td></tr><tr><td>Text / SequenceFile / Avro output</td><td><code>SET hive.exec.compress.output=true;</code> + <code>mapreduce.output.fileoutputformat.compress.codec</code></td></tr><tr><td>Intermediate data between stages</td><td><code>SET hive.exec.compress.intermediate=true;</code></td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>A codec setting affects only files written after it. Changing <code>TBLPROPERTIES</code> on an existing table leaves old files as they are (each file records its own codec, so mixed files still read fine). Rewrite partitions to apply the new codec.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Parquet inside out, then five codecs</h2>
+  <p>All outputs are real, from the Hive 4.2.1 lab (database <code>tiffingo</code>). Parquet metadata was read with Python’s pyarrow library.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · A Parquet table, and its default codec</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE f_parquet STORED AS PARQUET AS SELECT * FROM orders;
+$ ls -l …/f_parquet/       # then read the footer with pyarrow</code></pre><div class="output">f_parquet/000000_0   1,093,857 bytes   starts and ends with PAR1
+  created_by: parquet-mr version 1.15.2 (build 859eac16…)
+  num_rows: 50000   num_row_groups: 1
+  column order_id: compression: UNCOMPRESSED  encodings: PLAIN, RLE, BIT_PACKED
+                   statistics: min 100001  max 150000  null_count 0</div></div>
+      <span class="behind">Hive 4.2.1 uses the parquet-mr (Java) writer and, unless you set <code>parquet.compression</code>, writes uncompressed pages. Statistics are still written, per column chunk. Always set the codec explicitly for Parquet tables.</span></li>
+    <li><h4>Step 2 · Inside: encodings and sizes per column</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code># column-chunk metadata of a SNAPPY Parquet copy (c_pq_snappy)</code></pre><div class="output">created_by: parquet-mr version 1.15.2   num_rows: 50000   num_row_groups: 1
+column         physical type          encodings                     compressed  uncompressed
+order_id       INT32                  PLAIN, RLE, BIT_PACKED            200,134       200,110
+customer_id    INT32                  PLAIN_DICTIONARY, RLE, …           77,008        76,986
+restaurant_id  INT32                  PLAIN_DICTIONARY, RLE, …           44,488        44,466
+city           BYTE_ARRAY (String)    PLAIN_DICTIONARY, RLE, …           19,085        19,067
+order_ts       INT96                  PLAIN_DICTIONARY, RLE, …          267,267       446,305
+order_date     INT32 (Date)           PLAIN_DICTIONARY, RLE, …           31,621        31,603
+amount         FIXED_LEN_BYTE_ARRAY(5) (Decimal 10,2)  PLAIN               99,702       250,111
+payment        BYTE_ARRAY (String)    PLAIN_DICTIONARY, RLE, …           12,800        12,783
+status         BYTE_ARRAY (String)    PLAIN_DICTIONARY, RLE, …            7,883         9,959</div></div>
+      <span class="behind">Low-cardinality columns use <b>dictionary</b> encoding, so Snappy finds little left to squeeze (compressed ≈ uncompressed). The sorted <code>order_id</code> is stored PLAIN: 200 KB, where ORC needed 161 bytes. Timestamps are the biggest column, written as 12-byte <b>INT96</b> values.</span></li>
+    <li><h4>Step 3 · Same rows, five codecs, two formats</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE c_orc_zstd  STORED AS ORC     TBLPROPERTIES (&#x27;orc.compress&#x27;=&#x27;ZSTD&#x27;)        AS SELECT * FROM orders;
+CREATE TABLE c_pq_snappy STORED AS PARQUET TBLPROPERTIES (&#x27;parquet.compression&#x27;=&#x27;SNAPPY&#x27;) AS SELECT * FROM orders;
+-- … one table per codec, then ls -l</code></pre><div class="output">table          format   codec                   bytes
+c_orc_none     ORC      NONE                  674,283
+c_orc_snappy   ORC      SNAPPY                570,494
+c_orc_lz4      ORC      LZ4                   572,490
+f_orc          ORC      ZLIB (Hive default)   437,536
+c_orc_zstd     ORC      ZSTD                  436,490
+f_parquet      PARQUET  UNCOMPRESSED (default) 1,093,857
+c_pq_snappy    PARQUET  SNAPPY                762,424
+c_pq_zstd      PARQUET  ZSTD                  582,505
+c_pq_gzip      PARQUET  GZIP                  536,505</div></div>
+      <span class="behind">For both formats ZSTD and ZLIB/GZIP give the smallest files; Snappy and LZ4 save less. ORC is smaller than Parquet with every codec on this data, mainly because of its integer encodings. ORC with no compression at all (674 KB) is only a little bigger than Parquet with ZSTD (583 KB): encoding matters as much as the codec.</span></li>
+    <li><h4>Step 4 · Speed: what each codec costs</h4>
+      <div class="code" data-lang="python" data-file="Python"><pre><code># compress / decompress the 3.7 MB text file of 50,000 orders with each codec
+# (cramjam library, best of 5 runs, one CPU core)</code></pre><div class="output">codec     compressed bytes  ratio  compress MB/s  decompress MB/s
+snappy           1,232,657   3.0x            655            1,385
+lz4              1,184,237   3.2x            670            2,593
+zstd-3             739,460   5.1x            303            1,162
+gzip-6             712,143   5.2x             40              622
+bzip2-9            468,562   8.0x             18               38
+(input: the 3,735,865-byte text file of 50,000 orders; best of 5 runs, one CPU core of our cloud machine)</div></div>
+      <span class="behind">The trade-off in numbers: Snappy and LZ4 compress about <b>16 times faster</b> than gzip, and LZ4 decompresses fastest. ZSTD gets gzip’s ratio while decompressing about twice as fast. bzip2 has the best ratio but decompresses at 38 MB/s, roughly 36 times slower than Snappy. Your hardware gives different absolute numbers; the order stays the same.</span></li>
+    <li><h4>Step 5 · Statistics-based skipping: Parquet vs ORC</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.tez.exec.print.summary=true;
+SELECT COUNT(*) AS n FROM c_pq_snappy WHERE amount &gt; 900;          -- ORC: 0 splits
+SELECT COUNT(*) AS n FROM c_pq_snappy WHERE customer_id = 1492;
+
+SET parquet.block.size=100000;    -- small row groups, for the demo only
+CREATE TABLE pq_sorted STORED AS PARQUET TBLPROPERTIES (&#x27;parquet.compression&#x27;=&#x27;SNAPPY&#x27;)
+  AS SELECT * FROM orders ORDER BY customer_id;
+SELECT COUNT(*) AS n FROM pq_sorted WHERE customer_id = 1492;</code></pre><div class="output">SELECT COUNT(*) AS n FROM c_pq_snappy WHERE amount &gt; 900;
+  result 0 · RECORDS_IN 50000 · RAW_INPUT_SPLITS 1
+SELECT COUNT(*) AS n FROM c_pq_snappy WHERE customer_id = 1492;
+  result 41 · RECORDS_IN 50000 · RAW_INPUT_SPLITS 1
+SELECT COUNT(*) AS n FROM pq_sorted WHERE customer_id = 1492;
+  result 41 · RECORDS_IN 1458 · RAW_INPUT_SPLITS 1
+
+(pq_sorted: 35 row groups of about 1,460 rows; first ones: customer 1–57, 57–114, 114–173 …)</div></div>
+      <span class="behind">On the decimal <code>amount</code> filter Hive read every Parquet row, while the same filter skipped the whole ORC file (6.2). Row-group statistics did work on a sorted integer column: 1,458 rows read instead of 50,000. Lesson: Parquet skipping depends on the column type and the reader version, so check counters for your important filters.</span></li>
+    <li><h4>Step 6 · Files from another engine: Parquet reads by name</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>-- written by Python/pyarrow, not Hive:
+--   part-v1.parquet (snappy): customer_id, name, city
+--   part-v2.parquet (zstd):   customer_id, plan, city, name   (new column, new order)
+CREATE EXTERNAL TABLE cust_pq (customer_id INT, name STRING, plan STRING, city STRING)
+STORED AS PARQUET LOCATION &#x27;file:///data/tiffingo/pq_ext&#x27;;
+SELECT * FROM cust_pq ORDER BY customer_id;</code></pre><div class="output">+----------------------+---------------+---------------+---------------+
+| cust_pq.customer_id  | cust_pq.name  | cust_pq.plan  | cust_pq.city  |
++----------------------+---------------+---------------+---------------+
+| 1                    | Aarav Desai   | NULL          | Bengaluru     |
+| 2                    | Ananya Iyer   | NULL          | Mumbai        |
+| 3                    | Arjun Nair    | NULL          | Mumbai        |
+| 4                    | Diya Patil    | Gold          | Pune          |
+| 5                    | Ishaan Khan   | Basic         | Thane         |
++----------------------+---------------+---------------+---------------+</div></div>
+      <span class="behind">Hive matched Parquet columns by <b>name</b>, so the different column order did not matter, and two codecs in the same table are fine because each file records its own. A column missing from old files came back as NULL (Parquet has no defaults, unlike Avro in 6.1).</span></li>
+    <li><h4>Step 7 · Timestamps: INT96 vs INT64</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.parquet.write.int64.timestamp;          -- false
+SET hive.parquet.write.int64.timestamp=true;
+CREATE TABLE pq_ts64 STORED AS PARQUET AS
+  SELECT order_id, order_ts FROM orders WHERE order_id &lt; 100004;
+SELECT * FROM pq_ts64;
+$ pyarrow schema of pq_ts64</code></pre><div class="output">+-------------------+------------------------+
+| pq_ts64.order_id  |    pq_ts64.order_ts    |
++-------------------+------------------------+
+| 100001            | 2026-10-29 20:49:00.0  |
+| 100002            | 2026-10-17 20:25:00.0  |
+| 100003            | 2026-10-20 09:08:00.0  |
++-------------------+------------------------+
+
+optional int64 order_ts (Timestamp(isAdjustedToUTC=false, timeUnit=microseconds))
+(default tables: optional int96 order_ts)</div></div>
+      <span class="behind">INT96 is a deprecated encoding that some newer tools read differently or not at all. With the setting on, Hive writes standard INT64 microsecond timestamps marked as local time (not UTC). When Parquet tables are shared with Spark or Trino, agree on the timestamp encoding and time zone (Lesson 4.1).</span></li>
+    <li><h4>Step 8 · Does the format change query time on small data?</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT city, SUM(amount) FROM &lt;table&gt; GROUP BY city;   -- each table, 5 runs</code></pre><div class="output">f_text         TEXTFILE                 3.27 s
+f_avro         AVRO                     3.43 s
+f_orc          ORC ZLIB                 3.13 s
+c_orc_snappy   ORC SNAPPY               3.21 s
+c_pq_snappy    PARQUET SNAPPY           3.17 s
+c_pq_gzip      PARQUET GZIP             3.31 s</div></div>
+      <span class="behind">All within 0.3 s of each other. On 50,000 rows, starting the job costs far more than reading 0.4–3.7 MB. Format and codec differences show up when tables are gigabytes or larger, where bytes read dominate. Benchmark with realistic volumes before deciding, and use counters (rows and bytes read) rather than stopwatch time on toy data.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Inside Parquet, and what codecs cost</h2>
+  <p>Left: real output. Right: what happens inside the file.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Structure, encodings, size and speed <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real output">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; CREATE TABLE f_parquet STORED AS PARQUET</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">    AS SELECT * FROM orders;</text><text x="26" y="78" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">$ pyarrow: compression: UNCOMPRESSED</text><text x="26" y="92" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  file: 1,093,857 bytes</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">order_id   PLAIN              200,134 B</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">city       PLAIN_DICTIONARY    19,085 B</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">order_ts   INT96              267,267 B</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">amount     FIXED_LEN(5)        99,702 B</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">ORC ZLIB      437,536</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">ORC ZSTD      436,490</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">PQ  GZIP      536,505</text><text x="26" y="92" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">PQ  ZSTD      582,505</text><text x="26" y="106" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">PQ  SNAPPY    762,424</text><text x="26" y="120" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">PQ  NONE    1,093,857</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">codec    ratio  compress  decompress</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">snappy   3.0x   655 MB/s  1385 MB/s</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">lz4      3.2x   670 MB/s  2593 MB/s</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">zstd-3   5.1x   303 MB/s  1162 MB/s</text><text x="26" y="106" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">gzip-6   5.2x    40 MB/s   622 MB/s</text><text x="26" y="120" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">bzip2-9  8.0x    18 MB/s    38 MB/s</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … c_pq_snappy WHERE amount &gt; 900;</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">| 0 |  RECORDS_IN 50000</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … pq_sorted WHERE customer_id = 1492;</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 41 | RECORDS_IN 1458</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A plain Parquet CTAS wrote uncompressed pages: 1.09 MB.</li>
+          <li>Per-column metadata: dictionary for repeats, PLAIN for ids, INT96 timestamps.</li>
+          <li>Five codecs on two formats: ZSTD and ZLIB/GZIP give the smallest files.</li>
+          <li>Speed: Snappy and LZ4 are fast; bzip2 is very slow.</li>
+          <li>Parquet skipped row groups on a sorted id, but not on the decimal filter.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What happens inside the file">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A Parquet file</text><rect x="20" y="40" width="34" height="60" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="37" y="74" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink mono">PAR1</text><rect x="58" y="40" width="104" height="60" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="110" y="52" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">row group 0</text><rect x="62" y="58" width="30" height="38" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="77" y="72" text-anchor="middle" font-size="6.2" class="s-ink mono">col1</text><text x="77" y="86" text-anchor="middle" font-size="5.8" class="s-ink2">pages</text><rect x="95" y="58" width="30" height="38" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="110" y="72" text-anchor="middle" font-size="6.2" class="s-ink mono">col2</text><text x="110" y="86" text-anchor="middle" font-size="5.8" class="s-ink2">pages</text><rect x="128" y="58" width="30" height="38" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="143" y="72" text-anchor="middle" font-size="6.2" class="s-ink mono">col3</text><text x="143" y="86" text-anchor="middle" font-size="5.8" class="s-ink2">pages</text><rect x="166" y="40" width="104" height="60" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="218" y="52" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">row group 1</text><rect x="170" y="58" width="30" height="38" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="185" y="72" text-anchor="middle" font-size="6.2" class="s-ink mono">col1</text><text x="185" y="86" text-anchor="middle" font-size="5.8" class="s-ink2">pages</text><rect x="203" y="58" width="30" height="38" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="218" y="72" text-anchor="middle" font-size="6.2" class="s-ink mono">col2</text><text x="218" y="86" text-anchor="middle" font-size="5.8" class="s-ink2">pages</text><rect x="236" y="58" width="30" height="38" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="251" y="72" text-anchor="middle" font-size="6.2" class="s-ink mono">col3</text><text x="251" y="86" text-anchor="middle" font-size="5.8" class="s-ink2">pages</text><rect x="276" y="40" width="64" height="60" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="308" y="68" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">footer</text><text x="308" y="82" text-anchor="middle" font-size="6.6" class="s-ink2 mono">+ PAR1</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Footer: schema, row groups, statistics.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Codec chosen per column chunk at write time.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Encoding happens before compression</text><rect x="20" y="44" width="150" height="70" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="95" y="62" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink">dictionary</text><text x="95" y="80" text-anchor="middle" font-size="7.2" class="s-ink2 mono">Mumbai → 0, Pune → 1 …</text><text x="95" y="96" text-anchor="middle" font-size="7.2" class="s-green">already tiny</text><rect x="190" y="44" width="150" height="70" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="265" y="62" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink">PLAIN</text><text x="265" y="80" text-anchor="middle" font-size="7.2" class="s-ink2 mono">4 bytes × 50,000 ids</text><text x="265" y="96" text-anchor="middle" font-size="7.2" class="s-red">codec must do the work</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">ORC’s RLE turned the same ids into 161 bytes.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bytes on disk by codec</text><text x="96" y="39" text-anchor="end" font-size="7" class="s-ink mono">ORC NONE</text><rect x="102" y="30" width="123" height="9" rx="2" style="fill:var(--blue)"/><text x="229" y="38" font-size="6.6" class="s-ink2 mono">674 KB</text><text x="96" y="51" text-anchor="end" font-size="7" class="s-ink mono">ORC SNAPPY</text><rect x="102" y="42" width="104" height="9" rx="2" style="fill:var(--blue)"/><text x="210" y="50" font-size="6.6" class="s-ink2 mono">570 KB</text><text x="96" y="63" text-anchor="end" font-size="7" class="s-ink mono">ORC LZ4</text><rect x="102" y="54" width="105" height="9" rx="2" style="fill:var(--blue)"/><text x="211" y="62" font-size="6.6" class="s-ink2 mono">572 KB</text><text x="96" y="75" text-anchor="end" font-size="7" class="s-ink mono">ORC ZLIB</text><rect x="102" y="66" width="80" height="9" rx="2" style="fill:var(--blue)"/><text x="186" y="74" font-size="6.6" class="s-ink2 mono">438 KB</text><text x="96" y="87" text-anchor="end" font-size="7" class="s-ink mono">ORC ZSTD</text><rect x="102" y="78" width="80" height="9" rx="2" style="fill:var(--blue)"/><text x="186" y="86" font-size="6.6" class="s-ink2 mono">436 KB</text><text x="96" y="99" text-anchor="end" font-size="7" class="s-ink mono">PQ NONE</text><rect x="102" y="90" width="200" height="9" rx="2" style="fill:var(--violet)"/><text x="306" y="98" font-size="6.6" class="s-ink2 mono">1094 KB</text><text x="96" y="111" text-anchor="end" font-size="7" class="s-ink mono">PQ SNAPPY</text><rect x="102" y="102" width="139" height="9" rx="2" style="fill:var(--violet)"/><text x="245" y="110" font-size="6.6" class="s-ink2 mono">762 KB</text><text x="96" y="123" text-anchor="end" font-size="7" class="s-ink mono">PQ ZSTD</text><rect x="102" y="114" width="107" height="9" rx="2" style="fill:var(--violet)"/><text x="213" y="122" font-size="6.6" class="s-ink2 mono">583 KB</text><text x="96" y="135" text-anchor="end" font-size="7" class="s-ink mono">PQ GZIP</text><rect x="102" y="126" width="98" height="9" rx="2" style="fill:var(--violet)"/><text x="204" y="134" font-size="6.6" class="s-ink2 mono">537 KB</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">ORC (blue) smaller than Parquet (violet) on this data.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Ratio vs decompression speed</text><rect x="70" y="40" width="75" height="7" rx="2" style="fill:var(--green)"/><rect x="70" y="48" width="139" height="7" rx="2" style="fill:var(--blue)"/><text x="64" y="50" text-anchor="end" font-size="7.2" class="s-ink mono">snappy</text><rect x="70" y="60" width="80" height="7" rx="2" style="fill:var(--green)"/><rect x="70" y="68" width="260" height="7" rx="2" style="fill:var(--blue)"/><text x="64" y="70" text-anchor="end" font-size="7.2" class="s-ink mono">lz4</text><rect x="70" y="80" width="127" height="7" rx="2" style="fill:var(--green)"/><rect x="70" y="88" width="117" height="7" rx="2" style="fill:var(--blue)"/><text x="64" y="90" text-anchor="end" font-size="7.2" class="s-ink mono">zstd-3</text><rect x="70" y="100" width="130" height="7" rx="2" style="fill:var(--green)"/><rect x="70" y="108" width="62" height="7" rx="2" style="fill:var(--blue)"/><text x="64" y="110" text-anchor="end" font-size="7.2" class="s-ink mono">gzip-6</text><rect x="70" y="120" width="200" height="7" rx="2" style="fill:var(--green)"/><rect x="70" y="128" width="4" height="7" rx="2" style="fill:var(--blue)"/><text x="64" y="130" text-anchor="end" font-size="7.2" class="s-ink mono">bzip2-9</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">green = ratio · blue = decompress speed</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">bzip2: best ratio, slowest by far.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Row-group statistics in Parquet</text><rect x="20" y="50" width="60" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="50" y="66" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">RG23</text><text x="50" y="80" text-anchor="middle" font-size="6.2" class="s-ink2 mono">1350–1409</text><rect x="84" y="50" width="60" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="114" y="66" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">RG24</text><text x="114" y="80" text-anchor="middle" font-size="6.2" class="s-ink2 mono">1409–1469</text><rect x="148" y="50" width="60" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="178" y="66" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">RG25</text><text x="178" y="80" text-anchor="middle" font-size="6.2" class="s-ink2 mono">1469–1528</text><rect x="212" y="50" width="60" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="242" y="66" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">RG26</text><text x="242" y="80" text-anchor="middle" font-size="6.2" class="s-ink2 mono">1528–1584</text><rect x="276" y="50" width="60" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="306" y="66" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink">RG27</text><text x="306" y="80" text-anchor="middle" font-size="6.2" class="s-ink2 mono">1584–1642</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Sorted ints: groups skipped (1,458 rows read).</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Decimal amount > 900: nothing skipped in our lab.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A Parquet file is row groups of column chunks and pages, with the footer at the end.</li>
+          <li>Encodings shrink data before the codec; PLAIN columns rely on the codec alone.</li>
+          <li>Each codec trades CPU for space differently; encodings decide the rest.</li>
+          <li>Fast codecs suit hot data; strong codecs suit data that is stored long and read rarely.</li>
+          <li>Readers compare filters with each row group’s min and max, where the type supports it.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a codec policy, sharing Parquet with other engines, and a storage bill.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-policy">A codec policy: hot, warm and cold data</h3>
+  <p class="anim-intro">Choosing codecs by how often data is read. Speeds are from our measurement.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Codec policy <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Fast codecs for frequently read recent data, ZSTD for older data, with partitions rewritten as data cools">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One codec policy for the lake</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">hot (last 7 days) · warm (90 days) · cold (years)</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Different data, different needs.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">(typical policy)</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hot: read all day</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">SNAPPY or LZ4 · fastest to decompress</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Real: LZ4 decompresses at 2,593 MB/s.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Warm and cold: stored long</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">ZSTD · gzip-level size, faster reads</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Real: 5.1× ratio, 1,162 MB/s decompress.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Re-compress when data cools</text><text x="180" y="52" text-anchor="middle" font-size="8" class="s-ink mono">INSERT OVERWRITE … PARTITION (dt='…')</text><text x="180" y="68" text-anchor="middle" font-size="8" class="s-ink mono">with TBLPROPERTIES codec = ZSTD</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Old files keep their codec until rewritten.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Measure</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">storage bill vs query CPU per month</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Many teams simply use ZSTD everywhere now.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Group data by how often it is read.</li>
+          <li>Hot data uses a fast codec.</li>
+          <li>Older data uses ZSTD for size with good speed.</li>
+          <li>Rewrite partitions to change their codec.</li>
+          <li>Watch storage and CPU costs.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-sharing">One Parquet table, three engines</h3>
+  <p class="anim-intro">Making a Hive Parquet table safe for Spark and Trino. The query result is real.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Cross-engine Parquet <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Set the codec and timestamp encoding explicitly, rely on by-name columns, and verify results in every engine">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Sharing a table with Spark and Trino</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">STORED AS PARQUET, codec set explicitly</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Parquet is every engine’s common format.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Timestamps</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-red mono">Hive default: INT96 (legacy)</text><text x="180" y="74" text-anchor="middle" font-size="8" class="s-green mono">hive.parquet.write.int64.timestamp=true</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Agree the encoding and time zone with readers.</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT * FROM cust_pq ORDER BY customer_id;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 1 | Aarav Desai | NULL  | Bengaluru |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 4 | Diya Patil  | Gold  | Pune      |</text><text x="26" y="92" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  files written by pyarrow, other order</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Columns by name</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">new columns: NULL in old files</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Add columns; avoid renames without a plan.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Check from both sides</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink2">same COUNT, SUM and a few timestamps in each engine</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A 5-minute test avoids weeks of confusion.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Use Parquet with an explicit codec for shared tables.</li>
+          <li>Decide how timestamps are written.</li>
+          <li>Hive read files written by another tool, by column name.</li>
+          <li>New columns read as NULL in old files.</li>
+          <li>Compare results in each engine.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-bill">Halving a storage bill with one property</h3>
+  <p class="anim-intro">Uncompressed Parquet is an easy mistake with Hive’s default. Ratios from our lab; the 400 TB is illustrative.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Storage clean-up <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Uncompressed Parquet tables are fixed by setting a codec for new writes and rewriting old partitions gradually">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Storage bill: 400 TB of uncompressed Parquet</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-red">written by CTAS jobs without a codec</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Like our f_parquet: UNCOMPRESSED.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">(illustrative size)</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Estimate with the lab ratio</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">ZSTD: 582,505 / 1,093,857 = 0.53</text><text x="180" y="74" text-anchor="middle" font-size="8.4" font-weight="700" class="s-green mono">400 TB → about 213 TB</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Measure on one real partition first.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix new writes first</text><text x="180" y="56" text-anchor="middle" font-size="7.2" class="s-ink mono">ALTER TABLE … SET TBLPROPERTIES ('parquet.compression'='ZSTD')</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Every new file is compressed from now on.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rewrite old partitions gradually</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">oldest first, off-peak, counts checked</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each file keeps its own codec, so reads never break.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Guard rail</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">review TBLPROPERTIES in every new table</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A default that silently costs money.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Jobs wrote uncompressed Parquet for months.</li>
+          <li>The lab ratio suggests ZSTD would almost halve it.</li>
+          <li>Set the codec on the table for new files.</li>
+          <li>Rewrite old partitions step by step.</li>
+          <li>Make codec review part of table creation.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Parquet and codecs at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-green mono">PAR1</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">shared lake</text></svg></div>
+    <div><h4>1. The shared format of the lake</h4>
+      <p>Cloud data lakes keep most curated tables in Parquet so that Spark jobs, SQL engines, notebooks and BI tools all read the same files.</p>
+      <div class="uc-flow"><span>Hive / Spark write</span><i>→</i><span class="java">Parquet</span><i>→</i><span>Every engine reads</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-blue mono">ZSTD</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">default codec</text></svg></div>
+    <div><h4>2. ZSTD as the new default</h4>
+      <p>Many platforms have moved from Snappy or GZIP to ZSTD, because it gives gzip-like size with much faster reads.</p>
+      <div class="uc-flow"><span>Old codec</span><i>→</i><span class="java">rewrite with ZSTD</span><i>→</i><span>Smaller, fast</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">Iceberg</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">on Parquet</text></svg></div>
+    <div><h4>3. Table formats on Parquet</h4>
+      <p>Apache Iceberg and Delta Lake usually store their data files as Parquet and add a metadata layer for snapshots and updates (Module 7).</p>
+      <div class="uc-flow"><span>Parquet files</span><i>→</i><span class="java">table metadata</span><i>→</i><span>Lakehouse tables</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc mono">pandas</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">data science</text></svg></div>
+    <div><h4>4. Handing data to data scientists</h4>
+      <p>A Parquet extract with a few columns opens directly in pandas or Polars, typed and compressed, unlike a CSV dump.</p>
+      <div class="uc-flow"><span>Hive query</span><i>→</i><span class="java">Parquet extract</span><i>→</i><span>Notebook</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">₹ / TB</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">cost control</text></svg></div>
+    <div><h4>5. Storage and scan costs</h4>
+      <p>On cloud engines that charge per byte scanned, columnar formats plus a good codec reduce both the storage bill and the query bill.</p>
+      <div class="uc-flow"><span>Raw data</span><i>→</i><span class="java">columnar + codec</span><i>→</i><span>Lower bills</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: the codec trade-off</h2>
+  <p>Compression always trades CPU time for space. These programs measure it in your browser and show why encodings matter. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># Compression ratio and speed of the codecs Python ships with,
+# on order lines like TiffinGo&#x27;s (Snappy/LZ4/ZSTD are not in the browser)
+import zlib, bz2, lzma, time
+lines = &quot;&quot;.join(f&quot;{100000 + i},{(i * 7919) % 2000 + 1},{[&#x27;Mumbai&#x27;,&#x27;Pune&#x27;,&#x27;Thane&#x27;,&#x27;Delhi&#x27;][i % 4]},&quot;
+                f&quot;2026-10-{i % 30 + 1:02d},{(i * 37) % 800 + 40}.00,UPI,DELIVERED\n&quot; for i in range(20000))
+data = lines.encode()
+
+for name, comp, dec in [(&quot;zlib-1&quot;, lambda d: zlib.compress(d, 1), zlib.decompress),
+                        (&quot;zlib-6&quot;, lambda d: zlib.compress(d, 6), zlib.decompress),
+                        (&quot;bzip2&quot;, bz2.compress, bz2.decompress),
+                        (&quot;lzma&quot;, lzma.compress, lzma.decompress)]:
+    t = time.perf_counter(); z = comp(data); c = time.perf_counter() - t
+    t = time.perf_counter(); dec(z); d = time.perf_counter() - t
+    print(f&quot;{name:7} ratio {len(data) / len(z):4.1f}x  compress {c * 1000:6.1f} ms  decompress {d * 1000:6.1f} ms&quot;)</code></pre><div class="output">zlib-1  ratio  4.7x  compress    3.4 ms  decompress    1.6 ms
+zlib-6  ratio  6.0x  compress    4.9 ms  decompress    1.0 ms
+bzip2   ratio 13.6x  compress   52.2 ms  decompress   18.2 ms
+lzma    ratio 28.0x  compress  201.0 ms  decompress    3.8 ms</div></div>
+  <ul class="anno"><li><code>for name, comp, dec in [(&quot;zlib-1&quot;, lambda d: zlib.compress(d, 1), zlib.decompress),</code><span>zlib is the algorithm behind ORC’s ZLIB and GZIP. Level 1 is faster, level 6 smaller.</span></li><li><code>                        (&quot;lzma&quot;, lzma.compress, lzma.decompress)]:</code><span>lzma (xz) is like bzip2: very small, very slow. Neither is used inside ORC or Parquet.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Ratio vs speed",
+   "hint": "Press <b>Run<\/b>. Stronger codecs give a higher ratio and take longer, the same pattern as our measured Snappy → bzip2 table.",
+   "code": "# Compression ratio and speed of the codecs Python ships with,\n# on order lines like TiffinGo's (Snappy/LZ4/ZSTD are not in the browser)\nimport zlib, bz2, lzma, time\nlines = \"\".join(f\"{100000 + i},{(i * 7919) % 2000 + 1},{['Mumbai','Pune','Thane','Delhi'][i % 4]},\"\n                f\"2026-10-{i % 30 + 1:02d},{(i * 37) % 800 + 40}.00,UPI,DELIVERED\\n\" for i in range(20000))\ndata = lines.encode()\n\nfor name, comp, dec in [(\"zlib-1\", lambda d: zlib.compress(d, 1), zlib.decompress),\n                        (\"zlib-6\", lambda d: zlib.compress(d, 6), zlib.decompress),\n                        (\"bzip2\", bz2.compress, bz2.decompress),\n                        (\"lzma\", lzma.compress, lzma.decompress)]:\n    t = time.perf_counter(); z = comp(data); c = time.perf_counter() - t\n    t = time.perf_counter(); dec(z); d = time.perf_counter() - t\n    print(f\"{name:7} ratio {len(data) / len(z):4.1f}x  compress {c * 1000:6.1f} ms  decompress {d * 1000:6.1f} ms\")\n"
+  },
+  {
+   "label": "2 · Predict first: encoding before compression",
+   "hint": "<b>Predict first:<\/b> which is smaller after zlib: sorted ids written as text, or as (start, step, count)? (ORC’s RLE stored 50,000 sorted ids in 161 bytes.)",
+   "code": "import zlib\nids = range(100001, 150001)\nplain = \",\".join(map(str, ids)).encode()\nrle = b\"100001,1,50000\"\nprint(\"plain + zlib:\", len(zlib.compress(plain)))\nprint(\"RLE         :\", len(rle))\n"
+  },
+  {
+   "label": "3 · Dictionary encoding",
+   "hint": "Parquet and ORC replace repeated strings by small numbers. Real lab: city took about 19–21 KB for 50,000 rows.",
+   "code": "cities = [\"Mumbai\", \"Pune\", \"Thane\", \"Delhi\", \"Bengaluru\", \"Chennai\", \"Hyderabad\", \"Navi Mumbai\"]\nvalues = [cities[(i * 7) % 8] for i in range(50000)]\ndictionary = sorted(set(values))\ncodes = [dictionary.index(v) for v in values[:10]]\nprint(dictionary)\nprint(\"first codes:\", codes, \" bytes as text:\", sum(len(v) for v in values), \" as 3-bit codes:\", 50000 * 3 // 8)\n"
+  },
+  {
+   "label": "4 · Storage cost by codec",
+   "hint": "Real Parquet sizes for 50,000 orders. Change <code>rows<\/code> to 1 billion to see the yearly difference.",
+   "code": "sizes = {\"UNCOMPRESSED\": 1093857, \"SNAPPY\": 762424, \"ZSTD\": 582505, \"GZIP\": 536505}\nrows = 50000\nfor codec, b in sizes.items():\n    print(f\"{codec:12} {b / rows * 1_000_000_000 / 1e9:7.1f} GB per billion rows\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This job sets a codec name that does not exist, so nothing is compressed. Use one of SNAPPY, GZIP, ZSTD, LZ4.",
+   "code": "VALID = {\"UNCOMPRESSED\", \"SNAPPY\", \"GZIP\", \"ZSTD\", \"LZ4\", \"LZ4_RAW\", \"BROTLI\", \"LZO\"}\ntable_props = {\"parquet.compression\": \"ZSTANDARD\"}\ncodec = table_props[\"parquet.compression\"]\nassert codec in VALID, f\"unknown Parquet codec '{codec}'\"\nprint(\"writing with\", codec)\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: check the codec settings and mixed files</h3>
+  <p>More statements to try on the lab. <b>Outputs are real</b>, from Hive 4.2.1.</p>
+  <div class="pcrun"><h4>1 · The defaults that decide compression</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SET hive.exec.orc.default.compress;
+SET hive.exec.compress.intermediate;
+SET hive.parquet.write.int64.timestamp;
+SET parquet.compression;          -- not set: the writer default applies</code></pre><div class="output">+----------------------------------------+
+|                  set                   |
++----------------------------------------+
+| hive.exec.compress.intermediate=false  |
++----------------------------------------+
++--------------------------------------+
+|                 set                  |
++--------------------------------------+
+| hive.exec.orc.default.compress=ZLIB  |
++--------------------------------------+
++-------------------------------------------+
+|                    set                    |
++-------------------------------------------+
+| hive.parquet.write.int64.timestamp=false  |
++-------------------------------------------+</div></div>
+  <p class="muted">parquet.compression is not set at all, so the Parquet writer used its own default (UNCOMPRESSED in our lab). Intermediate data between Tez stages is not compressed either; <code>hive.exec.compress.intermediate=true</code> can help network-heavy jobs.</p></div>
+  <div class="pcrun"><h4>2 · One table, two codecs</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SELECT regexp_extract(INPUT__FILE__NAME, &#x27;[^/]+$&#x27;, 0) AS file, COUNT(*) AS n
+FROM cust_pq GROUP BY INPUT__FILE__NAME;
+-- part-v1.parquet: snappy, part-v2.parquet: zstd (written by pyarrow)</code></pre><div class="output">+------------------+----+
+|       file       | n  |
++------------------+----+
+| part-v1.parquet  | 3  |
+| part-v2.parquet  | 2  |
++------------------+----+</div></div>
+  <p class="muted">Each Parquet file records its own codec per column chunk, so files with different codecs can live in one table. That is what makes changing the codec gradually (scenario 3) safe.</p></div>
+  <div class="pcrun"><h4>3 · Choose codecs per table</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>CREATE TABLE orders_hot  STORED AS ORC     TBLPROPERTIES (&#x27;orc.compress&#x27;=&#x27;SNAPPY&#x27;)       AS SELECT * FROM orders;
+CREATE TABLE orders_cold STORED AS PARQUET TBLPROPERTIES (&#x27;parquet.compression&#x27;=&#x27;ZSTD&#x27;) AS SELECT * FROM orders;</code></pre><div class="output">same rows as c_orc_snappy (570,494 bytes) and c_pq_zstd (582,505 bytes) in Step 3</div></div>
+  <p class="muted">Set the codec in the DDL so it travels with the table, rather than relying on a session SET that other jobs may forget.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Choosing a codec from requirements</h2>
+  <p>A small decision procedure using our measured numbers. Watch <code>pick</code> change as the rules are applied.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "codecs = {\"snappy\": (3.0, 1385), \"lz4\": (3.2, 2593), \"zstd\": (5.1, 1162), \"gzip\": (5.2, 622)}",
+  "need_ratio, need_speed = 4.0, 1000          # at least 4x smaller, 1,000 MB/s reads",
+  "pick = None",
+  "for name, (ratio, speed) in codecs.items():",
+  "    if ratio >= need_ratio and speed >= need_speed:",
+  "        pick = name",
+  "print(pick)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Data",
+   "note": "Ratio and decompression MB/s from Step 4. <code>codecs<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ],
+   "newVar": "codecs"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>need_ratio<\/code> is created: 4.0. <code>need_speed<\/code> is created: 1000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ],
+   "newVar": "need_speed"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>pick<\/code> is created: None.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "None"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ],
+   "newVar": "pick"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>name<\/code> is created: &#x27;snappy&#x27;. <code>ratio<\/code> is created: 3.0. <code>speed<\/code> is created: 1385.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "None"
+      ],
+      [
+       "name",
+       "'snappy'"
+      ],
+      [
+       "ratio",
+       "3.0"
+      ],
+      [
+       "speed",
+       "1385"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ],
+   "newVar": "speed"
+  },
+  {
+   "line": 5,
+   "phase": "Rule",
+   "note": "Both requirements must hold. The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "None"
+      ],
+      [
+       "name",
+       "'snappy'"
+      ],
+      [
+       "ratio",
+       "3.0"
+      ],
+      [
+       "speed",
+       "1385"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;lz4&#x27;. <code>ratio<\/code> changes to 3.2. <code>speed<\/code> changes to 2593.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "None"
+      ],
+      [
+       "name",
+       "'lz4'"
+      ],
+      [
+       "ratio",
+       "3.2"
+      ],
+      [
+       "speed",
+       "2593"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ],
+   "newVar": "speed"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "None"
+      ],
+      [
+       "name",
+       "'lz4'"
+      ],
+      [
+       "ratio",
+       "3.2"
+      ],
+      [
+       "speed",
+       "2593"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;zstd&#x27;. <code>ratio<\/code> changes to 5.1. <code>speed<\/code> changes to 1162.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "None"
+      ],
+      [
+       "name",
+       "'zstd'"
+      ],
+      [
+       "ratio",
+       "5.1"
+      ],
+      [
+       "speed",
+       "1162"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ],
+   "newVar": "speed"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "None"
+      ],
+      [
+       "name",
+       "'zstd'"
+      ],
+      [
+       "ratio",
+       "5.1"
+      ],
+      [
+       "speed",
+       "1162"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>pick<\/code> changes to &#x27;zstd&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "'zstd'"
+      ],
+      [
+       "name",
+       "'zstd'"
+      ],
+      [
+       "ratio",
+       "5.1"
+      ],
+      [
+       "speed",
+       "1162"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ],
+   "newVar": "pick"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;gzip&#x27;. <code>ratio<\/code> changes to 5.2. <code>speed<\/code> changes to 622.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "'zstd'"
+      ],
+      [
+       "name",
+       "'gzip'"
+      ],
+      [
+       "ratio",
+       "5.2"
+      ],
+      [
+       "speed",
+       "622"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ],
+   "newVar": "speed"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "'zstd'"
+      ],
+      [
+       "name",
+       "'gzip'"
+      ],
+      [
+       "ratio",
+       "5.2"
+      ],
+      [
+       "speed",
+       "622"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "'zstd'"
+      ],
+      [
+       "name",
+       "'gzip'"
+      ],
+      [
+       "ratio",
+       "5.2"
+      ],
+      [
+       "speed",
+       "622"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Result",
+   "note": "Only ZSTD meets both, which is why it has become a popular default. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "codecs",
+       "→ dict #1"
+      ],
+      [
+       "need_ratio",
+       "4.0"
+      ],
+      [
+       "need_speed",
+       "1000"
+      ],
+      [
+       "pick",
+       "'zstd'"
+      ],
+      [
+       "name",
+       "'gzip'"
+      ],
+      [
+       "ratio",
+       "5.2"
+      ],
+      [
+       "speed",
+       "622"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;snappy&#x27;: → tuple #2, &#x27;lz4&#x27;: → tuple #3, &#x27;zstd&#x27;: → tuple #4, &#x27;gzip&#x27;: → tuple #5}",
+    "<b>#2 tuple (2)<\/b> (3.0, 1385)",
+    "<b>#3 tuple (2)<\/b> (3.2, 2593)",
+    "<b>#4 tuple (2)<\/b> (5.1, 1162)",
+    "<b>#5 tuple (2)<\/b> (5.2, 622)"
+   ],
+   "out": "zstd\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three codec and format decisions with real numbers.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Storage · estimate</span></div>
+    <h4>How much does compression save per year?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>TiffinGo will keep 3 years of orders in Parquet. Using the real bytes per order, estimate storage for UNCOMPRESSED, SNAPPY and ZSTD at 50 lakh orders a day.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>bytes for 50,000 orders: 1,093,857 / 762,424 / 582,505</pre></div><div><small>Expected output</small><pre>UNCOMPRESSED  119.8 GB
+SNAPPY         83.5 GB
+ZSTD           63.8 GB</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Bytes per order = size ÷ 50,000.</li><li>Multiply by orders per day × 365 × 3.</li><li>Compare in GB.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "ZSTD needs about 56 GB less than uncompressed over three years (64 GB instead of 120 GB). Orders are small rows; event and log tables are often a thousand times bigger, and HDFS replication (3 copies) triples every number.",
+   "code": "sizes = {\"UNCOMPRESSED\": 1093857, \"SNAPPY\": 762424, \"ZSTD\": 582505}\norders = 50_00_000 * 365 * 3\nfor codec, b in sizes.items():\n    print(f\"{codec:12} {b / 50000 * orders / 1e9:6.1f} GB\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "sizes = {\"UNCOMPRESSED\": 1093857, \"SNAPPY\": 762424, \"ZSTD\": 582505}",
+  "orders = 50_00_000 * 365 * 3",
+  "for codec, b in sizes.items():",
+  "    print(f\"{codec:12} {b / 50000 * orders / 1e9:6.1f} GB\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>sizes<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sizes",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;UNCOMPRESSED&#x27;: 1093857, &#x27;SNAPPY&#x27;: 762424, &#x27;ZSTD&#x27;: 582505}"
+   ],
+   "newVar": "sizes"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>orders<\/code> is created: 5475000000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sizes",
+       "→ dict #1"
+      ],
+      [
+       "orders",
+       "5475000000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;UNCOMPRESSED&#x27;: 1093857, &#x27;SNAPPY&#x27;: 762424, &#x27;ZSTD&#x27;: 582505}"
+   ],
+   "newVar": "orders"
+  },
+  {
+   "line": 3,
+   "phase": "Scale",
+   "note": "Real data compresses differently; measure one real partition before planning. <code>codec<\/code> is created: &#x27;UNCOMPRESSED&#x27;. <code>b<\/code> is created: 1093857.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sizes",
+       "→ dict #1"
+      ],
+      [
+       "orders",
+       "5475000000"
+      ],
+      [
+       "codec",
+       "'UNCOMPRESSED'"
+      ],
+      [
+       "b",
+       "1093857"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;UNCOMPRESSED&#x27;: 1093857, &#x27;SNAPPY&#x27;: 762424, &#x27;ZSTD&#x27;: 582505}"
+   ],
+   "newVar": "b"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sizes",
+       "→ dict #1"
+      ],
+      [
+       "orders",
+       "5475000000"
+      ],
+      [
+       "codec",
+       "'UNCOMPRESSED'"
+      ],
+      [
+       "b",
+       "1093857"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;UNCOMPRESSED&#x27;: 1093857, &#x27;SNAPPY&#x27;: 762424, &#x27;ZSTD&#x27;: 582505}"
+   ],
+   "out": "UNCOMPRESSED  119.8 GB\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>codec<\/code> changes to &#x27;SNAPPY&#x27;. <code>b<\/code> changes to 762424.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sizes",
+       "→ dict #1"
+      ],
+      [
+       "orders",
+       "5475000000"
+      ],
+      [
+       "codec",
+       "'SNAPPY'"
+      ],
+      [
+       "b",
+       "762424"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;UNCOMPRESSED&#x27;: 1093857, &#x27;SNAPPY&#x27;: 762424, &#x27;ZSTD&#x27;: 582505}"
+   ],
+   "newVar": "b"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sizes",
+       "→ dict #1"
+      ],
+      [
+       "orders",
+       "5475000000"
+      ],
+      [
+       "codec",
+       "'SNAPPY'"
+      ],
+      [
+       "b",
+       "762424"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;UNCOMPRESSED&#x27;: 1093857, &#x27;SNAPPY&#x27;: 762424, &#x27;ZSTD&#x27;: 582505}"
+   ],
+   "out": "SNAPPY         83.5 GB\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>codec<\/code> changes to &#x27;ZSTD&#x27;. <code>b<\/code> changes to 582505.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sizes",
+       "→ dict #1"
+      ],
+      [
+       "orders",
+       "5475000000"
+      ],
+      [
+       "codec",
+       "'ZSTD'"
+      ],
+      [
+       "b",
+       "582505"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;UNCOMPRESSED&#x27;: 1093857, &#x27;SNAPPY&#x27;: 762424, &#x27;ZSTD&#x27;: 582505}"
+   ],
+   "newVar": "b"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sizes",
+       "→ dict #1"
+      ],
+      [
+       "orders",
+       "5475000000"
+      ],
+      [
+       "codec",
+       "'ZSTD'"
+      ],
+      [
+       "b",
+       "582505"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;UNCOMPRESSED&#x27;: 1093857, &#x27;SNAPPY&#x27;: 762424, &#x27;ZSTD&#x27;: 582505}"
+   ],
+   "out": "ZSTD           63.8 GB\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sizes",
+       "→ dict #1"
+      ],
+      [
+       "orders",
+       "5475000000"
+      ],
+      [
+       "codec",
+       "'ZSTD'"
+      ],
+      [
+       "b",
+       "582505"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;UNCOMPRESSED&#x27;: 1093857, &#x27;SNAPPY&#x27;: 762424, &#x27;ZSTD&#x27;: 582505}"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Engineering · format choice</span></div>
+    <h4>ORC or Parquet for this table?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Score both formats for a table with these needs: (1) Hive UPDATE/DELETE, (2) read by Spark notebooks, (3) smallest storage. Weight the needs 3, 2, 1.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>ORC: ACID yes, Spark yes, smallest yes · Parquet: ACID no (in Hive), Spark yes, smallest no</pre></div><div><small>Expected output</small><pre>ORC 6
+Parquet 2</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Give each format 1 or 0 per need.</li><li>Multiply by the weight.</li><li>Pick the higher total.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Remove the ACID need and Parquet ties ORC on Spark, losing only on size. Many teams then pick Parquet for its wider tool support, or Iceberg on Parquet for updates (Module 7).",
+   "code": "weights = {\"hive_acid\": 3, \"spark\": 2, \"smallest\": 1}\norc = {\"hive_acid\": 1, \"spark\": 1, \"smallest\": 1}\nparquet = {\"hive_acid\": 0, \"spark\": 1, \"smallest\": 0}\nfor name, f in [(\"ORC\", orc), (\"Parquet\", parquet)]:\n    print(name, sum(weights[k] * f[k] for k in weights))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "weights = {\"hive_acid\": 3, \"spark\": 2, \"smallest\": 1}",
+  "orc = {\"hive_acid\": 1, \"spark\": 1, \"smallest\": 1}",
+  "parquet = {\"hive_acid\": 0, \"spark\": 1, \"smallest\": 0}",
+  "for name, f in [(\"ORC\", orc), (\"Parquet\", parquet)]:",
+  "    print(name, sum(weights[k] * f[k] for k in weights))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Weights",
+   "note": "Hive ACID tables require ORC, so that need dominates. <code>weights<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "weights",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;hive_acid&#x27;: 3, &#x27;spark&#x27;: 2, &#x27;smallest&#x27;: 1}"
+   ],
+   "newVar": "weights"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>orc<\/code> is created: → dict #2. A new dict object (#2) is created: {&#x27;hive_acid&#x27;: 1, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "weights",
+       "→ dict #1"
+      ],
+      [
+       "orc",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;hive_acid&#x27;: 3, &#x27;spark&#x27;: 2, &#x27;smallest&#x27;: 1}",
+    "<b>#2 dict (3)<\/b> {&#x27;hive_acid&#x27;: 1, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 1}"
+   ],
+   "newVar": "orc"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>parquet<\/code> is created: → dict #3. A new dict object (#3) is created: {&#x27;hive_acid&#x27;: 0, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 0}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "weights",
+       "→ dict #1"
+      ],
+      [
+       "orc",
+       "→ dict #2"
+      ],
+      [
+       "parquet",
+       "→ dict #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;hive_acid&#x27;: 3, &#x27;spark&#x27;: 2, &#x27;smallest&#x27;: 1}",
+    "<b>#2 dict (3)<\/b> {&#x27;hive_acid&#x27;: 1, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 1}",
+    "<b>#3 dict (3)<\/b> {&#x27;hive_acid&#x27;: 0, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 0}"
+   ],
+   "newVar": "parquet"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>name<\/code> is created: &#x27;ORC&#x27;. <code>f<\/code> is created: → dict #2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "weights",
+       "→ dict #1"
+      ],
+      [
+       "orc",
+       "→ dict #2"
+      ],
+      [
+       "parquet",
+       "→ dict #3"
+      ],
+      [
+       "name",
+       "'ORC'"
+      ],
+      [
+       "f",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;hive_acid&#x27;: 3, &#x27;spark&#x27;: 2, &#x27;smallest&#x27;: 1}",
+    "<b>#2 dict (3)<\/b> {&#x27;hive_acid&#x27;: 1, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 1}",
+    "<b>#3 dict (3)<\/b> {&#x27;hive_acid&#x27;: 0, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 0}"
+   ],
+   "newVar": "f"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "weights",
+       "→ dict #1"
+      ],
+      [
+       "orc",
+       "→ dict #2"
+      ],
+      [
+       "parquet",
+       "→ dict #3"
+      ],
+      [
+       "name",
+       "'ORC'"
+      ],
+      [
+       "f",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;hive_acid&#x27;: 3, &#x27;spark&#x27;: 2, &#x27;smallest&#x27;: 1}",
+    "<b>#2 dict (3)<\/b> {&#x27;hive_acid&#x27;: 1, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 1}",
+    "<b>#3 dict (3)<\/b> {&#x27;hive_acid&#x27;: 0, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 0}"
+   ],
+   "out": "ORC 6\n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;Parquet&#x27;. <code>f<\/code> changes to → dict #3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "weights",
+       "→ dict #1"
+      ],
+      [
+       "orc",
+       "→ dict #2"
+      ],
+      [
+       "parquet",
+       "→ dict #3"
+      ],
+      [
+       "name",
+       "'Parquet'"
+      ],
+      [
+       "f",
+       "→ dict #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;hive_acid&#x27;: 3, &#x27;spark&#x27;: 2, &#x27;smallest&#x27;: 1}",
+    "<b>#2 dict (3)<\/b> {&#x27;hive_acid&#x27;: 1, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 1}",
+    "<b>#3 dict (3)<\/b> {&#x27;hive_acid&#x27;: 0, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 0}"
+   ],
+   "newVar": "f"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "weights",
+       "→ dict #1"
+      ],
+      [
+       "orc",
+       "→ dict #2"
+      ],
+      [
+       "parquet",
+       "→ dict #3"
+      ],
+      [
+       "name",
+       "'Parquet'"
+      ],
+      [
+       "f",
+       "→ dict #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;hive_acid&#x27;: 3, &#x27;spark&#x27;: 2, &#x27;smallest&#x27;: 1}",
+    "<b>#2 dict (3)<\/b> {&#x27;hive_acid&#x27;: 1, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 1}",
+    "<b>#3 dict (3)<\/b> {&#x27;hive_acid&#x27;: 0, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 0}"
+   ],
+   "out": "Parquet 2\n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "weights",
+       "→ dict #1"
+      ],
+      [
+       "orc",
+       "→ dict #2"
+      ],
+      [
+       "parquet",
+       "→ dict #3"
+      ],
+      [
+       "name",
+       "'Parquet'"
+      ],
+      [
+       "f",
+       "→ dict #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;hive_acid&#x27;: 3, &#x27;spark&#x27;: 2, &#x27;smallest&#x27;: 1}",
+    "<b>#2 dict (3)<\/b> {&#x27;hive_acid&#x27;: 1, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 1}",
+    "<b>#3 dict (3)<\/b> {&#x27;hive_acid&#x27;: 0, &#x27;spark&#x27;: 1, &#x27;smallest&#x27;: 0}"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Performance · benchmark design</span></div>
+    <h4>Why the 50,000-row benchmark was useless</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>All formats took 3.1–3.4 s in Step 8. Model query time as fixed overhead + bytes ÷ read speed, and find the table size at which ORC (0.44 MB per 50,000 rows) beats text (3.74 MB) by more than 10%.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>overhead 3.0 s; effective read speed 50 MB/s (illustrative)</pre></div><div><small>Expected output</small><pre>400,000 rows: text 3.6 s, ORC 3.1 s</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>time = overhead + size / speed.</li><li>Grow the row count.</li><li>Stop when text is 10% slower than ORC.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The difference appears around a few million rows in this model. Benchmarks need realistic volumes, and counters (rows, bytes read) are more reliable than wall time on small tests.",
+   "code": "overhead, speed = 3.0, 50e6\ntext_b, orc_b = 3735865 / 50000, 437536 / 50000      # bytes per row (real)\nrows = 50000\nwhile True:\n    t_text = overhead + rows * text_b / speed\n    t_orc = overhead + rows * orc_b / speed\n    if t_text > 1.1 * t_orc:\n        break\n    rows *= 2\nprint(f\"{rows:,} rows: text {t_text:.1f} s, ORC {t_orc:.1f} s\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "overhead, speed = 3.0, 50e6",
+  "text_b, orc_b = 3735865 / 50000, 437536 / 50000      # bytes per row (real)",
+  "rows = 50000",
+  "while True:",
+  "    t_text = overhead + rows * text_b / speed",
+  "    t_orc = overhead + rows * orc_b / speed",
+  "    if t_text > 1.1 * t_orc:",
+  "        break",
+  "    rows *= 2",
+  "print(f\"{rows:,} rows: text {t_text:.1f} s, ORC {t_orc:.1f} s\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>overhead<\/code> is created: 3.0. <code>speed<\/code> is created: 50000000.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "speed"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>text_b<\/code> is created: 74.7173. <code>orc_b<\/code> is created: 8.7507.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "orc_b"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>rows<\/code> is created: 50000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "50000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "rows"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "50000"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>t_text<\/code> is created: 3.0747.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "50000"
+      ],
+      [
+       "t_text",
+       "3.0747"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "t_text"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>t_orc<\/code> is created: 3.0088.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "50000"
+      ],
+      [
+       "t_text",
+       "3.0747"
+      ],
+      [
+       "t_orc",
+       "3.0088"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "t_orc"
+  },
+  {
+   "line": 7,
+   "phase": "Growth",
+   "note": "Overhead stops dominating once the data takes seconds to read. The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "50000"
+      ],
+      [
+       "t_text",
+       "3.0747"
+      ],
+      [
+       "t_orc",
+       "3.0088"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>rows<\/code> changes to 100000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "100000"
+      ],
+      [
+       "t_text",
+       "3.0747"
+      ],
+      [
+       "t_orc",
+       "3.0088"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "rows"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "100000"
+      ],
+      [
+       "t_text",
+       "3.0747"
+      ],
+      [
+       "t_orc",
+       "3.0088"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>t_text<\/code> changes to 3.1494.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "100000"
+      ],
+      [
+       "t_text",
+       "3.1494"
+      ],
+      [
+       "t_orc",
+       "3.0088"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "t_text"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>t_orc<\/code> changes to 3.0175.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "100000"
+      ],
+      [
+       "t_text",
+       "3.1494"
+      ],
+      [
+       "t_orc",
+       "3.0175"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "t_orc"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "100000"
+      ],
+      [
+       "t_text",
+       "3.1494"
+      ],
+      [
+       "t_orc",
+       "3.0175"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>rows<\/code> changes to 200000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "200000"
+      ],
+      [
+       "t_text",
+       "3.1494"
+      ],
+      [
+       "t_orc",
+       "3.0175"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "rows"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "200000"
+      ],
+      [
+       "t_text",
+       "3.1494"
+      ],
+      [
+       "t_orc",
+       "3.0175"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>t_text<\/code> changes to 3.2989.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "200000"
+      ],
+      [
+       "t_text",
+       "3.2989"
+      ],
+      [
+       "t_orc",
+       "3.0175"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "t_text"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>t_orc<\/code> changes to 3.035.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "200000"
+      ],
+      [
+       "t_text",
+       "3.2989"
+      ],
+      [
+       "t_orc",
+       "3.035"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "t_orc"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "200000"
+      ],
+      [
+       "t_text",
+       "3.2989"
+      ],
+      [
+       "t_orc",
+       "3.035"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>rows<\/code> changes to 400000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "400000"
+      ],
+      [
+       "t_text",
+       "3.2989"
+      ],
+      [
+       "t_orc",
+       "3.035"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "rows"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "400000"
+      ],
+      [
+       "t_text",
+       "3.2989"
+      ],
+      [
+       "t_orc",
+       "3.035"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>t_text<\/code> changes to 3.5977.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "400000"
+      ],
+      [
+       "t_text",
+       "3.5977"
+      ],
+      [
+       "t_orc",
+       "3.035"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "t_text"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>t_orc<\/code> changes to 3.07.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "400000"
+      ],
+      [
+       "t_text",
+       "3.5977"
+      ],
+      [
+       "t_orc",
+       "3.07"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "t_orc"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "400000"
+      ],
+      [
+       "t_text",
+       "3.5977"
+      ],
+      [
+       "t_orc",
+       "3.07"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>break<\/code> leaves the loop immediately.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "400000"
+      ],
+      [
+       "t_text",
+       "3.5977"
+      ],
+      [
+       "t_orc",
+       "3.07"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "overhead",
+       "3.0"
+      ],
+      [
+       "speed",
+       "50000000.0"
+      ],
+      [
+       "text_b",
+       "74.7173"
+      ],
+      [
+       "orc_b",
+       "8.7507"
+      ],
+      [
+       "rows",
+       "400000"
+      ],
+      [
+       "t_text",
+       "3.5977"
+      ],
+      [
+       "t_orc",
+       "3.07"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "400,000 rows: text 3.6 s, ORC 3.1 s\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: In our Hive 4.2.1 lab, how was a plain CTAS STORED AS PARQUET compressed?",
+  "options": [
+   "ZLIB",
+   "SNAPPY",
+   "UNCOMPRESSED",
+   "ZSTD"
+  ],
+  "answer": 2,
+  "why": "Set parquet.compression (table property or session) to get compression."
+ },
+ {
+  "q": "Beginner: Which codec is generally the fastest to decompress?",
+  "options": [
+   "bzip2",
+   "LZ4",
+   "gzip",
+   "ZLIB"
+  ],
+  "answer": 1,
+  "why": "Measured: LZ4 2,593 MB/s vs gzip 622 and bzip2 38."
+ },
+ {
+  "q": "Beginner: What is the Parquet equivalent of an ORC stripe?",
+  "options": [
+   "Row group",
+   "Page",
+   "Footer",
+   "Dictionary"
+  ],
+  "answer": 0,
+  "why": "Row groups contain column chunks, which contain pages."
+ },
+ {
+  "q": "Intermediate: Which property sets the codec of an ORC table?",
+  "options": [
+   "'parquet.compression'",
+   "'hive.exec.compress.output'",
+   "'orc.codec'",
+   "'orc.compress'"
+  ],
+  "answer": 3,
+  "why": "TBLPROPERTIES ('orc.compress'='ZSTD'); the default comes from hive.exec.orc.default.compress (ZLIB)."
+ },
+ {
+  "q": "Intermediate: Why was the sorted order_id 200 KB in Parquet but 161 bytes in ORC?",
+  "options": [
+   "Parquet is broken",
+   "ORC dropped the column",
+   "Parquet stored it PLAIN; ORC used run-length encoding",
+   "Different data"
+  ],
+  "answer": 2,
+  "why": "Encodings matter as much as codecs."
+ },
+ {
+  "q": "Intermediate: Hive reads a Parquet file whose columns are in a different order than the table. What happens?",
+  "options": [
+   "Values shift",
+   "Columns are matched by name",
+   "Error",
+   "Only the first column is read"
+  ],
+  "answer": 1,
+  "why": "Real lab: files from pyarrow with a different order read correctly; a missing column became NULL."
+ },
+ {
+  "q": "Advanced: How did Hive 4.2.1 write Parquet timestamps by default?",
+  "options": [
+   "INT96",
+   "INT64 millis",
+   "STRING",
+   "DATE"
+  ],
+  "answer": 0,
+  "why": "hive.parquet.write.int64.timestamp=false. Set it to true for INT64 microseconds."
+ },
+ {
+  "q": "Advanced: All formats answered in 3.1–3.4 s on 50,000 rows. What does that show?",
+  "options": [
+   "Formats do not matter",
+   "Text is best",
+   "Parquet is slowest",
+   "Fixed job overhead dominates small data; benchmark at realistic scale"
+  ],
+  "answer": 3,
+  "why": "Use counters and realistic volumes to compare formats."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 6.3 in one screen</h3>
+    <ul><li><b>Parquet:</b> file = row groups (≈128 MB) → column chunks → pages (≈1 MB); footer with schema + statistics; <code>PAR1</code> at both ends.</li><li><b>Hive 4.2.1 default:</b> Parquet <b>UNCOMPRESSED</b> (set <code>parquet.compression</code>); ORC <b>ZLIB</b> (<code>orc.compress</code>).</li><li><b>Real sizes:</b> ORC ZSTD 436 KB ≈ ZLIB 438 · Parquet GZIP 537 · ZSTD 583 · SNAPPY 762 · NONE 1,094.</li><li><b>Speed (measured):</b> LZ4/Snappy fastest · ZSTD gzip-like ratio with ~2× faster decompression · bzip2 best ratio, ~36× slower than Snappy.</li><li><b>Choose:</b> hot → Snappy/LZ4 · warm/cold → ZSTD (or ZLIB/GZIP) · text archives → bzip2. Compress inside containers.</li><li><b>Encodings first:</b> dictionary for repeats, RLE for runs; Parquet stored sorted ids PLAIN (200 KB) vs ORC 161 bytes.</li><li><b>Timestamps:</b> INT96 by default; <code>hive.parquet.write.int64.timestamp=true</code> → INT64 micros.</li><li>Parquet columns matched <b>by name</b>; missing → NULL; mixed codecs per file are fine.</li><li>Skipping: sorted int filter skipped Parquet row groups (1,458 rows); decimal <code>amount &gt; 900</code> did not (ORC did). Benchmark at real scale.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Should I choose ORC or Parquet?</summary><p>Choose ORC for Hive-centred warehouses and when you need Hive ACID tables; it was smaller on our data and skipped more. Choose Parquet when many engines share the data (Spark, Trino, cloud services, pandas), or when a table format like Iceberg or Delta is built on it. Both are good; consistency within a platform matters more than the choice.</p></details>
+    <details><summary>Is Snappy still a good default?</summary><p>It is fast and safe, which is why it was the default in many tools for years. ZSTD now gives much smaller files with decompression speeds that are close enough for most analytics, so many teams have switched. Use Snappy or LZ4 where CPU is the bottleneck.</p></details>
+    <details><summary>Does compression make queries slower?</summary><p>It costs CPU to decompress, but it saves disk and network reads. For big analytic scans on HDFS or object storage, reading fewer bytes usually wins, so compressed columnar data is faster overall. On tiny datasets, as our 50,000-row test showed, neither effect is visible.</p></details>
+    <details><summary>Why does Hive still write INT96 timestamps?</summary><p>For compatibility with older Hive, Impala and Spark versions that expect INT96. Newer readers prefer INT64 with a logical timestamp type. If all your readers are recent, enabling <code>hive.parquet.write.int64.timestamp</code> avoids the deprecated encoding; test time zone handling in each engine.</p></details>
+    <details><summary>Can one table mix ORC and Parquet files?</summary><p>Not in one plain table: the table’s InputFormat and SerDe decide how every file is read. Different partitions can have different formats (ALTER TABLE … PARTITION … SET FILEFORMAT), but this is confusing and rarely worth it. Codecs, on the other hand, can safely differ file by file.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs about codecs, sizes and Parquet behaviour, with the HiveQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Compression ratio</h4></div>
+      <p>Compute the ratio of uncompressed to ZSTD Parquet.</p>
+      <div class="prob__io"><div><small>Input</small><pre>1,093,857 and 582,505 bytes</pre></div><div><small>Expected output</small><pre>1.88</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(1093857 / 582505, 2))</code></pre><div class="output">1.88</div></div>
+        <p><b>How it works:</b> 1.88×. ZSTD almost halves our Parquet table.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Magic bytes check</h4></div>
+      <p>Check whether a file looks like Parquet.</p>
+      <div class="prob__io"><div><small>Input</small><pre>first and last 4 bytes</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>head, tail = b&quot;PAR1&quot;, b&quot;PAR1&quot;
+print(head == b&quot;PAR1&quot; and tail == b&quot;PAR1&quot;)</code></pre><div class="output">True</div></div>
+        <p><b>How it works:</b> Parquet files start and end with PAR1; the footer length sits just before the final PAR1.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Pick a codec</h4></div>
+      <p>Pick a codec for each table temperature.</p>
+      <div class="prob__io"><div><small>Input</small><pre>hot, warm, cold, text archive</pre></div><div><small>Expected output</small><pre>hot -&gt; SNAPPY or LZ4
+warm -&gt; ZSTD
+cold -&gt; ZSTD or GZIP
+text archive -&gt; BZIP2</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>policy = {&quot;hot&quot;: &quot;SNAPPY or LZ4&quot;, &quot;warm&quot;: &quot;ZSTD&quot;, &quot;cold&quot;: &quot;ZSTD or GZIP&quot;, &quot;text archive&quot;: &quot;BZIP2&quot;}
+for k, v in policy.items():
+    print(k, &quot;-&gt;&quot;, v)</code></pre><div class="output">hot -&gt; SNAPPY or LZ4
+warm -&gt; ZSTD
+cold -&gt; ZSTD or GZIP
+text archive -&gt; BZIP2</div></div>
+        <p><b>How it works:</b> Follows the measured trade-off: speed for hot data, size for data stored long.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Decompression time</h4></div>
+      <p>How long does it take to decompress 10 GB with each codec on one core?</p>
+      <div class="prob__io"><div><small>Input</small><pre>measured MB/s</pre></div><div><small>Expected output</small><pre>lz4         3.9 s
+snappy      7.2 s
+zstd        8.6 s
+gzip       16.1 s
+bzip2     263.2 s</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>speeds = {&quot;lz4&quot;: 2593, &quot;snappy&quot;: 1385, &quot;zstd&quot;: 1162, &quot;gzip&quot;: 622, &quot;bzip2&quot;: 38}
+for c, s in speeds.items():
+    print(f&quot;{c:7} {10000 / s:7.1f} s&quot;)</code></pre><div class="output">lz4         3.9 s
+snappy      7.2 s
+zstd        8.6 s
+gzip       16.1 s
+bzip2     263.2 s</div></div>
+        <p><b>How it works:</b> From 4 seconds (LZ4) to over 4 minutes (bzip2) per core. Clusters spread it over many cores, but the ratio stays.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Rows read with sorted row groups</h4></div>
+      <p>Parquet row groups of 1,460 rows; customer 1492 falls in one group. How many rows are read?</p>
+      <div class="prob__io"><div><small>Input</small><pre>35 groups</pre></div><div><small>Expected output</small><pre>[(1469, 1528)] -&gt; about 1,458 rows</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>groups = [(1350, 1409), (1409, 1469), (1469, 1528), (1528, 1584)]
+print([g for g in groups if g[0] &lt;= 1492 &lt;= g[1]], &quot;-&gt; about 1,458 rows&quot;)</code></pre><div class="output">[(1469, 1528)] -&gt; about 1,458 rows</div></div>
+        <p><b>How it works:</b> One row group (1469–1528), matching the real counter of 1,458 rows.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Missing column in old files</h4></div>
+      <p>Read old Parquet records that lack the plan column.</p>
+      <div class="prob__io"><div><small>Input</small><pre>old and new records</pre></div><div><small>Expected output</small><pre>[1, &#x27;Aarav Desai&#x27;, None, &#x27;Bengaluru&#x27;]
+[4, &#x27;Diya Patil&#x27;, &#x27;Gold&#x27;, &#x27;Pune&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>cols = [&quot;customer_id&quot;, &quot;name&quot;, &quot;plan&quot;, &quot;city&quot;]
+recs = [{&quot;customer_id&quot;: 1, &quot;name&quot;: &quot;Aarav Desai&quot;, &quot;city&quot;: &quot;Bengaluru&quot;}, {&quot;customer_id&quot;: 4, &quot;plan&quot;: &quot;Gold&quot;, &quot;city&quot;: &quot;Pune&quot;, &quot;name&quot;: &quot;Diya Patil&quot;}]
+for r in recs:
+    print([r.get(c) for c in cols])</code></pre><div class="output">[1, &#x27;Aarav Desai&#x27;, None, &#x27;Bengaluru&#x27;]
+[4, &#x27;Diya Patil&#x27;, &#x27;Gold&#x27;, &#x27;Pune&#x27;]</div></div>
+        <p><b>How it works:</b> Missing columns read as NULL (None), by name, as in the real cust_pq output. Avro could have supplied a default instead.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Monthly saving from a codec switch</h4></div>
+      <p>A team stores 300 TB of Snappy Parquet. Estimate the saving if rewritten with ZSTD using the lab ratio.</p>
+      <div class="prob__io"><div><small>Input</small><pre>SNAPPY 762,424 vs ZSTD 582,505 bytes</pre></div><div><small>Expected output</small><pre>71 TB saved</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>ratio = 582505 / 762424
+print(round(300 * (1 - ratio)), &quot;TB saved&quot;)</code></pre><div class="output">71 TB saved</div></div>
+        <p><b>How it works:</b> About 71 TB, using the lab ratio. Real ratios vary by data; test a sample first.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Codec decision record</h4></div>
+      <p>Print a one-line decision for a shared Parquet table.</p>
+      <div class="prob__io"><div><small>Input</small><pre>needs: shared with Spark, read hourly, 2-year retention</pre></div><div><small>Expected output</small><pre>Parquet + ZSTD, INT64 timestamps, partitioned by date: shared engines, frequent reads, long retention</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;Parquet + ZSTD, INT64 timestamps, partitioned by date: shared engines, frequent reads, long retention&quot;)</code></pre><div class="output">Parquet + ZSTD, INT64 timestamps, partitioned by date: shared engines, frequent reads, long retention</div></div>
+        <p><b>How it works:</b> DDL: STORED AS PARQUET TBLPROPERTIES ('parquet.compression'='ZSTD') with SET hive.parquet.write.int64.timestamp=true in the load job.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Codec and format questions often come as cost or performance problems. Show that you can reason with numbers.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Big data</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“ORC vs Parquet”</h4>
+      <p class="scn__situation">Compare ORC and Parquet and say when you would use each.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know both are columnar and where they differ?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>Both are columnar, self-describing, compressed formats with statistics for skipping. ORC has stripes with row-group indexes every 10,000 rows and bloom filters, is the default choice in Hive and required for Hive ACID; Parquet has row groups and pages and is the common format across Spark, Trino and cloud tools. Pick ORC for Hive-centred warehouses, Parquet for multi-engine lakes.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Saying one is “row” and the other “column” based.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Parquet table bigger than expected</h4>
+      <p class="scn__situation">A new Parquet table is twice the size of the ORC table with the same data.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you check the codec?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Inspect the files (parquet-tools / pyarrow): compression UNCOMPRESSED.</li>
+          <li>Set <code>parquet.compression</code> in TBLPROPERTIES (ZSTD or SNAPPY) and rewrite the data.</li>
+          <li>Add codec review to table-creation checklists.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> “Parquet is just bigger than ORC.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Timestamps differ between Hive and Spark</h4>
+      <p class="scn__situation">The same Parquet table shows different timestamps in Hive and in Spark.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know INT96 and time zone handling?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Check the physical type: Hive writes INT96 by default; engines interpret it and time zones differently.</li>
+          <li>Write INT64 timestamps (<code>hive.parquet.write.int64.timestamp=true</code>) and agree on UTC storage.</li>
+          <li>Verify a few known rows in every engine.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Adding 5:30 by hand in one engine.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Architecture</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Codec strategy for a growing lake</h4>
+      <p class="scn__situation">Storage grows 40% a year and query CPU is also rising. Propose a codec and format strategy.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you balance storage and CPU with evidence?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Measure on real partitions: size and query CPU for Snappy, ZSTD and ZLIB.</li>
+          <li>Hot partitions in a fast codec, older partitions rewritten to ZSTD; compress intermediate data for shuffle-heavy jobs.</li>
+          <li>Standardise formats (ORC for Hive ACID, Parquet/Iceberg for shared data) and track bytes stored and scanned per table.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> “Use the strongest compression everywhere.”</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

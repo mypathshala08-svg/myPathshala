@@ -1,0 +1,1708 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join strategies | MyPhatshala</title>
+<meta name="description" content="Spark join strategies measured with PySpark 4.3.0: 5M orders joined to 4,000 customers with broadcast, shuffle_hash, merge and shuffle_replicate_nl hints (1.55 s, 4.53 s, 6.73 s, CartesianProduct), Exchange counts in the plan, forcing a broadcast of a 5M-row side, and bucketed tables that sort-merge join with zero shuffles (1.68 s vs 5.31 s).">
+<meta name="mp:minutes" content="30">
+<link rel="canonical" href="https://myphatshala.in/courses/spark-pyspark/08-performance-tuning/02-join-strategies/">
+<meta property="og:title" content="Join strategies · MyPhatshala">
+<meta property="og:description" content="Broadcast 1.55 s, sort-merge 6.73 s, bucketed 1.68 s: the same Spark join with every strategy, measured and explained.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Join strategies", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Spark and PySpark", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="08-performance-tuning/02-join-strategies" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Spark and PySpark syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Spark and PySpark</a><span>›</span><b>Lesson 8.2</b></nav>
+    <h1>Join strategies</h1>
+    <p class="lead">The same join can be 4x faster or slower depending on the <b>physical strategy</b>. This lesson forces broadcast hash, shuffled hash and sort-merge joins with hints, counts shuffles in the plan, tests a dangerous forced broadcast, and removes the shuffle with <b>bucketing</b>. <b>All outputs are real</b> (PySpark 4.3.0).</p>
+    <div class="lesson-meta"><span>Module 8 · Performance tuning</span><span>⏱ 30 min</span><span>Intermediate → Advanced</span><span>PySpark 4.3.0</span><span>4 join hints</span><span>Bucketing measured</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Same join, four times faster”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> join types in <a href="../../06-transformations/02-joins/">6.2</a>, plans in <a href="../../07-spark-sql/03-catalyst-and-explain/">7.3</a>, AQE in <a href="../../07-spark-sql/04-adaptive-query-execution/">7.4</a>.</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s loyalty job joins every order with the customer tier table. After someone set <code>spark.sql.autoBroadcastJoinThreshold=-1</code> to “fix” an out-of-memory error elsewhere, the job silently became 4x slower.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Spark joins two tables using one of several physical strategies. We forced each strategy with hints on 5 million orders joined to 4,000 customers and timed them, then compared a bucketed join with a normal one.">
+        <rect x="14" y="30" width="100" height="40" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="64.0" y="41" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">orders</text><text x="64.0" y="51" text-anchor="middle" font-size="6.4" class="s-ink2 mono">5M rows</text><rect x="14" y="96" width="100" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="64.0" y="107" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">customers</text><text x="64.0" y="117" text-anchor="middle" font-size="6.4" class="s-ink2 mono">4,000 rows</text><path d="M116 116L176 80" style="fill:none;stroke:var(--green);stroke-width:1.2"/><path d="M172.2 85.9L176 80L169.0 80.6" style="fill:none;stroke:var(--green);stroke-width:1.2"/><text x="150" y="108" text-anchor="middle" font-size="7" class="s-green">copy</text><path d="M116 50L176 62" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M169.2 63.7L176 62L170.4 57.8" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="180" y="54" width="190" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="275.0" y="65" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">BroadcastHashJoin</text><text x="275.0" y="75" text-anchor="middle" font-size="6.4" class="s-ink2 mono">no shuffle of orders</text><rect x="400" y="12" width="232" height="132" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="516" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured (5M orders)</text><text x="412" y="52" font-size="7.2" class="s-green mono">broadcast   : 1.55 s,   8 tasks</text><text x="412" y="68" font-size="7.2" class="s-acc mono">shuffle_hash: 4.53 s, 208 tasks</text><text x="412" y="84" font-size="7.2" class="s-red mono">sort-merge  : 6.73 s, 208 tasks</text><text x="412" y="100" font-size="7.2" class="s-green mono">bucketed SMJ: 1.68 s, 0 Exchange</text><text x="412" y="116" font-size="7.2" class="s-acc mono">plain SMJ   : 5.31 s, 2 Exchange</text><text x="412" y="132" font-size="7.2" class="s-red mono">5M broadcast: works, risky</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">The fastest join is the one that <tspan font-weight="700" class="s-acc">does not shuffle</tspan> the big table.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, a join is a join. How can the same join be 4x slower?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Spark has several <b>physical join strategies</b>. If one side is small, it copies it to every executor and never moves the big table. Otherwise it shuffles both sides by the key, and then either sorts them or builds hash tables.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>And we can choose?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Spark chooses using size estimates and thresholds, and you can override it with <b>hints</b>. Today we force each strategy, time it, read the plans, and see how <b>bucketing</b> removes the shuffle for repeated joins. All outputs are real (PySpark 4.3.0).</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Physical join strategies</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>Spark SQL implements equi-joins with three main physical operators. A <b>broadcast hash join</b> (BHJ) sends the smaller relation to every executor and builds a hash table there, so the larger side is not shuffled; it is chosen when a side’s estimated size is below <code>spark.sql.autoBroadcastJoinThreshold</code> (10 MB) or a broadcast hint is given. A <b>sort-merge join</b> (SMJ) shuffles both sides by the join key, sorts each partition and merges them; it is the default for large inputs. A <b>shuffled hash join</b> (SHJ) shuffles both sides and builds a hash table from the smaller side per partition, avoiding the sort. Non-equi joins use a <b>broadcast nested loop join</b> or a <b>cartesian product</b>. Hints (<code>BROADCAST</code>, <code>MERGE</code>, <code>SHUFFLE_HASH</code>, <code>SHUFFLE_REPLICATE_NL</code>) override the choice; bucketed tables can skip the shuffle.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Spark can join by copying a small table to every machine (broadcast), or by moving both tables so matching keys meet and then sorting (sort-merge) or hashing (shuffled hash). Broadcast avoids moving the big table and is usually fastest; the others work for any size. Hints let you choose.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>BHJ</b><span>Broadcast hash join: small side copied.</span></div>
+    <div class="term"><b>SMJ</b><span>Sort-merge join: shuffle + sort both.</span></div>
+    <div class="term"><b>SHJ</b><span>Shuffled hash join: shuffle + hash.</span></div>
+    <div class="term"><b>BNLJ</b><span>Broadcast nested loop: non-equi joins.</span></div>
+    <div class="term"><b>Join hint</b><span>Tells Spark which strategy to use.</span></div>
+    <div class="term"><b>autoBroadcastJoinThreshold</b><span>10 MB default; -1 disables.</span></div>
+    <div class="term"><b>BroadcastExchange</b><span>Plan node that ships the small side.</span></div>
+    <div class="term"><b>Bucketing</b><span>Pre-shuffled, pre-sorted table files.</span></div>
+  </div>
+
+  <h3>The strategies side by side</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:660px">
+    <thead><tr><th>Strategy</th><th>Shuffles</th><th>Best when</th><th>Lab (5M × 4,000)</th></tr></thead>
+    <tbody><tr><td>Broadcast hash</td><td>Neither side (small side copied)</td><td>One side small (≤ ~10–100 MB)</td><td>1.55 s, 8 tasks</td></tr><tr><td>Shuffled hash</td><td>Both</td><td>One side much smaller, fits in memory per partition</td><td>4.53 s, 208 tasks</td></tr><tr><td>Sort-merge</td><td>Both (+ sort)</td><td>Both sides large</td><td>6.73 s, 208 tasks</td></tr><tr><td>Cartesian / BNLJ</td><td>Varies</td><td>Non-equi conditions only</td><td>hint gave CartesianProduct</td></tr><tr><td>Bucketed SMJ</td><td>None (pre-bucketed)</td><td>Same big join repeated</td><td>1.68 s vs 5.31 s</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Join strategies at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Matching guests to tables</h4>
+      <ul>
+        <li>Broadcast: give every waiter a copy of the short guest list. Nobody moves.</li>
+        <li>Sort-merge: both long lists are sorted by name and walked together.</li>
+        <li>Shuffle hash: split both lists by first letter, then use a lookup table per letter.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The API</h4>
+      <ul>
+        <li><code>F.broadcast(df)</code> or <code>df.hint("broadcast")</code>, <code>"merge"</code>, <code>"shuffle_hash"</code>, <code>"shuffle_replicate_nl"</code>; SQL <code>/*+ BROADCAST(c) */</code>.</li>
+        <li><code>spark.sql.autoBroadcastJoinThreshold</code> (10 MB), <code>spark.sql.join.preferSortMergeJoin</code> (true).</li>
+        <li><code>df.write.bucketBy(n, "key").sortBy("key").saveAsTable(...)</code>.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>Broadcast 1.55 s (8 tasks), shuffled hash 4.53 s, sort-merge 6.73 s (208 tasks each).</li>
+        <li>The broadcast plan had 0 hash Exchanges; sort-merge had 2.</li>
+        <li>Bucketed tables: sort-merge with 0 Exchanges, 1.68 s vs 5.31 s.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “Explain Spark join strategies.” Broadcast hash join copies the small side to all executors and avoids shuffling the big side; it is chosen below <code>autoBroadcastJoinThreshold</code> (10 MB) or with a hint. Sort-merge join shuffles and sorts both sides and is the default for large tables. Shuffled hash join shuffles both and hashes the smaller side per partition. Non-equi joins use broadcast nested loop or cartesian joins. Bucketing on the join key lets sort-merge skip the shuffle.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Hints in DataFrame and SQL</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Hint</th><th>DataFrame</th><th>SQL</th><th>Plan in our lab</th></tr></thead>
+    <tbody><tr><td>Broadcast</td><td><code>F.broadcast(c)</code> / <code>c.hint("broadcast")</code></td><td><code>/*+ BROADCAST(c) */</code></td><td>BroadcastHashJoin</td></tr><tr><td>Merge</td><td><code>c.hint("merge")</code></td><td><code>/*+ MERGE(c) */</code></td><td>SortMergeJoin</td></tr><tr><td>Shuffle hash</td><td><code>c.hint("shuffle_hash")</code></td><td><code>/*+ SHUFFLE_HASH(c) */</code></td><td>ShuffledHashJoin</td></tr><tr><td>Replicate NL</td><td><code>c.hint("shuffle_replicate_nl")</code></td><td><code>/*+ SHUFFLE_REPLICATE_NL(c) */</code></td><td>CartesianProduct</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>A broadcast hint is an order, not a suggestion: Spark will try to collect the side on the driver and send it to every executor, even a huge one. Our forced broadcast of 5 million rows worked on a 3 GB driver (5.32 s), but on a cluster a mis-estimated side causes driver OOM or a broadcast timeout. Setting the threshold to <code>-1</code> everywhere is the opposite mistake: every small dimension join becomes a shuffle.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Forcing each strategy</h2>
+  <p>All outputs are real: PySpark 4.3.0, <code>local[4]</code>, AQE off (so the plan does not change at run time), 5,000,000 orders joined on <code>customer_id</code> to 4,000 customers. Strategies are read from the executed plan; timings are warm runs.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Spark’s automatic choice</h4>
+      <div class="code" data-lang="python" data-file="l82_joins.py"><pre><code>cust = spark.range(1, 4001).select(F.col(&quot;id&quot;).cast(&quot;int&quot;).alias(&quot;customer_id&quot;), (F.col(&quot;id&quot;) % 5).alias(&quot;tier&quot;))
+print(strat(o.join(cust, &quot;customer_id&quot;)))
+spark.conf.set(&quot;spark.sql.autoBroadcastJoinThreshold&quot;, -1)
+print(strat(o.join(cust, &quot;customer_id&quot;)))</code></pre><div class="output">default autoBroadcastJoinThreshold: 10485760b
+== 1) auto choice
+small dim (4000 rows) -&gt; BroadcastHashJoin
+threshold -1 -&gt; SortMergeJoin</div></div>
+      <span class="behind">The customer side is tiny, far below 10 MB, so Spark picked a <b>broadcast hash join</b> by itself. Disabling the threshold with <code>-1</code> forced it back to <b>sort-merge</b>, the default for “big” joins.</span></li>
+    <li><h4>Step 2 · Hints and timings</h4>
+      <div class="code" data-lang="python" data-file="l82_joins.py"><pre><code>for h in (&quot;broadcast&quot;, &quot;merge&quot;, &quot;shuffle_hash&quot;, &quot;shuffle_replicate_nl&quot;):
+    print(h, strat(o.join(cust.hint(h), &quot;customer_id&quot;)))
+for h in (&quot;broadcast&quot;, &quot;merge&quot;, &quot;shuffle_hash&quot;):
+    run(f&quot;join with {h}&quot;, sink(o.join(cust.hint(h), &quot;customer_id&quot;)))</code></pre><div class="output">== 2) hints (threshold -1, so only hint decides)
+hint broadcast             -&gt; BroadcastHashJoin
+hint merge                 -&gt; SortMergeJoin
+hint shuffle_hash          -&gt; ShuffledHashJoin
+hint shuffle_replicate_nl  -&gt; CartesianProduct
+join with broadcast                       :  1.55 s, tasks    8, spill mem    0.0 MiB disk   0.0 MiB
+join with merge                           :  6.73 s, tasks  208, spill mem    0.0 MiB disk   0.0 MiB
+join with shuffle_hash                    :  4.53 s, tasks  208, spill mem    0.0 MiB disk   0.0 MiB</div></div>
+      <span class="behind">Each hint produced exactly the requested operator. Broadcast: <b>1.55 s</b> with 8 tasks (just scanning orders). Shuffled hash: <b>4.53 s</b>. Sort-merge: <b>6.73 s</b>, 4.3x slower, with 208 tasks because both sides were shuffled into 200 partitions and sorted. <code>shuffle_replicate_nl</code> on an equi-join gave a <b>CartesianProduct</b>: never use it for normal keys.</span></li>
+    <li><h4>Step 3 · Read the plan, count Exchanges</h4>
+      <div class="code" data-lang="python" data-file="l82_joins.py"><pre><code>for h in (&quot;broadcast&quot;, &quot;merge&quot;):
+    p = o.join(cust.hint(h), &quot;customer_id&quot;)._jdf.queryExecution().executedPlan().toString()
+    print(h, p.count(&quot;Exchange hashpartitioning&quot;), p.count(&quot;BroadcastExchange&quot;))</code></pre><div class="output">== 3) exchanges in plan
+broadcast -&gt; Exchange hashpartitioning: 0 | BroadcastExchange: 1
+merge -&gt; Exchange hashpartitioning: 2 | BroadcastExchange: 0</div></div>
+      <span class="behind">The quickest way to understand a join’s cost: count <code>Exchange hashpartitioning</code> nodes. Each is a full shuffle of one side. Broadcast had <b>0</b> (plus one cheap BroadcastExchange of 4,000 rows); sort-merge had <b>2</b>, moving all 5 million orders across the network.</span></li>
+    <li><h4>Step 4 · Forcing a broadcast of a big side</h4>
+      <div class="code" data-lang="python" data-file="l82_joins.py"><pre><code>o2 = o.select(&quot;order_id&quot;, &quot;amount&quot;)          # 5,000,000 rows
+run(&quot;broadcast 5M-row side&quot;, sink(o.join(F.broadcast(o2), &quot;order_id&quot;)))
+run(&quot;sort-merge same join&quot;,  sink(o.join(o2, &quot;order_id&quot;)))</code></pre><div class="output">== 4) forcing broadcast of a BIG side (5M rows)
+broadcast 5M-row side                     :  5.32 s, tasks    8, spill mem    0.0 MiB disk   0.0 MiB
+sort-merge same join                      :  7.62 s, tasks  208, spill mem    0.0 MiB disk   0.0 MiB</div></div>
+      <span class="behind">It worked here and was even faster (5.32 s vs 7.62 s), because we run in one process with a 3 GB driver. On a cluster the driver collects the side, builds the hash table and ships it to every executor: a few hundred MB per executor, times every concurrent job. Spark refuses broadcasts above 8 GB and fails on driver memory or <code>spark.sql.broadcastTimeout</code> (300 s) long before that.</span></li>
+    <li><h4>Step 5 · Bucketing removes the shuffle</h4>
+      <div class="code" data-lang="python" data-file="l82_joins.py"><pre><code>o.write.bucketBy(16, &quot;customer_id&quot;).sortBy(&quot;customer_id&quot;).saveAsTable(&quot;ob&quot;)
+cust.write.bucketBy(16, &quot;customer_id&quot;).sortBy(&quot;customer_id&quot;).saveAsTable(&quot;cb&quot;)
+b = spark.table(&quot;ob&quot;).join(spark.table(&quot;cb&quot;), &quot;customer_id&quot;)   # threshold -1</code></pre><div class="output">== 5) bucketed tables: join without shuffle
+bucketed join: SortMergeJoin | Exchange count: 0
+plain join: SortMergeJoin | Exchange count: 2
+bucketed SMJ                              :  1.68 s, tasks   16, spill mem    0.0 MiB disk   0.0 MiB
+plain SMJ                                 :  5.31 s, tasks  208, spill mem    0.0 MiB disk   0.0 MiB</div></div>
+      <span class="behind">Both tables were written in 16 buckets hashed by <code>customer_id</code>. The join is still a sort-merge join, but with <b>0 Exchanges</b>: bucket 3 of orders only needs bucket 3 of customers. <b>1.68 s vs 5.31 s</b>. The shuffle was paid once at write time, so bucketing pays off when the same big join runs many times. Both sides need the same bucket column and compatible bucket counts.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Who moves, and how much</h2>
+  <p>Left: real outputs. Right: how each strategy moves data.</p>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">Who moves, and how much <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">small dim -&gt; BroadcastHashJoin</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">threshold -1 -&gt; SortMergeJoin</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">broadcast   : 1.55 s,   8 tasks</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">shuffle_hash: 4.53 s, 208 tasks</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">merge       : 6.73 s, 208 tasks</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">broadcast: Exchange 0, Broadcast 1</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">merge    : Exchange 2, Broadcast 0</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">bucketed SMJ: Exchange 0, 1.68 s</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">plain SMJ   : Exchange 2, 5.31 s</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Automatic choice.</li>
+          <li>Forced by hints.</li>
+          <li>Exchanges in the plan.</li>
+          <li>Bucketing.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What Spark does">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Size decides</text><rect x="20" y="40" width="110" height="32" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="75.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">customers</text><text x="75.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">≈ 60 KB</text><path d="M132 56L226 56" style="fill:none;stroke:var(--green);stroke-width:1.1"/><path d="M219.7 59.0L226 56L219.7 53.0" style="fill:none;stroke:var(--green);stroke-width:1.1"/><text x="180" y="50" text-anchor="middle" font-size="8" class="s-ink2">≤ 10 MB ?</text><rect x="230" y="40" width="110" height="32" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="285.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">broadcast</text><text x="285.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">yes</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Else: sort-merge by default.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Broadcast: big side stays put</text><text x="80" y="38" text-anchor="middle" font-size="7" class="s-blue">orders partitions (stay)</text><rect x="30" y="46" width="22" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="58" y="46" width="22" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="86" y="46" width="22" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="114" y="46" width="22" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="36" y="80" width="10" height="10" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="80" width="10" height="10" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="92" y="80" width="10" height="10" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="120" y="80" width="10" height="10" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="260" y="62" text-anchor="middle" font-size="7.2" class="s-green">copy of dim</text><text x="260" y="92" text-anchor="middle" font-size="7.2" class="s-green">per executor</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">8 tasks, no shuffle.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Sort-merge: both move</text><rect x="8" y="50" width="72" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="44.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">orders</text><text x="44.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">shuffle</text><rect x="94" y="50" width="72" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="130.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">customers</text><text x="130.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">shuffle</text><path d="M80 65.0L94 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M87.7 68.0L94 65.0L87.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="180" y="50" width="72" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="216.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">sort</text><text x="216.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">both</text><path d="M166 65.0L180 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M173.7 68.0L180 65.0L173.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="266" y="50" width="72" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="302.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">merge</text><text x="302.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">walk</text><path d="M252 65.0L266 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M259.7 68.0L266 65.0L259.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">2 Exchanges, 208 tasks.</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bucketed: pre-shuffled</text><rect x="20" y="46" width="74" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="57.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">bucket 0</text><text x="57.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">o ⋈ c</text><rect x="104" y="46" width="74" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="141.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">bucket 1</text><text x="141.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">o ⋈ c</text><rect x="188" y="46" width="74" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="225.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">bucket 2</text><text x="225.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">o ⋈ c</text><rect x="272" y="46" width="74" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="309.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">bucket 3</text><text x="309.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">o ⋈ c</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Matching buckets join locally.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Threshold check.</li>
+          <li>Broadcast hash join.</li>
+          <li>Sort-merge join.</li>
+          <li>Bucketed join.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a global threshold mistake, a wrong size estimate, and a repeated big-to-big join.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-threshold">The global -1</h3>
+  <p class="anim-intro">Broadcast threshold regressions. (Typical; timings from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Broadcast threshold <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A global broadcast threshold of -1 made every dimension join a sort-merge join">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Threshold set to -1</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">to stop one OOM elsewhere</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Global setting.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Every dim join shuffles</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">1.55 s → 6.73 s in our lab</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">4x slower, silently.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Restore the default</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">10 MB (or a bit higher)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Small sides broadcast again.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix the real OOM locally</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">hint("merge") on that one join</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Targeted, not global.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Check plans in CI</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">expect BroadcastHashJoin</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Catch regressions.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>-1.</li>
+          <li>Slow.</li>
+          <li>Default.</li>
+          <li>Local fix.</li>
+          <li>CI check.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-hint">When the optimizer guesses wrong</h3>
+  <p class="anim-intro">Broadcast hints. (Typical; behaviour from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Broadcast hint <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Use AQE or a broadcast hint when a side is small after filtering">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Dim filtered at run time</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">estimate 2 GB, real 3 MB</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Optimizer guesses wrong.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Plan: sort-merge</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">big fact table shuffled</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Slow.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Option 1: AQE</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">switches at run time (7.4)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Automatic.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Option 2: hint</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">F.broadcast(dim_filtered)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">You know it is small.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Verify in the SQL tab</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">BroadcastHashJoin in final plan</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Measure.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Wrong estimate.</li>
+          <li>SMJ.</li>
+          <li>AQE.</li>
+          <li>Hint.</li>
+          <li>Verify.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-bucket">The hourly big-to-big join</h3>
+  <p class="anim-intro">Bucketing to avoid repeated shuffles. (Typical; timings from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Bucketing <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Bucket both tables on the join key so repeated sort-merge joins skip the shuffle">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Orders ⋈ deliveries, hourly</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">both 500 GB, same key</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Two full shuffles every hour.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bucket both by order_id</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">bucketBy(512, "order_id")</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Shuffle paid once at write.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Join plan: no Exchange</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">1.68 s vs 5.31 s in our lab</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each hour saves the shuffle.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Catch: bucket rules</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">same key; table must be read as a table</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Not just a parquet path.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Modern alternative</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">Iceberg/Delta clustering + SPJ</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Storage-partitioned joins.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Big × big.</li>
+          <li>Bucket.</li>
+          <li>No shuffle.</li>
+          <li>Rules.</li>
+          <li>Alternatives.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Join strategies at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-blue">star</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">schema</text></svg></div>
+    <div><h4>1. Fact-to-dimension joins</h4>
+      <p>Orders joined to cities, restaurants and plans: every dimension under the threshold is broadcast.</p>
+      <div class="uc-flow"><span>Fact</span><i>→</i><span class="java">broadcast dims</span><i>→</i><span>No shuffle</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-green">big×big</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">SMJ</text></svg></div>
+    <div><h4>2. Large-to-large joins</h4>
+      <p>Sessions joined to clickstream use sort-merge; tuning focuses on partitions and skew.</p>
+      <div class="uc-flow"><span>Big</span><i>→</i><span class="java">sort-merge</span><i>→</i><span>Big</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">bucket</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">tables</text></svg></div>
+    <div><h4>3. Repeated joins</h4>
+      <p>Tables joined many times a day on the same key are bucketed or clustered once.</p>
+      <div class="uc-flow"><span>Write once</span><i>→</i><span class="java">bucketBy</span><i>→</i><span>Join many</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">range</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">joins</text></svg></div>
+    <div><h4>4. Range joins</h4>
+      <p>Matching GPS pings to time windows uses non-equi conditions; keep one side small to get a broadcast nested loop join.</p>
+      <div class="uc-flow"><span>ts BETWEEN</span><i>→</i><span class="java">BNLJ (small side)</span><i>→</i><span>Matches</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">hint</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">review</text></svg></div>
+    <div><h4>5. Code reviews</h4>
+      <p>Teams require a comment on every broadcast hint explaining why the side is small.</p>
+      <div class="uc-flow"><span>Hint</span><i>→</i><span class="java">size proof</span><i>→</i><span>Safe merge</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: choosing a join</h2>
+  <p>A simplified version of Spark’s join selection. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># How Spark picks a join strategy (simplified)
+def choose(small_mb, threshold_mb=10, equi=True, hint=None):
+    if hint:
+        return hint
+    if not equi:
+        return &quot;BroadcastNestedLoopJoin&quot; if small_mb &lt;= threshold_mb else &quot;CartesianProduct&quot;
+    if threshold_mb &gt;= 0 and small_mb &lt;= threshold_mb:
+        return &quot;BroadcastHashJoin&quot;
+    return &quot;SortMergeJoin&quot;
+
+print(choose(0.06))                    # 4,000 customers
+print(choose(0.06, threshold_mb=-1))   # broadcast disabled
+print(choose(800))                     # big dimension
+print(choose(800, hint=&quot;ShuffledHashJoin&quot;))</code></pre><div class="output">BroadcastHashJoin
+SortMergeJoin
+SortMergeJoin
+ShuffledHashJoin</div></div>
+  <ul class="anno"><li><code>    if threshold_mb &gt;= 0 and small_mb &lt;= threshold_mb:</code><span>autoBroadcastJoinThreshold: 10 MB by default, -1 disables it.</span></li><li><code>    return &quot;SortMergeJoin&quot;</code><span>spark.sql.join.preferSortMergeJoin=true makes this the default for big sides.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Then raise the threshold to 1000 for the 800 MB side.",
+   "code": "# How Spark picks a join strategy (simplified)\ndef choose(small_mb, threshold_mb=10, equi=True, hint=None):\n    if hint:\n        return hint\n    if not equi:\n        return \"BroadcastNestedLoopJoin\" if small_mb <= threshold_mb else \"CartesianProduct\"\n    if threshold_mb >= 0 and small_mb <= threshold_mb:\n        return \"BroadcastHashJoin\"\n    return \"SortMergeJoin\"\n\nprint(choose(0.06))                    # 4,000 customers\nprint(choose(0.06, threshold_mb=-1))   # broadcast disabled\nprint(choose(800))                     # big dimension\nprint(choose(800, hint=\"ShuffledHashJoin\"))\n"
+  },
+  {
+   "label": "2 · Predict first: shuffles",
+   "hint": "<b>Predict first:<\/b> how many sides are shuffled per strategy?",
+   "code": "shuffles = {\"BroadcastHashJoin\": 0, \"ShuffledHashJoin\": 2, \"SortMergeJoin\": 2, \"bucketed SMJ\": 0}\nfor k, v in shuffles.items():\n    print(f\"{k:18} {v}\")\n"
+  },
+  {
+   "label": "3 · Broadcast cost",
+   "hint": "Memory used by a broadcast on 200 executors.",
+   "code": "side_mb, executors = 300, 200\nprint(side_mb * executors / 1024, \"GB of executor memory in total\")\n"
+  },
+  {
+   "label": "4 · Buckets that match",
+   "hint": "Which bucket of customers does order bucket 3 need?",
+   "code": "buckets = 16\nfor cid in (3, 19, 35):\n    print(cid, \"-> bucket\", cid % buckets)\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "A broadcast hint on a side that grew to 12 GB.",
+   "code": "side_gb = 12\nassert side_gb < 8, \"Spark cannot broadcast tables larger than 8 GB (and the driver usually dies first)\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: join strategies</h3>
+  <p>In the <code>pyspark</code> shell. <b>Outputs are real</b> (PySpark 4.3.0).</p>
+  <div class="pcrun"><h4>1 · Threshold</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>spark.conf.get(&quot;spark.sql.autoBroadcastJoinThreshold&quot;)</code></pre><div class="output">&#x27;10485760b&#x27;</div></div>
+  <p class="muted">10 MB.</p></div>
+  <div class="pcrun"><h4>2 · Hint</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>o.join(cust.hint(&quot;shuffle_hash&quot;), &quot;customer_id&quot;).explain()</code></pre><div class="output">+- ShuffledHashJoin [customer_id], [customer_id], Inner, BuildRight</div></div>
+  <p class="muted">Build side = hashed side.</p></div>
+  <div class="pcrun"><h4>3 · SQL hint</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>spark.sql(&quot;SELECT /*+ BROADCAST(c) */ * FROM o JOIN c USING (customer_id)&quot;).explain()</code></pre><div class="output">+- BroadcastHashJoin [customer_id], [customer_id], Inner, BuildRight, false</div></div>
+  <p class="muted">Same as F.broadcast.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>A hash join in miniature</h2>
+  <p>Build a hash table from the small side, probe it with the big side.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "small = [(1, \"Gold\"), (2, \"Silver\")]",
+  "big = [(101, 1), (102, 2), (103, 1)]",
+  "table = {}",
+  "for k, v in small:",
+  "    table[k] = v",
+  "out = []",
+  "for oid, k in big:",
+  "    out.append((oid, table[k]))",
+  "print(out)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>small<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)"
+   ],
+   "newVar": "small"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>big<\/code> is created: → list #4. A new list object (#4) is created: [→ tuple #5, → tuple #6, → tuple #7] A new tuple object (#5) is created: (101, 1) A new tuple object (#6) is created: (102, 2) A new tuple object (#7) is created: (103, 1)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)"
+   ],
+   "newVar": "big"
+  },
+  {
+   "line": 3,
+   "phase": "Build",
+   "note": "Small side becomes a hash table. <code>table<\/code> is created: → dict #8. A new dict object (#8) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (0)<\/b> {}"
+   ],
+   "newVar": "table"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>k<\/code> is created: 1. <code>v<\/code> is created: &#x27;Gold&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "1"
+      ],
+      [
+       "v",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (0)<\/b> {}"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #8 dict now holds {1: &#x27;Gold&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "1"
+      ],
+      [
+       "v",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (1)<\/b> {1: &#x27;Gold&#x27;}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to 2. <code>v<\/code> changes to &#x27;Silver&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "2"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (1)<\/b> {1: &#x27;Gold&#x27;}"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #8 dict now holds {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "2"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (2)<\/b> {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "2"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (2)<\/b> {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Probe",
+   "note": "Each big-side row looks up its key. <code>out<\/code> is created: → list #9. A new list object (#9) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "2"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ],
+      [
+       "out",
+       "→ list #9"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (2)<\/b> {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}",
+    "<b>#9 list (0)<\/b> []"
+   ],
+   "newVar": "out"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to 1. <code>oid<\/code> is created: 101.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "1"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ],
+      [
+       "out",
+       "→ list #9"
+      ],
+      [
+       "oid",
+       "101"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (2)<\/b> {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}",
+    "<b>#9 list (0)<\/b> []"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #9 list now holds [→ tuple #10] A new tuple object (#10) is created: (101, &#x27;Gold&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "1"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ],
+      [
+       "out",
+       "→ list #9"
+      ],
+      [
+       "oid",
+       "101"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (2)<\/b> {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}",
+    "<b>#9 list (1)<\/b> [→ tuple #10]",
+    "<b>#10 tuple (2)<\/b> (101, &#x27;Gold&#x27;)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to 2. <code>oid<\/code> changes to 102.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "2"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ],
+      [
+       "out",
+       "→ list #9"
+      ],
+      [
+       "oid",
+       "102"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (2)<\/b> {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}",
+    "<b>#9 list (1)<\/b> [→ tuple #10]",
+    "<b>#10 tuple (2)<\/b> (101, &#x27;Gold&#x27;)"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #9 list now holds [→ tuple #10, → tuple #11] A new tuple object (#11) is created: (102, &#x27;Silver&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "2"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ],
+      [
+       "out",
+       "→ list #9"
+      ],
+      [
+       "oid",
+       "102"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (2)<\/b> {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}",
+    "<b>#9 list (2)<\/b> [→ tuple #10, → tuple #11]",
+    "<b>#10 tuple (2)<\/b> (101, &#x27;Gold&#x27;)",
+    "<b>#11 tuple (2)<\/b> (102, &#x27;Silver&#x27;)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to 1. <code>oid<\/code> changes to 103.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "1"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ],
+      [
+       "out",
+       "→ list #9"
+      ],
+      [
+       "oid",
+       "103"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (2)<\/b> {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}",
+    "<b>#9 list (2)<\/b> [→ tuple #10, → tuple #11]",
+    "<b>#10 tuple (2)<\/b> (101, &#x27;Gold&#x27;)",
+    "<b>#11 tuple (2)<\/b> (102, &#x27;Silver&#x27;)"
+   ],
+   "newVar": "oid"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #9 list now holds [→ tuple #10, → tuple #11, → tuple #12] A new tuple object (#12) is created: (103, &#x27;Gold&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "1"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ],
+      [
+       "out",
+       "→ list #9"
+      ],
+      [
+       "oid",
+       "103"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (2)<\/b> {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}",
+    "<b>#9 list (3)<\/b> [→ tuple #10, → tuple #11, → tuple #12]",
+    "<b>#10 tuple (2)<\/b> (101, &#x27;Gold&#x27;)",
+    "<b>#11 tuple (2)<\/b> (102, &#x27;Silver&#x27;)",
+    "<b>#12 tuple (2)<\/b> (103, &#x27;Gold&#x27;)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "1"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ],
+      [
+       "out",
+       "→ list #9"
+      ],
+      [
+       "oid",
+       "103"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (2)<\/b> {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}",
+    "<b>#9 list (3)<\/b> [→ tuple #10, → tuple #11, → tuple #12]",
+    "<b>#10 tuple (2)<\/b> (101, &#x27;Gold&#x27;)",
+    "<b>#11 tuple (2)<\/b> (102, &#x27;Silver&#x27;)",
+    "<b>#12 tuple (2)<\/b> (103, &#x27;Gold&#x27;)"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "small",
+       "→ list #1"
+      ],
+      [
+       "big",
+       "→ list #4"
+      ],
+      [
+       "table",
+       "→ dict #8"
+      ],
+      [
+       "k",
+       "1"
+      ],
+      [
+       "v",
+       "'Silver'"
+      ],
+      [
+       "out",
+       "→ list #9"
+      ],
+      [
+       "oid",
+       "103"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [→ tuple #2, → tuple #3]",
+    "<b>#2 tuple (2)<\/b> (1, &#x27;Gold&#x27;)",
+    "<b>#3 tuple (2)<\/b> (2, &#x27;Silver&#x27;)",
+    "<b>#4 list (3)<\/b> [→ tuple #5, → tuple #6, → tuple #7]",
+    "<b>#5 tuple (2)<\/b> (101, 1)",
+    "<b>#6 tuple (2)<\/b> (102, 2)",
+    "<b>#7 tuple (2)<\/b> (103, 1)",
+    "<b>#8 dict (2)<\/b> {1: &#x27;Gold&#x27;, 2: &#x27;Silver&#x27;}",
+    "<b>#9 list (3)<\/b> [→ tuple #10, → tuple #11, → tuple #12]",
+    "<b>#10 tuple (2)<\/b> (101, &#x27;Gold&#x27;)",
+    "<b>#11 tuple (2)<\/b> (102, &#x27;Silver&#x27;)",
+    "<b>#12 tuple (2)<\/b> (103, &#x27;Gold&#x27;)"
+   ],
+   "out": "[(101, 'Gold'), (102, 'Silver'), (103, 'Gold')]\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three join decisions at TiffinGo.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Joins · basics</span></div>
+    <h4>Will it broadcast?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A restaurants table is 6 MB on disk. Default settings.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>6 MB, 10 MB threshold</pre></div><div><small>Expected output</small><pre>BroadcastHashJoin</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Compare estimate to threshold.</li><li>Parquet size underestimates memory.</li><li>Check the plan.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 1.",
+   "code": "print(\"BroadcastHashJoin\" if 6 <= 10 else \"SortMergeJoin\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print(\"BroadcastHashJoin\" if 6 <= 10 else \"SortMergeJoin\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Estimate",
+   "note": "Based on file size statistics. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "BroadcastHashJoin\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Joins · hints</span></div>
+    <h4>Choose a hint</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A 2 GB dim joins a 2 TB fact; executors have 8 GB.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>2 GB vs 2 TB</pre></div><div><small>Expected output</small><pre>shuffle_hash</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>2 GB per executor is too much to broadcast safely.</li><li>Shuffled hash avoids the sort.</li><li>Or sort-merge if memory is tight.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 2.",
+   "code": "dim_gb, exec_gb = 2, 8\nprint(\"shuffle_hash\" if dim_gb < exec_gb * 0.1 * 50 else \"merge\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "dim_gb, exec_gb = 2, 8",
+  "print(\"shuffle_hash\" if dim_gb < exec_gb * 0.1 * 50 else \"merge\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>dim_gb<\/code> is created: 2. <code>exec_gb<\/code> is created: 8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dim_gb",
+       "2"
+      ],
+      [
+       "exec_gb",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "exec_gb"
+  },
+  {
+   "line": 2,
+   "phase": "Per partition",
+   "note": "SHJ needs one partition of the small side in memory. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "dim_gb",
+       "2"
+      ],
+      [
+       "exec_gb",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "shuffle_hash\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Joins · bucketing</span></div>
+    <h4>Is bucketing worth it?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A 500 GB join runs 24 times a day.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>shuffle 10 min each</pre></div><div><small>Expected output</small><pre>saves 225 minutes per day</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Bucketing costs one shuffle at write time.</li><li>Saves the shuffle on every join.</li><li>Compare.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 5.",
+   "code": "write_once, saved_per_run, runs = 15, 10, 24\nprint(\"saves\", saved_per_run * runs - write_once, \"minutes per day\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "write_once, saved_per_run, runs = 15, 10, 24",
+  "print(\"saves\", saved_per_run * runs - write_once, \"minutes per day\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Trade-off",
+   "note": "Only for repeated joins on the same key. <code>write_once<\/code> is created: 15. <code>saved_per_run<\/code> is created: 10. <code>runs<\/code> is created: 24.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "write_once",
+       "15"
+      ],
+      [
+       "saved_per_run",
+       "10"
+      ],
+      [
+       "runs",
+       "24"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "runs"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "write_once",
+       "15"
+      ],
+      [
+       "saved_per_run",
+       "10"
+      ],
+      [
+       "runs",
+       "24"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "saves 225 minutes per day\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: Which join avoids shuffling the big table?",
+  "options": [
+   "Sort-merge",
+   "Shuffled hash",
+   "Broadcast hash",
+   "Cartesian"
+  ],
+  "answer": 2,
+  "why": "Small side copied."
+ },
+ {
+  "q": "Beginner: Default autoBroadcastJoinThreshold?",
+  "options": [
+   "1 MB",
+   "10 MB",
+   "100 MB",
+   "1 GB"
+  ],
+  "answer": 1,
+  "why": "-1 disables."
+ },
+ {
+  "q": "Beginner: DataFrame broadcast hint?",
+  "options": [
+   "F.broadcast(df)",
+   "df.cache()",
+   "df.persist()",
+   "df.repartition()"
+  ],
+  "answer": 0,
+  "why": "Or df.hint(\"broadcast\")."
+ },
+ {
+  "q": "Intermediate: Lab timings broadcast vs sort-merge?",
+  "options": [
+   "Same",
+   "6.73 s vs 1.55 s",
+   "10 s vs 1 s",
+   "1.55 s vs 6.73 s"
+  ],
+  "answer": 3,
+  "why": "4.3x."
+ },
+ {
+  "q": "Intermediate: How many hash Exchanges in a sort-merge join plan?",
+  "options": [
+   "0",
+   "1",
+   "2",
+   "200"
+  ],
+  "answer": 2,
+  "why": "One per side."
+ },
+ {
+  "q": "Intermediate: Bucketed tables joined on the bucket key…",
+  "options": [
+   "Need 2 shuffles",
+   "Need no shuffle",
+   "Are broadcast",
+   "Fail"
+  ],
+  "answer": 1,
+  "why": "0 Exchanges, 1.68 s."
+ },
+ {
+  "q": "Advanced: Risk of broadcasting a big side?",
+  "options": [
+   "Driver OOM / broadcast timeout",
+   "None",
+   "Wrong results",
+   "More shuffles"
+  ],
+  "answer": 0,
+  "why": "Collected on the driver."
+ },
+ {
+  "q": "Advanced: shuffle_replicate_nl on an equi-join gave…",
+  "options": [
+   "BHJ",
+   "SMJ",
+   "SHJ",
+   "CartesianProduct"
+  ],
+  "answer": 3,
+  "why": "Avoid for equi-joins."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 8.2 in one screen</h3>
+    <ul><li>BHJ: copy small side, no shuffle of the big side (1.55 s).</li><li>SMJ: shuffle + sort both (6.73 s); SHJ: shuffle + hash (4.53 s).</li><li>Threshold 10 MB; -1 disables broadcast globally (dangerous).</li><li>Hints: broadcast, merge, shuffle_hash, shuffle_replicate_nl; SQL <code>/*+ BROADCAST(t) */</code>.</li><li>Count <code>Exchange hashpartitioning</code> nodes to see shuffles.</li><li>Forced broadcasts of big sides risk driver OOM and timeouts.</li><li>Bucketing on the join key: SMJ with 0 Exchanges (1.68 s vs 5.31 s).</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Which side should be broadcast?</summary><p>The smaller side after filters, and for outer joins only the side that is allowed to be the build side (for a left join, the right side).</p></details>
+    <details><summary>Why did Spark not broadcast a 6 MB Parquet table?</summary><p>Size estimates use statistics; in memory the data may be much larger, or a filter or UDF may make the estimate unknown. Check the plan, use AQE or a hint.</p></details>
+    <details><summary>Is shuffled hash join better than sort-merge?</summary><p>Often faster because it skips the sort, but each partition of the build side must fit in memory. Spark 4 picks it more often when preferSortMergeJoin is false or a hint is given.</p></details>
+    <details><summary>Does bucketing work with plain Parquet paths?</summary><p>No, the bucket spec lives in the catalog; read it as a table with spark.table.</p></details>
+    <details><summary>What is a storage-partitioned join?</summary><p>A V2 data source feature (e.g. Iceberg) where tables partitioned the same way are joined without a shuffle, similar to bucketing.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs about join strategies.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Speed-up</h4></div>
+      <p>Broadcast vs sort-merge.</p>
+      <div class="prob__io"><div><small>Input</small><pre>1.55 vs 6.73 s</pre></div><div><small>Expected output</small><pre>4.3</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(6.73 / 1.55, 1))</code></pre><div class="output">4.3</div></div>
+        <p><b>How it works:</b> 4.3x.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Broadcast check</h4></div>
+      <p>Broadcast a 25 MB side by default?</p>
+      <div class="prob__io"><div><small>Input</small><pre>10 MB</pre></div><div><small>Expected output</small><pre>False</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(25 &lt;= 10)</code></pre><div class="output">False</div></div>
+        <p><b>How it works:</b> No, unless hinted or threshold raised.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Bucket of a key</h4></div>
+      <p>Bucket for customer 37 in 16 buckets (simplified).</p>
+      <div class="prob__io"><div><small>Input</small><pre>37</pre></div><div><small>Expected output</small><pre>5</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(37 % 16)</code></pre><div class="output">5</div></div>
+        <p><b>How it works:</b> Spark uses Murmur3 hash, same idea.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Broadcast memory</h4></div>
+      <p>Total memory for a 200 MB broadcast on 150 executors.</p>
+      <div class="prob__io"><div><small>Input</small><pre>200 MB</pre></div><div><small>Expected output</small><pre>29.296875 GB</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(200 * 150 / 1024, &quot;GB&quot;)</code></pre><div class="output">29.296875 GB</div></div>
+        <p><b>How it works:</b> Each executor holds a copy.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Shuffle volume</h4></div>
+      <p>Data shuffled by SMJ vs BHJ.</p>
+      <div class="prob__io"><div><small>Input</small><pre>fact 400 GB, dim 50 MB</pre></div><div><small>Expected output</small><pre>SMJ: 400.05 GB | BHJ: 0 GB (+ broadcast)</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;SMJ:&quot;, 400 + 0.05, &quot;GB | BHJ: 0 GB (+ broadcast)&quot;)</code></pre><div class="output">SMJ: 400.05 GB | BHJ: 0 GB (+ broadcast)</div></div>
+        <p><b>How it works:</b> The big side dominates.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Pick strategy</h4></div>
+      <p>Write the decision rule.</p>
+      <div class="prob__io"><div><small>Input</small><pre>sizes</pre></div><div><small>Expected output</small><pre>[&#x27;broadcast&#x27;, &#x27;broadcast&#x27;, &#x27;sort-merge&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>def pick(small_mb):
+    return &quot;broadcast&quot; if small_mb &lt;= 10 else &quot;sort-merge&quot;
+print([pick(s) for s in (1, 9, 50)])</code></pre><div class="output">[&#x27;broadcast&#x27;, &#x27;broadcast&#x27;, &#x27;sort-merge&#x27;]</div></div>
+        <p><b>How it works:</b> Simplified.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Daily saving</h4></div>
+      <p>Minutes saved per day with broadcast.</p>
+      <div class="prob__io"><div><small>Input</small><pre>5.18 s × 2,000 runs</pre></div><div><small>Expected output</small><pre>173 minutes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(5.18 * 2000 / 60), &quot;minutes&quot;)</code></pre><div class="output">173 minutes</div></div>
+        <p><b>How it works:</b> Small joins run often.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Bucketing ROI</h4></div>
+      <p>Break-even runs for bucketing.</p>
+      <div class="prob__io"><div><small>Input</small><pre>write 15 min, save 10 min/run</pre></div><div><small>Expected output</small><pre>2 runs</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+print(math.ceil(15 / 10), &quot;runs&quot;)</code></pre><div class="output">2 runs</div></div>
+        <p><b>How it works:</b> Pays off after two joins.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Join strategy questions are a favourite in Spark interviews.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Spark</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is a broadcast join?”</h4>
+      <p class="scn__situation">Explain broadcast joins.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> when used?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>Spark sends the small table to every executor and builds a hash table, so the large table is joined where it sits without a shuffle. It is used automatically below <code>autoBroadcastJoinThreshold</code> (10 MB) or with <code>F.broadcast</code>. In my test it was 4.3x faster than sort-merge.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Broadcasting large tables.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Slow dimension join</h4>
+      <p class="scn__situation">Joining orders to a 5 MB city table takes 10 minutes.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> what do you check?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>The plan: SortMergeJoin with two Exchanges?</li>
+          <li>The threshold setting (maybe -1) and size estimates.</li>
+          <li>Add a broadcast hint or rely on AQE; verify BroadcastHashJoin.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Adding executors.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Broadcast OOM</h4>
+      <p class="scn__situation">A job fails with driver OutOfMemory during a broadcast.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> fix?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Find which side is broadcast; its real size grew.</li>
+          <li>Remove the hint or lower the threshold for that query.</li>
+          <li>Use shuffled hash or sort-merge for that join.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Raising driver memory forever.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Repeated big joins</h4>
+      <p class="scn__situation">Two 1 TB tables are joined on the same key 20 times a day.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> design?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Bucket (or cluster/partition the same way in Iceberg/Delta) both on the key.</li>
+          <li>Verify zero Exchanges in the join plan.</li>
+          <li>Keep bucket counts aligned as data grows.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Relying on more shuffle partitions only.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Spark and PySpark syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/spark-pyspark.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

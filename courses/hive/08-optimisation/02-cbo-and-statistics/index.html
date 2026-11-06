@@ -1,0 +1,1882 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The cost-based optimiser and statistics | MyPhatshala</title>
+<meta name="description" content="How Hive’s cost-based optimiser (Apache Calcite) uses table, partition and column statistics, with real Hive 4.2.1 results: ANALYZE TABLE and FOR COLUMNS, DESCRIBE FORMATTED, estimates before and after statistics (3 → 667 for 517 real rows), skew and the uniform assumption, exact estimates from partitions, stale statistics that still say COMPLETE, a join that flips from map join to shuffle join because of statistics, NOSCAN on ORC, and COUNT(*) answered from the metastore.">
+<meta name="mp:minutes" content="40">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/08-optimisation/02-cbo-and-statistics/">
+<meta property="og:title" content="The cost-based optimiser and statistics · MyPhatshala">
+<meta property="og:description" content="Hive guessed 3 rows; there were 517. Then stale statistics changed a join. The cost-based optimiser and statistics in Hive 4.2.1, with real outputs.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "The cost-based optimiser and statistics", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="08-optimisation/02-cbo-and-statistics" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 8.2</b></nav>
+    <h1>The cost-based optimiser and statistics</h1>
+    <p class="lead">Lesson 8.1 found estimates that were wildly off. This lesson shows <b>where estimates come from</b>: statistics in the metastore read by the <b>cost-based optimiser</b>. We gather them with ANALYZE, watch the plan improve, find where even complete statistics mislead, and run two experiments: stale statistics that still say COMPLETE, and a join that changes strategy because of them. <b>All outputs are real</b>, from Hive 4.2.1.</p>
+    <div class="lesson-meta"><span>Module 8 · Query optimisation</span><span>⏱ 40 min</span><span>Intermediate → Advanced</span><span>Real Hive 4.2.1 outputs</span><span>Stale-stats experiment</span><span>Join flipped by statistics</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Why does Hive think there are only 3 Gold customers?”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> read <a href="../01-explain-in-depth/">8.1 EXPLAIN in depth</a>; recall partitions (<a href="../../05-partitioning-and-bucketing/01-partitioning/">5.1</a>) and the metastore (<a href="../../01-introduction/03-hive-architecture-and-metastore/">2.2</a>).</p></div>
+  <div class="story">
+    <p class="narration">In Lesson 8.1, EXPLAIN ANALYZE showed Kabir that Hive expected 3 Gold customers when there were 517. Riya wants to know where such numbers come from, and whether a wrong guess can really make a query slow.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="The cost-based optimiser reads statistics from the metastore. Customers had no row count or column statistics, so it guessed 3 Gold customers instead of 517; after ANALYZE it guessed 667.">
+        <rect x="10" y="12" width="190" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="105" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">Metastore statistics</text><text x="22" y="52" font-size="7.2" class="s-red mono">customers: numRows ?</text><text x="22" y="68" font-size="7.2" class="s-red mono">plan: distinct ?</text><text x="22" y="84" font-size="7.2" class="s-green mono">orders: 50,000 rows</text><text x="22" y="100" font-size="7.2" class="s-green mono">order_date: 30 distinct</text><text x="22" y="116" font-size="7.2" class="s-green mono">min 10-01 · max 10-30</text><path d="M206 76L246 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M239.7 79.0L246 76L239.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="252" y="46" width="110" height="60" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="307" y="72" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">Cost-based</text><text x="307" y="88" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">optimiser</text><path d="M368 76L404 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M397.7 79.0L404 76L397.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="410" y="12" width="220" height="128" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="520" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">Its guesses</text><rect x="422" y="40" width="196" height="26" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="520.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Gold customers</text><text x="520.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">est 3 · real 517</text><rect x="422" y="72" width="196" height="26" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="520.0" y="83" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">after ANALYZE</text><text x="520.0" y="93" text-anchor="middle" font-size="6.4" class="s-ink2 mono">est 667 · real 517</text><rect x="422" y="104" width="196" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="520.0" y="115" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">join strategy</text><text x="520.0" y="125" text-anchor="middle" font-size="6.4" class="s-ink2 mono">chosen from these numbers</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">The optimiser is only as good as <tspan font-weight="700" class="s-acc">the statistics it reads</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, Hive scans the table anyway. Why does it need to guess?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Because it decides the plan <b>before</b> reading any data: join order, map join or shuffle join, number of reducers. For that it uses <b>statistics</b> stored in the metastore: row counts, sizes, and per column the number of distinct values, nulls, minimum and maximum. The <b>cost-based optimiser</b> (CBO, built on Apache Calcite) turns them into estimates for every operator.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>And our customers table had none?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Only the file size. We will run <code>ANALYZE TABLE</code>, watch the estimates change, then do two experiments the tutorials skip: stale statistics that still say <code>COMPLETE</code>, and a join that changes strategy just because the statistics changed. All outputs are real, from Hive 4.2.1.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>The cost-based optimiser and statistics</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>Hive’s <b>cost-based optimiser</b> (CBO), enabled by <code>hive.cbo.enable=true</code>, uses Apache Calcite to rewrite a query’s logical plan and to choose join order and join algorithms by comparing estimated costs. The costs are derived from <b>statistics</b> kept in the Hive Metastore at table, partition and column level: row counts and sizes (basic statistics) and, per column, number of distinct values, nulls, minimum and maximum. Statistics are collected automatically when data is written through Hive (<code>hive.stats.autogather</code>, <code>hive.stats.column.autogather</code>) or explicitly with <code>ANALYZE TABLE … COMPUTE STATISTICS [FOR COLUMNS]</code>, and can also answer some queries directly (<code>hive.compute.query.using.stats</code>).</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Before running a query, Hive estimates how many rows each step will produce, using facts about the data stored in the metastore. The optimiser picks the plan with the lowest estimated cost. If the facts are missing or old, the estimates and the plan can be badly wrong; ANALYZE TABLE refreshes them.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>CBO</b><span>Cost-based optimiser (Apache Calcite) in Hive.</span></div>
+    <div class="term"><b>Basic stats</b><span>numRows, numFiles, totalSize, rawDataSize per table or partition.</span></div>
+    <div class="term"><b>Column stats</b><span>NDV, nulls, min, max, lengths per column.</span></div>
+    <div class="term"><b>NDV</b><span>Number of distinct values (Hive uses the HyperLogLog sketch).</span></div>
+    <div class="term"><b>Selectivity</b><span>Fraction of rows a filter is expected to keep.</span></div>
+    <div class="term"><b>Cardinality</b><span>Estimated number of rows out of an operator.</span></div>
+    <div class="term"><b>Stale stats</b><span>Statistics that no longer match the data.</span></div>
+    <div class="term"><b>Autogather</b><span>Collecting statistics automatically while writing data.</span></div>
+  </div>
+
+  <h3>Settings that matter</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:700px">
+    <thead><tr><th>Setting</th><th>Lab value (Hive 4.2.1)</th><th>Effect</th></tr></thead>
+    <tbody><tr><td><code>hive.cbo.enable</code></td><td>true</td><td>Use Calcite cost-based planning</td></tr><tr><td><code>hive.stats.autogather</code></td><td>true</td><td>Basic stats on INSERT / CTAS</td></tr><tr><td><code>hive.stats.column.autogather</code></td><td>true</td><td>Column stats on INSERT</td></tr><tr><td><code>hive.stats.fetch.column.stats</code></td><td>true</td><td>Planner reads column stats</td></tr><tr><td><code>hive.compute.query.using.stats</code></td><td>true</td><td>Answer COUNT/MIN/MAX from stats when they are trusted</td></tr><tr><td><code>hive.stats.estimate</code></td><td>true</td><td>Estimate rows from file size when numRows is missing</td></tr><tr><td><code>hive.stats.ndv.algo</code></td><td>hll</td><td>HyperLogLog for distinct counts</td></tr><tr><td><code>hive.auto.convert.join.noconditionaltask.size</code></td><td>10000000</td><td>Bytes below which the small side is broadcast (map join)</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Statistics at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A shopkeeper’s guess</h4>
+      <ul>
+        <li>Before packing for a trip, you guess how many bags you need. Hive does the same before running a query: it guesses how many rows each step will produce.</li>
+        <li>The guesses come from <b>statistics</b>: facts about each table saved in the metastore, like “50,000 rows” or “30 different dates”.</li>
+        <li>Good statistics → good plan. Missing or old statistics → Hive can pick a slow plan.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> What is stored and how it is used</h4>
+      <ul>
+        <li><b>Table / partition (basic) stats:</b> <code>numRows</code>, <code>numFiles</code>, <code>totalSize</code>, <code>rawDataSize</code>. Seen with <code>DESCRIBE FORMATTED</code> or <code>SHOW TBLPROPERTIES</code>.</li>
+        <li><b>Column stats:</b> <code>distinct_count</code> (NDV), <code>num_nulls</code>, <code>min</code>/<code>max</code>, <code>avg_col_len</code>/<code>max_col_len</code>, true/false counts. Seen with <code>DESCRIBE FORMATTED t col</code>.</li>
+        <li>Gathered automatically on INSERT (<code>hive.stats.autogather</code>, <code>hive.stats.column.autogather</code>) or by hand with <code>ANALYZE TABLE … COMPUTE STATISTICS [FOR COLUMNS]</code>.</li>
+        <li>Selectivity rules of thumb: <code>col = v</code> → rows / NDV; ranges → interpolated between min and max; values are assumed evenly spread.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li><code>Tbl:COMPLETE</code> means statistics <i>exist</i>, not that they are <i>correct</i>: after an INSERT with autogather off, Hive said COMPLETE with 100 rows for a 2,000-row table.</li>
+        <li>Statistics alone flipped a join: stale stats → map join; fresh stats → shuffle (merge) join, same SQL, same threshold.</li>
+        <li>Even complete stats mislead: equality on our DATE column was estimated at half the table (25,000 for 1,621), and skewed values (Pune) are under-estimated. A partition gave an exact 1,621.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “What is CBO in Hive and why does it need statistics?” CBO (Calcite) chooses join order and join types by estimated cost; costs come from row counts and column statistics in the metastore. Collect them with ANALYZE TABLE … COMPUTE STATISTICS and … FOR COLUMNS, or automatically on INSERT. Check with DESCRIBE FORMATTED and in EXPLAIN (Tbl:/Col: COMPLETE, PARTIAL or NONE).</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Ways to gather and check statistics</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:720px">
+    <thead><tr><th>Command</th><th>Gathers / shows</th><th>Notes</th></tr></thead>
+    <tbody><tr><td><code>ANALYZE TABLE t COMPUTE STATISTICS</code></td><td>numRows, sizes</td><td>Reads the data (a job)</td></tr><tr><td><code>ANALYZE TABLE t COMPUTE STATISTICS NOSCAN</code></td><td>numFiles, totalSize only</td><td>Fast: no data read</td></tr><tr><td><code>ANALYZE TABLE t COMPUTE STATISTICS FOR COLUMNS [c1, c2]</code></td><td>Column stats</td><td>All columns if none listed</td></tr><tr><td><code>ANALYZE TABLE t PARTITION (d='…') COMPUTE STATISTICS …</code></td><td>One partition</td><td>Use after loading a partition</td></tr><tr><td><code>DESCRIBE FORMATTED t</code> / <code>SHOW TBLPROPERTIES t</code></td><td>Basic stats, COLUMN_STATS_ACCURATE</td><td>Table level</td></tr><tr><td><code>DESCRIBE FORMATTED t col</code></td><td>Column stats of one column</td><td>Add PARTITION (…) for a partition</td></tr><tr><td><code>EXPLAIN q</code></td><td><code>Tbl:</code> / <code>Col:</code> COMPLETE · PARTIAL · NONE</td><td>What the planner sees</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p><code>COMPLETE</code> in EXPLAIN only says that statistics are present. If files were added outside Hive (external tables), or an INSERT ran with autogather off, the numbers can be old and Hive will not notice. Refresh statistics as part of every load job.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>From a bad estimate to a different join</h2>
+  <p>All outputs are real, from the Hive 4.2.1 lab (database <code>tiffingo</code>). Plan outputs keep only the lines with row counts.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · What is switched on, and what customers has</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.cbo.enable; SET hive.stats.autogather; SET hive.stats.column.autogather;
+SET hive.compute.query.using.stats; SET hive.stats.fetch.column.stats;
+SET hive.stats.kll.enable; SET hive.stats.estimate;
+SHOW TBLPROPERTIES customers;</code></pre><div class="output">hive.cbo.enable=true
+hive.stats.autogather=true
+hive.stats.column.autogather=true
+hive.compute.query.using.stats=true
+hive.stats.fetch.column.stats=true
+hive.stats.kll.enable=false
+hive.stats.estimate=true
+
++-------------------------+-------------+
+|        prpt_name        | prpt_value  |
++-------------------------+-------------+
+| EXTERNAL                | TRUE        |
+| bucketing_version       | 2           |
+| numFiles                | 1           |
+| numFilesErasureCoded    | 0           |
+| skip.header.line.count  | 1           |
+| totalSize               | 91618       |
+| transient_lastDdlTime   | 1793087473  |
++-------------------------+-------------+</div></div>
+      <span class="behind">Every statistics feature is on. But <code>customers</code> is an external text table whose file was placed there, not written by an INSERT, so it has only <code>numFiles</code> and <code>totalSize</code>: <b>no numRows</b>. That is why the plan in Lesson 8.1 showed 1,413 rows, a guess from the file size (<code>hive.stats.estimate</code>).</span></li>
+    <li><h4>Step 2 · No column statistics → a guess of 3</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>DESCRIBE FORMATTED customers plan;
+-- and from Lesson 8.1, EXPLAIN ANALYZE:</code></pre><div class="output">+------------------+--------------------+
+| column_property  |       value        |
++------------------+--------------------+
+| col_name         | plan               |
+| data_type        | string             |
+| min              |                    |
+| max              |                    |
+| num_nulls        |                    |
+| distinct_count   |                    |
+| avg_col_len      |                    |
+| max_col_len      |                    |
+| num_trues        |                    |
+| num_falses       |                    |
+| bit_vector       |                    |
+| comment          | from deserializer  |
++------------------+--------------------+
+
+                            Filter Operator [FIL_25] (rows=3/517 width=346)
+                              TableScan [TS_3] (rows=1413/2000 width=346)
+                                tiffingo@customers,c,Tbl:COMPLETE,Col:NONE,Output:[&quot;customer_id&quot;,&quot;city&quot;,&quot;plan&quot;]</div></div>
+      <span class="behind">Every column statistic is empty. Without the number of distinct values of <code>plan</code>, Hive cannot compute “rows / distinct values” and falls back to default selectivities, which here produced <b>3</b> Gold customers out of an estimated 1,413. The real number is 517.</span></li>
+    <li><h4>Step 3 · ANALYZE TABLE</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>ANALYZE TABLE customers COMPUTE STATISTICS;
+ANALYZE TABLE customers COMPUTE STATISTICS FOR COLUMNS;
+DESCRIBE FORMATTED customers plan;</code></pre><div class="output">+------------------------+----------------------------------------------------+
+|    column_property     |                       value                        |
++------------------------+----------------------------------------------------+
+| col_name               | plan                                               |
+| data_type              | string                                             |
+| min                    |                                                    |
+| max                    |                                                    |
+| num_nulls              | 0                                                  |
+| distinct_count         | 3                                                  |
+| avg_col_len            | 4.9835                                             |
+| max_col_len            | 6                                                  |
+| num_trues              |                                                    |
+| num_falses             |                                                    |
+| bit_vector             |                                                    |
+| comment                | from deserializer                                  |
+| COLUMN_STATS_ACCURATE  | {\&quot;BASIC_STATS\&quot;:\&quot;true\&quot;,\&quot;COLUMN_STATS\&quot;:{\&quot;city\&quot;:\&quot;true\&quot;,\&quot;customer_id\&quot;:\&quot;true\&quot;,\&quot;joined_on\&quot;:\&quot;true\&quot;,\&quot;name\&quot;:\&quot;true\&quot;,\&quot;plan\&quot;:\&quot;true\&quot;,\&quot;state\&quot;:\&quot;true\&quot;}} |
++------------------------+----------------------------------------------------+</div></div>
+      <span class="behind">The first command counts rows; the second computes column statistics for every column. Now <code>plan</code> has <b>3 distinct values</b> and 0 nulls, and <code>COLUMN_STATS_ACCURATE</code> lists every column as true.</span></li>
+    <li><h4>Step 4 · The same EXPLAIN ANALYZE, after statistics</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>EXPLAIN ANALYZE SELECT c.city, COUNT(*) AS n, SUM(o.amount) AS rev … LIMIT 3;
+-- operator lines with rows=estimate/actual</code></pre><div class="output">        Limit [LIM_37] (rows=3/3 width=211)
+          Select Operator [SEL_36] (rows=8/4 width=211)
+              Top N Key Operator [TNK_34] (rows=8/6 width=211)
+                Group By Operator [GBY_33] (rows=8/8 width=211)
+                    Group By Operator [GBY_31] (rows=8/8 width=211)
+                      Map Join Operator [MAPJOIN_30] (rows=8338/427 width=203)
+                          Select Operator [SEL_26] (rows=667/517 width=95)
+                            Filter Operator [FIL_25] (rows=667/517 width=184)
+                              TableScan [TS_3] (rows=2000/2000 width=184)
+                                tiffingo@customers,c,Tbl:COMPLETE,Col:COMPLETE,Output:[&quot;customer_id&quot;,&quot;city&quot;,&quot;plan&quot;]
+                      &lt;-Select Operator [SEL_29] (rows=25000/1621 width=116)
+                          Filter Operator [FIL_28] (rows=25000/1621 width=172)
+                            TableScan [TS_0] (rows=50000/50000 width=172)
+                              tiffingo@orders,o,Tbl:COMPLETE,Col:COMPLETE,Output:[&quot;customer_id&quot;,&quot;order_date&quot;,&quot;amount&quot;]</div></div>
+      <span class="behind">customers: <b>2000/2000</b> exact, Col:COMPLETE. Gold: <b>667/517</b> (2,000 / 3 distinct plans). Join: 8,338/427, group by: 8/8. Huge improvement, from 172× off to 1.3× off on Gold. But the date filter is still <b>25000/1621</b> although orders has full column statistics. Next step looks at that.</span></li>
+    <li><h4>Step 5 · Complete statistics, still wrong estimates</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>-- estimates from EXPLAIN vs real COUNT(*) on orders (50,000 rows, Col:COMPLETE)
+EXPLAIN SELECT COUNT(*) FROM orders_by_day WHERE order_date = &#x27;2026-10-05&#x27;;   -- partitioned copy</code></pre><div class="output">filter on orders (50,000 rows, column stats COMPLETE)   estimated rows   actual rows
+city = &#x27;Pune&#x27;                                                  6,250          7,930
+customer_id = 1492                                                24             41
+amount &gt; 500                                                  22,619          5,642
+order_date = &#x27;2026-10-05&#x27;                                     25,000          1,621
+
+                TableScan [TS_0] (rows=1621 width=112)
+                  tiffingo@orders_by_day,orders_by_day,Tbl:COMPLETE,Col:COMPLETE,Output:[&quot;amount&quot;]</div></div>
+      <span class="behind">Equality on a normal column uses rows / NDV: <code>city = 'Pune'</code> → 50,000 / 8 = 6,250, but Pune really has 7,930 (data is <b>skewed</b>). <code>amount &gt; 500</code> interpolates between min and max assuming an even spread: 22,619 vs 5,642. Equality on our DATE column was estimated at <b>half the table</b> in Hive 4.2.1, while a range on the same column used min/max (<code>&gt; '2026-10-28'</code> → 3,448). On the <b>partitioned</b> copy the estimate is exact, 1,621, because each partition has its own numRows.</span></li>
+    <li><h4>Step 6 · Stale statistics that say COMPLETE</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE cust_stale STORED AS ORC AS SELECT * FROM customers WHERE customer_id &lt;= 100;
+SET hive.stats.autogather=false;
+INSERT INTO cust_stale SELECT * FROM customers WHERE customer_id &gt; 100;
+SELECT COUNT(*) AS real_rows FROM cust_stale;
+SHOW TBLPROPERTIES cust_stale;
+EXPLAIN SELECT city, COUNT(*) FROM cust_stale WHERE plan = &#x27;Gold&#x27; GROUP BY city;</code></pre><div class="output">+------------+
+| real_rows  |
++------------+
+| 2000       |
++------------+
++-------------------------+-------------+
+|        prpt_name        | prpt_value  |
++-------------------------+-------------+
+| EXTERNAL                | TRUE        |
+| TRANSLATED_TO_EXTERNAL  | TRUE        |
+| bucketing_version       | 2           |
+| external.table.purge    | TRUE        |
+| numFiles                | 2           |
+| numFilesErasureCoded    | 0           |
+| numRows                 | 100         |
+| rawDataSize             | 41900       |
+| totalSize               | 11936       |
+| transient_lastDdlTime   | 1793099659  |
++-------------------------+-------------+
+
+                Filter Operator [FIL_9] (rows=33 width=180)
+                  TableScan [TS_0] (rows=100 width=180)
+                    tiffingo@cust_stale,cust_stale,Tbl:COMPLETE,Col:COMPLETE,Output:[&quot;city&quot;,&quot;plan&quot;]</div></div>
+      <span class="behind">The table really has <b>2,000</b> rows, but numRows still says <b>100</b>, and EXPLAIN shows <code>Tbl:COMPLETE,Col:COMPLETE</code> with rows=100. Nothing warns you. After <code>ANALYZE TABLE cust_stale COMPUTE STATISTICS</code> and <code>… FOR COLUMNS</code>, the same EXPLAIN shows 2,000 and Gold 667. In real platforms this happens when files are copied in by Spark, DistCp or <code>hdfs dfs -put</code>, or autogather is switched off for speed.</span></li>
+    <li><h4>Step 7 · Statistics alone change the join</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.auto.convert.join.noconditionaltask.size=20000;   -- small, to show the effect
+EXPLAIN SELECT c.city, SUM(o.amount) FROM orders o JOIN cust_stale2 c   -- stale: numRows 100
+  ON o.customer_id = c.customer_id WHERE c.plan = &#x27;Gold&#x27; GROUP BY c.city;
+EXPLAIN … JOIN cust_stale c …                                            -- fresh: 2,000</code></pre><div class="output">-- stale statistics
+Map 1 &lt;- Map 3 (BROADCAST_EDGE)
+Reducer 2 &lt;- Map 1 (SIMPLE_EDGE)
+        &lt;-Map 1 [SIMPLE_EDGE] vectorized
+              Map Join Operator [MAPJOIN_26] (rows=802 width=203)
+              &lt;-Map 3 [BROADCAST_EDGE] vectorized
+                    Filter Operator [FIL_21] (rows=33 width=184)
+                      TableScan [TS_3] (rows=100 width=184)
+              &lt;-Select Operator [SEL_25] (rows=50000 width=116)
+
+-- fresh statistics
+Reducer 2 &lt;- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)
+Reducer 3 &lt;- Reducer 2 (SIMPLE_EDGE)
+        &lt;-Reducer 2 [SIMPLE_EDGE]
+              Merge Join Operator [MERGEJOIN_19] (rows=16675 width=203)
+              &lt;-Map 1 [SIMPLE_EDGE] vectorized
+              &lt;-Map 4 [SIMPLE_EDGE] vectorized
+                    Filter Operator [FIL_23] (rows=667 width=184)
+                      TableScan [TS_3] (rows=2000 width=184)</div></div>
+      <span class="behind">Same SQL, same data, same threshold. With stale statistics Hive believes the Gold side is 33 rows (about 3 KB) and <b>broadcasts</b> it: map join. With fresh statistics it is 667 rows (about 63 KB), above our 20,000-byte limit, so Hive picks a <b>shuffle (merge) join</b> with an extra reducer stage. At production scale the dangerous case is the first: a table believed small but really huge gets broadcast and tasks run out of memory.</span></li>
+    <li><h4>Step 8 · Answers straight from statistics</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>EXPLAIN SELECT COUNT(*) FROM orders;        -- external table
+EXPLAIN SELECT COUNT(*) FROM orders_acid;   -- managed ACID table
+SELECT COUNT(*) FROM orders_acid;</code></pre><div class="output">Plan optimized by CBO.
+
+Vertex dependency in root stage
+Reducer 2 &lt;- Map 1 (CUSTOM_SIMPLE_EDGE)
+
+Stage-0
+…
+
+Plan optimized by CBO.
+
+Stage-0
+  Fetch Operator
+    limit:1
+
++-------+
+|  _c0  |
++-------+
+| 4886  |
++-------+
+INFO  : Completed executing command(…); Time taken: 0.0 seconds</div></div>
+      <span class="behind">With <code>hive.compute.query.using.stats=true</code>, COUNT(*) on the ACID table is answered from the metastore: the plan is only a Fetch Operator and the query took 0.0 seconds of execution (4,886 rows). On the external <code>orders</code> table Hive still runs a Map and a Reducer, because files of an external table can change without Hive knowing. Hive trusts statistics for answers only where it controls every write.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>How statistics turn into a plan</h2>
+  <p>Left: real outputs. Right: what the optimiser does with them.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">From metastore numbers to a plan <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SHOW TBLPROPERTIES customers;</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">numFiles     1</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">totalSize    91618</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">numRows      (missing)</text><text x="26" y="106" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; DESCRIBE FORMATTED customers plan;</text><text x="26" y="120" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">distinct_count   (empty)</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; EXPLAIN ANALYZE …</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Filter plan = &#x27;Gold&#x27; (rows=3/517)</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">TableScan customers (rows=1413/2000)</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  Tbl:COMPLETE, Col:NONE</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; ANALYZE TABLE customers COMPUTE STATISTICS;</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; ANALYZE … FOR COLUMNS;</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">distinct_count   3</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">num_nulls        0</text><text x="26" y="106" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">COLUMN_STATS_ACCURATE … true</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; EXPLAIN ANALYZE …</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">TableScan customers (rows=2000/2000)</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Filter plan = &#x27;Gold&#x27; (rows=667/517)</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">Map Join (rows=8338/427)</text><text x="26" y="106" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Filter order_date (rows=25000/1621)</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">numRows 100   (real rows 2000)</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">Tbl:COMPLETE,Col:COMPLETE</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">stale  -&gt; Map 1 &lt;- Map 3 (BROADCAST_EDGE)</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">fresh  -&gt; Reducer 2 &lt;- Map 1, Map 4</text><text x="26" y="106" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">          (SIMPLE_EDGE): merge join</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>customers has no row count and no column statistics.</li>
+          <li>The plan guessed 3 Gold customers; there are 517.</li>
+          <li>ANALYZE TABLE computes basic and column statistics.</li>
+          <li>Estimates are now close; the date filter is still far off.</li>
+          <li>Stale statistics made Hive broadcast; fresh ones made it shuffle.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="How the optimiser uses them">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Where estimates come from</text><rect x="14" y="50" width="78" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="53.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Metastore</text><text x="53.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">numRows · NDV</text><rect x="100" y="50" width="78" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="139.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Selectivity</text><text x="139.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">rows / NDV</text><path d="M93 65L99 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M92.7 68.0L99 65L92.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="186" y="50" width="78" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="225.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Cardinality</text><text x="225.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">per operator</text><path d="M179 65L185 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M178.7 68.0L185 65L178.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="272" y="50" width="78" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="311.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Plan</text><text x="311.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">join · reducers</text><path d="M265 65L271 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M264.7 68.0L271 65L264.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="10" y="140" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="160.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No numRows, no NDV → guesses.</text><text x="180.0" y="175.0" text-anchor="middle" font-size="8.8" class="s-ink2">Only file size was known.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A default selectivity</text><rect x="14" y="50" width="78" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="53.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Metastore</text><text x="53.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">numRows · NDV</text><rect x="100" y="50" width="78" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="139.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Selectivity</text><text x="139.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">rows / NDV</text><path d="M93 65L99 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M92.7 68.0L99 65L92.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="186" y="50" width="78" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="225.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Cardinality</text><text x="225.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">per operator</text><path d="M179 65L185 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M178.7 68.0L185 65L178.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="272" y="50" width="78" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="311.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Plan</text><text x="311.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">join · reducers</text><path d="M265 65L271 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M264.7 68.0L271 65L264.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><text x="180" y="110" text-anchor="middle" font-size="8.4" class="s-red mono">1,413 estimated rows → 3 Gold</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Without NDV, Hive cannot compute rows / NDV.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">ANALYZE fills the metastore</text><rect x="14" y="50" width="78" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="53.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Metastore</text><text x="53.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">numRows · NDV</text><rect x="100" y="50" width="78" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="139.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Selectivity</text><text x="139.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">rows / NDV</text><path d="M93 65L99 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M92.7 68.0L99 65L92.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="186" y="50" width="78" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="225.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Cardinality</text><text x="225.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">per operator</text><path d="M179 65L185 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M178.7 68.0L185 65L178.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="272" y="50" width="78" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="311.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Plan</text><text x="311.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">join · reducers</text><path d="M265 65L271 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M264.7 68.0L271 65L264.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><text x="180" y="110" text-anchor="middle" font-size="8.4" class="s-green mono">plan: NDV = 3, nulls = 0</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Basic stats + column stats.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">rows / NDV = 2000 / 3 = 667</text><rect x="14" y="50" width="78" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="53.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Metastore</text><text x="53.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">numRows · NDV</text><rect x="100" y="50" width="78" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="139.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Selectivity</text><text x="139.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">rows / NDV</text><path d="M93 65L99 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M92.7 68.0L99 65L92.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="186" y="50" width="78" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="225.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Cardinality</text><text x="225.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">per operator</text><path d="M179 65L185 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M178.7 68.0L185 65L178.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="272" y="50" width="78" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="311.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Plan</text><text x="311.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">join · reducers</text><path d="M265 65L271 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M264.7 68.0L271 65L264.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><text x="180" y="110" text-anchor="middle" font-size="8.4" class="s-green mono">actual 517: close enough</text><rect x="10" y="140" width="340" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="160.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Uniform assumption: good, not perfect.</text><text x="180.0" y="175.0" text-anchor="middle" font-size="8.8" class="s-ink2">Skewed values still surprise.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Estimates choose the join</text><rect x="14" y="50" width="78" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="53.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Metastore</text><text x="53.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">numRows · NDV</text><rect x="100" y="50" width="78" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="139.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Selectivity</text><text x="139.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">rows / NDV</text><path d="M93 65L99 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M92.7 68.0L99 65L92.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="186" y="50" width="78" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="225.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Cardinality</text><text x="225.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">per operator</text><path d="M179 65L185 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M178.7 68.0L185 65L178.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="272" y="50" width="78" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="311.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Plan</text><text x="311.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">join · reducers</text><path d="M265 65L271 65" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M264.7 68.0L271 65L264.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><text x="180" y="110" text-anchor="middle" font-size="8.2" class="s-ink mono">small side under threshold → broadcast</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Stale numbers, different plan.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The optimiser reads statistics from the metastore before any data is read.</li>
+          <li>With nothing to go on, Hive applies default selectivities.</li>
+          <li>Statistics are stored in the metastore and reused by every query.</li>
+          <li>Equality filters use rows divided by distinct values, assuming an even spread.</li>
+          <li>Join type and reducer counts follow from the estimated sizes.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: stale statistics, skewed data, and a statistics policy.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-stale">Files written by another engine</h3>
+  <p class="anim-intro">Statistics go stale when data arrives without Hive. Lab numbers are real; the platform story is typical.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Stale statistics <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Files loaded by Spark leave Hive statistics stale, the plan uses old numbers, and an ANALYZE step in the pipeline fixes it">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly Spark job adds files</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">to an external Hive table</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hive did not write them, so no autogather.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Statistics still say last month</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-red mono">numRows 100 · real 2,000 (our lab)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">EXPLAIN still shows Tbl:COMPLETE.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Plan built on old numbers</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-red">“small” table broadcast to every task</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">At scale: memory errors or slow map joins.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix in the pipeline</text><text x="180" y="56" text-anchor="middle" font-size="7.6" class="s-ink mono">ANALYZE TABLE … PARTITION (…) COMPUTE STATISTICS</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Right after each load, per new partition.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Check it</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink2">compare numRows with COUNT(*) on a sample of tables</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A weekly statistics health check.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Data arrives without Hive.</li>
+          <li>Statistics keep their old values.</li>
+          <li>The optimiser trusts them.</li>
+          <li>Refresh statistics after each load.</li>
+          <li>Monitor statistics health.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-skew">Skewed data and the uniform assumption</h3>
+  <p class="anim-intro">Even with complete statistics, estimates assume values are evenly spread. All numbers are real lab outputs.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Skewed estimates <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Column statistics give averages; skewed values and ranges are estimated with an even-spread assumption">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Uniform assumption</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">city = 'Pune' → 50,000 / 8 cities = 6,250</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Every city assumed equal.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Reality</text><rect x="60" y="50" width="160" height="12" rx="2" style="fill:var(--blue)"/><text x="230" y="60" font-size="8" class="s-ink2">estimate 6,250</text><rect x="60" y="72" width="203" height="12" rx="2" style="fill:var(--track)"/><text x="270" y="82" font-size="8" class="s-ink2">actual 7,930</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Real lab numbers.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Ranges too</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-red mono">amount > 500: est 22,619 · actual 5,642</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Min–max interpolation assumes even spread.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">What helps</text><text x="180" y="52" text-anchor="middle" font-size="8" class="s-ink mono">partition on the filter column (exact numRows)</text><text x="180" y="70" text-anchor="middle" font-size="8" class="s-ink mono">skew-aware joins (Lesson 8.3)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Design for the real distribution.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Rule</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">small gaps rarely change the plan</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Investigate the big gaps first.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Equality uses rows divided by distinct values.</li>
+          <li>Pune is more common than average.</li>
+          <li>Ranges are interpolated between min and max.</li>
+          <li>Partitions and skew handling help.</li>
+          <li>Focus on the largest estimate errors.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-policy">A statistics policy for a whole warehouse</h3>
+  <p class="anim-intro">A practical policy many teams follow. (Typical practice; the 1-second partition ANALYZE is from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Statistics policy <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Autogather for Hive writes, per-partition ANALYZE for other loads, key columns first, verified in EXPLAIN">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A statistics policy for a warehouse</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">300 tables, daily partitions</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Keep stats fresh without huge cost.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hive writes → autogather</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink mono">hive.stats.autogather · column.autogather = true</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Free for INSERT and CTAS.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Other engines → ANALYZE per partition</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink mono">ANALYZE … PARTITION (d='…') … FOR COLUMNS</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Only the new partition: ~1 s in our lab.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Columns that matter</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">join keys, filter columns, group-by columns</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">FOR COLUMNS c1, c2 to save time on wide tables.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Verify in EXPLAIN</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">no Col:NONE / PARTIAL on key tables</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Part of the plan review checklist.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Define a policy, not one-off fixes.</li>
+          <li>Let Hive gather stats on its own writes.</li>
+          <li>Analyze new partitions loaded by other tools.</li>
+          <li>Prioritise columns used by joins and filters.</li>
+          <li>Check plans for missing statistics.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Statistics at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green mono">ANALYZE</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">after each load</text></svg></div>
+    <div><h4>1. ETL pipelines</h4>
+      <p>Load jobs end with ANALYZE on the new partition, so downstream reports are planned with current numbers.</p>
+      <div class="uc-flow"><span>Load</span><i>→</i><span class="java">ANALYZE</span><i>→</i><span>Fresh plans</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">joins</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">right strategy</text></svg></div>
+    <div><h4>2. Stable join plans</h4>
+      <p>Accurate sizes keep map joins for truly small tables and shuffle joins for big ones, avoiding memory failures.</p>
+      <div class="uc-flow"><span>Stats</span><i>→</i><span class="java">join choice</span><i>→</i><span>No OOM</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-violet mono">COUNT(*)</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">from metastore</text></svg></div>
+    <div><h4>3. Instant metadata answers</h4>
+      <p>On managed (ACID) tables, COUNT(*), MIN and MAX can be answered from statistics without running a job.</p>
+      <div class="uc-flow"><span>Query</span><i>→</i><span class="java">stats</span><i>→</i><span>Instant</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc">profiling</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">data quality</text></svg></div>
+    <div><h4>4. Cheap data profiling</h4>
+      <p>Column statistics (nulls, distinct counts, min and max) give data quality teams a quick profile of every column.</p>
+      <div class="uc-flow"><span>Column stats</span><i>→</i><span class="java">profile</span><i>→</i><span>Quality checks</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">health</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">stats monitor</text></svg></div>
+    <div><h4>5. Platform health checks</h4>
+      <p>Platform teams flag tables whose numRows is missing or far from reality before users notice slow queries.</p>
+      <div class="uc-flow"><span>Metastore</span><i>→</i><span class="java">check</span><i>→</i><span>Alerts</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: estimate like the optimiser</h2>
+  <p>These programs reproduce the optimiser’s arithmetic with the real numbers from the lab. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># How Hive estimates a filter from column statistics (simplified)
+num_rows = 50000
+ndv = {&quot;city&quot;: 8, &quot;plan&quot;: 3, &quot;customer_id&quot;: 2000}
+amount_min, amount_max = 40, 880                # real min / max from DESCRIBE FORMATTED
+
+def eq_estimate(col):                           # col = value
+    return round(num_rows / ndv[col])
+
+def range_estimate(lo):                         # amount &gt; lo, even spread
+    return round(num_rows * (amount_max - lo) / (amount_max - amount_min))
+
+print(&quot;city = &#x27;Pune&#x27;  :&quot;, eq_estimate(&quot;city&quot;), &quot; (real 7,930)&quot;)
+print(&quot;amount &gt; 500   :&quot;, range_estimate(500), &quot; (real 5,642)&quot;)
+print(&quot;plan = &#x27;Gold&#x27; on 2,000 customers:&quot;, round(2000 / ndv[&quot;plan&quot;]), &quot; (real 517)&quot;)</code></pre><div class="output">city = &#x27;Pune&#x27;  : 6250  (real 7,930)
+amount &gt; 500   : 22619  (real 5,642)
+plan = &#x27;Gold&#x27; on 2,000 customers: 667  (real 517)</div></div>
+  <ul class="anno"><li><code>    return round(num_rows / ndv[col])</code><span>Equality: rows divided by the number of distinct values. 50,000 / 8 = 6,250, exactly what EXPLAIN printed for Pune.</span></li><li><code>    return round(num_rows * (amount_max - lo) / (amount_max - amount_min))</code><span>Ranges: a straight line between min and max, assuming values are evenly spread. With the real min 40 and max 880 this gives 22,619, exactly Hive’s estimate.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Equality and ranges",
+   "hint": "Press <b>Run<\/b>. The Pune and Gold numbers match the real EXPLAIN output (6,250 and 667). Real counts: 7,930 and 517.",
+   "code": "# How Hive estimates a filter from column statistics (simplified)\nnum_rows = 50000\nndv = {\"city\": 8, \"plan\": 3, \"customer_id\": 2000}\namount_min, amount_max = 40, 880                # real min / max from DESCRIBE FORMATTED\n\ndef eq_estimate(col):                           # col = value\n    return round(num_rows / ndv[col])\n\ndef range_estimate(lo):                         # amount > lo, even spread\n    return round(num_rows * (amount_max - lo) / (amount_max - amount_min))\n\nprint(\"city = 'Pune'  :\", eq_estimate(\"city\"), \" (real 7,930)\")\nprint(\"amount > 500   :\", range_estimate(500), \" (real 5,642)\")\nprint(\"plan = 'Gold' on 2,000 customers:\", round(2000 / ndv[\"plan\"]), \" (real 517)\")\n"
+  },
+  {
+   "label": "2 · Predict first: estimate error",
+   "hint": "<b>Predict first:<\/b> which estimate is furthest from reality? Real pairs from the lab.",
+   "code": "pairs = {\"Pune\": (6250, 7930), \"customer 1492\": (24, 41), \"amount > 500\": (22619, 5642), \"date = 10-05\": (25000, 1621)}\nfor k, (e, a) in pairs.items():\n    print(f\"{k:14} x{max(e, a) / min(e, a):5.1f}\")\n"
+  },
+  {
+   "label": "3 · Map join or not",
+   "hint": "Hive broadcasts the small side if its estimated size is under the threshold. Try the stale (33 rows) and fresh (667 rows) estimates.",
+   "code": "threshold = 20000          # bytes, as in our experiment\nwidth = 95                 # bytes per row after Select\nfor rows in [33, 667]:\n    size = rows * width\n    print(rows, \"rows ->\", size, \"bytes ->\", \"MAP JOIN\" if size <= threshold else \"SHUFFLE JOIN\")\n"
+  },
+  {
+   "label": "4 · Stale or fresh?",
+   "hint": "Compare metastore numRows with a real count. Flag tables more than 20% off.",
+   "code": "tables = {\"cust_stale\": (100, 2000), \"customers\": (2000, 2000), \"orders\": (50000, 50000)}\nfor t, (stats, real) in tables.items():\n    off = abs(stats - real) / real\n    print(f\"{t:11} stats {stats:>6} real {real:>6} ->\", \"STALE\" if off > 0.2 else \"ok\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This health check never finds stale tables. Fix the comparison.",
+   "code": "stats, real = 100, 2000\nstale = stats > real * 1.2           # bug: only catches tables that shrank\nassert stale, \"numRows can be too LOW as well: compare the absolute difference\"\nprint(\"stale\")\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: NOSCAN, partition statistics and column statistics</h3>
+  <p>More statistics commands on the lab tables. <b>Outputs are real</b>, from Hive 4.2.1.</p>
+  <div class="pcrun"><h4>1 · NOSCAN on an ORC table with stale numRows</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>-- cust_stale2: numRows was 100, real rows 2000
+ANALYZE TABLE cust_stale2 COMPUTE STATISTICS NOSCAN;
+SHOW TBLPROPERTIES cust_stale2 (&#x27;numRows&#x27;);
+SHOW TBLPROPERTIES cust_stale2 (&#x27;numFiles&#x27;);</code></pre><div class="output">+------------+-------------+
+| prpt_name  | prpt_value  |
++------------+-------------+
+| numRows    | 2000        |
++------------+-------------+
++------------+-------------+
+| prpt_name  | prpt_value  |
++------------+-------------+
+| numFiles   | 2           |
++------------+-------------+</div></div>
+  <p class="muted">NOSCAN does not launch a job, yet numRows became 2,000. For ORC, Hive can read the row count from each file’s footer, so NOSCAN is a cheap fix for ORC/Parquet tables. On a text table it can only record file counts and sizes.</p></div>
+  <div class="pcrun"><h4>2 · Statistics of one partition</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>DESCRIBE FORMATTED orders_by_day PARTITION (order_date=&#x27;2026-10-05&#x27;);
+-- statistics lines</code></pre><div class="output">|                                   | numFiles                                           | 1                                                  |
+|                                   | numRows                                            | 1621                                               |
+|                                   | rawDataSize                                        | 695409                                             |
+|                                   | totalSize                                          | 13269                                              |</div></div>
+  <p class="muted">Each partition keeps its own numRows: 1,621 for 5 October. That is why the estimate on the partitioned table was exact while the same filter on the unpartitioned table was estimated at 25,000.</p></div>
+  <div class="pcrun"><h4>3 · Column statistics of a DATE column</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>DESCRIBE FORMATTED orders order_date;</code></pre><div class="output">+------------------------+----------------------------------------------------+
+|    column_property     |                       value                        |
++------------------------+----------------------------------------------------+
+| col_name               | order_date                                         |
+| data_type              | date                                               |
+| min                    | 2026-10-01                                         |
+| max                    | 2026-10-30                                         |
+| num_nulls              | 0                                                  |
+| distinct_count         | 30                                                 |
+| avg_col_len            |                                                    |
+| max_col_len            |                                                    |
++------------------------+----------------------------------------------------+</div></div>
+  <p class="muted">min, max and 30 distinct values, all correct, gathered automatically when the table was loaded with INSERT. Hive 4.2.1 still estimated equality on this column at half the table; range filters on it did use min and max.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Estimating the Gold filter, before and after ANALYZE</h2>
+  <p>Follow the numbers the optimiser uses for <code>plan = 'Gold'</code>.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "num_rows = None             # no numRows in the metastore",
+  "size_estimate = 1413        # rows guessed from file size",
+  "ndv = None                  # no column statistics",
+  "est = 3                     # default selectivity: the plan said 3",
+  "num_rows = 2000             # after ANALYZE ... COMPUTE STATISTICS",
+  "ndv = 3                     # after ANALYZE ... FOR COLUMNS",
+  "est = round(num_rows / ndv)",
+  "print(\"estimate:\", est, \"real: 517\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>num_rows<\/code> is created: None.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "num_rows",
+       "None"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "num_rows"
+  },
+  {
+   "line": 2,
+   "phase": "Guess",
+   "note": "hive.stats.estimate turned the file size into 1,413 rows. <code>size_estimate<\/code> is created: 1413.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "num_rows",
+       "None"
+      ],
+      [
+       "size_estimate",
+       "1413"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "size_estimate"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>ndv<\/code> is created: None.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "num_rows",
+       "None"
+      ],
+      [
+       "size_estimate",
+       "1413"
+      ],
+      [
+       "ndv",
+       "None"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "ndv"
+  },
+  {
+   "line": 4,
+   "phase": "Before",
+   "note": "Without NDV, Hive falls back to default selectivities. <code>est<\/code> is created: 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "num_rows",
+       "None"
+      ],
+      [
+       "size_estimate",
+       "1413"
+      ],
+      [
+       "ndv",
+       "None"
+      ],
+      [
+       "est",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "est"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>num_rows<\/code> changes to 2000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "num_rows",
+       "2000"
+      ],
+      [
+       "size_estimate",
+       "1413"
+      ],
+      [
+       "ndv",
+       "None"
+      ],
+      [
+       "est",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "num_rows"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>ndv<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "num_rows",
+       "2000"
+      ],
+      [
+       "size_estimate",
+       "1413"
+      ],
+      [
+       "ndv",
+       "3"
+      ],
+      [
+       "est",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "ndv"
+  },
+  {
+   "line": 7,
+   "phase": "After",
+   "note": "2,000 / 3 = 667, close to the real 517. <code>est<\/code> changes to 667.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "num_rows",
+       "2000"
+      ],
+      [
+       "size_estimate",
+       "1413"
+      ],
+      [
+       "ndv",
+       "3"
+      ],
+      [
+       "est",
+       "667"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "est"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "num_rows",
+       "2000"
+      ],
+      [
+       "size_estimate",
+       "1413"
+      ],
+      [
+       "ndv",
+       "3"
+      ],
+      [
+       "est",
+       "667"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "estimate: 667 real: 517\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three statistics decisions you will face on a real platform.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Data engineering · loads</span></div>
+    <h4>Which ANALYZE after which load?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>For three loads, write the statistics command that should follow.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>A: INSERT into ORC table by Hive · B: Spark writes a new partition d=2026-10-27 · C: text files copied with hdfs dfs -put</pre></div><div><small>Expected output</small><pre>A Hive INSERT (ORC)  -&gt; nothing: autogather
+B Spark partition    -&gt; ANALYZE TABLE t PARTITION (d=&#x27;2026-10-27&#x27;) COMPUTE STATISTICS FOR COLUMNS;
+C hdfs put (text)    -&gt; ANALYZE TABLE t COMPUTE STATISTICS; ... FOR COLUMNS;</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Hive writes gather statistics automatically.</li><li>Other writers: analyse the new partition.</li><li>Text files: a full ANALYZE is needed for row counts.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "For ORC or Parquet, NOSCAN already fixed numRows in our lab (from file footers); column statistics still need FOR COLUMNS.",
+   "code": "loads = {\n  \"A Hive INSERT (ORC)\": \"nothing: autogather\",\n  \"B Spark partition\":   \"ANALYZE TABLE t PARTITION (d='2026-10-27') COMPUTE STATISTICS FOR COLUMNS;\",\n  \"C hdfs put (text)\":   \"ANALYZE TABLE t COMPUTE STATISTICS; ... FOR COLUMNS;\",\n}\nfor k, v in loads.items():\n    print(f\"{k:20} -> {v}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "loads = {",
+  "  \"A Hive INSERT (ORC)\": \"nothing: autogather\",",
+  "  \"B Spark partition\":   \"ANALYZE TABLE t PARTITION (d='2026-10-27') COMPUTE STATISTICS FOR COLUMNS;\",",
+  "  \"C hdfs put (text)\":   \"ANALYZE TABLE t COMPUTE STATISTICS; ... FOR COLUMNS;\",",
+  "}",
+  "for k, v in loads.items():",
+  "    print(f\"{k:20} -> {v}\")"
+ ],
+ "steps": [
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 3,
+   "phase": "Partition",
+   "note": "Analyse only what changed.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>loads<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;A Hive INSERT (ORC…: &#x27;nothing: autogather&#x27;, &#x27;B Spark partition&#x27;: &quot;ANALYZE TABLE t PARTI…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A Hive INSERT (ORC…: &#x27;nothing: autogather&#x27;, &#x27;B Spark partition&#x27;: &quot;ANALYZE TABLE t PARTI…"
+   ],
+   "newVar": "loads"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>k<\/code> is created: &#x27;A Hive INSERT (ORC)&#x27;. <code>v<\/code> is created: &#x27;nothing: autogather&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'A Hive INSERT (ORC)'"
+      ],
+      [
+       "v",
+       "'nothing: autogather'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A Hive INSERT (ORC…: &#x27;nothing: autogather&#x27;, &#x27;B Spark partition&#x27;: &quot;ANALYZE TABLE t PARTI…"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'A Hive INSERT (ORC)'"
+      ],
+      [
+       "v",
+       "'nothing: autogather'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A Hive INSERT (ORC…: &#x27;nothing: autogather&#x27;, &#x27;B Spark partition&#x27;: &quot;ANALYZE TABLE t PARTI…"
+   ],
+   "out": "A Hive INSERT (ORC)  -> nothing: autogather\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to &#x27;B Spark partition&#x27;. <code>v<\/code> changes to &quot;ANALYZE TABLE t PARTITION (d=&#x27;2026-10-27&#x27;) COMPUTE STATISTICS FOR CO….",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'B Spark partition'"
+      ],
+      [
+       "v",
+       "\"ANALYZE TABLE t PARTITION (d='2026-10-27') COMPUTE STATISTICS FOR CO…"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A Hive INSERT (ORC…: &#x27;nothing: autogather&#x27;, &#x27;B Spark partition&#x27;: &quot;ANALYZE TABLE t PARTI…"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'B Spark partition'"
+      ],
+      [
+       "v",
+       "\"ANALYZE TABLE t PARTITION (d='2026-10-27') COMPUTE STATISTICS FOR CO…"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A Hive INSERT (ORC…: &#x27;nothing: autogather&#x27;, &#x27;B Spark partition&#x27;: &quot;ANALYZE TABLE t PARTI…"
+   ],
+   "out": "B Spark partition    -> ANALYZE TABLE t PARTITION (d='2026-10-27') COMPUTE STATISTICS FOR COLUMNS;\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to &#x27;C hdfs put (text)&#x27;. <code>v<\/code> changes to &#x27;ANALYZE TABLE t COMPUTE STATISTICS; ... FOR COLUMNS;&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'C hdfs put (text)'"
+      ],
+      [
+       "v",
+       "'ANALYZE TABLE t COMPUTE STATISTICS; ... FOR COLUMNS;'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A Hive INSERT (ORC…: &#x27;nothing: autogather&#x27;, &#x27;B Spark partition&#x27;: &quot;ANALYZE TABLE t PARTI…"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'C hdfs put (text)'"
+      ],
+      [
+       "v",
+       "'ANALYZE TABLE t COMPUTE STATISTICS; ... FOR COLUMNS;'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A Hive INSERT (ORC…: &#x27;nothing: autogather&#x27;, &#x27;B Spark partition&#x27;: &quot;ANALYZE TABLE t PARTI…"
+   ],
+   "out": "C hdfs put (text)    -> ANALYZE TABLE t COMPUTE STATISTICS; ... FOR COLUMNS;\n"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'C hdfs put (text)'"
+      ],
+      [
+       "v",
+       "'ANALYZE TABLE t COMPUTE STATISTICS; ... FOR COLUMNS;'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;A Hive INSERT (ORC…: &#x27;nothing: autogather&#x27;, &#x27;B Spark partition&#x27;: &quot;ANALYZE TABLE t PARTI…"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Platform · monitoring</span></div>
+    <h4>Find stale tables</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Compare metastore numRows with real counts for a list of tables and report the worst first.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>cust_stale: 100 vs 2,000 · customers: 2,000 vs 2,000 · orders: 50,000 vs 50,000</pre></div><div><small>Expected output</small><pre>cust_stale  x20.0
+customers   x1.0
+orders      x1.0</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Get numRows from SHOW TBLPROPERTIES.</li><li>Get COUNT(*) (on samples for big tables).</li><li>Sort by the ratio.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Real: cust_stale was 20× off while EXPLAIN said Tbl:COMPLETE. A nightly job like this catches it before users do.",
+   "code": "t = {\"cust_stale\": (100, 2000), \"customers\": (2000, 2000), \"orders\": (50000, 50000)}\nfor name, (s, r) in sorted(t.items(), key=lambda kv: -max(kv[1]) / min(kv[1])):\n    print(f\"{name:11} x{max(s, r) / min(s, r):.1f}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "t = {\"cust_stale\": (100, 2000), \"customers\": (2000, 2000), \"orders\": (50000, 50000)}",
+  "for name, (s, r) in sorted(t.items(), key=lambda kv: -max(kv[1]) / min(kv[1])):",
+  "    print(f\"{name:11} x{max(s, r) / min(s, r):.1f}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>t<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "t",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;cust_stale&#x27;: → tuple #2, &#x27;customers&#x27;: → tuple #3, &#x27;orders&#x27;: → tuple #4}",
+    "<b>#2 tuple (2)<\/b> (100, 2000)",
+    "<b>#3 tuple (2)<\/b> (2000, 2000)",
+    "<b>#4 tuple (2)<\/b> (50000, 50000)"
+   ],
+   "newVar": "t"
+  },
+  {
+   "line": 2,
+   "phase": "Order",
+   "note": "The worst ratio first: that table will mislead the planner most. <code>name<\/code> is created: &#x27;cust_stale&#x27;. <code>s<\/code> is created: 100. <code>r<\/code> is created: 2000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "t",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'cust_stale'"
+      ],
+      [
+       "s",
+       "100"
+      ],
+      [
+       "r",
+       "2000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;cust_stale&#x27;: → tuple #2, &#x27;customers&#x27;: → tuple #3, &#x27;orders&#x27;: → tuple #4}",
+    "<b>#2 tuple (2)<\/b> (100, 2000)",
+    "<b>#3 tuple (2)<\/b> (2000, 2000)",
+    "<b>#4 tuple (2)<\/b> (50000, 50000)"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "t",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'cust_stale'"
+      ],
+      [
+       "s",
+       "100"
+      ],
+      [
+       "r",
+       "2000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;cust_stale&#x27;: → tuple #2, &#x27;customers&#x27;: → tuple #3, &#x27;orders&#x27;: → tuple #4}",
+    "<b>#2 tuple (2)<\/b> (100, 2000)",
+    "<b>#3 tuple (2)<\/b> (2000, 2000)",
+    "<b>#4 tuple (2)<\/b> (50000, 50000)"
+   ],
+   "out": "cust_stale  x20.0\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;customers&#x27;. <code>s<\/code> changes to 2000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "t",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'customers'"
+      ],
+      [
+       "s",
+       "2000"
+      ],
+      [
+       "r",
+       "2000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;cust_stale&#x27;: → tuple #2, &#x27;customers&#x27;: → tuple #3, &#x27;orders&#x27;: → tuple #4}",
+    "<b>#2 tuple (2)<\/b> (100, 2000)",
+    "<b>#3 tuple (2)<\/b> (2000, 2000)",
+    "<b>#4 tuple (2)<\/b> (50000, 50000)"
+   ],
+   "newVar": "s"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "t",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'customers'"
+      ],
+      [
+       "s",
+       "2000"
+      ],
+      [
+       "r",
+       "2000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;cust_stale&#x27;: → tuple #2, &#x27;customers&#x27;: → tuple #3, &#x27;orders&#x27;: → tuple #4}",
+    "<b>#2 tuple (2)<\/b> (100, 2000)",
+    "<b>#3 tuple (2)<\/b> (2000, 2000)",
+    "<b>#4 tuple (2)<\/b> (50000, 50000)"
+   ],
+   "out": "customers   x1.0\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>name<\/code> changes to &#x27;orders&#x27;. <code>s<\/code> changes to 50000. <code>r<\/code> changes to 50000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "t",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'orders'"
+      ],
+      [
+       "s",
+       "50000"
+      ],
+      [
+       "r",
+       "50000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;cust_stale&#x27;: → tuple #2, &#x27;customers&#x27;: → tuple #3, &#x27;orders&#x27;: → tuple #4}",
+    "<b>#2 tuple (2)<\/b> (100, 2000)",
+    "<b>#3 tuple (2)<\/b> (2000, 2000)",
+    "<b>#4 tuple (2)<\/b> (50000, 50000)"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "t",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'orders'"
+      ],
+      [
+       "s",
+       "50000"
+      ],
+      [
+       "r",
+       "50000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;cust_stale&#x27;: → tuple #2, &#x27;customers&#x27;: → tuple #3, &#x27;orders&#x27;: → tuple #4}",
+    "<b>#2 tuple (2)<\/b> (100, 2000)",
+    "<b>#3 tuple (2)<\/b> (2000, 2000)",
+    "<b>#4 tuple (2)<\/b> (50000, 50000)"
+   ],
+   "out": "orders      x1.0\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "t",
+       "→ dict #1"
+      ],
+      [
+       "name",
+       "'orders'"
+      ],
+      [
+       "s",
+       "50000"
+      ],
+      [
+       "r",
+       "50000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;cust_stale&#x27;: → tuple #2, &#x27;customers&#x27;: → tuple #3, &#x27;orders&#x27;: → tuple #4}",
+    "<b>#2 tuple (2)<\/b> (100, 2000)",
+    "<b>#3 tuple (2)<\/b> (2000, 2000)",
+    "<b>#4 tuple (2)<\/b> (50000, 50000)"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Architecture · memory</span></div>
+    <h4>Why stale stats can crash a map join</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A dimension table grew from 1 MB to 2 GB, but statistics still say 1 MB. The map-join threshold is 10 MB (the lab default). What happens?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>stats 1 MB · real 2 GB · threshold 10,000,000 bytes</pre></div><div><small>Expected output</small><pre>plan: MAP JOIN
+hash table each task must hold: 2000 MB</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Planner compares the estimate with the threshold.</li><li>Estimate says broadcast.</li><li>Every task must build a 2 GB hash table.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Illustrative sizes. Our lab showed the same mechanism at small scale: stale stats → BROADCAST_EDGE, fresh stats → merge join. Hive has run-time safeguards for some cases, but fresh statistics are the real fix.",
+   "code": "threshold = 10_000_000\nstats_size, real_size = 1_000_000, 2_000_000_000\nplan = \"MAP JOIN\" if stats_size <= threshold else \"SHUFFLE JOIN\"\nprint(\"plan:\", plan)\nprint(\"hash table each task must hold:\", real_size // 1_000_000, \"MB\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "threshold = 10_000_000",
+  "stats_size, real_size = 1_000_000, 2_000_000_000",
+  "plan = \"MAP JOIN\" if stats_size <= threshold else \"SHUFFLE JOIN\"",
+  "print(\"plan:\", plan)",
+  "print(\"hash table each task must hold:\", real_size // 1_000_000, \"MB\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>threshold<\/code> is created: 10000000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "threshold",
+       "10000000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "threshold"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>stats_size<\/code> is created: 1000000. <code>real_size<\/code> is created: 2000000000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "threshold",
+       "10000000"
+      ],
+      [
+       "stats_size",
+       "1000000"
+      ],
+      [
+       "real_size",
+       "2000000000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "real_size"
+  },
+  {
+   "line": 3,
+   "phase": "Decision",
+   "note": "Made from statistics only, before any data is read. <code>plan<\/code> is created: &#x27;MAP JOIN&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "threshold",
+       "10000000"
+      ],
+      [
+       "stats_size",
+       "1000000"
+      ],
+      [
+       "real_size",
+       "2000000000"
+      ],
+      [
+       "plan",
+       "'MAP JOIN'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "plan"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "threshold",
+       "10000000"
+      ],
+      [
+       "stats_size",
+       "1000000"
+      ],
+      [
+       "real_size",
+       "2000000000"
+      ],
+      [
+       "plan",
+       "'MAP JOIN'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "plan: MAP JOIN\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "threshold",
+       "10000000"
+      ],
+      [
+       "stats_size",
+       "1000000"
+      ],
+      [
+       "real_size",
+       "2000000000"
+      ],
+      [
+       "plan",
+       "'MAP JOIN'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "hash table each task must hold: 2000 MB\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: Which command gathers column statistics?",
+  "options": [
+   "ANALYZE TABLE t COMPUTE STATISTICS",
+   "DESCRIBE t",
+   "ANALYZE TABLE t COMPUTE STATISTICS FOR COLUMNS",
+   "MSCK REPAIR TABLE t"
+  ],
+  "answer": 2,
+  "why": "Without FOR COLUMNS only basic statistics (rows, sizes) are collected."
+ },
+ {
+  "q": "Beginner: Where does Hive keep statistics?",
+  "options": [
+   "In the data files only",
+   "In the Hive Metastore",
+   "In HiveServer2 memory",
+   "In YARN"
+  ],
+  "answer": 1,
+  "why": "As table/partition parameters and column statistics tables in the metastore."
+ },
+ {
+  "q": "Beginner: What does Col:NONE in EXPLAIN mean?",
+  "options": [
+   "No column statistics available",
+   "No columns read",
+   "Columns are null",
+   "Vectorisation is off"
+  ],
+  "answer": 0,
+  "why": "customers had Col:NONE before ANALYZE."
+ },
+ {
+  "q": "Intermediate: After ANALYZE, why was plan = 'Gold' estimated at 667?",
+  "options": [
+   "Random",
+   "From a histogram",
+   "From the previous run",
+   "2,000 rows / 3 distinct values"
+  ],
+  "answer": 3,
+  "why": "Equality selectivity = 1 / NDV, assuming an even spread."
+ },
+ {
+  "q": "Intermediate: An INSERT ran with hive.stats.autogather=false. What did EXPLAIN show?",
+  "options": [
+   "Tbl:NONE",
+   "An error",
+   "Tbl:COMPLETE with the old row count (100 instead of 2,000)",
+   "The real count"
+  ],
+  "answer": 2,
+  "why": "COMPLETE means statistics exist, not that they are current."
+ },
+ {
+  "q": "Intermediate: Why was the filter on the partitioned table estimated exactly (1,621)?",
+  "options": [
+   "Luck",
+   "Each partition has its own numRows",
+   "It used a histogram",
+   "Partitions disable CBO"
+  ],
+  "answer": 1,
+  "why": "Pruning picks one partition, whose numRows is exact."
+ },
+ {
+  "q": "Advanced: Same SQL, same threshold; stale stats gave a map join and fresh stats a merge join. Why?",
+  "options": [
+   "The join type is chosen from the estimated size of the small side",
+   "A bug",
+   "Merge join is always better",
+   "Vectorisation changed"
+  ],
+  "answer": 0,
+  "why": "33 rows estimated (under the threshold) vs 667 (over it)."
+ },
+ {
+  "q": "Advanced: Why did COUNT(*) on the external orders table still run a job?",
+  "options": [
+   "Stats were missing",
+   "COUNT(*) never uses stats",
+   "The table was too big",
+   "Hive only answers from statistics where it controls all writes, not for external tables"
+  ],
+  "answer": 3,
+  "why": "The ACID table was answered by a Fetch operator in 0.0 s."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 8.2 in one screen</h3>
+    <ul><li><b>CBO</b> (Calcite, <code>hive.cbo.enable</code>) picks join order and join types by estimated cost; estimates come from <b>metastore statistics</b>.</li><li><b>Basic:</b> numRows, numFiles, totalSize, rawDataSize. <b>Column:</b> NDV (HLL), nulls, min, max, lengths.</li><li><b>Gather:</b> autogather on Hive writes; <code>ANALYZE TABLE t [PARTITION (…)] COMPUTE STATISTICS [NOSCAN | FOR COLUMNS [c…]]</code>.</li><li><b>Check:</b> <code>DESCRIBE FORMATTED t [col]</code>, <code>SHOW TBLPROPERTIES</code>, EXPLAIN <code>Tbl:/Col: COMPLETE|PARTIAL|NONE</code>.</li><li><b>Estimates:</b> equality = rows / NDV; ranges interpolated min→max; values assumed evenly spread → skew is under-estimated.</li><li>Lab: Gold 3 → 667 (real 517) after ANALYZE; DATE equality still 25,000 (real 1,621); partition → exact 1,621.</li><li><b>Stale stats</b> still say COMPLETE (100 vs 2,000) and can flip joins (map join ↔ merge join). Analyse after every non-Hive load.</li><li><b>compute.query.using.stats:</b> COUNT(*) from metastore for managed/ACID tables (Fetch only); external tables still run a job.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Does ANALYZE TABLE lock or slow down the table?</summary><p>It reads the data (except NOSCAN) and writes only metadata. Queries can keep running. On big tables analyse new partitions only, and list the important columns in FOR COLUMNS to save time.</p></details>
+    <details><summary>Are statistics gathered automatically?</summary><p>For data written through Hive (INSERT, CTAS, and in Hive 4 also column statistics on INSERT), yes, when autogather is on. Not for files placed by other tools: Spark (unless it updates Hive statistics), DistCp, hdfs dfs -put, or LOAD DATA in some cases.</p></details>
+    <details><summary>What are KLL histograms in Hive 4?</summary><p>Hive 4 can store KLL sketches as histograms for numeric columns (<code>hive.stats.kll.enable</code>). They are meant to improve range estimates on skewed data. In our lab, switching it on and re-analysing did not change the estimates of our queries, so measure on your own data before relying on it.</p></details>
+    <details><summary>Does Spark use Hive statistics?</summary><p>Spark SQL reads table statistics from the metastore when its own CBO is enabled, and has its own ANALYZE TABLE command that writes statistics in Spark’s format. Engines do not always read each other’s column statistics, so analyse with the engine that will query the table.</p></details>
+    <details><summary>Can I set statistics by hand?</summary><p>Yes, for example <code>ALTER TABLE t SET TBLPROPERTIES ('numRows'='…')</code> or ALTER TABLE … UPDATE STATISTICS. It is useful for testing plans, but in production hand-written numbers become stale too; prefer ANALYZE.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs that reproduce the optimiser’s statistics arithmetic, with the HiveQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Equality estimate</h4></div>
+      <p>Estimate rows for plan = 'Gold' with 2,000 rows and 3 distinct plans.</p>
+      <div class="prob__io"><div><small>Input</small><pre>2,000 and 3</pre></div><div><small>Expected output</small><pre>667</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(2000 / 3))</code></pre><div class="output">667</div></div>
+        <p><b>How it works:</b> 667, the estimate after ANALYZE TABLE customers COMPUTE STATISTICS FOR COLUMNS.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Estimate error</h4></div>
+      <p>How many times off was the date estimate?</p>
+      <div class="prob__io"><div><small>Input</small><pre>estimate 25,000, actual 1,621</pre></div><div><small>Expected output</small><pre>15.4</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(25000 / 1621, 1))</code></pre><div class="output">15.4</div></div>
+        <p><b>How it works:</b> 15.4×. Partitioning by date gave an exact estimate.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Stale ratio</h4></div>
+      <p>Metastore says 100 rows, COUNT(*) says 2,000. How stale?</p>
+      <div class="prob__io"><div><small>Input</small><pre>100 and 2,000</pre></div><div><small>Expected output</small><pre>20.0 x more rows than the statistics say</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(2000 / 100, &quot;x more rows than the statistics say&quot;)</code></pre><div class="output">20.0 x more rows than the statistics say</div></div>
+        <p><b>How it works:</b> Fix with ANALYZE TABLE cust_stale COMPUTE STATISTICS (or NOSCAN for ORC).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Distinct per column</h4></div>
+      <p>Compute NDV per column from a small sample, like FOR COLUMNS does.</p>
+      <div class="prob__io"><div><small>Input</small><pre>sample rows</pre></div><div><small>Expected output</small><pre>city 3
+plan 3</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>rows = [(&quot;Pune&quot;, &quot;Gold&quot;), (&quot;Mumbai&quot;, &quot;Basic&quot;), (&quot;Pune&quot;, &quot;Silver&quot;), (&quot;Delhi&quot;, &quot;Gold&quot;)]
+for i, col in enumerate([&quot;city&quot;, &quot;plan&quot;]):
+    print(col, len({r[i] for r in rows}))</code></pre><div class="output">city 3
+plan 3</div></div>
+        <p><b>How it works:</b> Hive uses HyperLogLog sketches to approximate NDV without keeping every value.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Range estimate</h4></div>
+      <p>Estimate rows for order_date > '2026-10-28' with 30 days between min and max.</p>
+      <div class="prob__io"><div><small>Input</small><pre>50,000 rows, 10-01 to 10-30</pre></div><div><small>Expected output</small><pre>3448</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>rows, days_total, days_after = 50000, 29, 2
+print(round(rows * days_after / days_total))</code></pre><div class="output">3448</div></div>
+        <p><b>How it works:</b> 3,448: exactly what Hive 4.2.1 printed for this range filter.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Partitions to analyse</h4></div>
+      <p>List partitions loaded today by Spark that need ANALYZE.</p>
+      <div class="prob__io"><div><small>Input</small><pre>load log</pre></div><div><small>Expected output</small><pre>ANALYZE TABLE orders PARTITION (d=&#x27;2026-10-27&#x27;) COMPUTE STATISTICS FOR COLUMNS;
+ANALYZE TABLE orders PARTITION (d=&#x27;2026-10-27b&#x27;) COMPUTE STATISTICS FOR COLUMNS;</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>log = [(&quot;2026-10-26&quot;, &quot;hive&quot;), (&quot;2026-10-27&quot;, &quot;spark&quot;), (&quot;2026-10-27b&quot;, &quot;spark&quot;)]
+for p, engine in log:
+    if engine != &quot;hive&quot;:
+        print(f&quot;ANALYZE TABLE orders PARTITION (d=&#x27;{p}&#x27;) COMPUTE STATISTICS FOR COLUMNS;&quot;)</code></pre><div class="output">ANALYZE TABLE orders PARTITION (d=&#x27;2026-10-27&#x27;) COMPUTE STATISTICS FOR COLUMNS;
+ANALYZE TABLE orders PARTITION (d=&#x27;2026-10-27b&#x27;) COMPUTE STATISTICS FOR COLUMNS;</div></div>
+        <p><b>How it works:</b> Hive writes are covered by autogather; other engines are not.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Broadcast risk</h4></div>
+      <p>For each dimension, would a stale estimate cause a broadcast of a table that is really too big?</p>
+      <div class="prob__io"><div><small>Input</small><pre>stats size, real size, 10 MB threshold</pre></div><div><small>Expected output</small><pre>stores     ok
+customers  RISK
+plans      ok</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>threshold = 10_000_000
+dims = {&quot;stores&quot;: (2e6, 3e6), &quot;customers&quot;: (5e6, 900e6), &quot;plans&quot;: (1e4, 1e4)}
+for d, (s, r) in dims.items():
+    risky = s &lt;= threshold &lt; r
+    print(f&quot;{d:10}&quot;, &quot;RISK&quot; if risky else &quot;ok&quot;)</code></pre><div class="output">stores     ok
+customers  RISK
+plans      ok</div></div>
+        <p><b>How it works:</b> customers is the risk: analyse it before the next report run.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Cost of ANALYZE vs benefit</h4></div>
+      <p>ANALYZE of a new partition takes about 1 s; a wrong join plan costs 10 minutes once a week. Worth it?</p>
+      <div class="prob__io"><div><small>Input</small><pre>illustrative</pre></div><div><small>Expected output</small><pre>ANALYZE per week: 7 s  vs  bad plan: 600 s</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>analyze_s_per_day = 1
+bad_plan_s_per_week = 600
+print(&quot;ANALYZE per week:&quot;, analyze_s_per_day * 7, &quot;s  vs  bad plan:&quot;, bad_plan_s_per_week, &quot;s&quot;)</code></pre><div class="output">ANALYZE per week: 7 s  vs  bad plan: 600 s</div></div>
+        <p><b>How it works:</b> 7 seconds against 10 minutes: refreshing statistics is almost always cheaper than a bad plan. Our partition ANALYZE took about 1 second.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Statistics questions separate people who tune by guessing from people who read plans.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Hive</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is the CBO in Hive?”</h4>
+      <p class="scn__situation">Explain the cost-based optimiser.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you connect CBO with statistics?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>The cost-based optimiser, based on Apache Calcite, chooses join order and join methods by estimating the cost of different plans. Costs come from statistics in the metastore: row counts and column statistics like distinct values, nulls, min and max. Gather them with ANALYZE TABLE … COMPUTE STATISTICS and … FOR COLUMNS; check them with DESCRIBE FORMATTED and in EXPLAIN.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Describing CBO without mentioning statistics.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Join started failing with out-of-memory</h4>
+      <p class="scn__situation">A daily join suddenly fails in map tasks with memory errors. The SQL did not change; a dimension table grew a lot.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you connect a memory failure to statistics?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>EXPLAIN: is the dimension broadcast (BROADCAST_EDGE, Map Join)? What size does the plan think it has?</li>
+          <li>Compare numRows/totalSize in the metastore with reality: likely stale (files written by another tool).</li>
+          <li>ANALYZE the table; the planner switches to a shuffle join. Add ANALYZE to the loading job.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Only raising container memory.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Analytics</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Estimates wrong even with statistics</h4>
+      <p class="scn__situation">EXPLAIN ANALYZE shows estimates 10× off on a table with full column statistics.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know the limits of statistics?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Statistics are averages: skewed values and correlated filters break the even-spread assumption.</li>
+          <li>Check whether the filter is on a partition column (exact counts) or could be.</li>
+          <li>If the plan choice is still right, accept the gap; if not, use hints or settings for that query, or redesign (partitioning, skew handling).</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> “Run ANALYZE again” when statistics are already fresh.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Statistics policy</h4>
+      <p class="scn__situation">Define how statistics are maintained across a warehouse fed by Hive, Spark and file drops.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you design a process, not a one-off fix?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Autogather on for Hive writes; per-partition ANALYZE … FOR COLUMNS (key columns) at the end of every non-Hive load.</li>
+          <li>Nightly health check comparing numRows with sampled counts; alert on large gaps.</li>
+          <li>Plan checks in CI flag Col:NONE/PARTIAL on critical tables.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Analysing every table nightly regardless of change.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

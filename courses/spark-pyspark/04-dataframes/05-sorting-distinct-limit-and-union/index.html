@@ -1,0 +1,1390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sorting, distinct, limit and union | MyPhatshala</title>
+<meta name="description" content="orderBy, sortWithinPartitions, limit, distinct and union in PySpark 4.3.0 on 5 million orders: a global sort that shuffled 120 MiB in 6.7 s against 2.0 s with no shuffle within partitions, where nulls go, a top-5 query planned as TakeOrderedAndProject in 0.8 s, exact versus approximate distinct counts (3,999 vs 3,985), union matching columns by position so that &quot;Card&quot; became a city, unionByName with allowMissingColumns, and intersect, subtract and exceptAll.">
+<meta name="mp:minutes" content="30">
+<link rel="canonical" href="https://myphatshala.in/courses/spark-pyspark/04-dataframes/05-sorting-distinct-limit-and-union/">
+<meta property="og:title" content="Sorting, distinct, limit and union · MyPhatshala">
+<meta property="og:description" content="union matches columns by position: our &quot;Card&quot; became a city with no error. Plus a top-5 of 5M rows in 0.8 s with no shuffle. Sorting, distinct, limit and union, measured.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Sorting, distinct, limit and union", "learningResourceType": "Lesson", "educationalLevel": "Beginner → Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Spark and PySpark", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="04-dataframes/05-sorting-distinct-limit-and-union" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Spark and PySpark syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Spark and PySpark</a><span>›</span><b>Lesson 4.5</b></nav>
+    <h1>Sorting, distinct, limit and union</h1>
+    <p class="lead">Sorting, de-duplicating, taking the top rows and stacking DataFrames are everyday operations with very different costs, and one of them, <code>union</code>, has a silent trap. This lesson measures them on 5 million orders. <b>All outputs are real</b> (PySpark 4.3.0).</p>
+    <div class="lesson-meta"><span>Module 4 · DataFrames</span><span>⏱ 30 min</span><span>Beginner → Intermediate</span><span>PySpark 4.3.0</span><span>5M orders timed</span><span>union trap reproduced</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Why is Card a city?”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> shuffles in <a href="../../02-rdds/04-narrow-vs-wide-and-the-shuffle/">2.4</a>, duplicates in <a href="../04-nulls-and-duplicates/">4.4</a>.</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo merged orders from its app and from a partner. Both feeds had <code>order_id, city, payment</code>, but the partner wrote <code>payment</code> before <code>city</code>. After <code>app.union(partner)</code> the city report showed thousands of orders from “Card” and “UPI”. No error, no warning.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Sorting, distinct, limit and union look simple but differ greatly in cost and correctness. We timed them on 5 million orders and merged two feeds whose columns were in a different order.">
+        <text x="14" y="32" font-size="6.8" font-weight="700" class="s-ink2">partition 1</text><rect x="14" y="36" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="31.0" y="47" text-anchor="middle" font-size="6.8" class="s-ink mono">530</text><rect x="51" y="36" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="68.0" y="47" text-anchor="middle" font-size="6.8" class="s-ink mono">120</text><rect x="88" y="36" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="105.0" y="47" text-anchor="middle" font-size="6.8" class="s-ink mono">840</text><text x="14" y="68" font-size="6.8" font-weight="700" class="s-ink2">partition 2</text><rect x="14" y="72" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="31.0" y="83" text-anchor="middle" font-size="6.8" class="s-ink mono">300</text><rect x="51" y="72" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="68.0" y="83" text-anchor="middle" font-size="6.8" class="s-ink mono">760</text><rect x="88" y="72" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="105.0" y="83" text-anchor="middle" font-size="6.8" class="s-ink mono">210</text><path d="M130 62L170 62" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M163.7 65.0L170 62L163.7 59.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><text x="150" y="54" text-anchor="middle" font-size="6.8" class="s-ink2">orderBy</text><text x="176" y="32" font-size="6.8" font-weight="700" class="s-ink2">after: p1</text><rect x="176" y="36" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="193.0" y="47" text-anchor="middle" font-size="6.8" class="s-ink mono">120</text><rect x="213" y="36" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="230.0" y="47" text-anchor="middle" font-size="6.8" class="s-ink mono">210</text><rect x="250" y="36" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="267.0" y="47" text-anchor="middle" font-size="6.8" class="s-ink mono">300</text><text x="176" y="68" font-size="6.8" font-weight="700" class="s-ink2">p2</text><rect x="176" y="72" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="193.0" y="83" text-anchor="middle" font-size="6.8" class="s-ink mono">530</text><rect x="213" y="72" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="230.0" y="83" text-anchor="middle" font-size="6.8" class="s-ink mono">760</text><rect x="250" y="72" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="267.0" y="83" text-anchor="middle" font-size="6.8" class="s-ink mono">840</text><rect x="400" y="12" width="232" height="132" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="516" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured</text><text x="412" y="52" font-size="7.2" class="s-acc mono">orderBy 5M rows: 6.7 s, 120 MiB</text><text x="412" y="68" font-size="7.2" class="s-green mono">sortWithinPartitions: 2.0 s, 0</text><text x="412" y="84" font-size="7.2" class="s-green mono">orderBy+limit(5): 0.8 s, no shuffle</text><text x="412" y="100" font-size="7.2" class="s-ink mono">countDistinct 3999, approx 3985</text><text x="412" y="116" font-size="7.2" class="s-red mono">union by position: Card in city</text><text x="412" y="132" font-size="7.2" class="s-green mono">unionByName: correct</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">A global sort is a <tspan font-weight="700" class="s-acc">shuffle</tspan>; union matches columns by <tspan font-weight="700" class="s-acc">position</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, the columns have the same names. Why did Spark mix them?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Because <code>union</code> matches columns by <b>position</b>, like SQL <code>UNION ALL</code>. Names are ignored. <code>unionByName</code> matches by name.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>And Riya’s top-5 query takes a second, but sorting the full table takes much longer. Isn’t it the same sort?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>No. Spark knows it only needs five rows and never sorts the rest. Today: sorting and its shuffle, nulls in sort order, limit, distinct counts and every kind of union, with timings on 5 million orders. All outputs are real (PySpark 4.3.0).</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Ordering and combining DataFrames</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><code>orderBy</code> (alias <code>sort</code>) returns a DataFrame totally ordered by the given expressions; Spark implements it with a <b>range-partitioning shuffle</b> (sampling the data to choose partition boundaries) followed by a sort within each partition. Ascending order places nulls first and descending order places them last unless specified. <code>sortWithinPartitions</code> sorts each partition without a shuffle. <code>limit(n)</code> returns at most n rows; combined with <code>orderBy</code> it is planned as a top-k operator (<code>TakeOrderedAndProject</code>) that keeps only n rows per partition. <code>distinct</code> removes duplicate rows via an aggregation (a shuffle). <code>union</code> returns all rows of two DataFrames with the same number of columns, <b>resolving columns by position</b> and keeping duplicates (SQL UNION ALL); <code>unionByName</code> resolves by name. <code>intersect</code>, <code>subtract</code> (EXCEPT DISTINCT) and <code>exceptAll</code> implement set operations.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>A full sort moves data between machines and is expensive; sorting within partitions or taking a top-N is cheap. distinct also needs a shuffle. union simply stacks two DataFrames by column position, so columns must be in the same order; unionByName lines them up by name.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>orderBy / sort</b><span>Global order; range shuffle.</span></div>
+    <div class="term"><b>sortWithinPartitions</b><span>Order inside each partition; no shuffle.</span></div>
+    <div class="term"><b>TakeOrderedAndProject</b><span>Top-k plan for orderBy + limit.</span></div>
+    <div class="term"><b>nulls first / last</b><span>Where nulls go in the order.</span></div>
+    <div class="term"><b>approx_count_distinct</b><span>HyperLogLog estimate of distinct values.</span></div>
+    <div class="term"><b>union</b><span>Stack rows by column position (UNION ALL).</span></div>
+    <div class="term"><b>unionByName</b><span>Stack rows by column name.</span></div>
+    <div class="term"><b>exceptAll</b><span>Subtract keeping duplicates.</span></div>
+  </div>
+
+  <h3>What each operation costs</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th>Operation</th><th>Shuffle?</th><th>Lab (5M orders)</th></tr></thead>
+    <tbody><tr><td><code>orderBy</code> / <code>sort</code></td><td>Yes (range) + sampling</td><td>6.7 s, 120.1 MiB</td></tr><tr><td><code>sortWithinPartitions</code></td><td>No</td><td>2.0 s, 0 MiB</td></tr><tr><td><code>orderBy(…).limit(5)</code></td><td>No (top-k per partition)</td><td>0.8 s</td></tr><tr><td><code>limit(5)</code></td><td>No</td><td>0.12 s</td></tr><tr><td><code>distinct</code> / <code>countDistinct</code></td><td>Yes (aggregation)</td><td>3,999 customers, 0.6–0.9 s</td></tr><tr><td><code>approx_count_distinct</code></td><td>Small (sketches)</td><td>3,985 (0.35% off)</td></tr><tr><td><code>union</code></td><td>No</td><td>partitions add up: 2 + 3 = 5</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Sort, distinct, limit and union at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Exam answer sheets</h4>
+      <ul>
+        <li>Sorting all sheets of a whole school by marks means collecting them from every class (a shuffle). Sorting inside each class is quick.</li>
+        <li>Finding the top 5 does not need a full sort: each class sends its own top 5 and you pick from those.</li>
+        <li>Stacking two piles of sheets works only if both forms have their boxes in the same order.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The API</h4>
+      <ul>
+        <li><code>orderBy</code>/<code>sort</code> (global, shuffle), <code>sortWithinPartitions</code> (no shuffle); <code>F.desc</code>, <code>asc_nulls_last</code> etc.</li>
+        <li><code>limit(n)</code>, <code>distinct()</code>, <code>F.countDistinct</code>, <code>F.approx_count_distinct</code>.</li>
+        <li><code>union</code> (by position, keeps duplicates), <code>unionByName(allowMissingColumns=True)</code>, <code>intersect</code>, <code>subtract</code>, <code>exceptAll</code>.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>Sorting 5M orders: 6.7 s and 120 MiB of shuffle; <code>sortWithinPartitions</code>: 2.0 s and no shuffle.</li>
+        <li><code>orderBy().limit(5)</code> became <b>TakeOrderedAndProject</b>: 0.8 s, no shuffle.</li>
+        <li>Same-typed columns in a different order were unioned silently into the wrong columns; <code>unionByName</code> fixed it.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “union vs unionByName?” <code>union</code> matches columns by position and keeps duplicates (UNION ALL); with same-typed columns in a different order it silently puts values in the wrong columns. <code>unionByName</code> matches by name and, with <code>allowMissingColumns=True</code>, fills missing columns with null. Use <code>distinct()</code> after union for SQL UNION semantics.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Set operations</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Method</th><th>SQL</th><th>Duplicates</th><th>Lab (x = 0..5, y = 3..8)</th></tr></thead>
+    <tbody><tr><td><code>union</code> / <code>unionAll</code></td><td>UNION ALL</td><td>kept</td><td>12 rows, 9 distinct</td></tr><tr><td><code>union().distinct()</code></td><td>UNION</td><td>removed</td><td>9</td></tr><tr><td><code>unionByName</code></td><td>—</td><td>kept</td><td>by name</td></tr><tr><td><code>intersect</code></td><td>INTERSECT</td><td>removed</td><td>[3, 4, 5]</td></tr><tr><td><code>intersectAll</code></td><td>INTERSECT ALL</td><td>kept</td><td></td></tr><tr><td><code>subtract</code></td><td>EXCEPT</td><td>removed</td><td>[0, 1, 2]</td></tr><tr><td><code>exceptAll</code></td><td>EXCEPT ALL</td><td>kept</td><td>[1,1,2] − [1] = [1, 2]</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p><code>limit(n)</code> without <code>orderBy</code> returns <b>some</b> n rows, not the first n of a file or of any order. It is fine for a peek; it is wrong for “latest 10 orders”. Always pair a meaningful limit with an <code>orderBy</code>, and add a tiebreaker column if values can repeat.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Sorting 5 million orders and merging two feeds</h2>
+  <p>All outputs are real: PySpark 4.3.0, local mode with 2 cores, <code>orders_big</code> (5,000,000 rows in Parquet, 2 partitions), 8 shuffle partitions. Timings write to the <code>noop</code> sink so that no output cost is included.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · A global sort is a shuffle</h4>
+      <div class="code" data-lang="python" data-file="l45_sort.py"><pre><code>big.orderBy(F.desc(&quot;amount&quot;)).write.format(&quot;noop&quot;).mode(&quot;overwrite&quot;).save()
+big.sort(&quot;amount&quot;).write.format(&quot;noop&quot;).mode(&quot;overwrite&quot;).save()
+big.sortWithinPartitions(F.desc(&quot;amount&quot;)).write.format(&quot;noop&quot;).mode(&quot;overwrite&quot;).save()
+# stages and shuffle bytes from the REST API</code></pre><div class="output">== 1) orderBy vs sort vs sortWithinPartitions (write to noop)
+orderBy(amount desc)  :  6.7 s, new stages 4, shuffle write 120.1 MiB
+sort(&#x27;amount&#x27;)        :  7.0 s, new stages 4, shuffle write 120.1 MiB
+sortWithinPartitions  :  2.0 s, new stages 1, shuffle write 0.0 MiB</div></div>
+      <span class="behind"><code>orderBy</code> and <code>sort</code> are the same operation: 4 new stages (a sampling job to choose range boundaries, then the shuffle) and <b>120 MiB</b> written to shuffle files, 6.7–7.0 s. <code>sortWithinPartitions</code> kept every row on its executor: one stage, no shuffle, 2.0 s. Use it when each output file only needs to be sorted inside, for example before writing Parquet for better compression.</span></li>
+    <li><h4>Step 2 · Where nulls go</h4>
+      <div class="code" data-lang="python" data-file="l45_sort.py"><pre><code>d = spark.createDataFrame([(1, 300), (2, None), (3, 120)], &quot;id INT, amount INT&quot;)
+d.orderBy(&quot;amount&quot;); d.orderBy(F.desc(&quot;amount&quot;)); d.orderBy(F.asc_nulls_last(&quot;amount&quot;))
+df.orderBy(&quot;city&quot;, F.desc(&quot;n&quot;))</code></pre><div class="output">== 2) nulls in sort order
+asc            : [None, 120, 300]
+desc           : [300, 120, None]
+asc_nulls_last : [120, 300, None]
+multi-column   : [(&#x27;Delhi&#x27;, 9), (&#x27;Pune&#x27;, 7), (&#x27;Pune&#x27;, 5)]</div></div>
+      <span class="behind">Ascending puts nulls <b>first</b>, descending puts them <b>last</b>: a “cheapest orders” report would start with the unknown ones. <code>asc_nulls_last</code>, <code>desc_nulls_first</code> and friends make it explicit. Multiple columns sort left to right, each with its own direction.</span></li>
+    <li><h4>Step 3 · limit and top-N</h4>
+      <div class="code" data-lang="python" data-file="l45_sort.py"><pre><code>top = big.orderBy(F.desc(&quot;amount&quot;)).limit(5)
+top.collect()
+big.limit(5).collect()
+top.explain()      # TakeOrderedAndProject</code></pre><div class="output">== 3) limit
+orderBy+limit(5): 0.8 s, shuffle 0.0 MiB
+limit(5) only   : 0.12 s</div></div>
+      <span class="behind">Top 5 of 5 million took <b>0.8 s with no shuffle</b>: the plan is <code>TakeOrderedAndProject</code>, which keeps the 5 largest rows per partition and merges them on the driver. A plain <code>limit(5)</code> (plan <code>CollectLimit</code>) read just enough to return five rows: 0.12 s. Compare with the 6.7 s full sort in Step 1.</span></li>
+    <li><h4>Step 4 · distinct and counting distinct values</h4>
+      <div class="code" data-lang="python" data-file="l45_sort.py"><pre><code>big.select(&quot;customer_id&quot;).distinct().count()
+big.select(F.countDistinct(&quot;customer_id&quot;)).first()
+big.select(F.approx_count_distinct(&quot;customer_id&quot;)).first()</code></pre><div class="output">== 4) distinct and countDistinct
+distinct().count()    : 3999 in 0.89 s
+countDistinct         : 3999 in 0.57 s
+approx_count_distinct : 3985 in 0.77 s</div></div>
+      <span class="behind">Both exact methods found 3,999 customers; both need a shuffle. <code>approx_count_distinct</code> (HyperLogLog, default 5% maximum error) said 3,985, 0.35% off. On billions of rows and in streaming the approximate version is much cheaper, because it shuffles small sketches instead of values.</span></li>
+    <li><h4>Step 5 · union matches by position</h4>
+      <div class="code" data-lang="python" data-file="l45_sort.py"><pre><code>a = spark.createDataFrame([(1, &quot;Pune&quot;, 450)], &quot;order_id INT, city STRING, amount INT&quot;)
+b2 = spark.createDataFrame([(2, 380, &quot;Delhi&quot;)], &quot;order_id INT, amount INT, city STRING&quot;)
+a.union(b2).show()                            # types differ
+s1 = …&quot;order_id INT, city STRING, payment STRING&quot;
+s2 = …&quot;order_id INT, payment STRING, city STRING&quot;
+s1.union(s2).show(); s1.unionByName(s2).show(); a.unionByName(b2).show()
+a.unionByName(c); a.unionByName(c, allowMissingColumns=True)</code></pre><div class="output">== 5) union is by position
+union: NumberFormatException [CAST_INVALID_INPUT] The value &#x27;Pune&#x27; of the type &quot;STRING&quot; cannot be cast to &quot;BIGINT&quot; because it is malforme …
+same types, different order -&gt; no error:
++--------+----+-------+
+|order_id|city|payment|
++--------+----+-------+
+|       1|Pune|    UPI|
+|       2|Card|  Delhi|
++--------+----+-------+
++--------+-----+-------+
+|order_id| city|payment|
++--------+-----+-------+
+|       1| Pune|    UPI|
+|       2|Delhi|   Card|
++--------+-----+-------+
++--------+-----+------+
+|order_id| city|amount|
++--------+-----+------+
+|       1| Pune|   450|
+|       2|Delhi|   380|
++--------+-----+------+
+unionByName missing col: AnalysisException [UNRESOLVED_COLUMN_AMONG_FIELD_NAMES] Cannot resolve column name &quot;amount&quot; among (order_id, cit …
++--------+----+------+
+|order_id|city|amount|
++--------+----+------+
+|       1|Pune|   450|
+|       3|Pune|  NULL|
++--------+----+------+</div></div>
+      <span class="behind">When the types clash, union tried to cast <code>Pune</code> to a number and ANSI mode stopped it. When the types match, there is <b>no error</b>: <code>Card</code> landed in <code>city</code> and <code>Delhi</code> in <code>payment</code>, exactly the bug in our story. <code>unionByName</code> put every value in the right column; a missing column was an error until <code>allowMissingColumns=True</code> filled it with null.</span></li>
+    <li><h4>Step 6 · Duplicates and set operations</h4>
+      <div class="code" data-lang="python" data-file="l45_sort.py"><pre><code>x = spark.range(0, 6, 1, 2); y = spark.range(3, 9, 1, 3)
+u = x.union(y); u.count(), u.distinct().count(), u.rdd.getNumPartitions()
+x.intersect(y); x.subtract(y)
+z.subtract(w); z.exceptAll(w)</code></pre><div class="output">== 6) union keeps duplicates; partitions add up
+union rows: 12 | distinct: 9 | partitions: 5
+intersect: [3, 4, 5] | subtract: [0, 1, 2]
+subtract : [2] | exceptAll: [1, 2]</div></div>
+      <span class="behind"><code>union</code> kept the overlapping 3, 4, 5 twice: 12 rows, 9 distinct. It did not shuffle; it simply concatenated the partitions, so 2 + 3 = <b>5 partitions</b>. Repeated unions of many small DataFrames therefore create many partitions (and long lineages, Lesson 3.3). <code>subtract</code> removed duplicates as well, <code>exceptAll</code> removed one copy per match.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Order costs a shuffle; union trusts positions</h2>
+  <p>Left: real outputs. Right: what moves between partitions.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Order costs a shuffle; union trusts positions <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">orderBy             : 6.7 s, 120 MiB</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">sortWithinPartitions: 2.0 s, 0 MiB</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">asc            : [None, 120, 300]</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">desc           : [300, 120, None]</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">asc_nulls_last : [120, 300, None]</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">orderBy+limit(5): 0.8 s, no shuffle</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">plan: TakeOrderedAndProject</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">limit(5) only   : 0.12 s</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">countDistinct        : 3999</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">approx_count_distinct: 3985</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">union      : 2 | Card | Delhi</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">unionByName: 2 | Delhi | Card</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">union rows 12, partitions 5</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The global sort shuffled 120 MiB.</li>
+          <li>Nulls first ascending, last descending.</li>
+          <li>Top 5 without sorting everything.</li>
+          <li>Exact vs approximate distinct.</li>
+          <li>union mixed columns silently.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What moves">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Range shuffle for a global order</text><text x="20" y="36" font-size="6.8" font-weight="700" class="s-ink2">p1</text><rect x="20" y="40" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="37.0" y="51" text-anchor="middle" font-size="6.8" class="s-ink mono">530</text><rect x="57" y="40" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="74.0" y="51" text-anchor="middle" font-size="6.8" class="s-ink mono">120</text><rect x="94" y="40" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="111.0" y="51" text-anchor="middle" font-size="6.8" class="s-ink mono">840</text><text x="20" y="72" font-size="6.8" font-weight="700" class="s-ink2">p2</text><rect x="20" y="76" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="37.0" y="87" text-anchor="middle" font-size="6.8" class="s-ink mono">300</text><rect x="57" y="76" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="74.0" y="87" text-anchor="middle" font-size="6.8" class="s-ink mono">760</text><rect x="94" y="76" width="34" height="16" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="111.0" y="87" text-anchor="middle" font-size="6.8" class="s-ink mono">210</text><path d="M140 66L196 66" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M189.7 69.0L196 66L189.7 63.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><text x="204" y="36" font-size="6.8" font-weight="700" class="s-ink2">low range</text><rect x="204" y="40" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="221.0" y="51" text-anchor="middle" font-size="6.8" class="s-ink mono">120</text><rect x="241" y="40" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="258.0" y="51" text-anchor="middle" font-size="6.8" class="s-ink mono">210</text><rect x="278" y="40" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="295.0" y="51" text-anchor="middle" font-size="6.8" class="s-ink mono">300</text><text x="204" y="72" font-size="6.8" font-weight="700" class="s-ink2">high range</text><rect x="204" y="76" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="221.0" y="87" text-anchor="middle" font-size="6.8" class="s-ink mono">530</text><rect x="241" y="76" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="258.0" y="87" text-anchor="middle" font-size="6.8" class="s-ink mono">760</text><rect x="278" y="76" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="295.0" y="87" text-anchor="middle" font-size="6.8" class="s-ink mono">840</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Every row may move.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nulls have a place</text><text x="40" y="46" font-size="6.8" font-weight="700" class="s-ink2">asc</text><rect x="40" y="50" width="60" height="20" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="70.0" y="61" text-anchor="middle" font-size="6.8" class="s-ink mono">null</text><rect x="103" y="50" width="60" height="20" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="133.0" y="61" text-anchor="middle" font-size="6.8" class="s-ink mono">120</text><rect x="166" y="50" width="60" height="20" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="196.0" y="61" text-anchor="middle" font-size="6.8" class="s-ink mono">300</text><text x="40" y="92" font-size="6.8" font-weight="700" class="s-ink2">asc_nulls_last</text><rect x="40" y="96" width="60" height="20" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="70.0" y="107" text-anchor="middle" font-size="6.8" class="s-ink mono">120</text><rect x="103" y="96" width="60" height="20" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="133.0" y="107" text-anchor="middle" font-size="6.8" class="s-ink mono">300</text><rect x="166" y="96" width="60" height="20" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="196.0" y="107" text-anchor="middle" font-size="6.8" class="s-ink mono">null</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Say where nulls go.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Top-k per partition</text><text x="20" y="36" font-size="6.8" font-weight="700" class="s-ink2">p1 top</text><rect x="20" y="40" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="37.0" y="51" text-anchor="middle" font-size="6.8" class="s-ink mono">840</text><rect x="57" y="40" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="74.0" y="51" text-anchor="middle" font-size="6.8" class="s-ink mono">530</text><text x="20" y="72" font-size="6.8" font-weight="700" class="s-ink2">p2 top</text><rect x="20" y="76" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="37.0" y="87" text-anchor="middle" font-size="6.8" class="s-ink mono">760</text><rect x="57" y="76" width="34" height="16" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="74.0" y="87" text-anchor="middle" font-size="6.8" class="s-ink mono">300</text><path d="M110 66L190 66" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M183.7 69.0L190 66L183.7 63.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="196" y="52" width="120" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="256.0" y="63" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">driver</text><text x="256.0" y="73" text-anchor="middle" font-size="6.4" class="s-ink2 mono">merge 4 rows</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No full sort, no shuffle.</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Distinct needs grouping</text><rect x="8" y="40" width="96" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="56.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">values</text><text x="56.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">5M</text><rect x="126" y="40" width="96" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="174.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">shuffle</text><text x="174.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">by value</text><path d="M104 55.0L126 55.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M119.7 58.0L126 55.0L119.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="244" y="40" width="96" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="292.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">3,999</text><text x="292.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">exact</text><path d="M222 55.0L244 55.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M237.7 58.0L244 55.0L237.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="8" y="90" width="96" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="56.0" y="101" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">sketches</text><text x="56.0" y="111" text-anchor="middle" font-size="6.4" class="s-ink2 mono">small</text><rect x="126" y="90" width="96" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="174.0" y="101" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">3,985</text><text x="174.0" y="111" text-anchor="middle" font-size="6.4" class="s-ink2 mono">approx</text><path d="M104 105.0L126 105.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M119.7 108.0L126 105.0L119.7 102.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Exact or approximate.</text></g><g data-on="5"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Position, not name</text><text x="20" y="36" font-size="6.8" font-weight="700" class="s-ink2">app</text><rect x="20" y="40" width="50" height="18" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="45.0" y="51" text-anchor="middle" font-size="6.8" class="s-ink mono">id</text><rect x="73" y="40" width="50" height="18" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="98.0" y="51" text-anchor="middle" font-size="6.8" class="s-ink mono">city</text><rect x="126" y="40" width="50" height="18" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="151.0" y="51" text-anchor="middle" font-size="6.8" class="s-ink mono">pay</text><text x="20" y="78" font-size="6.8" font-weight="700" class="s-ink2">partner</text><rect x="20" y="82" width="50" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="45.0" y="93" text-anchor="middle" font-size="6.8" class="s-ink mono">id</text><rect x="73" y="82" width="50" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="98.0" y="93" text-anchor="middle" font-size="6.8" class="s-ink mono">pay</text><rect x="126" y="82" width="50" height="18" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="151.0" y="93" text-anchor="middle" font-size="6.8" class="s-ink mono">city</text><text x="200" y="60" font-size="7.6" class="s-red mono">union: col 2 = col 2</text><text x="200" y="92" font-size="7.6" class="s-green mono">byName: city = city</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Use unionByName for feeds.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Range partitions, then local sorts.</li>
+          <li>Explicit null ordering.</li>
+          <li>TakeOrderedAndProject.</li>
+          <li>Aggregation or HyperLogLog sketches.</li>
+          <li>union ignores column names.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: payment methods that became cities, a global sort nobody needed, and exact counts on a dashboard.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-union">Payment methods became cities</h3>
+  <p class="anim-intro">union by position. (Behaviour from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">union by position <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="union ignores names; same-typed columns in a different order are silently swapped; use unionByName">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">App feed + partner feed</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">app.union(partner)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same column names.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">City report: “Card”, “UPI”</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">thousands of orders</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No error anywhere.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Partner order: payment, city</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">union matched by position</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Like our Step 5.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">unionByName</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">app.unionByName(partner)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Columns matched by name.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Check values too</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">city IN (known cities)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Catch the next surprise.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Two feeds.</li>
+          <li>Wrong report.</li>
+          <li>Positions differ.</li>
+          <li>unionByName.</li>
+          <li>Validate.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-sort">A global sort nobody needed</h3>
+  <p class="anim-intro">Avoiding unnecessary shuffles. (Timings from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Unneeded global sort <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A global orderBy shuffles all data; sort within partitions or partition the output instead">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly export sorted by date</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">df.orderBy("order_date").write…</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Takes 40 minutes.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nobody needs a global order</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">files are read by date filter</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Only order inside files.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">sortWithinPartitions</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">no range shuffle</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">6.7 s → 2.0 s in our lab.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or partitionBy("order_date")</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">folders per date (Lesson 5.3)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Pruning instead of sorting.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Sort only when it matters</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">final reports, top-N</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Not by habit.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Global sort.</li>
+          <li>Not needed.</li>
+          <li>Local sort.</li>
+          <li>Partition.</li>
+          <li>Sort on purpose.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-hll">Exact counts nobody needed</h3>
+  <p class="anim-intro">Approximate distinct counts. (Typical; accuracy from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Approximate distinct <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="HyperLogLog sketches estimate distinct counts cheaply; use exact counts only where they are required">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Daily active users, every minute</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">countDistinct(user_id) on 2B events</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cluster busy all day.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Exact distinct shuffles values</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">every user id moves</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Expensive.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">approx_count_distinct</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">rsd=0.01 for 1% error</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Sketches, not values.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Dashboard is fine with ±1%</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">our lab: 0.35% off</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Much cheaper.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Exact for billing</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">once a day, countDistinct</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Right tool per question.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Heavy query.</li>
+          <li>Shuffles values.</li>
+          <li>Approximate.</li>
+          <li>Good enough.</li>
+          <li>Exact for billing.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Sorting and combining at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-blue">top-N</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">reports</text></svg></div>
+    <div><h4>1. Leaderboards</h4>
+      <p>Top restaurants, top cities and top customers are orderBy + limit: cheap top-k plans.</p>
+      <div class="uc-flow"><span>Aggregate</span><i>→</i><span class="java">orderBy + limit</span><i>→</i><span>Top 10</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-green">feeds</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">merge</text></svg></div>
+    <div><h4>2. Merging feeds</h4>
+      <p>Data from apps, partners and regions is combined with unionByName and allowMissingColumns.</p>
+      <div class="uc-flow"><span>Feeds</span><i>→</i><span class="java">unionByName</span><i>→</i><span>One table</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-violet">DAU</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">HLL</text></svg></div>
+    <div><h4>3. Active-user metrics</h4>
+      <p>Product dashboards use approx_count_distinct for daily and monthly active users.</p>
+      <div class="uc-flow"><span>Events</span><i>→</i><span class="java">approx distinct</span><i>→</i><span>DAU</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">diff</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">reconcile</text></svg></div>
+    <div><h4>4. Reconciliation</h4>
+      <p>exceptAll between yesterday’s and today’s snapshots lists added and removed records.</p>
+      <div class="uc-flow"><span>Two snapshots</span><i>→</i><span class="java">exceptAll</span><i>→</i><span>Differences</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">files</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">sorted</text></svg></div>
+    <div><h4>5. Better compressed files</h4>
+      <p>Data is sorted within partitions before writing Parquet so similar values compress well and min/max stats skip more.</p>
+      <div class="uc-flow"><span>DataFrame</span><i>→</i><span class="java">sortWithinPartitions</span><i>→</i><span>Parquet</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: union vs unionByName</h2>
+  <p>A model of Step 5. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># union by position vs unionByName (plain Python model)
+app     = {&quot;cols&quot;: [&quot;order_id&quot;, &quot;city&quot;, &quot;payment&quot;], &quot;rows&quot;: [(1, &quot;Pune&quot;, &quot;UPI&quot;)]}
+partner = {&quot;cols&quot;: [&quot;order_id&quot;, &quot;payment&quot;, &quot;city&quot;], &quot;rows&quot;: [(2, &quot;Card&quot;, &quot;Delhi&quot;)]}
+
+def union(a, b):                  # by position: b&#x27;s names are ignored
+    return a[&quot;rows&quot;] + b[&quot;rows&quot;]
+
+def union_by_name(a, b):
+    idx = [b[&quot;cols&quot;].index(c) for c in a[&quot;cols&quot;]]
+    return a[&quot;rows&quot;] + [tuple(r[i] for i in idx) for r in b[&quot;rows&quot;]]
+
+print(&quot;columns    :&quot;, app[&quot;cols&quot;])
+print(&quot;union      :&quot;, union(app, partner))
+print(&quot;unionByName:&quot;, union_by_name(app, partner))</code></pre><div class="output">columns    : [&#x27;order_id&#x27;, &#x27;city&#x27;, &#x27;payment&#x27;]
+union      : [(1, &#x27;Pune&#x27;, &#x27;UPI&#x27;), (2, &#x27;Card&#x27;, &#x27;Delhi&#x27;)]
+unionByName: [(1, &#x27;Pune&#x27;, &#x27;UPI&#x27;), (2, &#x27;Delhi&#x27;, &#x27;Card&#x27;)]</div></div>
+  <ul class="anno"><li><code>def union(a, b):                  # by position: b&#x27;s names are ignored</code><span>In our lab, Card landed in city with no error.</span></li><li><code>    idx = [b[&quot;cols&quot;].index(c) for c in a[&quot;cols&quot;]]</code><span>unionByName looks each column up by name.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Then add a partner column \"tip\" and handle it like allowMissingColumns.",
+   "code": "# union by position vs unionByName (plain Python model)\napp     = {\"cols\": [\"order_id\", \"city\", \"payment\"], \"rows\": [(1, \"Pune\", \"UPI\")]}\npartner = {\"cols\": [\"order_id\", \"payment\", \"city\"], \"rows\": [(2, \"Card\", \"Delhi\")]}\n\ndef union(a, b):                  # by position: b's names are ignored\n    return a[\"rows\"] + b[\"rows\"]\n\ndef union_by_name(a, b):\n    idx = [b[\"cols\"].index(c) for c in a[\"cols\"]]\n    return a[\"rows\"] + [tuple(r[i] for i in idx) for r in b[\"rows\"]]\n\nprint(\"columns    :\", app[\"cols\"])\nprint(\"union      :\", union(app, partner))\nprint(\"unionByName:\", union_by_name(app, partner))\n"
+  },
+  {
+   "label": "2 · Predict first: top-k",
+   "hint": "<b>Predict first:<\/b> how many rows reach the driver for top 5 with 2 partitions?",
+   "code": "partitions, k = 2, 5\nprint(partitions * k, \"rows merged on the driver (TakeOrderedAndProject)\")\n"
+  },
+  {
+   "label": "3 · Nulls in order",
+   "hint": "Sort with None first (ascending) and last.",
+   "code": "vals = [300, None, 120]\nprint(sorted(vals, key=lambda v: (v is not None, v or 0)))\nprint(sorted(vals, key=lambda v: (v is None, v or 0)))\n"
+  },
+  {
+   "label": "4 · Set operations",
+   "hint": "intersect, subtract and union counts.",
+   "code": "x, y = set(range(0, 6)), set(range(3, 9))\nprint(sorted(x & y), sorted(x - y), len(list(range(0, 6)) + list(range(3, 9))), len(x | y))\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This job takes the \"latest 10 orders\" without ordering.",
+   "code": "query = \"orders.limit(10)\"\nassert \"orderBy\" in query, \"limit without orderBy returns any 10 rows: add orderBy(desc('order_ts'), 'order_id')\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: sorting and unions</h3>
+  <p>In the <code>pyspark</code> shell. <b>Outputs are real</b> (PySpark 4.3.0).</p>
+  <div class="pcrun"><h4>1 · Nulls in order</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>[r.amount for r in d.orderBy(&quot;amount&quot;).collect()]</code></pre><div class="output">[None, 120, 300]</div></div>
+  <p class="muted">Ascending: nulls first.</p></div>
+  <div class="pcrun"><h4>2 · union keeps duplicates</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>u = spark.range(0, 6, 1, 2).union(spark.range(3, 9, 1, 3))
+u.count(), u.distinct().count(), u.rdd.getNumPartitions()</code></pre><div class="output">(12, 9, 5)</div></div>
+  <p class="muted">Partitions add up.</p></div>
+  <div class="pcrun"><h4>3 · exceptAll</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>sorted(r.id for r in z.exceptAll(w).collect())</code></pre><div class="output">[1, 2]</div></div>
+  <p class="muted">subtract would give [2].</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>How top-k avoids a full sort</h2>
+  <p>Follow each partition sending only its own top rows.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "p1, p2 = [530, 120, 840], [300, 760, 210]",
+  "k = 2",
+  "local = sorted(p1, reverse=True)[:k] + sorted(p2, reverse=True)[:k]",
+  "top = sorted(local, reverse=True)[:k]",
+  "print(local, top)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>p1<\/code> is created: → list #1. <code>p2<\/code> is created: → list #2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "p1",
+       "→ list #1"
+      ],
+      [
+       "p2",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [530, 120, 840]",
+    "<b>#2 list (3)<\/b> [300, 760, 210]"
+   ],
+   "newVar": "p2"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>k<\/code> is created: 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "p1",
+       "→ list #1"
+      ],
+      [
+       "p2",
+       "→ list #2"
+      ],
+      [
+       "k",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [530, 120, 840]",
+    "<b>#2 list (3)<\/b> [300, 760, 210]"
+   ],
+   "newVar": "k"
+  },
+  {
+   "line": 3,
+   "phase": "Per partition",
+   "note": "Each partition keeps only k rows. <code>local<\/code> is created: → list #3. A new list object (#3) is created: [840, 530, 760, 300]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "p1",
+       "→ list #1"
+      ],
+      [
+       "p2",
+       "→ list #2"
+      ],
+      [
+       "k",
+       "2"
+      ],
+      [
+       "local",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [530, 120, 840]",
+    "<b>#2 list (3)<\/b> [300, 760, 210]",
+    "<b>#3 list (4)<\/b> [840, 530, 760, 300]"
+   ],
+   "newVar": "local"
+  },
+  {
+   "line": 4,
+   "phase": "Driver",
+   "note": "Merges 2 × k rows instead of sorting all. <code>top<\/code> is created: → list #4. A new list object (#4) is created: [840, 760]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "p1",
+       "→ list #1"
+      ],
+      [
+       "p2",
+       "→ list #2"
+      ],
+      [
+       "k",
+       "2"
+      ],
+      [
+       "local",
+       "→ list #3"
+      ],
+      [
+       "top",
+       "→ list #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [530, 120, 840]",
+    "<b>#2 list (3)<\/b> [300, 760, 210]",
+    "<b>#3 list (4)<\/b> [840, 530, 760, 300]",
+    "<b>#4 list (2)<\/b> [840, 760]"
+   ],
+   "newVar": "top"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "p1",
+       "→ list #1"
+      ],
+      [
+       "p2",
+       "→ list #2"
+      ],
+      [
+       "k",
+       "2"
+      ],
+      [
+       "local",
+       "→ list #3"
+      ],
+      [
+       "top",
+       "→ list #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [530, 120, 840]",
+    "<b>#2 list (3)<\/b> [300, 760, 210]",
+    "<b>#3 list (4)<\/b> [840, 530, 760, 300]",
+    "<b>#4 list (2)<\/b> [840, 760]"
+   ],
+   "out": "[840, 530, 760, 300] [840, 760]\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three tasks from TiffinGo reports.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Sorting · basics</span></div>
+    <h4>Top 3 cities by revenue</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Return the three cities with the highest revenue.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>city revenue</pre></div><div><small>Expected output</small><pre>[(&#x27;Mumbai&#x27;, 2712820), (&#x27;Bengaluru&#x27;, 2499060), (&#x27;Pune&#x27;, 2148270)]</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>groupBy + sum.</li><li>orderBy desc.</li><li>limit(3).</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Revenue from Lesson 4.1.",
+   "code": "rev = {\"Mumbai\": 2712820, \"Bengaluru\": 2499060, \"Pune\": 2148270, \"Delhi\": 1501340}\nprint(sorted(rev.items(), key=lambda kv: -kv[1])[:3])\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "rev = {\"Mumbai\": 2712820, \"Bengaluru\": 2499060, \"Pune\": 2148270, \"Delhi\": 1501340}",
+  "print(sorted(rev.items(), key=lambda kv: -kv[1])[:3])"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>rev<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rev",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Mumbai&#x27;: 2712820, &#x27;Bengaluru&#x27;: 2499060, &#x27;Pune&#x27;: 2148270, &#x27;Delhi&#x27;: 1501340}"
+   ],
+   "newVar": "rev"
+  },
+  {
+   "line": 2,
+   "phase": "Top-k",
+   "note": "In Spark this is TakeOrderedAndProject, no full sort. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rev",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Mumbai&#x27;: 2712820, &#x27;Bengaluru&#x27;: 2499060, &#x27;Pune&#x27;: 2148270, &#x27;Delhi&#x27;: 1501340}"
+   ],
+   "out": "[('Mumbai', 2712820), ('Bengaluru', 2499060), ('Pune', 2148270)]\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Union · feeds</span></div>
+    <h4>Merge three regional feeds safely</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Combine feeds whose columns differ in order and one lacks tip.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>north, south, west</pre></div><div><small>Expected output</small><pre>from functools import reduce
+feeds = [north, south, west]
+orders = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), feeds)</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>unionByName.</li><li>allowMissingColumns=True.</li><li>Validate city values.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 5: union put Card in city.",
+   "code": "print(\"\"\"from functools import reduce\nfeeds = [north, south, west]\norders = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), feeds)\"\"\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print(\"\"\"from functools import reduce",
+  "feeds = [north, south, west]",
+  "orders = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), feeds)\"\"\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "from functools import reduce\nfeeds = [north, south, west]\norders = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), feeds)\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Set ops · reconciliation</span></div>
+    <h4>What changed since yesterday?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>List orders added and removed between two snapshots.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>yesterday, today</pre></div><div><small>Expected output</small><pre>added [104, 104] removed [101]</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>today.exceptAll(yesterday) = added.</li><li>yesterday.exceptAll(today) = removed.</li><li>exceptAll keeps duplicates honest.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "subtract would hide the duplicate 104.",
+   "code": "yesterday, today = [101, 102, 103], [102, 103, 104, 104]\nadded = [x for x in today if x not in yesterday]\nremoved = [x for x in yesterday if x not in today]\nprint(\"added\", added, \"removed\", removed)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "yesterday, today = [101, 102, 103], [102, 103, 104, 104]",
+  "added = [x for x in today if x not in yesterday]",
+  "removed = [x for x in yesterday if x not in today]",
+  "print(\"added\", added, \"removed\", removed)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>yesterday<\/code> is created: → list #1. <code>today<\/code> is created: → list #2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "yesterday",
+       "→ list #1"
+      ],
+      [
+       "today",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [101, 102, 103]",
+    "<b>#2 list (4)<\/b> [102, 103, 104, 104]"
+   ],
+   "newVar": "today"
+  },
+  {
+   "line": 2,
+   "phase": "exceptAll",
+   "note": "A repeated 104 shows up twice, like exceptAll.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "yesterday",
+       "→ list #1"
+      ],
+      [
+       "today",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [101, 102, 103]",
+    "<b>#2 list (4)<\/b> [102, 103, 104, 104]"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "yesterday",
+       "→ list #1"
+      ],
+      [
+       "today",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [101, 102, 103]",
+    "<b>#2 list (4)<\/b> [102, 103, 104, 104]"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "yesterday",
+       "→ list #1"
+      ],
+      [
+       "today",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [101, 102, 103]",
+    "<b>#2 list (4)<\/b> [102, 103, 104, 104]"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "yesterday",
+       "→ list #1"
+      ],
+      [
+       "today",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [101, 102, 103]",
+    "<b>#2 list (4)<\/b> [102, 103, 104, 104]"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>added<\/code> is created: → list #3. A new list object (#3) is created: [104, 104]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "yesterday",
+       "→ list #1"
+      ],
+      [
+       "today",
+       "→ list #2"
+      ],
+      [
+       "added",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [101, 102, 103]",
+    "<b>#2 list (4)<\/b> [102, 103, 104, 104]",
+    "<b>#3 list (2)<\/b> [104, 104]"
+   ],
+   "newVar": "added"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "yesterday",
+       "→ list #1"
+      ],
+      [
+       "today",
+       "→ list #2"
+      ],
+      [
+       "added",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [101, 102, 103]",
+    "<b>#2 list (4)<\/b> [102, 103, 104, 104]",
+    "<b>#3 list (2)<\/b> [104, 104]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "yesterday",
+       "→ list #1"
+      ],
+      [
+       "today",
+       "→ list #2"
+      ],
+      [
+       "added",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [101, 102, 103]",
+    "<b>#2 list (4)<\/b> [102, 103, 104, 104]",
+    "<b>#3 list (2)<\/b> [104, 104]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "yesterday",
+       "→ list #1"
+      ],
+      [
+       "today",
+       "→ list #2"
+      ],
+      [
+       "added",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [101, 102, 103]",
+    "<b>#2 list (4)<\/b> [102, 103, 104, 104]",
+    "<b>#3 list (2)<\/b> [104, 104]"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>removed<\/code> is created: → list #4. A new list object (#4) is created: [101]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "yesterday",
+       "→ list #1"
+      ],
+      [
+       "today",
+       "→ list #2"
+      ],
+      [
+       "added",
+       "→ list #3"
+      ],
+      [
+       "removed",
+       "→ list #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [101, 102, 103]",
+    "<b>#2 list (4)<\/b> [102, 103, 104, 104]",
+    "<b>#3 list (2)<\/b> [104, 104]",
+    "<b>#4 list (1)<\/b> [101]"
+   ],
+   "newVar": "removed"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "yesterday",
+       "→ list #1"
+      ],
+      [
+       "today",
+       "→ list #2"
+      ],
+      [
+       "added",
+       "→ list #3"
+      ],
+      [
+       "removed",
+       "→ list #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [101, 102, 103]",
+    "<b>#2 list (4)<\/b> [102, 103, 104, 104]",
+    "<b>#3 list (2)<\/b> [104, 104]",
+    "<b>#4 list (1)<\/b> [101]"
+   ],
+   "out": "added [104, 104] removed [101]\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: Is sort() different from orderBy()?",
+  "options": [
+   "Yes",
+   "sort is local",
+   "No, aliases",
+   "orderBy is approximate"
+  ],
+  "answer": 2,
+  "why": "Same plan."
+ },
+ {
+  "q": "Beginner: Where do nulls go in ascending order?",
+  "options": [
+   "Last",
+   "First",
+   "Removed",
+   "Random"
+  ],
+  "answer": 1,
+  "why": "[None, 120, 300]."
+ },
+ {
+  "q": "Beginner: union matches columns by…",
+  "options": [
+   "Position",
+   "Name",
+   "Type",
+   "Alphabet"
+  ],
+  "answer": 0,
+  "why": "Like UNION ALL."
+ },
+ {
+  "q": "Intermediate: What did orderBy + limit(5) become?",
+  "options": [
+   "Full sort",
+   "CollectLimit",
+   "Exchange",
+   "TakeOrderedAndProject"
+  ],
+  "answer": 3,
+  "why": "0.8 s, no shuffle."
+ },
+ {
+  "q": "Intermediate: sortWithinPartitions…",
+  "options": [
+   "Shuffles",
+   "Is approximate",
+   "Sorts each partition without a shuffle",
+   "Returns one partition"
+  ],
+  "answer": 2,
+  "why": "2.0 s vs 6.7 s."
+ },
+ {
+  "q": "Intermediate: union of 2 and 3 partitions has…",
+  "options": [
+   "2",
+   "5",
+   "3",
+   "200"
+  ],
+  "answer": 1,
+  "why": "No shuffle; partitions concatenate."
+ },
+ {
+  "q": "Advanced: Why use approx_count_distinct?",
+  "options": [
+   "It shuffles small sketches instead of values",
+   "It is exact",
+   "It sorts",
+   "It caches"
+  ],
+  "answer": 0,
+  "why": "3,985 vs 3,999 here."
+ },
+ {
+  "q": "Advanced: z = [1,1,2], w = [1]. z.exceptAll(w) gives…",
+  "options": [
+   "[2]",
+   "[1, 1, 2]",
+   "[]",
+   "[1, 2]"
+  ],
+  "answer": 3,
+  "why": "Removes one copy per match."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 4.5 in one screen</h3>
+    <ul><li><code>orderBy</code> = <code>sort</code>: range shuffle + sampling (5M rows: 6.7 s, 120 MiB).</li><li><code>sortWithinPartitions</code>: no shuffle (2.0 s).</li><li>Ascending → nulls first; descending → nulls last; use <code>asc_nulls_last</code> etc.</li><li><code>orderBy().limit(k)</code> → <b>TakeOrderedAndProject</b> (0.8 s); <code>limit</code> without order = any rows.</li><li><code>distinct</code>/<code>countDistinct</code> shuffle; <code>approx_count_distinct</code> uses sketches.</li><li><code>union</code> = by <b>position</b>, keeps duplicates; <code>unionByName(allowMissingColumns=True)</code>.</li><li>Set ops: <code>intersect</code>, <code>subtract</code>, <code>exceptAll</code>, <code>intersectAll</code>.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Is unionAll different from union?</summary><p>No. In DataFrames both keep duplicates; unionAll is an older alias.</p></details>
+    <details><summary>Does orderBy before write keep the order in files?</summary><p>Rows are sorted across output files, but readers do not guarantee order unless they sort again. Sort when you read for a report.</p></details>
+    <details><summary>How does Spark choose range boundaries?</summary><p>It samples the data (the extra job we saw) and picks boundaries so partitions are roughly equal; skewed keys can still make one partition large.</p></details>
+    <details><summary>Is limit cheap on any plan?</summary><p>Only when Spark can stop early. After a wide transformation such as groupBy, the whole input is still processed.</p></details>
+    <details><summary>Can I sort by an expression?</summary><p>Yes: <code>df.orderBy(F.length("city").desc())</code> or <code>df.orderBy(F.expr("amount * 1.05"))</code>.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs about order, distinct values and set operations.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Shuffle saved</h4></div>
+      <p>Seconds saved by sorting within partitions.</p>
+      <div class="prob__io"><div><small>Input</small><pre>6.7 vs 2.0</pre></div><div><small>Expected output</small><pre>4.7</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(6.7 - 2.0, 1))</code></pre><div class="output">4.7</div></div>
+        <p><b>How it works:</b> No range shuffle.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Approx error</h4></div>
+      <p>Relative error of the estimate.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3,985 vs 3,999</pre></div><div><small>Expected output</small><pre>0.35%</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{abs(3985 - 3999) / 3999:.2%}&quot;)</code></pre><div class="output">0.35%</div></div>
+        <p><b>How it works:</b> Well inside the default 5%.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Top 2</h4></div>
+      <p>Top 2 amounts.</p>
+      <div class="prob__io"><div><small>Input</small><pre>[530, 120, 840, 300]</pre></div><div><small>Expected output</small><pre>[840, 530]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(sorted([530, 120, 840, 300], reverse=True)[:2])</code></pre><div class="output">[840, 530]</div></div>
+        <p><b>How it works:</b> orderBy(desc).limit(2).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>UNION semantics</h4></div>
+      <p>Rows after UNION (distinct) of two lists.</p>
+      <div class="prob__io"><div><small>Input</small><pre>0..5 and 3..8</pre></div><div><small>Expected output</small><pre>9</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(len(set(range(0, 6)) | set(range(3, 9))))</code></pre><div class="output">9</div></div>
+        <p><b>How it works:</b> union().distinct() = 9.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Reorder columns</h4></div>
+      <p>Reorder a row to match another column order.</p>
+      <div class="prob__io"><div><small>Input</small><pre>partner order</pre></div><div><small>Expected output</small><pre>(2, &#x27;Delhi&#x27;, &#x27;Card&#x27;)</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>target = [&quot;order_id&quot;, &quot;city&quot;, &quot;payment&quot;]
+src = {&quot;order_id&quot;: 2, &quot;payment&quot;: &quot;Card&quot;, &quot;city&quot;: &quot;Delhi&quot;}
+print(tuple(src[c] for c in target))</code></pre><div class="output">(2, &#x27;Delhi&#x27;, &#x27;Card&#x27;)</div></div>
+        <p><b>How it works:</b> What unionByName does.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Partitions after unions</h4></div>
+      <p>Partitions after unioning 30 daily DataFrames of 4 partitions.</p>
+      <div class="prob__io"><div><small>Input</small><pre>30 × 4</pre></div><div><small>Expected output</small><pre>120</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(30 * 4)</code></pre><div class="output">120</div></div>
+        <p><b>How it works:</b> Coalesce afterwards if they are small.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Wrong city orders</h4></div>
+      <p>Share of orders in a fake city after the bad union.</p>
+      <div class="prob__io"><div><small>Input</small><pre>partner 12,000 of 62,000</pre></div><div><small>Expected output</small><pre>19.4%</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{12000 / 62000:.1%}&quot;)</code></pre><div class="output">19.4%</div></div>
+        <p><b>How it works:</b> All partner rows were affected.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Leaderboard</h4></div>
+      <p>Top 3 restaurants by orders.</p>
+      <div class="prob__io"><div><small>Input</small><pre>counts</pre></div><div><small>Expected output</small><pre>[&#x27;Patel Thali&#x27;, &#x27;Desai Mess&#x27;, &#x27;Nair Bhojanalay&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>c = {&quot;Desai Mess&quot;: 812, &quot;Nair Bhojanalay&quot;: 790, &quot;Patel Thali&quot;: 845, &quot;Rao Tiffins&quot;: 640}
+print(sorted(c, key=c.get, reverse=True)[:3])</code></pre><div class="output">[&#x27;Patel Thali&#x27;, &#x27;Desai Mess&#x27;, &#x27;Nair Bhojanalay&#x27;]</div></div>
+        <p><b>How it works:</b> groupBy, count, orderBy, limit.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">These operations look simple; interviewers ask about their cost and traps.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · PySpark</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“union vs unionByName?”</h4>
+      <p class="scn__situation">What is the difference between union and unionByName?</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know resolution rules?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p><code>union</code> stacks rows by column position and keeps duplicates; it does not check names, so same-typed columns in another order get mixed silently. <code>unionByName</code> matches names and can fill missing columns with <code>allowMissingColumns=True</code>.</p>
+        <p class="scn__avoid"><b>Avoid:</b> “union removes duplicates.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>Top N efficiently</h4>
+      <p class="scn__situation">Return the 10 biggest orders out of a billion.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know top-k planning?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li><code>orderBy(F.desc("amount")).limit(10)</code>.</li>
+          <li>Spark plans TakeOrderedAndProject: k rows per partition, merged on the driver.</li>
+          <li>No full sort; 0.8 s on 5M rows in my test.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Sorting everything and calling take(10) on a cached result.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Slow orderBy before write</h4>
+      <p class="scn__situation">A job sorts all data before writing and is slow.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you remove unnecessary shuffles?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Ask whether a global order is needed.</li>
+          <li>Use sortWithinPartitions or partitionBy on write.</li>
+          <li>Our lab: 6.7 s and 120 MiB vs 2.0 s and 0.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Increasing executors first.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Analytics</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Distinct users at scale</h4>
+      <p class="scn__situation">Dashboards count distinct users on billions of events every few minutes.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know approximate algorithms?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>approx_count_distinct (HyperLogLog) with a chosen rsd.</li>
+          <li>Pre-aggregate sketches per hour/day where possible.</li>
+          <li>Exact counts only for billing or audits.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Exact distinct everywhere.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Spark and PySpark syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/spark-pyspark.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

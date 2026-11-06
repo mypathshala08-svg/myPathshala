@@ -1,0 +1,4734 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Partitioning: make Hive read only the folders you need | MyPhatshala</title>
+<meta name="description" content="Hive partitioning explained with real Hive 4.2.1 results: PARTITIONED BY, static partitions with INSERT and LOAD DATA, the col=value folder layout, SHOW PARTITIONS, EXPLAIN DEPENDENCY, partition pruning proved with Tez counters (1,621 rows read instead of 50,000), multi-level partitions, ADD/RENAME/DROP PARTITION, the strict partition filter check, and two traps: filtering on the wrong column and loading data into the wrong partition.">
+<meta name="mp:minutes" content="35">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/05-partitioning-and-bucketing/01-partitioning/">
+<meta property="og:title" content="Partitioning: make Hive read only the folders you need · MyPhatshala">
+<meta property="og:description" content="A one-day query read 50,000 rows. After partitioning it read 1,621. Hive partitioning with real counters and the traps that silently undo it.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Partitioning: make Hive read only the folders you need", "learningResourceType": "Lesson", "educationalLevel": "Beginner → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="05-partitioning-and-bucketing/01-partitioning" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 5.1</b></nav>
+    <h1>Partitioning: make Hive read only the folders you need</h1>
+    <p class="lead">Partitioning is the single most important performance idea in Hive: store each day in its own folder, and a one-day query opens one folder. In this lesson Kabir builds <code>orders_by_day</code>, proves with Hive’s own counters that a one-day query now reads <b>1,621 rows instead of 50,000</b>, and finds two traps that undo partitioning without any error. <b>All outputs are real</b>, from Hive 4.2.1.</p>
+    <div class="lesson-meta"><span>Module 5 · Partitioning and bucketing</span><span>⏱ 35 min</span><span>Beginner → Advanced</span><span>Real Hive 4.2.1 outputs</span><span>Pruning proved with counters</span><span>Static partitions</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Every daily report reads the whole month”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> you need managed vs external tables (<a href="../../02-hiveql/02-managed-vs-external-tables/">2.2</a>), loading data (<a href="../../02-hiveql/05-loading-data/">2.5</a>) and how a query becomes a job (<a href="../../01-introduction/04-how-a-hive-query-becomes-a-job/">1.4</a>).</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s operations team runs the same question every morning: yesterday’s orders and revenue per city. The <code>orders</code> table holds a month of data and keeps growing. Kabir notices that a query for a single day reads all 50,000 rows, every time. At 50 lakh orders a month, that would be 50 lakh rows read to answer a one-day question.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="On the left one folder holds all orders, so a query for one day reads all 50,000 rows. On the right the table has one folder per day, and the same query opens only the 5 October folder and reads 1,621 rows.">
+        <rect x="10" y="12" width="230" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="125" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">orders: one big folder</text><rect x="24" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="41" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="58" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="75" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="92" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="109" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="126" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="143" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="160" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="177" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="194" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="211" y="44" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="24" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="41" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="58" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="75" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="92" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="109" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="126" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="143" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="160" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="177" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="194" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="211" y="58" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="24" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="41" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="58" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="75" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="92" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="109" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="126" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="143" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="160" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="177" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="194" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="211" y="72" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="24" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="41" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="58" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="75" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="92" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="109" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="126" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="143" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="160" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="177" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="194" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="211" y="86" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="24" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="41" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="58" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="75" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="92" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="109" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="126" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="143" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="160" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="177" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="194" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><rect x="211" y="100" width="13" height="10" rx="2" style="fill:var(--track)"/><text x="125" y="132" text-anchor="middle" font-size="7.2" font-weight="700" class="s-red">WHERE order_date = 10-05 → read all 50,000 rows</text><path d="M246 76L286 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M279.7 79.0L286 76L279.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="292" y="12" width="338" height="128" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="461" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-green">orders_by_day: one folder per day</text><g opacity=".3"><path d="M304 52h14l4 4h26v22h-44z" class="s-card2" style="stroke:var(--line)"/><text x="326" y="88" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-01</text></g><g opacity=".3"><path d="M350 52h14l4 4h26v22h-44z" class="s-card2" style="stroke:var(--line)"/><text x="372" y="88" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-02</text></g><g opacity=".3"><path d="M396 52h14l4 4h26v22h-44z" class="s-card2" style="stroke:var(--line)"/><text x="418" y="88" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-03</text></g><g opacity=".3"><path d="M442 52h14l4 4h26v22h-44z" class="s-card2" style="stroke:var(--line)"/><text x="464" y="88" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-04</text></g><g><path d="M488 52h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="510" y="88" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-05</text></g><g opacity=".3"><path d="M534 52h14l4 4h26v22h-44z" class="s-card2" style="stroke:var(--line)"/><text x="556" y="88" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-06</text></g><g opacity=".3"><path d="M580 52h14l4 4h26v22h-44z" class="s-card2" style="stroke:var(--line)"/><text x="602" y="88" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-07</text></g><text x="461" y="112" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">order_date=2026-10-05/ only</text><text x="461" y="132" text-anchor="middle" font-size="7.6" font-weight="700" class="s-green">read 1,621 rows instead of 50,000</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">A partition is just a <tspan font-weight="700" class="s-acc">sub-folder</tspan>. Filter on it, and Hive opens only the folders you need.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, the WHERE clause says one day. Why does Hive still read everything?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Because the table is one folder of files, and Hive cannot know which file holds which day without opening it. If we store each day in <b>its own sub-folder</b>, <code>order_date=2026-10-05/</code>, Hive reads the folder name and skips the others. That is <b>partitioning</b>.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So the date is in the folder name, not inside the file?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Exactly. The partition column lives in the metastore and the path; the data files hold only the other columns. Today we build <code>orders_by_day</code>, prove with Hive’s own counters that a one-day query reads 1,621 rows instead of 50,000, and find two ways to lose that benefit without noticing. All outputs are real, from Hive 4.2.1.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Partitioning in Hive</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Partitioning</b> divides a table into parts based on the values of one or more <b>partition columns</b>, declared with <code>PARTITIONED BY (col type, …)</code>. Each distinct combination of values is a <b>partition</b>, stored as a separate sub-directory of the table location named <code>col=value</code> and registered in the metastore. Partition columns are virtual: they are not stored inside the data files, but can be queried like normal columns. When a query filters on partition columns, Hive reads only the matching partitions; this is called <b>partition pruning</b>.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>You tell Hive to keep each day (or city, or month) in its own folder. When you ask for one day, Hive opens only that folder and skips the rest, so the query reads much less data.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Partition column</b><span>The column in <code>PARTITIONED BY</code>; its value is the folder name, not data in the file.</span></div>
+    <div class="term"><b>Partition</b><span>One value (or combination) of the partition columns, e.g. <code>order_date=2026-10-05</code>.</span></div>
+    <div class="term"><b>Partition pruning</b><span>Skipping partitions that the WHERE clause rules out, before any file is read.</span></div>
+    <div class="term"><b>Static partition</b><span>You write the value in the statement: <code>PARTITION (dt='2026-10-03')</code>.</span></div>
+    <div class="term"><b>Dynamic partition</b><span>Hive takes the value from the last SELECT column (Lesson 5.2).</span></div>
+    <div class="term"><b>Multi-level partition</b><span><code>PARTITIONED BY (order_date, city)</code> → <code>order_date=…/city=…/</code>.</span></div>
+    <div class="term"><b>EXPLAIN DEPENDENCY</b><span>Shows the tables and partitions a query will read.</span></div>
+    <div class="term"><b>RECORDS_IN_Map_1</b><span>Tez counter: how many rows the first stage really read.</span></div>
+  </div>
+
+  <h3>The proof: same answer, very different work (real Tez counters)</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Table and filter</th><th>Answer</th><th>Rows read</th><th>Folders read</th></tr></thead>
+    <tbody><tr><td><code>orders</code> (not partitioned), <code>order_date='2026-10-05'</code></td><td>230</td><td>50,000</td><td>1</td></tr><tr><td><code>orders_by_day</code>, <code>order_date='2026-10-05'</code></td><td>230</td><td><b>1,621</b></td><td><b>1</b> of 30</td></tr><tr><td><code>orders_by_day</code>, <code>to_date(order_ts)='2026-10-05'</code></td><td>230</td><td>50,000</td><td>30 of 30</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Partitioning at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Files sorted into labelled boxes</h4>
+      <ul>
+        <li>Imagine a month of bills in one big box. To find 5 October’s bills you must look at every bill.</li>
+        <li>Now keep one box per day, with the date written on it. You open only the “5 October” box.</li>
+        <li>In Hive the box is a folder like <code>order_date=2026-10-05</code>, and the label is the <b>partition column</b>. You choose it with <code>PARTITIONED BY</code> when you create the table.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How Hive uses partitions</h4>
+      <ul>
+        <li>Every partition is a row in the metastore (table <code>PARTITIONS</code>) pointing to its folder. <code>SHOW PARTITIONS t;</code> lists them.</li>
+        <li>When WHERE filters on the partition column, the planner asks the metastore for the matching partitions only. This is <b>partition pruning</b>; <code>EXPLAIN DEPENDENCY</code> shows which partitions a query will read.</li>
+        <li><b>Static partition:</b> you name the value: <code>INSERT … PARTITION (order_date='2026-10-05') SELECT …</code> or <code>LOAD DATA … PARTITION (dt='…')</code>. <b>Dynamic:</b> Hive takes the value from the data (Lesson 5.2).</li>
+        <li>Partitions can nest: <code>PARTITIONED BY (order_date DATE, city STRING)</code> creates <code>order_date=…/city=…/</code>.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the planner can and cannot prune</h4>
+      <ul>
+        <li>In our lab Hive 4.2.1 pruned even through functions on the partition column: <code>date_format(order_date,'EEE')='Sat'</code> read 4 partitions, <code>order_date &gt;= date_sub(current_date, 3)</code> read 7.</li>
+        <li>It <b>cannot</b> prune on a different column that “means the same”: <code>to_date(order_ts)='2026-10-05'</code> read all 30 folders and 50,000 rows, although the answer was identical. It also cannot prune when the filter is <code>OR</code>-ed with a non-partition condition.</li>
+        <li>Static partitions are <b>trusted</b>, not checked: loading 3 October’s file into <code>dt='2026-10-04'</code> succeeded and duplicated 1,668 orders.</li>
+        <li>Safety switch: <code>SET hive.strict.checks.no.partition.filter=true</code> rejects queries on partitioned tables without a partition filter (Error 10056). Default in 4.2.1: false.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “What is partitioning and why is it used?” Say: it splits a table into sub-directories by the value of a column; queries that filter on that column read only the matching directories (partition pruning), so they scan less data. Partition columns are not stored in the data files. Then name static vs dynamic partitions.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Ways to create and fill partitions</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:720px">
+    <thead><tr><th>Way</th><th>Statement</th><th>Good for</th></tr></thead>
+    <tbody><tr><td>Static INSERT</td><td><code>INSERT INTO t PARTITION (order_date='2026-10-01') SELECT … WHERE order_date = '2026-10-01'</code></td><td>Daily jobs that load one known day</td></tr><tr><td>Static LOAD</td><td><code>LOAD DATA LOCAL INPATH 'f.csv' INTO TABLE t PARTITION (dt='2026-10-03')</code></td><td>Landing a file that belongs to one day</td></tr><tr><td>Dynamic INSERT</td><td><code>INSERT OVERWRITE TABLE t PARTITION (order_date) SELECT …, order_date FROM orders</code></td><td>Back-filling many days at once (5.2)</td></tr><tr><td>Mixed (static + dynamic)</td><td><code>PARTITION (order_date='2026-10-05', city)</code></td><td>One day, split by city automatically</td></tr><tr><td>Empty partition</td><td><code>ALTER TABLE t ADD PARTITION (order_date='2026-10-31')</code></td><td>Pre-creating folders, external data</td></tr></tbody>
+  </table>
+  </div>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+    <tbody><tr><td><code>SHOW PARTITIONS t [PARTITION (col='v')]</code></td><td>Lists partitions, optionally filtered</td></tr><tr><td><code>DESCRIBE FORMATTED t PARTITION (col='v')</code></td><td>Location, numFiles, numRows, totalSize of one partition</td></tr><tr><td><code>ALTER TABLE t ADD [IF NOT EXISTS] PARTITION (…) [LOCATION '…']</code></td><td>Registers a partition (and its folder)</td></tr><tr><td><code>ALTER TABLE t PARTITION (…) RENAME TO PARTITION (…)</code></td><td>Changes the value and moves the folder</td></tr><tr><td><code>ALTER TABLE t DROP [IF EXISTS] PARTITION (col &gt;= 'v')</code></td><td>Removes one or a range of partitions</td></tr><tr><td><code>EXPLAIN DEPENDENCY SELECT …</code></td><td>Which partitions the query will read</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Choose a partition column with a <b>moderate</b> number of values that queries filter on: date is the classic choice. Partitioning by <code>customer_id</code> (2,000 values) or <code>order_id</code> (50,000) creates thousands of tiny folders and makes every query slower. Lesson 5.4 covers design.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Kabir builds orders_by_day</h2>
+  <p>All outputs are real, from the Hive 4.2.1 lab (database <code>tiffingo</code>).</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Create the table and load two days with static partitions</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE orders_by_day (
+  order_id INT, customer_id INT, city STRING, order_ts TIMESTAMP,
+  amount DECIMAL(10,2), payment STRING, status STRING)
+PARTITIONED BY (order_date DATE)
+STORED AS ORC;
+
+INSERT INTO orders_by_day PARTITION (order_date=&#x27;2026-10-01&#x27;)
+SELECT order_id, customer_id, city, order_ts, amount, payment, status
+FROM orders WHERE order_date = &#x27;2026-10-01&#x27;;
+-- same for 2026-10-02
+
+SHOW PARTITIONS orders_by_day;
+SELECT order_date, COUNT(*) AS n FROM orders_by_day GROUP BY order_date;</code></pre><div class="output">+------------------------+
+|       partition        |
++------------------------+
+| order_date=2026-10-01  |
+| order_date=2026-10-02  |
++------------------------+
++-------------+-------+
+| order_date  |   n   |
++-------------+-------+
+| 2026-10-01  | 1641  |
+| 2026-10-02  | 1617  |
++-------------+-------+</div></div>
+      <span class="behind"><code>order_date</code> is <b>not</b> in the column list; it appears only in <code>PARTITIONED BY</code>. In a static insert the SELECT returns only the 7 data columns, and the PARTITION clause supplies the date.</span></li>
+    <li><h4>Step 2 · The partition column is in the folder name, not the file</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>DESCRIBE orders_by_day;</code></pre><div class="output">+--------------------------+----------------+----------+
+|         col_name         |   data_type    | comment  |
++--------------------------+----------------+----------+
+| order_id                 | int            |          |
+| customer_id              | int            |          |
+| city                     | string         |          |
+| order_ts                 | timestamp      |          |
+| amount                   | decimal(10,2)  |          |
+| payment                  | string         |          |
+| status                   | string         |          |
+| order_date               | date           |          |
+|                          | NULL           | NULL     |
+| # Partition Information  | NULL           | NULL     |
+| # col_name               | data_type      | comment  |
+| order_date               | date           |          |
++--------------------------+----------------+----------+
+
+$ find …/tiffingo.db/orders_by_day -type f
+…/orders_by_day/order_date=2026-10-01/000000_0
+…/orders_by_day/order_date=2026-10-02/000000_0</div></div>
+      <span class="behind">DESCRIBE lists <code>order_date</code> twice: as a queryable column, and under “# Partition Information”. On disk each day is a folder <code>order_date=…</code> with its own ORC file. The rest of October was loaded with one dynamic insert (Lesson 5.2), giving 30 partitions.</span></li>
+    <li><h4>Step 3 · Ask Hive which partitions it will read</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>EXPLAIN DEPENDENCY SELECT COUNT(*) FROM orders_by_day
+WHERE order_date = &#x27;2026-10-05&#x27;;
+
+EXPLAIN DEPENDENCY SELECT COUNT(*) FROM orders_by_day
+WHERE order_date BETWEEN &#x27;2026-10-05&#x27; AND &#x27;2026-10-07&#x27;;</code></pre><div class="output">+----------------------------------------------------+
+|                      Explain                       |
++----------------------------------------------------+
+| {&quot;input_tables&quot;:[{&quot;tablename&quot;:&quot;tiffingo@orders_by_day&quot;,&quot;tabletype&quot;:&quot;EXTERNAL_TABLE&quot;}],&quot;input_partitions&quot;:[{&quot;partitionName&quot;:&quot;tiffingo@orders_by_day@order_date=2026-10-05&quot;}]} |
++----------------------------------------------------+</div></div>
+      <span class="behind"><code>input_partitions</code> lists exactly one folder for one day and three for a three-day range. Pruning happens at <b>planning</b> time, from the metastore, before any file is opened.</span></li>
+    <li><h4>Step 4 · Prove it with Tez counters</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.tez.exec.print.summary=true;
+SELECT COUNT(*) AS n FROM orders_by_day WHERE order_date=&#x27;2026-10-05&#x27; AND city=&#x27;Pune&#x27;;
+SELECT COUNT(*) AS n FROM orders        WHERE order_date=&#x27;2026-10-05&#x27; AND city=&#x27;Pune&#x27;;</code></pre><div class="output">SELECT COUNT(*) AS n FROM orders_by_day WHERE order_date=&#x27;2026-10-05&#x27; AND city=&#x27;Pune&#x27;;
+  result 230 · RECORDS_IN 1621 · INPUT_DIRECTORIES 1 · INPUT_FILES 1
+SELECT COUNT(*) AS n FROM orders WHERE order_date=&#x27;2026-10-05&#x27; AND city=&#x27;Pune&#x27;;
+  result 230 · RECORDS_IN 50000 · INPUT_DIRECTORIES 1 · INPUT_FILES 1</div></div>
+      <span class="behind">Both queries answer 230 (Pune, 5 October, the same as Lesson 3.6). The partitioned table read <b>1,621</b> rows; the flat table read all <b>50,000</b>. That is 31 times less work for one day, and the gap grows with every month of history.</span></li>
+    <li><h4>Step 5 · Trap 1: filtering on the wrong column</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT COUNT(*) AS n FROM orders_by_day
+WHERE to_date(order_ts) = &#x27;2026-10-05&#x27; AND city = &#x27;Pune&#x27;;
+
+-- EXPLAIN DEPENDENCY, number of input partitions (real):
+--   no WHERE                                        30
+--   city = &#x27;Pune&#x27;                                   30
+--   order_date = &#x27;2026-10-05&#x27; OR city = &#x27;Pune&#x27;      30
+--   date_format(order_date, &#x27;EEE&#x27;) = &#x27;Sat&#x27;           4
+--   order_date &gt;= date_sub(current_date, 3)          7
+--   to_date(order_ts) = &#x27;2026-10-05&#x27;                30</code></pre><div class="output">SELECT COUNT(*) AS n FROM orders_by_day WHERE to_date(order_ts)=&#x27;2026-10-05&#x27; AND city=&#x27;Pune&#x27;;
+  result 230 · RECORDS_IN 50000 · INPUT_DIRECTORIES 30 · INPUT_FILES 30</div></div>
+      <span class="behind"><code>order_ts</code> holds the same day, but it is an ordinary column, so Hive must open all 30 folders. Functions on the partition column itself still pruned in 4.2.1 (4 Saturdays, the last 7 days). An <code>OR</code> with a non-partition condition disables pruning. Always filter on the partition column directly.</span></li>
+    <li><h4>Step 6 · Trap 2: static partitions are trusted, not checked</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE orders_daily_txt (order_id INT, customer_id INT, restaurant_id INT,
+  city STRING, amount INT, payment STRING, status STRING)
+PARTITIONED BY (dt STRING) ROW FORMAT DELIMITED FIELDS TERMINATED BY &#x27;,&#x27;;
+
+LOAD DATA LOCAL INPATH &#x27;/data/stage/orders_2026-10-03.csv&#x27;
+  INTO TABLE orders_daily_txt PARTITION (dt=&#x27;2026-10-03&#x27;);
+-- the next morning, a copy-paste mistake:
+LOAD DATA LOCAL INPATH &#x27;/data/stage/orders_2026-10-03.csv&#x27;
+  INTO TABLE orders_daily_txt PARTITION (dt=&#x27;2026-10-04&#x27;);
+
+SELECT dt, COUNT(*) AS n, SUM(amount) AS rev FROM orders_daily_txt GROUP BY dt ORDER BY dt;
+SELECT COUNT(*) AS same_orders_twice FROM orders_daily_txt a JOIN orders_daily_txt b
+  ON a.order_id = b.order_id AND a.dt = &#x27;2026-10-03&#x27; AND b.dt = &#x27;2026-10-04&#x27;;</code></pre><div class="output">+-------------+-------+---------+
+|     dt      |   n   |   rev   |
++-------------+-------+---------+
+| 2026-10-03  | 1668  | 493530  |
+| 2026-10-04  | 1668  | 493530  |
++-------------+-------+---------+
++--------------------+
+| same_orders_twice  |
++--------------------+
+| 1668               |
++--------------------+</div></div>
+      <span class="behind">Hive moved the file into <code>dt=2026-10-04/</code> without looking inside: the CSV has no date column, so there is nothing to check. 1,668 orders now count twice. The fix was <code>ALTER TABLE orders_daily_txt DROP PARTITION (dt='2026-10-04')</code>. Add a check in daily jobs, such as comparing <code>MIN/MAX(order_ts)</code> with the partition value.</span></li>
+    <li><h4>Step 7 · Manage partitions and switch on the safety check</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>ALTER TABLE orders_by_day ADD PARTITION (order_date=&#x27;2026-10-31&#x27;);
+ALTER TABLE orders_by_day PARTITION (order_date=&#x27;2026-10-31&#x27;)
+  RENAME TO PARTITION (order_date=&#x27;2026-11-01&#x27;);
+ALTER TABLE orders_by_day DROP IF EXISTS PARTITION (order_date &gt;= &#x27;2026-11-01&#x27;);
+
+SET hive.strict.checks.no.partition.filter=true;
+SELECT COUNT(*) FROM orders_by_day;</code></pre><div class="output">Error: Error while compiling statement: FAILED: SemanticException [Error 10056]: Queries against partitioned tables without a partition filter are disabled for safety reasons …</div></div>
+      <span class="behind"><code>ADD</code> creates an empty partition (a query on it returns 0 rows), <code>RENAME</code> moves it, and <code>DROP</code> accepts a range. With the strict check on, a query without a partition filter is refused (Error 10056): useful on shared clusters, where one forgotten filter can read years of data.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Folders, metadata and pruning</h2>
+  <p>Left: real Beeline output. Right: what the metastore, the planner and the folders do.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Folders, pruning and the two traps <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real Beeline output">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; CREATE TABLE orders_by_day (…)</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  PARTITIONED BY (order_date DATE) STORED AS ORC;</text><text x="26" y="78" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; INSERT … PARTITION (order_date=&#x27;2026-10-01&#x27;) …</text><text x="26" y="92" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SHOW PARTITIONS orders_by_day;</text><text x="26" y="106" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| order_date=2026-10-01 |</text><text x="26" y="120" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| order_date=2026-10-02 |</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; EXPLAIN DEPENDENCY … WHERE order_date = &#x27;2026-10-05&#x27;;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  &quot;input_partitions&quot;:[</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">    &quot;…@order_date=2026-10-05&quot;]</text><text x="26" y="92" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve"></text><text x="26" y="106" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  1 partition of 30</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT COUNT(*) … order_date=&#x27;2026-10-05&#x27; AND city=&#x27;Pune&#x27;;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 230 |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  RECORDS_IN_Map_1: 1621</text><text x="26" y="92" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  (flat orders table: 50000)</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … WHERE to_date(order_ts) = &#x27;2026-10-05&#x27; …</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 230 |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  RECORDS_IN_Map_1: 50000</text><text x="26" y="92" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  INPUT_DIRECTORIES_Map_1: 30</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; LOAD DATA … orders_2026-10-03.csv</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">    INTO TABLE … PARTITION (dt=&#x27;2026-10-04&#x27;);</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 2026-10-03 | 1668 | 493530 |</text><text x="26" y="92" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">| 2026-10-04 | 1668 | 493530 |</text><text x="26" y="106" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  same orders, two days</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Kabir creates the partitioned table and loads two days.</li>
+          <li>EXPLAIN DEPENDENCY: a one-day query reads one partition.</li>
+          <li>Tez counters: 1,621 rows read instead of 50,000.</li>
+          <li>Filtering on order_ts instead reads every folder.</li>
+          <li>A file loaded into the wrong partition duplicates orders.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What the metastore, the planner and the folders do">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Metastore: one row per partition</text><rect x="20" y="40" width="150" height="90" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="95" y="56" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink mono">PARTITIONS</text><text x="30" y="74" font-size="7.2" class="s-ink2 mono">order_date=2026-10-01</text><text x="30" y="88" font-size="7.2" class="s-ink2 mono">order_date=2026-10-02</text><path d="M172 82L206 82" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M199.7 85.0L206 82L199.7 79.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><g><path d="M212 56h14l4 4h26v22h-44z" class="s-card2" style="stroke:var(--line)"/><text x="234" y="92" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-01/</text></g><g><path d="M270 56h14l4 4h26v22h-44z" class="s-card2" style="stroke:var(--line)"/><text x="292" y="92" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-02/</text></g><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each partition = metastore row + folder.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">The date is not stored inside the ORC file.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Planner prunes before reading</text><rect x="18" y="46" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="48" y="62" text-anchor="middle" font-size="8" class="s-ink3 mono">10-01</text><text x="48" y="75" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="84" y="46" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="114" y="62" text-anchor="middle" font-size="8" class="s-ink3 mono">10-02</text><text x="114" y="75" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="150" y="46" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180" y="62" text-anchor="middle" font-size="8" class="s-ink3 mono">10-03</text><text x="180" y="75" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="216" y="46" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="246" y="62" text-anchor="middle" font-size="8" class="s-ink3 mono">10-04</text><text x="246" y="75" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="282" y="46" width="60" height="36" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="312" y="62" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-05</text><text x="312" y="75" text-anchor="middle" font-size="6.8" class="s-green">read</text><rect x="18" y="90" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="48" y="106" text-anchor="middle" font-size="8" class="s-ink3 mono">10-06</text><text x="48" y="119" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="84" y="90" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="114" y="106" text-anchor="middle" font-size="8" class="s-ink3 mono">10-07</text><text x="114" y="119" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="150" y="90" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180" y="106" text-anchor="middle" font-size="8" class="s-ink3 mono">10-08</text><text x="180" y="119" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="216" y="90" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="246" y="106" text-anchor="middle" font-size="8" class="s-ink3 mono">10-09</text><text x="246" y="119" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="282" y="90" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="312" y="106" text-anchor="middle" font-size="8" class="s-ink3 mono">10-10</text><text x="312" y="119" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">WHERE order_date = 10-05 → one folder</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">decided from metadata alone</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Work done (rows read)</text><rect x="30" y="50" width="9.726" height="20" rx="4" style="fill:var(--green)"/><text x="30" y="44" font-size="8" font-weight="700" class="s-green">orders_by_day: 1,621</text><rect x="30" y="96" width="300" height="20" rx="4" style="fill:var(--track)"/><text x="30" y="90" font-size="8" font-weight="700" class="s-acc">orders (flat): 50,000</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same answer, 31× fewer rows.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Grows with every month of history.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">order_ts is not the partition column</text><rect x="18" y="46" width="60" height="36" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="48" y="62" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-01</text><text x="48" y="75" text-anchor="middle" font-size="6.8" class="s-red">read</text><rect x="84" y="46" width="60" height="36" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="114" y="62" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-02</text><text x="114" y="75" text-anchor="middle" font-size="6.8" class="s-red">read</text><rect x="150" y="46" width="60" height="36" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180" y="62" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-03</text><text x="180" y="75" text-anchor="middle" font-size="6.8" class="s-red">read</text><rect x="216" y="46" width="60" height="36" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="246" y="62" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-04</text><text x="246" y="75" text-anchor="middle" font-size="6.8" class="s-red">read</text><rect x="282" y="46" width="60" height="36" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="312" y="62" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-05</text><text x="312" y="75" text-anchor="middle" font-size="6.8" class="s-red">read</text><rect x="18" y="90" width="60" height="36" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="48" y="106" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-06</text><text x="48" y="119" text-anchor="middle" font-size="6.8" class="s-red">read</text><rect x="84" y="90" width="60" height="36" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="114" y="106" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-07</text><text x="114" y="119" text-anchor="middle" font-size="6.8" class="s-red">read</text><rect x="150" y="90" width="60" height="36" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180" y="106" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-08</text><text x="180" y="119" text-anchor="middle" font-size="6.8" class="s-red">read</text><rect x="216" y="90" width="60" height="36" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="246" y="106" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-09</text><text x="246" y="119" text-anchor="middle" font-size="6.8" class="s-red">read</text><rect x="282" y="90" width="60" height="36" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="312" y="106" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-10</text><text x="312" y="119" text-anchor="middle" font-size="6.8" class="s-red">read</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hive cannot know which folder holds which order_ts.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">All 30 folders opened.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Static value = a label, not a check</text><rect x="30" y="46" width="120" height="50" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="90" y="66" text-anchor="middle" font-size="7.6" class="s-ink mono">orders_2026-10-03</text><text x="90" y="82" text-anchor="middle" font-size="7.2" class="s-ink2 mono">.csv (no date col)</text><path d="M152 70L200 70" style="fill:none;stroke:#D64545;stroke-width:2"/><path d="M193.7 73.0L200 70L193.7 67.0" style="fill:none;stroke:#D64545;stroke-width:2"/><g><path d="M214 52h14l4 4h26v22h-44z" class="s-soft-acc" style="stroke:#D64545"/><text x="236" y="88" text-anchor="middle" font-size="6.6" class="s-ink2 mono">dt=2026-10-04/</text></g><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">LOAD only moves the file.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Validate dates in the job.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Each partition is a row in the metastore and a folder named order_date=….</li>
+          <li>The planner matches the WHERE clause against partition values and drops the rest.</li>
+          <li>Fewer folders opened means fewer rows read for the same answer.</li>
+          <li>order_ts is an ordinary column; only the partition column can prune.</li>
+          <li>In a static load Hive trusts the value you write and never looks inside the file.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a safe nightly load, a safety switch for shared clusters, and two-level partitions.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-nightly">A nightly load that is safe to re-run</h3>
+  <p class="anim-intro">Most production tables are loaded one partition per run. INSERT OVERWRITE on that partition makes re-runs safe. (Typical pattern.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Daily partition load <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A nightly job overwrites one date partition, can be re-run safely, leaves other days alone, is validated and old partitions are dropped">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly job: load yesterday</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">INSERT OVERWRITE TABLE orders_by_day</text><text x="180" y="72" text-anchor="middle" font-size="8.4" class="s-ink mono">  PARTITION (order_date='${hivevar:d}') SELECT …</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One partition per run, value passed in.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Job fails half-way and is re-run</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-red">INTO would add the rows a second time</text><text x="180" y="74" text-anchor="middle" font-size="8.4" font-weight="700" class="s-green">OVERWRITE replaces just that partition</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Re-runs are safe (idempotent).</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Other days are untouched</text><rect x="18" y="46" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="48" y="62" text-anchor="middle" font-size="8" class="s-ink3 mono">10-01</text><text x="48" y="75" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="84" y="46" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="114" y="62" text-anchor="middle" font-size="8" class="s-ink3 mono">10-02</text><text x="114" y="75" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="150" y="46" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180" y="62" text-anchor="middle" font-size="8" class="s-ink3 mono">10-03</text><text x="180" y="75" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="216" y="46" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="246" y="62" text-anchor="middle" font-size="8" class="s-ink3 mono">10-04</text><text x="246" y="75" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="282" y="46" width="60" height="36" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="312" y="62" text-anchor="middle" font-size="8" font-weight="700" class="s-ink mono">10-05</text><text x="312" y="75" text-anchor="middle" font-size="6.8" class="s-green">read</text><rect x="18" y="90" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="48" y="106" text-anchor="middle" font-size="8" class="s-ink3 mono">10-06</text><text x="48" y="119" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="84" y="90" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="114" y="106" text-anchor="middle" font-size="8" class="s-ink3 mono">10-07</text><text x="114" y="119" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="150" y="90" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180" y="106" text-anchor="middle" font-size="8" class="s-ink3 mono">10-08</text><text x="180" y="119" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="216" y="90" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="246" y="106" text-anchor="middle" font-size="8" class="s-ink3 mono">10-09</text><text x="246" y="119" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="282" y="90" width="60" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="312" y="106" text-anchor="middle" font-size="8" class="s-ink3 mono">10-10</text><text x="312" y="119" text-anchor="middle" font-size="6.8" class="s-ink3">skip</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">OVERWRITE on one partition never deletes the others.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check before publishing</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">MIN(to_date(order_ts)) = MAX(…) = ${d} ?</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Catches the wrong-date load from Step 6.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Retention</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink mono">ALTER TABLE … DROP PARTITION (order_date &lt; '2025-10-01')</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Old data goes in one metadata operation.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The scheduler passes yesterday’s date into the job.</li>
+          <li>If the job is re-run, OVERWRITE replaces the partition instead of doubling it.</li>
+          <li>Only the named partition changes.</li>
+          <li>A quick check confirms the data really belongs to that day.</li>
+          <li>Retention is one DROP PARTITION with a range.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-strict">Stopping full-table scans on a shared cluster</h3>
+  <p class="anim-intro">One missing WHERE clause on a partitioned table can read years of data. Hive can refuse such queries. Results are real.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Strict partition filter <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="With the strict check enabled, a query without a partition filter fails with error 10056 and a filtered one runs">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A dashboard query without a date filter</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink mono">SELECT city, SUM(amount) FROM orders_by_day GROUP BY city</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Reads every partition: years of data.</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SET hive.strict.checks.no.partition.filter=true;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT COUNT(*) FROM orders_by_day;</text><text x="26" y="78" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Error 10056: Queries against partitioned</text><text x="26" y="92" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  tables without a partition filter are</text><text x="26" y="106" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  disabled for safety reasons.</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SET hive.strict.checks.no.partition.filter=true;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT COUNT(*) AS n FROM orders_by_day</text><text x="26" y="78" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">    WHERE order_date = &#x27;2026-10-05&#x27;;</text><text x="26" y="92" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 1621 |</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Where to set it</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">hive-site.xml for shared clusters, or per session</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Default in 4.2.1 is false.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Result</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">mistakes fail fast instead of running for an hour</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cheap protection for busy clusters.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A dashboard query forgot the date filter.</li>
+          <li>With the strict check on, Hive refuses it with error 10056.</li>
+          <li>The same query with a partition filter runs normally.</li>
+          <li>Admins set it cluster-wide; users can set it per session.</li>
+          <li>Costly mistakes now fail in a second.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-multilevel">Two-level partitions: date and city</h3>
+  <p class="anim-intro">Nested partitions make very selective queries cheap, at the price of many more folders. Partition list is real.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Multi-level partitions <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A table partitioned by date and city creates eight folders per day; filtering on both reads one small folder">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Kitchen managers query one city, one day</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink mono">PARTITIONED BY (order_date DATE, city STRING)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Two-level folders: order_date=…/city=…/</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SHOW PARTITIONS orders_day_city;</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| order_date=2026-10-05/city=Bengaluru |</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| order_date=2026-10-05/city=Chennai   |</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">| …                                    |</text><text x="26" y="106" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| order_date=2026-10-05/city=Thane     |</text><text x="26" y="120" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  8 partitions for one day</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Filter on both → one small folder</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-green mono">order_date='2026-10-05' AND city='Thane'</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Filter on city only → one folder per day.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Order the levels by how queries filter.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The cost</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">30 days × 8 cities = 240 partitions / month</text><text x="180" y="74" text-anchor="middle" font-size="8.4" class="s-red">smaller files, more metastore rows</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each level multiplies the partition count.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Rule of thumb</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink2">aim for hundreds of MB or more per partition</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Details and alternatives in Lesson 5.4.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The table is partitioned first by date, then by city.</li>
+          <li>One day created eight city folders.</li>
+          <li>Filtering on both columns reads a single small folder.</li>
+          <li>But the number of partitions multiplies.</li>
+          <li>Keep partitions large; Lesson 5.4 shows the alternatives.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Partitioning at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green mono">dt=…</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">daily tables</text></svg></div>
+    <div><h4>1. Daily event and transaction tables</h4>
+      <p>Payment, click and order tables in data lakes are almost always partitioned by date, so daily reports and nightly jobs read one day.</p>
+      <div class="uc-flow"><span>Events</span><i>→</i><span class="java">PARTITIONED BY dt</span><i>→</i><span>Daily reports</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue mono">DROP</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">retention</text></svg></div>
+    <div><h4>2. Data retention and privacy rules</h4>
+      <p>Policies such as “keep raw logs for 90 days” are applied by dropping old partitions, a quick metadata operation instead of a DELETE over billions of rows.</p>
+      <div class="uc-flow"><span>Old partitions</span><i>→</i><span class="java">DROP PARTITION</span><i>→</i><span>Compliant lake</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="9" font-weight="700" class="s-violet mono">OVERWRITE</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">re-runnable</text></svg></div>
+    <div><h4>3. Safe re-processing</h4>
+      <p>When late data arrives or a bug is fixed, teams rebuild only the affected days with INSERT OVERWRITE … PARTITION, without touching the rest of the table.</p>
+      <div class="uc-flow"><span>Fix</span><i>→</i><span class="java">OVERWRITE one day</span><i>→</i><span>Corrected history</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc mono">region=…</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">per country</text></svg></div>
+    <div><h4>4. Regional data</h4>
+      <p>Companies operating in several countries often add a region or country level, so local teams and local data rules work on their own folders.</p>
+      <div class="uc-flow"><span>Global table</span><i>→</i><span class="java">region partition</span><i>→</i><span>Local queries</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="9" font-weight="700" class="s-acc">Spark/Trino</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">same folders</text></svg></div>
+    <div><h4>5. Shared by many engines</h4>
+      <p>The same partitioned folders in the metastore are pruned by Spark, Trino and Impala too, so one good layout speeds up every tool.</p>
+      <div class="uc-flow"><span>Metastore</span><i>→</i><span class="java">partition list</span><i>→</i><span>Any engine</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: folders and pruning</h2>
+  <p>A partitioned table behaves like a dictionary of folders keyed by the partition value. These programs show what pruning saves. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># A partitioned table is a dict of folders: {partition value: rows}
+orders = [(100001, &quot;2026-10-01&quot;, &quot;Pune&quot;, 530), (100002, &quot;2026-10-01&quot;, &quot;Thane&quot;, 500),
+          (100003, &quot;2026-10-02&quot;, &quot;Pune&quot;, 410), (100004, &quot;2026-10-05&quot;, &quot;Pune&quot;, 180),
+          (100005, &quot;2026-10-05&quot;, &quot;Mumbai&quot;, 480), (100006, &quot;2026-10-07&quot;, &quot;Pune&quot;, 460)]
+
+folders = {}
+for oid, day, city, amt in orders:                 # INSERT ... PARTITION (order_date)
+    folders.setdefault(f&quot;order_date={day}&quot;, []).append((oid, city, amt))
+
+wanted = &quot;order_date=2026-10-05&quot;                    # WHERE order_date = &#x27;2026-10-05&#x27;
+read = folders.get(wanted, [])                      # pruning: open one folder only
+print(sorted(folders))
+print(&quot;rows read:&quot;, len(read), &quot;of&quot;, len(orders))
+print(&quot;Pune revenue:&quot;, sum(a for _, c, a in read if c == &quot;Pune&quot;))</code></pre><div class="output">[&#x27;order_date=2026-10-01&#x27;, &#x27;order_date=2026-10-02&#x27;, &#x27;order_date=2026-10-05&#x27;, &#x27;order_date=2026-10-07&#x27;]
+rows read: 2 of 6
+Pune revenue: 180</div></div>
+  <ul class="anno"><li><code>    folders.setdefault(f&quot;order_date={day}&quot;, []).append((oid, city, amt))</code><span>The day becomes part of the folder name; the rows inside no longer need to store it.</span></li><li><code>read = folders.get(wanted, [])                      # pruning: open one folder only</code><span>The planner picks the folder by name, without opening the others.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Folders and pruning",
+   "hint": "Press <b>Run<\/b>. Only 2 of 6 rows are read, like 1,621 of 50,000 in the real lab.",
+   "code": "# A partitioned table is a dict of folders: {partition value: rows}\norders = [(100001, \"2026-10-01\", \"Pune\", 530), (100002, \"2026-10-01\", \"Thane\", 500),\n          (100003, \"2026-10-02\", \"Pune\", 410), (100004, \"2026-10-05\", \"Pune\", 180),\n          (100005, \"2026-10-05\", \"Mumbai\", 480), (100006, \"2026-10-07\", \"Pune\", 460)]\n\nfolders = {}\nfor oid, day, city, amt in orders:                 # INSERT ... PARTITION (order_date)\n    folders.setdefault(f\"order_date={day}\", []).append((oid, city, amt))\n\nwanted = \"order_date=2026-10-05\"                    # WHERE order_date = '2026-10-05'\nread = folders.get(wanted, [])                      # pruning: open one folder only\nprint(sorted(folders))\nprint(\"rows read:\", len(read), \"of\", len(orders))\nprint(\"Pune revenue:\", sum(a for _, c, a in read if c == \"Pune\"))\n"
+  },
+  {
+   "label": "2 · Predict first: a date range",
+   "hint": "<b>Predict first:<\/b> how many folders does 10-05 to 10-07 open? (Real EXPLAIN DEPENDENCY for the lab: 3.)",
+   "code": "days = [f\"2026-10-{d:02d}\" for d in range(1, 31)]\nlo, hi = \"2026-10-05\", \"2026-10-07\"\npicked = [d for d in days if lo <= d <= hi]\nprint(len(picked), picked)\n"
+  },
+  {
+   "label": "3 · The wrong column",
+   "hint": "Filtering on order_ts cannot use folder names, so every folder is opened. Real lab: 30 of 30.",
+   "code": "folders = {f\"2026-10-{d:02d}\": [f\"2026-10-{d:02d} 12:00\"] for d in range(1, 31)}\nopened = 0\nhits = 0\nfor name, rows in folders.items():           # no folder can be skipped\n    opened += 1\n    hits += sum(1 for ts in rows if ts.startswith(\"2026-10-05\"))\nprint(\"folders opened:\", opened, \"matching rows:\", hits)\n"
+  },
+  {
+   "label": "4 · Savings over a year",
+   "hint": "Change <code>rows_per_day<\/code> to 1_00_000 (one lakh). The fraction read stays 1/365.",
+   "code": "rows_per_day = 1621\ndays = 365\nfull = rows_per_day * days\nprint(\"flat table reads   \", full)\nprint(\"partitioned reads  \", rows_per_day)\nprint(\"times less work    \", full // rows_per_day)\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "Yesterday’s file was loaded into today’s partition too. Add a check that rejects a file whose dates do not match the partition value.",
+   "code": "def load(part, rows):\n    return {part: rows}            # Hive trusts the value; nothing is checked\nfile_rows = [\"2026-10-03 10:01\", \"2026-10-03 12:40\"]\np = load(\"2026-10-04\", file_rows)\nbad = [r for r in file_rows if not r.startswith(\"2026-10-04\")]\nassert not bad, f\"{len(bad)} rows do not belong to 2026-10-04\"\nprint(p)\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: inspect a partition and split one day by city</h3>
+  <p>Three more statements to try in Beeline on the TiffinGo data. <b>Outputs are real</b>, from Hive 4.2.1.</p>
+  <div class="pcrun"><h4>1 · Statistics of one partition</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>DESCRIBE FORMATTED orders_by_day PARTITION (order_date=&#x27;2026-10-05&#x27;);
+-- selected lines</code></pre><div class="output">| Partition Value:   | [2026-10-05]                                                   |
+| Location:          | file:/opt/hive/data/warehouse/tiffingo.db/orders_by_day/order_date=2026-10-05 |
+|                    | numFiles       | 1       |
+|                    | numRows        | 1621    |
+|                    | rawDataSize    | 695409  |
+|                    | totalSize      | 13269   |</div></div>
+  <p class="muted">Every partition has its own folder and its own statistics. ORC stored 1,621 rows in 13 KB on disk. The optimiser uses numRows when planning joins (Module 8).</p></div>
+  <div class="pcrun"><h4>2 · Static day, dynamic city</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>CREATE TABLE orders_day_city (order_id INT, customer_id INT, amount DECIMAL(10,2),
+  payment STRING, status STRING)
+PARTITIONED BY (order_date DATE, city STRING) STORED AS ORC;
+
+INSERT OVERWRITE TABLE orders_day_city PARTITION (order_date=&#x27;2026-10-05&#x27;, city)
+SELECT order_id, customer_id, amount, payment, status, city
+FROM orders WHERE order_date = &#x27;2026-10-05&#x27;;
+SHOW PARTITIONS orders_day_city;</code></pre><div class="output">+-----------------------------------------+
+|                partition                |
++-----------------------------------------+
+| order_date=2026-10-05/city=Bengaluru    |
+| order_date=2026-10-05/city=Chennai      |
+| order_date=2026-10-05/city=Delhi        |
+| order_date=2026-10-05/city=Hyderabad    |
+| order_date=2026-10-05/city=Mumbai       |
+| order_date=2026-10-05/city=Navi Mumbai  |
+| order_date=2026-10-05/city=Pune         |
+| order_date=2026-10-05/city=Thane        |
++-----------------------------------------+</div></div>
+  <p class="muted">The date is fixed (static) and the city comes from the last SELECT column (dynamic). One statement created eight folders. A static level must come <b>before</b> any dynamic level.</p></div>
+  <div class="pcrun"><h4>3 · A safe partition filter check</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SET hive.strict.checks.no.partition.filter=true;
+SELECT COUNT(*) AS n FROM orders_by_day WHERE order_date = &#x27;2026-10-05&#x27;;</code></pre><div class="output">+-------+
+|   n   |
++-------+
+| 1621  |
++-------+</div></div>
+  <p class="muted">With the safety check on, queries that filter on the partition column run normally; only unfiltered ones fail with Error 10056.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Pruning, one partition at a time</h2>
+  <p>The planner walks the list of partitions from the metastore and keeps those that match the filter. Watch <code>keep</code> grow.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "partitions = [\"2026-10-04\", \"2026-10-05\", \"2026-10-06\", \"2026-10-07\", \"2026-10-08\"]",
+  "lo, hi = \"2026-10-05\", \"2026-10-07\"",
+  "keep = []",
+  "for p in partitions:",
+  "    if lo <= p <= hi:",
+  "        keep.append(p)",
+  "print(len(keep), \"of\", len(partitions), keep)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Metastore",
+   "note": "Partition values come from metadata. No data file has been opened yet. <code>partitions<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]"
+   ],
+   "newVar": "partitions"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>lo<\/code> is created: &#x27;2026-10-05&#x27;. <code>hi<\/code> is created: &#x27;2026-10-07&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]"
+   ],
+   "newVar": "hi"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>keep<\/code> is created: → list #2. A new list object (#2) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "keep"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>p<\/code> is created: &#x27;2026-10-04&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-04'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 5,
+   "phase": "Filter",
+   "note": "The WHERE condition is tested against the folder value, not against rows. The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-04'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;2026-10-05&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-05'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-05'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [&#x27;2026-10-05&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-05'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;2026-10-05&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;2026-10-06&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-06'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;2026-10-05&#x27;]"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-06'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;2026-10-05&#x27;]"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [&#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-06'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;2026-10-07&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-07'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;]"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-07'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;]"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 list now holds [&#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-07'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;2026-10-08&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-08'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;]"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-08'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-08'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Result",
+   "note": "Three partitions, the same as the real EXPLAIN DEPENDENCY output. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "lo",
+       "'2026-10-05'"
+      ],
+      [
+       "hi",
+       "'2026-10-07'"
+      ],
+      [
+       "keep",
+       "→ list #2"
+      ],
+      [
+       "p",
+       "'2026-10-08'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;2026-10-04&#x27;, &#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;, &#x27;2026-10-08&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;2026-10-05&#x27;, &#x27;2026-10-06&#x27;, &#x27;2026-10-07&#x27;]"
+   ],
+   "out": "3 of 5 ['2026-10-05', '2026-10-06', '2026-10-07']\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three partition tasks from TiffinGo’s data team.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Reporting · pruning</span></div>
+    <h4>Yesterday’s revenue per city</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Every morning the job runs <code>SELECT city, SUM(amount) FROM orders_by_day WHERE order_date = date_sub(current_date, 1) GROUP BY city</code>. Simulate the folder read and the per-city sum.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>folders for 10-25, 10-26, 10-27; today is 2026-10-27  (sample rows)</pre></div><div><small>Expected output</small><pre>2026-10-26 {&#x27;Pune&#x27;: 710, &#x27;Thane&#x27;: 320}</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Work out yesterday’s date.</li><li>Open only that folder.</li><li>Sum the amounts per city.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Change the filter to the last 3 days. In Hive: <code>order_date &gt;= date_sub(current_date, 3)<\/code>, which read 7 partitions in our lab because the data ends on 30 October.",
+   "code": "from datetime import date, timedelta\nfolders = {\"2026-10-25\": [(\"Pune\", 410)], \"2026-10-26\": [(\"Pune\", 530), (\"Thane\", 320), (\"Pune\", 180)],\n           \"2026-10-27\": [(\"Thane\", 90)]}\nyesterday = (date(2026, 10, 27) - timedelta(days=1)).isoformat()\ntotals = {}\nfor city, amt in folders[yesterday]:\n    totals[city] = totals.get(city, 0) + amt\nprint(yesterday, totals)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "from datetime import date, timedelta",
+  "folders = {\"2026-10-25\": [(\"Pune\", 410)], \"2026-10-26\": [(\"Pune\", 530), (\"Thane\", 320), (\"Pune\", 180)],",
+  "           \"2026-10-27\": [(\"Thane\", 90)]}",
+  "yesterday = (date(2026, 10, 27) - timedelta(days=1)).isoformat()",
+  "totals = {}",
+  "for city, amt in folders[yesterday]:",
+  "    totals[city] = totals.get(city, 0) + amt",
+  "print(yesterday, totals)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>folders<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4} A new list object (#2) is created: [→ tuple #5] A new list object (#3) is created: [→ tuple #6, → tuple #7, → tuple #8] A new list object (#4) is created: [→ tuple #9] A new tuple object (#5) is created: (&#x27;Pune&#x27;, 410) A new tuple object (#6) is created: (&#x27;Pune&#x27;, 530) A new tuple object (#7) is created: (&#x27;Thane&#x27;, 320) A new tuple object (#8) is created: (&#x27;Pune&#x27;, 180) A new tuple object (#9) is created: (&#x27;Thane&#x27;, 90)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4}",
+    "<b>#2 list (1)<\/b> [→ tuple #5]",
+    "<b>#3 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#4 list (1)<\/b> [→ tuple #9]",
+    "<b>#5 tuple (2)<\/b> (&#x27;Pune&#x27;, 410)",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, 530)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Thane&#x27;, 320)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Pune&#x27;, 180)",
+    "<b>#9 tuple (2)<\/b> (&#x27;Thane&#x27;, 90)"
+   ],
+   "newVar": "folders"
+  },
+  {
+   "line": 4,
+   "phase": "Partition value",
+   "note": "In Hive, date_sub(current_date, 1) on the partition column was pruned correctly in our lab. <code>yesterday<\/code> is created: &#x27;2026-10-26&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ dict #1"
+      ],
+      [
+       "yesterday",
+       "'2026-10-26'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4}",
+    "<b>#2 list (1)<\/b> [→ tuple #5]",
+    "<b>#3 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#4 list (1)<\/b> [→ tuple #9]",
+    "<b>#5 tuple (2)<\/b> (&#x27;Pune&#x27;, 410)",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, 530)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Thane&#x27;, 320)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Pune&#x27;, 180)",
+    "<b>#9 tuple (2)<\/b> (&#x27;Thane&#x27;, 90)"
+   ],
+   "newVar": "yesterday"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>totals<\/code> is created: → dict #10. A new dict object (#10) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ dict #1"
+      ],
+      [
+       "yesterday",
+       "'2026-10-26'"
+      ],
+      [
+       "totals",
+       "→ dict #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4}",
+    "<b>#2 list (1)<\/b> [→ tuple #5]",
+    "<b>#3 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#4 list (1)<\/b> [→ tuple #9]",
+    "<b>#5 tuple (2)<\/b> (&#x27;Pune&#x27;, 410)",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, 530)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Thane&#x27;, 320)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Pune&#x27;, 180)",
+    "<b>#9 tuple (2)<\/b> (&#x27;Thane&#x27;, 90)",
+    "<b>#10 dict (0)<\/b> {}"
+   ],
+   "newVar": "totals"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>city<\/code> is created: &#x27;Pune&#x27;. <code>amt<\/code> is created: 530.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ dict #1"
+      ],
+      [
+       "yesterday",
+       "'2026-10-26'"
+      ],
+      [
+       "totals",
+       "→ dict #10"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "amt",
+       "530"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4}",
+    "<b>#2 list (1)<\/b> [→ tuple #5]",
+    "<b>#3 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#4 list (1)<\/b> [→ tuple #9]",
+    "<b>#5 tuple (2)<\/b> (&#x27;Pune&#x27;, 410)",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, 530)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Thane&#x27;, 320)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Pune&#x27;, 180)",
+    "<b>#9 tuple (2)<\/b> (&#x27;Thane&#x27;, 90)",
+    "<b>#10 dict (0)<\/b> {}"
+   ],
+   "newVar": "amt"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #10 dict now holds {&#x27;Pune&#x27;: 530}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ dict #1"
+      ],
+      [
+       "yesterday",
+       "'2026-10-26'"
+      ],
+      [
+       "totals",
+       "→ dict #10"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "amt",
+       "530"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4}",
+    "<b>#2 list (1)<\/b> [→ tuple #5]",
+    "<b>#3 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#4 list (1)<\/b> [→ tuple #9]",
+    "<b>#5 tuple (2)<\/b> (&#x27;Pune&#x27;, 410)",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, 530)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Thane&#x27;, 320)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Pune&#x27;, 180)",
+    "<b>#9 tuple (2)<\/b> (&#x27;Thane&#x27;, 90)",
+    "<b>#10 dict (1)<\/b> {&#x27;Pune&#x27;: 530}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>city<\/code> changes to &#x27;Thane&#x27;. <code>amt<\/code> changes to 320.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ dict #1"
+      ],
+      [
+       "yesterday",
+       "'2026-10-26'"
+      ],
+      [
+       "totals",
+       "→ dict #10"
+      ],
+      [
+       "city",
+       "'Thane'"
+      ],
+      [
+       "amt",
+       "320"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4}",
+    "<b>#2 list (1)<\/b> [→ tuple #5]",
+    "<b>#3 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#4 list (1)<\/b> [→ tuple #9]",
+    "<b>#5 tuple (2)<\/b> (&#x27;Pune&#x27;, 410)",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, 530)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Thane&#x27;, 320)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Pune&#x27;, 180)",
+    "<b>#9 tuple (2)<\/b> (&#x27;Thane&#x27;, 90)",
+    "<b>#10 dict (1)<\/b> {&#x27;Pune&#x27;: 530}"
+   ],
+   "newVar": "amt"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #10 dict now holds {&#x27;Pune&#x27;: 530, &#x27;Thane&#x27;: 320}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ dict #1"
+      ],
+      [
+       "yesterday",
+       "'2026-10-26'"
+      ],
+      [
+       "totals",
+       "→ dict #10"
+      ],
+      [
+       "city",
+       "'Thane'"
+      ],
+      [
+       "amt",
+       "320"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4}",
+    "<b>#2 list (1)<\/b> [→ tuple #5]",
+    "<b>#3 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#4 list (1)<\/b> [→ tuple #9]",
+    "<b>#5 tuple (2)<\/b> (&#x27;Pune&#x27;, 410)",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, 530)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Thane&#x27;, 320)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Pune&#x27;, 180)",
+    "<b>#9 tuple (2)<\/b> (&#x27;Thane&#x27;, 90)",
+    "<b>#10 dict (2)<\/b> {&#x27;Pune&#x27;: 530, &#x27;Thane&#x27;: 320}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>city<\/code> changes to &#x27;Pune&#x27;. <code>amt<\/code> changes to 180.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ dict #1"
+      ],
+      [
+       "yesterday",
+       "'2026-10-26'"
+      ],
+      [
+       "totals",
+       "→ dict #10"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "amt",
+       "180"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4}",
+    "<b>#2 list (1)<\/b> [→ tuple #5]",
+    "<b>#3 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#4 list (1)<\/b> [→ tuple #9]",
+    "<b>#5 tuple (2)<\/b> (&#x27;Pune&#x27;, 410)",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, 530)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Thane&#x27;, 320)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Pune&#x27;, 180)",
+    "<b>#9 tuple (2)<\/b> (&#x27;Thane&#x27;, 90)",
+    "<b>#10 dict (2)<\/b> {&#x27;Pune&#x27;: 530, &#x27;Thane&#x27;: 320}"
+   ],
+   "newVar": "amt"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #10 dict now holds {&#x27;Pune&#x27;: 710, &#x27;Thane&#x27;: 320}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ dict #1"
+      ],
+      [
+       "yesterday",
+       "'2026-10-26'"
+      ],
+      [
+       "totals",
+       "→ dict #10"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "amt",
+       "180"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4}",
+    "<b>#2 list (1)<\/b> [→ tuple #5]",
+    "<b>#3 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#4 list (1)<\/b> [→ tuple #9]",
+    "<b>#5 tuple (2)<\/b> (&#x27;Pune&#x27;, 410)",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, 530)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Thane&#x27;, 320)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Pune&#x27;, 180)",
+    "<b>#9 tuple (2)<\/b> (&#x27;Thane&#x27;, 90)",
+    "<b>#10 dict (2)<\/b> {&#x27;Pune&#x27;: 710, &#x27;Thane&#x27;: 320}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ dict #1"
+      ],
+      [
+       "yesterday",
+       "'2026-10-26'"
+      ],
+      [
+       "totals",
+       "→ dict #10"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "amt",
+       "180"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4}",
+    "<b>#2 list (1)<\/b> [→ tuple #5]",
+    "<b>#3 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#4 list (1)<\/b> [→ tuple #9]",
+    "<b>#5 tuple (2)<\/b> (&#x27;Pune&#x27;, 410)",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, 530)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Thane&#x27;, 320)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Pune&#x27;, 180)",
+    "<b>#9 tuple (2)<\/b> (&#x27;Thane&#x27;, 90)",
+    "<b>#10 dict (2)<\/b> {&#x27;Pune&#x27;: 710, &#x27;Thane&#x27;: 320}"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "folders",
+       "→ dict #1"
+      ],
+      [
+       "yesterday",
+       "'2026-10-26'"
+      ],
+      [
+       "totals",
+       "→ dict #10"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "amt",
+       "180"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {&#x27;2026-10-25&#x27;: → list #2, &#x27;2026-10-26&#x27;: → list #3, &#x27;2026-10-27&#x27;: → list #4}",
+    "<b>#2 list (1)<\/b> [→ tuple #5]",
+    "<b>#3 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#4 list (1)<\/b> [→ tuple #9]",
+    "<b>#5 tuple (2)<\/b> (&#x27;Pune&#x27;, 410)",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, 530)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Thane&#x27;, 320)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Pune&#x27;, 180)",
+    "<b>#9 tuple (2)<\/b> (&#x27;Thane&#x27;, 90)",
+    "<b>#10 dict (2)<\/b> {&#x27;Pune&#x27;: 710, &#x27;Thane&#x27;: 320}"
+   ],
+   "out": "2026-10-26 {'Pune': 710, 'Thane': 320}\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Data engineering · re-runs</span></div>
+    <h4>Why INSERT OVERWRITE for daily loads</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A nightly job loads one day. Tonight it crashes after writing and is re-run. Compare <code>INSERT INTO … PARTITION</code> with <code>INSERT OVERWRITE … PARTITION</code>.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>1,641 rows for 2026-10-01 (real count), loaded twice</pre></div><div><small>Expected output</small><pre>INTO 3282
+OVERWRITE 1641</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>INTO appends to the folder.</li><li>OVERWRITE replaces the folder contents.</li><li>Count rows after two runs.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "INTO gives 3,282 rows, OVERWRITE gives 1,641. That is why production loads use OVERWRITE on one partition: they are idempotent (safe to repeat).",
+   "code": "def run(table, part, rows, mode):\n    if mode == \"OVERWRITE\":\n        table[part] = list(rows)\n    else:\n        table.setdefault(part, []).extend(rows)\n\nrows = list(range(1641))\nfor mode in [\"INTO\", \"OVERWRITE\"]:\n    t = {}\n    run(t, \"2026-10-01\", rows, mode)\n    run(t, \"2026-10-01\", rows, mode)        # the re-run\n    print(mode, len(t[\"2026-10-01\"]))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "def run(table, part, rows, mode):",
+  "    if mode == \"OVERWRITE\":",
+  "        table[part] = list(rows)",
+  "    else:",
+  "        table.setdefault(part, []).extend(rows)",
+  "",
+  "rows = list(range(1641))",
+  "for mode in [\"INTO\", \"OVERWRITE\"]:",
+  "    t = {}",
+  "    run(t, \"2026-10-01\", rows, mode)",
+  "    run(t, \"2026-10-01\", rows, mode)        # the re-run",
+  "    print(mode, len(t[\"2026-10-01\"]))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>run<\/code> is created: function run().",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "run"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>rows<\/code> is created: → list #1. A new list object (#1) is created: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ],
+   "newVar": "rows"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>mode<\/code> is created: &#x27;INTO&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>t<\/code> is created: → dict #2. A new dict object (#2) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ],
+      [
+       "t",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "t"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "<code>run()<\/code> is called: a new frame is pushed with <code>table<\/code> = → dict #2, <code>part<\/code> = &#x27;2026-10-01&#x27;, <code>rows<\/code> = → list #1, <code>mode<\/code> = &#x27;INTO&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ],
+      [
+       "t",
+       "→ dict #2"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #2"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ],
+      [
+       "t",
+       "→ dict #2"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #2"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#2 dict (0)<\/b> {}"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;2026-10-01&#x27;: → list #3} A new list object (#3) is created: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ],
+      [
+       "t",
+       "→ dict #2"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #2"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#2 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #3}",
+    "<b>#3 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Return",
+   "note": "<code>run()<\/code> returns <b>None<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ],
+      [
+       "t",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#2 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #3}",
+    "<b>#3 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "<code>run()<\/code> is called: a new frame is pushed with <code>table<\/code> = → dict #2, <code>part<\/code> = &#x27;2026-10-01&#x27;, <code>rows<\/code> = → list #1, <code>mode<\/code> = &#x27;INTO&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ],
+      [
+       "t",
+       "→ dict #2"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #2"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#2 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #3}",
+    "<b>#3 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ],
+      [
+       "t",
+       "→ dict #2"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #2"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#2 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #3}",
+    "<b>#3 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #3 list now holds [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ],
+      [
+       "t",
+       "→ dict #2"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #2"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#2 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #3}",
+    "<b>#3 list (3282)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Return",
+   "note": "<code>run()<\/code> returns <b>None<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ],
+      [
+       "t",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#2 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #3}",
+    "<b>#3 list (3282)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ]
+  },
+  {
+   "line": 12,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'INTO'"
+      ],
+      [
+       "t",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#2 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #3}",
+    "<b>#3 list (3282)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ],
+   "out": "INTO 3282\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>mode<\/code> changes to &#x27;OVERWRITE&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#2 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #3}",
+    "<b>#3 list (3282)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>t<\/code> changes to → dict #4. A new dict object (#4) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#4 dict (0)<\/b> {}"
+   ],
+   "newVar": "t"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "<code>run()<\/code> is called: a new frame is pushed with <code>table<\/code> = → dict #4, <code>part<\/code> = &#x27;2026-10-01&#x27;, <code>rows<\/code> = → list #1, <code>mode<\/code> = &#x27;OVERWRITE&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #4"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #4"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#4 dict (0)<\/b> {}"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #4"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #4"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#4 dict (0)<\/b> {}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "OVERWRITE",
+   "note": "Replaces only this partition. Other days stay as they are. Object #4 dict now holds {&#x27;2026-10-01&#x27;: → list #5} A new list object (#5) is created: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #4"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #4"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#4 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #5}",
+    "<b>#5 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Return",
+   "note": "<code>run()<\/code> returns <b>None<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#4 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #5}",
+    "<b>#5 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "<code>run()<\/code> is called: a new frame is pushed with <code>table<\/code> = → dict #4, <code>part<\/code> = &#x27;2026-10-01&#x27;, <code>rows<\/code> = → list #1, <code>mode<\/code> = &#x27;OVERWRITE&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #4"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #4"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#4 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #5}",
+    "<b>#5 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #4"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #4"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#4 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #5}",
+    "<b>#5 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Object #4 dict now holds {&#x27;2026-10-01&#x27;: → list #6} A new list object (#6) is created: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #4"
+      ]
+     ]
+    },
+    {
+     "frame": "run()",
+     "vars": [
+      [
+       "table",
+       "→ dict #4"
+      ],
+      [
+       "part",
+       "'2026-10-01'"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#4 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #6}",
+    "<b>#6 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Return",
+   "note": "<code>run()<\/code> returns <b>None<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#4 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #6}",
+    "<b>#6 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ]
+  },
+  {
+   "line": 12,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#4 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #6}",
+    "<b>#6 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ],
+   "out": "OVERWRITE 1641\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "run",
+       "function run()"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "mode",
+       "'OVERWRITE'"
+      ],
+      [
+       "t",
+       "→ dict #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…",
+    "<b>#4 dict (1)<\/b> {&#x27;2026-10-01&#x27;: → list #6}",
+    "<b>#6 list (1641)<\/b> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24…"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Cost · capacity planning</span></div>
+    <h4>How much does pruning save over a year?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Orders grow 10% a month from 1,621 a day. A daily report reads one day. Compare the rows read per report on a flat table and on a table partitioned by day, after 12 months.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>1,621 orders/day in month 1, +10% each month, 30 days per month</pre></div><div><small>Expected output</small><pre>flat reads        1039650
+partitioned reads 4623
+ratio             225</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Build daily volumes month by month.</li><li>Flat table: the report reads the whole history.</li><li>Partitioned: it reads the last day only.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The ratio is about 225 after one year and keeps rising. With partitions the daily report costs roughly the same in month 12 as in month 1.",
+   "code": "daily = 1621\nhistory = 0\nfor month in range(1, 13):\n    history += daily * 30\n    last_day = daily\n    daily = round(daily * 1.10)\nprint(\"flat reads       \", history)\nprint(\"partitioned reads\", last_day)\nprint(\"ratio            \", round(history / last_day))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "daily = 1621",
+  "history = 0",
+  "for month in range(1, 13):",
+  "    history += daily * 30",
+  "    last_day = daily",
+  "    daily = round(daily * 1.10)",
+  "print(\"flat reads       \", history)",
+  "print(\"partitioned reads\", last_day)",
+  "print(\"ratio            \", round(history / last_day))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>daily<\/code> is created: 1621.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1621"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>history<\/code> is created: 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1621"
+      ],
+      [
+       "history",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> is created: 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1621"
+      ],
+      [
+       "history",
+       "0"
+      ],
+      [
+       "month",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "History",
+   "note": "A flat table keeps growing, so the same report gets slower every month. <code>history<\/code> changes to 48630.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1621"
+      ],
+      [
+       "history",
+       "48630"
+      ],
+      [
+       "month",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> is created: 1621.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1621"
+      ],
+      [
+       "history",
+       "48630"
+      ],
+      [
+       "month",
+       "1"
+      ],
+      [
+       "last_day",
+       "1621"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 1783.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1783"
+      ],
+      [
+       "history",
+       "48630"
+      ],
+      [
+       "month",
+       "1"
+      ],
+      [
+       "last_day",
+       "1621"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1783"
+      ],
+      [
+       "history",
+       "48630"
+      ],
+      [
+       "month",
+       "2"
+      ],
+      [
+       "last_day",
+       "1621"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>history<\/code> changes to 102120.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1783"
+      ],
+      [
+       "history",
+       "102120"
+      ],
+      [
+       "month",
+       "2"
+      ],
+      [
+       "last_day",
+       "1621"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> changes to 1783.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1783"
+      ],
+      [
+       "history",
+       "102120"
+      ],
+      [
+       "month",
+       "2"
+      ],
+      [
+       "last_day",
+       "1783"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 1961.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1961"
+      ],
+      [
+       "history",
+       "102120"
+      ],
+      [
+       "month",
+       "2"
+      ],
+      [
+       "last_day",
+       "1783"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1961"
+      ],
+      [
+       "history",
+       "102120"
+      ],
+      [
+       "month",
+       "3"
+      ],
+      [
+       "last_day",
+       "1783"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>history<\/code> changes to 160950.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1961"
+      ],
+      [
+       "history",
+       "160950"
+      ],
+      [
+       "month",
+       "3"
+      ],
+      [
+       "last_day",
+       "1783"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> changes to 1961.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "1961"
+      ],
+      [
+       "history",
+       "160950"
+      ],
+      [
+       "month",
+       "3"
+      ],
+      [
+       "last_day",
+       "1961"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 2157.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2157"
+      ],
+      [
+       "history",
+       "160950"
+      ],
+      [
+       "month",
+       "3"
+      ],
+      [
+       "last_day",
+       "1961"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> changes to 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2157"
+      ],
+      [
+       "history",
+       "160950"
+      ],
+      [
+       "month",
+       "4"
+      ],
+      [
+       "last_day",
+       "1961"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>history<\/code> changes to 225660.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2157"
+      ],
+      [
+       "history",
+       "225660"
+      ],
+      [
+       "month",
+       "4"
+      ],
+      [
+       "last_day",
+       "1961"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> changes to 2157.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2157"
+      ],
+      [
+       "history",
+       "225660"
+      ],
+      [
+       "month",
+       "4"
+      ],
+      [
+       "last_day",
+       "2157"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 2373.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2373"
+      ],
+      [
+       "history",
+       "225660"
+      ],
+      [
+       "month",
+       "4"
+      ],
+      [
+       "last_day",
+       "2157"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> changes to 5.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2373"
+      ],
+      [
+       "history",
+       "225660"
+      ],
+      [
+       "month",
+       "5"
+      ],
+      [
+       "last_day",
+       "2157"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>history<\/code> changes to 296850.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2373"
+      ],
+      [
+       "history",
+       "296850"
+      ],
+      [
+       "month",
+       "5"
+      ],
+      [
+       "last_day",
+       "2157"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> changes to 2373.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2373"
+      ],
+      [
+       "history",
+       "296850"
+      ],
+      [
+       "month",
+       "5"
+      ],
+      [
+       "last_day",
+       "2373"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 2610.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2610"
+      ],
+      [
+       "history",
+       "296850"
+      ],
+      [
+       "month",
+       "5"
+      ],
+      [
+       "last_day",
+       "2373"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> changes to 6.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2610"
+      ],
+      [
+       "history",
+       "296850"
+      ],
+      [
+       "month",
+       "6"
+      ],
+      [
+       "last_day",
+       "2373"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>history<\/code> changes to 375150.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2610"
+      ],
+      [
+       "history",
+       "375150"
+      ],
+      [
+       "month",
+       "6"
+      ],
+      [
+       "last_day",
+       "2373"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> changes to 2610.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2610"
+      ],
+      [
+       "history",
+       "375150"
+      ],
+      [
+       "month",
+       "6"
+      ],
+      [
+       "last_day",
+       "2610"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 2871.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2871"
+      ],
+      [
+       "history",
+       "375150"
+      ],
+      [
+       "month",
+       "6"
+      ],
+      [
+       "last_day",
+       "2610"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> changes to 7.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2871"
+      ],
+      [
+       "history",
+       "375150"
+      ],
+      [
+       "month",
+       "7"
+      ],
+      [
+       "last_day",
+       "2610"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>history<\/code> changes to 461280.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2871"
+      ],
+      [
+       "history",
+       "461280"
+      ],
+      [
+       "month",
+       "7"
+      ],
+      [
+       "last_day",
+       "2610"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> changes to 2871.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "2871"
+      ],
+      [
+       "history",
+       "461280"
+      ],
+      [
+       "month",
+       "7"
+      ],
+      [
+       "last_day",
+       "2871"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 3158.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3158"
+      ],
+      [
+       "history",
+       "461280"
+      ],
+      [
+       "month",
+       "7"
+      ],
+      [
+       "last_day",
+       "2871"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> changes to 8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3158"
+      ],
+      [
+       "history",
+       "461280"
+      ],
+      [
+       "month",
+       "8"
+      ],
+      [
+       "last_day",
+       "2871"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>history<\/code> changes to 556020.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3158"
+      ],
+      [
+       "history",
+       "556020"
+      ],
+      [
+       "month",
+       "8"
+      ],
+      [
+       "last_day",
+       "2871"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> changes to 3158.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3158"
+      ],
+      [
+       "history",
+       "556020"
+      ],
+      [
+       "month",
+       "8"
+      ],
+      [
+       "last_day",
+       "3158"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 3474.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3474"
+      ],
+      [
+       "history",
+       "556020"
+      ],
+      [
+       "month",
+       "8"
+      ],
+      [
+       "last_day",
+       "3158"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> changes to 9.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3474"
+      ],
+      [
+       "history",
+       "556020"
+      ],
+      [
+       "month",
+       "9"
+      ],
+      [
+       "last_day",
+       "3158"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>history<\/code> changes to 660240.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3474"
+      ],
+      [
+       "history",
+       "660240"
+      ],
+      [
+       "month",
+       "9"
+      ],
+      [
+       "last_day",
+       "3158"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> changes to 3474.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3474"
+      ],
+      [
+       "history",
+       "660240"
+      ],
+      [
+       "month",
+       "9"
+      ],
+      [
+       "last_day",
+       "3474"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 3821.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3821"
+      ],
+      [
+       "history",
+       "660240"
+      ],
+      [
+       "month",
+       "9"
+      ],
+      [
+       "last_day",
+       "3474"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> changes to 10.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3821"
+      ],
+      [
+       "history",
+       "660240"
+      ],
+      [
+       "month",
+       "10"
+      ],
+      [
+       "last_day",
+       "3474"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>history<\/code> changes to 774870.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3821"
+      ],
+      [
+       "history",
+       "774870"
+      ],
+      [
+       "month",
+       "10"
+      ],
+      [
+       "last_day",
+       "3474"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> changes to 3821.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "3821"
+      ],
+      [
+       "history",
+       "774870"
+      ],
+      [
+       "month",
+       "10"
+      ],
+      [
+       "last_day",
+       "3821"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 4203.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "4203"
+      ],
+      [
+       "history",
+       "774870"
+      ],
+      [
+       "month",
+       "10"
+      ],
+      [
+       "last_day",
+       "3821"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> changes to 11.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "4203"
+      ],
+      [
+       "history",
+       "774870"
+      ],
+      [
+       "month",
+       "11"
+      ],
+      [
+       "last_day",
+       "3821"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>history<\/code> changes to 900960.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "4203"
+      ],
+      [
+       "history",
+       "900960"
+      ],
+      [
+       "month",
+       "11"
+      ],
+      [
+       "last_day",
+       "3821"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> changes to 4203.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "4203"
+      ],
+      [
+       "history",
+       "900960"
+      ],
+      [
+       "month",
+       "11"
+      ],
+      [
+       "last_day",
+       "4203"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 4623.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "4623"
+      ],
+      [
+       "history",
+       "900960"
+      ],
+      [
+       "month",
+       "11"
+      ],
+      [
+       "last_day",
+       "4203"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>month<\/code> changes to 12.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "4623"
+      ],
+      [
+       "history",
+       "900960"
+      ],
+      [
+       "month",
+       "12"
+      ],
+      [
+       "last_day",
+       "4203"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "month"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>history<\/code> changes to 1039650.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "4623"
+      ],
+      [
+       "history",
+       "1039650"
+      ],
+      [
+       "month",
+       "12"
+      ],
+      [
+       "last_day",
+       "4203"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "history"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>last_day<\/code> changes to 4623.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "4623"
+      ],
+      [
+       "history",
+       "1039650"
+      ],
+      [
+       "month",
+       "12"
+      ],
+      [
+       "last_day",
+       "4623"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "last_day"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>daily<\/code> changes to 5085.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "5085"
+      ],
+      [
+       "history",
+       "1039650"
+      ],
+      [
+       "month",
+       "12"
+      ],
+      [
+       "last_day",
+       "4623"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "daily"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "5085"
+      ],
+      [
+       "history",
+       "1039650"
+      ],
+      [
+       "month",
+       "12"
+      ],
+      [
+       "last_day",
+       "4623"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "5085"
+      ],
+      [
+       "history",
+       "1039650"
+      ],
+      [
+       "month",
+       "12"
+      ],
+      [
+       "last_day",
+       "4623"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "flat reads        1039650\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "5085"
+      ],
+      [
+       "history",
+       "1039650"
+      ],
+      [
+       "month",
+       "12"
+      ],
+      [
+       "last_day",
+       "4623"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "partitioned reads 4623\n"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "daily",
+       "5085"
+      ],
+      [
+       "history",
+       "1039650"
+      ],
+      [
+       "month",
+       "12"
+      ],
+      [
+       "last_day",
+       "4623"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "ratio             225\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: Where is the value of a partition column stored?",
+  "options": [
+   "In every row of the data file",
+   "In a separate index file",
+   "In the folder name and the metastore",
+   "In the table comment"
+  ],
+  "answer": 2,
+  "why": "Partition columns are virtual: the data files hold only the other columns."
+ },
+ {
+  "q": "Beginner: What does partition pruning mean?",
+  "options": [
+   "Deleting old partitions",
+   "Skipping partitions the WHERE clause rules out",
+   "Merging small files",
+   "Sorting rows inside a partition"
+  ],
+  "answer": 1,
+  "why": "Hive reads only the folders that can match the filter. Real lab: 1 of 30 folders, 1,621 of 50,000 rows."
+ },
+ {
+  "q": "Beginner: Which command lists the partitions of a table?",
+  "options": [
+   "SHOW PARTITIONS t",
+   "DESCRIBE PARTITIONS t",
+   "LIST PARTITIONS t",
+   "SELECT * FROM PARTITIONS"
+  ],
+  "answer": 0,
+  "why": "SHOW PARTITIONS t, optionally with PARTITION (col='v') to filter."
+ },
+ {
+  "q": "Intermediate: orders_by_day is partitioned by order_date. Which filter reads all 30 partitions?",
+  "options": [
+   "order_date = '2026-10-05'",
+   "date_format(order_date,'EEE') = 'Sat'",
+   "order_date BETWEEN '2026-10-05' AND '2026-10-07'",
+   "to_date(order_ts) = '2026-10-05'"
+  ],
+  "answer": 3,
+  "why": "order_ts is an ordinary column. Functions on the partition column itself were still pruned in Hive 4.2.1."
+ },
+ {
+  "q": "Intermediate: In a static INSERT … PARTITION (order_date='2026-10-01') SELECT …, which columns should the SELECT return?",
+  "options": [
+   "All columns including order_date",
+   "Only order_date",
+   "Only the non-partition columns",
+   "Any columns; Hive matches by name"
+  ],
+  "answer": 2,
+  "why": "The PARTITION clause supplies the value, so the SELECT returns the data columns only, in order."
+ },
+ {
+  "q": "Intermediate: You LOAD 3 October’s file INTO PARTITION (dt='2026-10-04'). What does Hive do?",
+  "options": [
+   "Rejects it: dates do not match",
+   "Loads it into dt=2026-10-04 without checking",
+   "Moves rows to the right partition",
+   "Loads only matching rows"
+  ],
+  "answer": 1,
+  "why": "Real lab: 1,668 orders appeared under both days. Static values are trusted."
+ },
+ {
+  "q": "Advanced: What does SET hive.strict.checks.no.partition.filter=true do?",
+  "options": [
+   "Rejects queries on partitioned tables without a partition filter",
+   "Speeds up pruning",
+   "Forces dynamic partitions",
+   "Drops empty partitions"
+  ],
+  "answer": 0,
+  "why": "Error 10056 in our lab. Default in 4.2.1: false."
+ },
+ {
+  "q": "Advanced: Which is the best partition column for a 5-year orders table queried by day and by city?",
+  "options": [
+   "order_id",
+   "customer_id",
+   "amount",
+   "order_date"
+  ],
+  "answer": 3,
+  "why": "Moderate number of values and used in almost every filter. City can be a second level only if partitions stay large (Lesson 5.4)."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 5.1 in one screen</h3>
+    <ul><li><code>PARTITIONED BY (order_date DATE)</code>: the column is <b>not</b> in the column list; each value is a folder <code>order_date=…/</code> + a metastore row.</li><li><b>Pruning:</b> filter on the partition column → Hive opens only matching folders (real: 1 of 30, 1,621 of 50,000 rows).</li><li>Check it with <code>EXPLAIN DEPENDENCY</code> (input_partitions) or Tez counters (<code>RECORDS_IN_Map_1</code>).</li><li><b>No pruning</b> on other columns (<code>to_date(order_ts)</code> → 30 of 30) or with <code>OR</code> on a non-partition column. Functions on the partition column were pruned in 4.2.1.</li><li><b>Static:</b> <code>INSERT … PARTITION (col='v') SELECT data cols</code> or <code>LOAD DATA … PARTITION (…)</code>. The value is trusted, never checked.</li><li><b>Manage:</b> SHOW PARTITIONS · ADD [IF NOT EXISTS] · RENAME TO PARTITION · DROP [IF EXISTS] (ranges allowed) · DESCRIBE FORMATTED … PARTITION.</li><li><b>Daily loads:</b> INSERT OVERWRITE one partition → safe to re-run.</li><li><b>Safety:</b> <code>hive.strict.checks.no.partition.filter=true</code> → Error 10056 for unfiltered queries.</li><li>Good partition column: low-to-moderate cardinality, used in most filters (date). Bad: ids.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Is partitioning the same as indexing?</summary><p>No. An index points to rows inside files; a partition is a separate folder. Hive removed its old index feature in Hive 3.0. Partitioning, bucketing (Lesson 5.3) and the min/max statistics inside ORC and Parquet files are the ways Hive avoids reading data today.</p></details>
+    <details><summary>Can I change the partition column of an existing table?</summary><p>Not in place. Create a new table with the new PARTITIONED BY, copy the data with a dynamic INSERT OVERWRITE … SELECT (Lesson 5.2), check the counts, then swap the names. Plan the partition column before the table grows.</p></details>
+    <details><summary>Why is the partition column typed DATE and not STRING?</summary><p>Either works; the folder name is text in both cases. DATE stops values like “2026-13-45” and lets you compare and use date functions naturally. Many older tables use STRING (dt='20261005'), so check the type before writing filters: comparing a STRING partition with a DATE value can force a cast.</p></details>
+    <details><summary>Does a partitioned table make every query faster?</summary><p>Only queries that filter on the partition column. A query over the whole table reads everything anyway, and with many small partitions it can even be slower, because Hive must list and open more folders and files. That is why the choice of column matters (Lesson 5.4).</p></details>
+    <details><summary>What happens to the partition folder when I drop a partition?</summary><p>For a managed table the folder and files are deleted. For an external table only the metastore entry is removed and the files stay, unless the table has <code>external.table.purge=true</code>, which Hive 4 sets on tables created with a plain CREATE TABLE (see Lesson 2.2).</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs that simulate partitions and pruning, with the HiveQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Build the folder names</h4></div>
+      <p>Turn three partition values into Hive folder names.</p>
+      <div class="prob__io"><div><small>Input</small><pre>col = &#x27;order_date&#x27;, values 10-01, 10-02, 10-03</pre></div><div><small>Expected output</small><pre>order_date=2026-10-01/
+order_date=2026-10-02/
+order_date=2026-10-03/</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>col = &quot;order_date&quot;
+for v in [&quot;2026-10-01&quot;, &quot;2026-10-02&quot;, &quot;2026-10-03&quot;]:
+    print(f&quot;{col}={v}/&quot;)</code></pre><div class="output">order_date=2026-10-01/
+order_date=2026-10-02/
+order_date=2026-10-03/</div></div>
+        <p><b>How it works:</b> Hive names each partition folder <code>col=value</code>. Two levels give <code>order_date=…/city=…/</code>.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>How many partitions?</h4></div>
+      <p>A table is partitioned by date and city. How many partitions does one month create?</p>
+      <div class="prob__io"><div><small>Input</small><pre>30 days, 8 cities</pre></div><div><small>Expected output</small><pre>240</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>days, cities = 30, 8
+print(days * cities)</code></pre><div class="output">240</div></div>
+        <p><b>How it works:</b> 240 folders a month, 2,880 a year: each level multiplies the count. The real lab created 8 for one day.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Fraction read</h4></div>
+      <p>What share of rows does a one-day query read on the real table?</p>
+      <div class="prob__io"><div><small>Input</small><pre>1,621 of 50,000</pre></div><div><small>Expected output</small><pre>3.2%</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{100 * 1621 / 50000:.1f}%&quot;)</code></pre><div class="output">3.2%</div></div>
+        <p><b>How it works:</b> 3.2% of the rows: about 31 times less work than the flat table.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Which partitions match?</h4></div>
+      <p>Return the partitions that match <code>order_date &gt;= '2026-10-28'</code>.</p>
+      <div class="prob__io"><div><small>Input</small><pre>partitions 10-01 … 10-30</pre></div><div><small>Expected output</small><pre>[&#x27;2026-10-28&#x27;, &#x27;2026-10-29&#x27;, &#x27;2026-10-30&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>parts = [f&quot;2026-10-{d:02d}&quot; for d in range(1, 31)]
+print([p for p in parts if p &gt;= &quot;2026-10-28&quot;])</code></pre><div class="output">[&#x27;2026-10-28&#x27;, &#x27;2026-10-29&#x27;, &#x27;2026-10-30&#x27;]</div></div>
+        <p><b>How it works:</b> Three partitions. ISO dates (yyyy-MM-dd) sort correctly as text, which is one reason to use that format.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Static insert column list</h4></div>
+      <p>Given the table columns and the partition column, print the SELECT list for a static insert.</p>
+      <div class="prob__io"><div><small>Input</small><pre>orders_by_day</pre></div><div><small>Expected output</small><pre>SELECT order_id, customer_id, city, order_ts, amount, payment, status FROM orders WHERE order_date = &#x27;2026-10-01&#x27;</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>table_cols = [&quot;order_id&quot;, &quot;customer_id&quot;, &quot;city&quot;, &quot;order_ts&quot;, &quot;amount&quot;, &quot;payment&quot;, &quot;status&quot;]
+part_col = &quot;order_date&quot;
+print(&quot;SELECT &quot; + &quot;, &quot;.join(table_cols) + &quot; FROM orders WHERE &quot; + part_col + &quot; = &#x27;2026-10-01&#x27;&quot;)</code></pre><div class="output">SELECT order_id, customer_id, city, order_ts, amount, payment, status FROM orders WHERE order_date = &#x27;2026-10-01&#x27;</div></div>
+        <p><b>How it works:</b> The partition column is given in PARTITION (…), so it is not in the SELECT list. In a dynamic insert it would be added as the last column.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Validate a daily file</h4></div>
+      <p>Reject a load when any row’s date differs from the partition value.</p>
+      <div class="prob__io"><div><small>Input</small><pre>partition 2026-10-04, rows from 10-03</pre></div><div><small>Expected output</small><pre>REJECT 2 bad rows</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>part = &quot;2026-10-04&quot;
+rows = [&quot;2026-10-03 10:01&quot;, &quot;2026-10-03 12:40&quot;, &quot;2026-10-04 00:10&quot;]
+bad = [r for r in rows if r[:10] != part]
+print(&quot;REJECT&quot; if bad else &quot;OK&quot;, len(bad), &quot;bad rows&quot;)</code></pre><div class="output">REJECT 2 bad rows</div></div>
+        <p><b>How it works:</b> In HiveQL after loading to a staging table: <code>SELECT COUNT(*) FROM stage WHERE to_date(order_ts) &lt;&gt; '2026-10-04'</code>; stop the job if it is not 0.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Retention: what to drop</h4></div>
+      <p>Keep 90 days. On 2026-10-27, which month-start partitions are older than the cut-off?</p>
+      <div class="prob__io"><div><small>Input</small><pre>partitions on the 1st of each month in 2026</pre></div><div><small>Expected output</small><pre>cutoff 2026-07-29
+drop [&#x27;2026-01-01&#x27;, &#x27;2026-02-01&#x27;, &#x27;2026-03-01&#x27;, &#x27;2026-04-01&#x27;, &#x27;2026-05-01&#x27;, &#x27;2026-06-01&#x27;, &#x27;2026-07-01&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>from datetime import date, timedelta
+cutoff = date(2026, 10, 27) - timedelta(days=90)
+parts = [date(2026, m, 1) for m in range(1, 11)]
+print(&quot;cutoff&quot;, cutoff)
+print(&quot;drop&quot;, [p.isoformat() for p in parts if p &lt; cutoff])</code></pre><div class="output">cutoff 2026-07-29
+drop [&#x27;2026-01-01&#x27;, &#x27;2026-02-01&#x27;, &#x27;2026-03-01&#x27;, &#x27;2026-04-01&#x27;, &#x27;2026-05-01&#x27;, &#x27;2026-06-01&#x27;, &#x27;2026-07-01&#x27;]</div></div>
+        <p><b>How it works:</b> <code>ALTER TABLE t DROP IF EXISTS PARTITION (order_date &lt; '2026-07-29')</code> removes them in one metadata operation.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Monthly cost of a missing filter</h4></div>
+      <p>A dashboard refreshes every 15 minutes without a date filter. How many rows does it read per day compared with a one-day filter, for a year of history?</p>
+      <div class="prob__io"><div><small>Input</small><pre>1,621 rows/day, 365 days</pre></div><div><small>Expected output</small><pre>56799840 155616 365</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>refreshes = 24 * 4
+full = 1621 * 365 * refreshes
+filtered = 1621 * refreshes
+print(full, filtered, full // filtered)</code></pre><div class="output">56799840 155616 365</div></div>
+        <p><b>How it works:</b> 365 times more data read every day. Turning on <code>hive.strict.checks.no.partition.filter</code> catches this before it reaches production.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Partitioning is asked in almost every Hive and data engineering interview. Expect “why”, “which column” and “why is my query still slow”.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Hive</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is partitioning in Hive?”</h4>
+      <p class="scn__situation">Explain partitioning and give an example.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know what changes on disk and in the metastore?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>Partitioning splits a table into sub-folders by a column’s value, like <code>order_date=2026-10-05/</code>. Each partition is registered in the metastore. Queries that filter on that column read only the matching folders (partition pruning). Partition columns are not stored inside the files. Example: a daily orders table, where yesterday’s report reads one folder.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Saying partitions are “like indexes” or that they are separate tables.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Analytics</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>“The table is partitioned, but my query is slow”</h4>
+      <p class="scn__situation">A query on a date-partitioned table takes as long as on the flat table.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you verify pruning?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Run <code>EXPLAIN DEPENDENCY</code> and count <code>input_partitions</code>.</li>
+          <li>Check the WHERE clause: is it on the partition column, or on a timestamp column that holds the same date? Is it OR-ed with another condition?</li>
+          <li>Rewrite the filter on the partition column and compare <code>RECORDS_IN_Map_1</code>.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> “Add more memory”, before checking what the query reads.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Duplicate orders in one day</h4>
+      <p class="scn__situation">Finance finds the same orders on two days in a partitioned table loaded by LOAD DATA.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know that static partition values are not validated?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Confirm with a self-join on order_id across the two partitions.</li>
+          <li>Drop or overwrite the wrong partition.</li>
+          <li>Prevent it: load into staging, check that the dates match the target partition, then INSERT OVERWRITE that partition.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Running DISTINCT in every report instead of fixing the load.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Choosing the partition scheme</h4>
+      <p class="scn__situation">A new events table will get 200 million rows a day from 40 countries; most queries filter by date, some by country.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you balance pruning against the number of partitions?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Partition by event date first: every query uses it.</li>
+          <li>Add country as a second level only if each day-country folder stays large; otherwise keep country as a normal column and let ORC/Parquet statistics or bucketing help.</li>
+          <li>Estimate partitions per year (365 × 40 = 14,600) and file sizes before deciding, and enable the strict partition filter.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Partitioning by user_id or by hour without estimating folder counts.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,238 @@
+import os, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, '..', '..', '..', '..'))
+from svgkit import scn
+from shlesson import pc
+sys.path.insert(0, os.path.join(HERE, '..', '..'))
+from linuxkit import teaser
+BODY = body(HERE)
+
+META = dict(
+    module='01-start-here', lesson='06-terminal-console-shell-and-prompt-your-first', n='1.6',
+    module_label='Module 1 · Start here: what is Linux?',
+    title='Terminal, console, shell and prompt: your first commands',
+    desc='The difference between terminal, console, shell and prompt; the structure of a command (command, options, arguments); reading the prompt; your first fifteen Linux commands; getting help with man and --help; Tab completion, history, Ctrl+C and other shortcuts. With animations and real Bash.',
+    og_desc='Terminal vs shell vs prompt, command options and arguments, first commands and the shortcuts professionals use, explained with real Bash.',
+    minutes=30, level='Beginner',
+    lead='Riya’s first command never stops, and she is about to close the window. This lesson explains what the terminal, console, shell and prompt each are, how every command line is built (command, options, arguments), your first fifteen commands, how to get help without leaving the terminal, and the keyboard shortcuts that make you fast and safe.',
+    chips=['Story-based', '4 animations', 'Real Bash in your browser'],
+)
+
+MAIN = '''# Your first fifteen minutes at the prompt
+echo "Hello, I am learning Linux"
+date -d 2026-11-05 +"%d-%m-%Y (%A)"
+whoami
+hostname
+pwd
+ls -a
+mkdir -p practice/day1
+ls -l practice
+cd practice/day1
+pwd
+type cd ls
+ls /nope
+echo "last exit status: $?"
+'''
+
+RUN = dict(
+    heading='Your first command lines',
+    intro='<p>Read each line, guess its output, then run it. The second-last command fails on purpose so you can see an error and its exit status. The date is fixed with <code>-d</code> so the output matches; output shown is from a real run (user and host names will differ for you).</p>',
+    code=MAIN, expect='any',
+    anno=[
+        ('date -d 2026-11-05 +"%d-%m-%Y (%A)"', '<code>-d</code> gives a date to show; <code>+…</code> is the format. Remove <code>-d 2026-11-05</code> to see today.'),
+        ('hostname', 'The computer’s name, the part after @ in your prompt.'),
+        ('ls -a', '<code>-a</code> = all, including hidden names that start with a dot: <code>.</code> (this folder) and <code>..</code> (parent).'),
+        ('ls -l practice', 'Option <code>-l</code> (long format) plus argument <code>practice</code> (which folder to list).'),
+        ('type cd ls', 'One builtin, one program file.'),
+        ('ls /nope', 'An argument that does not exist: an error on the screen and a non-zero exit status.'),
+        ('echo "last exit status: $?"', '<code>$?</code> = exit status of the previous command: 2 for this ls error.'),
+    ],
+    tasks=[
+        dict(label='1 · Run it', hint='Press <b>Run</b>. Which line printed the error, and which number did <code>$?</code> show?', code=MAIN, expect='any'),
+        dict(label='2 · Predict first', hint='<b>Predict first:</b> <code>-l</code> and <code>-a</code> joined as <code>-la</code>: same output as <code>ls -l -a</code>? Run to check.',
+             code='mkdir -p demo && touch demo/a.txt demo/.hidden\nls -l -a demo | wc -l\nls -la demo | wc -l\n'),
+        dict(label='3 · Spot the error', hint='<b>Spot the error:</b> two typos. Read each error message and fix them. What exit status means “command not found”?',
+             code='ehco "hi"\necho "status: $?"\nls -z\necho "status: $?"\n', expect='any'),
+        dict(label='4 · Your turn', hint='Print a one-line “status card”: user, host, folder and date in the format DD/MM/YYYY.',
+             code='echo "$(whoami) | $(hostname) | $(pwd) | $(date +%d/%m/%Y)"\n'),
+        dict(label='5 · Challenge', hint='Use <code>--help</code> and grep to find which ls option sorts by file size. Then use it.',
+             code="ls --help | grep -i 'size'\nmkdir -p sz && head -c 500 /dev/zero > sz/small && head -c 5000 /dev/zero > sz/big\nls -lS sz\n"),
+    ],
+)
+
+PCRUN = dict(
+    heading='Run on your PC: your terminal, your prompt',
+    intro='<p>Some things only make sense in a real interactive terminal. <b>Outputs were recorded on a real Ubuntu 24.04 cloud VM</b> (host name <code>vm</code>, user <code>riya</code>).</p>',
+    items=[
+        dict(title='1 · How Ubuntu builds your prompt', cmd='echo "$PS1"', output=pc('bash -ic \'echo "$PS1"\' 2>/dev/null | tail -1'),
+             note='<code>\\u</code> = user, <code>\\h</code> = host, <code>\\w</code> = working folder, <code>\\$</code> = $ or # for root. The <code>debian_chroot</code> part is empty normally. Coloured terminals have extra colour codes.'),
+        dict(title='2 · Which pseudo-terminal are you on?', cmd='tty', output='/dev/pts/0',
+             note='Typical output in a terminal window or SSH session (our recording ran without a terminal, where tty prints “not a tty”). Open a second tab and run it again: you get <code>/dev/pts/1</code>.'),
+        dict(title='3 · Short help for a command', cmd='ls --help | head -3', output=pc('ls --help | head -3'),
+             note='Every GNU command has <code>--help</code>. Pipe it into <code>less</code> or <code>grep</code> to read or search it.'),
+        dict(title='4 · How long has the machine been running?', cmd='uptime', output=pc('uptime'),
+             note='Current time, up-time, logged-in users and the load averages (Lesson 18.3).'),
+        dict(title='5 · The full manual', cmd='man ls', output='LS(1)                       User Commands                      LS(1)\n\nNAME\n       ls - list directory contents\n\nSYNOPSIS\n       ls [OPTION]... [FILE]...',
+             note='Typical first lines (our build image has manuals removed to save space). Inside man: Space = next page, <code>/word</code> = search, <code>q</code> = quit. If <code>man</code> is missing in a minimal image, <code>sudo unminimize</code> restores it on Ubuntu.'),
+    ],
+)
+
+TRACE = dict(
+    heading='Options, arguments and exit statuses, line by line',
+    intro='<p>Watch <code>$?</code> in the <b>Shell</b> box: 0 after every success, something else after a failure. And see how arguments decide where things happen.</p>',
+    code='''mkdir -p notes
+cd notes
+echo "first command" > day1.txt
+ls -l
+cat day1.txt
+cat day2.txt
+cd ..
+pwd
+''',
+    notes={1: 'Argument :: <code>notes</code> tells mkdir which folder to create; <code>-p</code> is an option.',
+           4: 'Option :: <code>-l</code> changes how ls prints: long format with size and date.',
+           6: 'Error :: day2.txt does not exist, so cat prints an error and returns exit status 1.',
+           7: 'Parent :: <code>..</code> is an argument meaning “the folder above”.'},
+)
+
+WORKED_INTRO = 'Three tasks using only first-day commands: a personal status card, finding an option in the built-in help, and a timestamped work log.'
+EXAMPLES = [
+    dict(level='b', tag='Everyday', title='Your terminal status card',
+         problem='<p>Riya works in several terminals and SSH sessions. She wants a quick command that prints who and where she is, and the date, in a clear block.</p>',
+         inp='(the machine)',
+         approach=['Use <code>whoami</code>, <code>hostname</code>, <code>pwd</code> and <code>date</code>.', 'Print each on its own line with a label.'],
+         code='''echo "User   : $(whoami)"
+echo "Host   : $(hostname)"
+echo "Folder : $(pwd)"
+echo "Date   : $(date -d 2026-11-05 +'%d %b %Y')"
+''',
+         notes={4: 'Format :: <code>%b</code> is the short month name (Nov).'},
+         tryit='Remove <code>-d 2026-11-05</code> to show the real date, and add a line with <code>uptime -p</code>.'),
+    dict(level='i', tag='Getting help', title='Find the option without leaving the terminal',
+         problem='<p>Kabir wants <code>ls</code> to show sizes like 4.0K instead of 4096 and to sort by time. He does not remember the options and has no internet on the server.</p>',
+         inp='ls --help',
+         approach=['Search <code>ls --help</code> for “human” and for “time”.', 'Apply the options you found to a test folder.'],
+         code='''ls --help | grep -i human
+ls --help | grep -- '^  -t'
+mkdir -p logs && head -c 3000 /dev/zero > logs/app.log
+ls -lh logs
+''',
+         notes={2: 'Search :: <code>^  -t</code> = lines that start with two spaces and -t, the format ls --help uses for options.'},
+         tryit='Find the option that reverses the sort order (search for “reverse”).'),
+    dict(level='a', tag='Business problem', title='A timestamped work log in one command',
+         problem='<p>The support team asks interns to keep a simple log of what they did, one line per task with date and time. Riya wants to add an entry with one short command and then show the log.</p>',
+         inp='tasks: checked payment log; restarted test service',
+         approach=['<code>echo "$(date …) task" >> worklog.txt</code> appends one line (<code>>></code> adds, <code>></code> would overwrite).', 'Fixed times are used here so the output is repeatable.', '<code>cat -n</code> shows the log with line numbers.'],
+         code='''echo "$(date -d '2026-11-05 10:05' '+%F %H:%M') checked payment log" >> worklog.txt
+echo "$(date -d '2026-11-05 11:40' '+%F %H:%M') restarted test service" >> worklog.txt
+cat -n worklog.txt
+echo "Entries today: $(grep -c '^2026-11-05' worklog.txt)"
+''',
+         notes={1: 'Append :: <code>>></code> creates the file the first time and adds to the end after that.', 3: 'Numbered :: <code>cat -n</code> numbers each line.'},
+         tryit='Add a third entry and count again. What happens if you use <code>></code> instead of <code>>></code>?'),
+]
+
+QUIZ = mix([
+    dict(q='Which is the program that understands and runs your commands?', options=['The terminal', 'The shell', 'The prompt', 'The monitor'], answer=1,
+         why='The terminal is the window; the shell (bash) interprets commands; the prompt is the shell showing it is ready.'),
+    dict(q='In “ls -l /etc”, what is /etc?', options=['The command', 'An option', 'An argument', 'The prompt'], answer=2,
+         why='ls is the command, -l an option (how), /etc the argument (on what).'),
+    dict(q='Your prompt ends with # instead of $. What does it tell you?', options=['You are in a comment', 'You are root, the administrator', 'The command failed', 'You are offline'], answer=1,
+         why='# is the conventional prompt for root. Be extra careful: root can change or delete anything.'),
+    dict(q='A command keeps printing and never stops. What should you press?', options=['Ctrl+Z', 'Ctrl+C', 'Ctrl+S', 'Esc'], answer=1,
+         why='Ctrl+C sends SIGINT and stops it. Ctrl+Z only pauses it (it keeps existing in the background).'),
+    dict(q='Which key completes a file name for you?', options=['Enter', 'Tab', 'Shift', 'Space'], answer=1,
+         why='Tab completes commands and names; press it twice to see all choices.'),
+    dict(q='You typed “ehco hi”. What exit status will $? show?', options=['0', '1', '127', '255'], answer=2,
+         why='127 means “command not found”.'),
+    dict(q='How do you copy selected text in most Linux terminal windows?', options=['Ctrl+C', 'Ctrl+Shift+C', 'Alt+C', 'Ctrl+X'], answer=1,
+         why='Plain Ctrl+C is reserved for stopping programs, so terminals use Ctrl+Shift+C / Ctrl+Shift+V.'),
+])
+
+REVISION = [
+    '<b>Terminal</b> = window · <b>shell</b> = interpreter (bash) · <b>prompt</b> = “ready” · <b>console</b> = machine’s own text screen.',
+    'Command shape: <code>command [options] [arguments]</code>. <code>-a -l</code> = <code>-la</code>; long options: <code>--all</code>.',
+    'Prompt <code>user@host:folder$</code>; <code>~</code> = home; <code>$</code> user, <code>#</code> root. Built from PS1.',
+    'First commands: echo, date, whoami, hostname, pwd, ls, cd, uptime, clear, history, type, man, exit.',
+    'Help: <code>cmd --help</code>, <code>man cmd</code> (q quits, / searches).',
+    'Shortcuts: Tab, ↑, Ctrl+C (stop), Ctrl+L, Ctrl+A/E, Ctrl+R, Ctrl+D; copy/paste with Ctrl+Shift+C/V.',
+    '<code>echo $?</code>: 0 success; 127 command not found; other non-zero = some failure.',
+    'Read the prompt (user, host, folder) before any risky command.',
+]
+
+FAQ = [
+    ('What is the difference between a terminal and a shell?', 'The terminal is the interface (a window or device) that shows text and sends your keystrokes. The shell is the program running in it that interprets commands and runs programs. You can run different shells in the same terminal.'),
+    ('What is a console in Linux?', 'The system’s directly attached text terminal. Linux provides several virtual consoles (/dev/tty1–tty6), reachable on many desktops with Ctrl+Alt+F3 and so on.'),
+    ('Explain the parts of a Linux command.', 'Command (the program to run), options (modify behaviour, start with - or --), arguments (what to act on). Example: <code>cp -r src backup</code>: command cp, option -r (recursive), arguments src and backup.'),
+    ('What do $ and # mean in the prompt?', '$ means a normal user; # means the root (administrator) user.'),
+    ('How do you get help for a command without the internet?', '<code>command --help</code> for a summary, <code>man command</code> for the full manual, <code>man -k keyword</code> (apropos) to search manuals, and <code>type command</code> to see what it is.'),
+    ('What happens when you press Ctrl+C?', 'The terminal sends the SIGINT signal to the foreground process, which normally stops it. Programs may catch SIGINT to clean up first, as ping does when printing its statistics.'),
+]
+
+PRACTICE_INTRO = 'First-day practice at the prompt. Expected outputs are from real runs; dates are fixed so they repeat.'
+PROBLEMS = [
+    dict(level='easy', title='Hello with the date', stmt='Print “Hello! Today is &lt;weekday&gt;.” for 5 November 2026.', inp='2026-11-05',
+         code='echo "Hello! Today is $(date -d 2026-11-05 +%A)."\n', explain='<code>%A</code> prints the full weekday name.'),
+    dict(level='easy', title='Show hidden files', stmt='Create <code>.config</code> and <code>notes.txt</code> in a folder <code>h</code> and list all names, hidden ones included.', inp='(nothing)',
+         code='mkdir h && touch h/.config h/notes.txt\nls -a h\n', explain='Names starting with a dot are hidden from plain <code>ls</code>; <code>-a</code> shows them, plus <code>.</code> and <code>..</code>.'),
+    dict(level='easy', title='Combine options', stmt='Show the same folder with long format and hidden files using a single combined option.', inp='h/ from P2',
+         code='mkdir h && touch h/.config h/notes.txt\nls -la h | tail -2\n', explain='<code>-la</code> = <code>-l -a</code>. <code>tail -2</code> keeps the two file lines (dates in the output are from the run).'),
+    dict(level='medium', title='Count builtins', stmt='Of the names <code>cd echo ls pwd cat type</code>, how many are bash builtins?', inp='cd echo ls pwd cat type',
+         code='n=0\nfor c in cd echo ls pwd cat type; do\n  [ "$(type -t $c)" = builtin ] && n=$((n+1))\ndone\necho "builtins: $n of 6"\n', explain='<code>type -t</code> prints “builtin” for shell builtins; the counter is increased with <code>$((n+1))</code>.'),
+    dict(level='medium', title='Exit status table', stmt='Run <code>true</code>, <code>false</code>, a missing command and <code>ls</code> on a missing file, printing each exit status.', inp='(nothing)',
+         code="true;  echo \"true  -> $?\"\nfalse; echo \"false -> $?\"\nnocmd 2>/dev/null; echo \"nocmd -> $?\"\nls /missing 2>/dev/null; echo \"ls    -> $?\"\n",
+         explain='<code>true</code> always succeeds (0), <code>false</code> always fails (1), a missing command gives 127, and ls uses 2 for “serious trouble” such as a missing argument. <code>2>/dev/null</code> hides the error text.'),
+    dict(level='medium', title='Search the help text', stmt='Using <code>date --help</code>, print the help line that explains the <code>%A</code> format.', inp='date --help',
+         code="date --help | grep -- '%A'\n", explain='Help text is plain text, so grep can search it. <code>--</code> stops grep from treating the pattern as an option.'),
+    dict(level='business', title='Shift log for a support desk', stmt='Record three ticket actions with fixed times in <code>shift.log</code> and print the log with line numbers and the total count.', inp='09:10 T-101 opened\n09:45 T-101 resolved\n10:20 T-102 opened',
+         code="for e in '09:10 T-101 opened' '09:45 T-101 resolved' '10:20 T-102 opened'; do\n  echo \"2026-11-05 $e\" >> shift.log\ndone\ncat -n shift.log\necho \"Total actions: $(wc -l < shift.log)\"\n",
+         explain='Each loop round appends one line with <code>>></code>. <code>cat -n</code> numbers lines; <code>wc -l &lt;</code> counts them.'),
+    dict(level='business', title='Which tickets are still open?', stmt='From the shift log of P7, print ticket IDs that were opened but not resolved.', inp='shift.log from P7',
+         code="printf '2026-11-05 09:10 T-101 opened\\n2026-11-05 09:45 T-101 resolved\\n2026-11-05 10:20 T-102 opened\\n' > shift.log\nfor t in $(grep opened shift.log | cut -d' ' -f3); do\n  grep -q \"$t resolved\" shift.log || echo \"OPEN: $t\"\ndone\n",
+         explain='For each opened ticket, <code>grep -q</code> checks whether a “resolved” line exists; <code>||</code> prints only when it does not.'),
+]
+
+SCN_INTRO = 'First-week questions interviewers use to see whether you are comfortable at a Linux prompt.'
+SCENARIOS = (
+    scn('Any company · basics', 'Fresher', '“Read this prompt for me”',
+        'The interviewer shows <code>root@db-prod-02:/var/lib/mysql#</code> and asks what it tells you.',
+        'can you read the prompt and see the risk?',
+        '''<ul>
+          <li>User <b>root</b> (also shown by <code>#</code>), on host <b>db-prod-02</b> (a production database server by its name), in folder <code>/var/lib/mysql</code>, where MySQL stores its data files.</li>
+          <li>Any delete or move here could destroy data, so I would double-check every command, prefer read-only commands, and use sudo for single commands instead of a root shell.</li>
+        </ul>''', 'reading only the folder and ignoring the user and host.') +
+    scn('Product company · basics', 'Fresher', 'Terminal vs shell vs console',
+        'You are asked to explain the three words to a non-technical project manager.',
+        'can you separate them clearly?',
+        '''<ul>
+          <li>Terminal: the window where you type, like a chat window.</li>
+          <li>Shell: the program on the other side that understands the commands and runs them (bash).</li>
+          <li>Console: the machine’s own built-in text screen, used when there is no window system or for rescue.</li>
+        </ul>''', 'saying all three are the same.') +
+    scn('Operations · practical', 'Fresher', 'A command that hangs',
+        'You ran a command on a server and it has printed nothing for five minutes. What do you do?',
+        'do you know safe ways to regain control and investigate?',
+        '''<ol>
+          <li>Press Ctrl+C to interrupt it. If it ignores that, press Ctrl+Z to suspend it, then use <code>jobs</code> and <code>kill %1</code> (Module 11).</li>
+          <li>Find out why: maybe it was waiting for input, a network host was unreachable, or the command expected a file argument and was reading the keyboard instead.</li>
+          <li>Re-run with a timeout or verbose option (<code>-v</code>) if available.</li>
+        </ol>''', 'closing the SSH window or rebooting the server.') +
+    scn('Any company · habits', 'Fresher', '“How do you work fast in the terminal?”',
+        'The interviewer asks which habits make you productive at the command line.',
+        'do you know professional shortcuts and help tools?',
+        '''<ul>
+          <li>Tab completion for commands, paths and options; Up arrow and Ctrl+R to reuse history.</li>
+          <li>Ctrl+A/Ctrl+E to edit long lines, Ctrl+L to clear, Ctrl+C to cancel.</li>
+          <li><code>--help</code>, <code>man</code> and <code>type</code> to check options before running anything risky, and <code>echo $?</code> to confirm success.</li>
+        </ul>''', '“I copy commands from Google.”')
+) + teaser('2.1', 'On Windows, files live on C: and D:. Linux has no drive letters at all. So where are your second disk, your USB stick and even your running programs?')
+
+from linuxkit import mindmap
+MINDMAP = mindmap('At the prompt', [
+    ('Four words', 'blue', ['terminal = window', 'shell = interpreter', 'prompt = ready', 'console = machine screen']),
+    ('Command line', 'acc', ['command options args', '-la = -l -a', 'quote names with spaces']),
+    ('Prompt', 'green', ['user@host:folder$', '$ user, # root', 'built from PS1']),
+    ('Help', 'violet', ['cmd --help', 'man cmd (q quits)', 'type cmd']),
+    ('Shortcuts', 'amber', ['Tab, ↑, Ctrl+R', 'Ctrl+C stops (SIGINT)', 'Ctrl+Shift+C copies']),
+    ('Exit status', 'red', ['echo $?', '0 = success', '127 = not found, 130 = ^C']),
+])

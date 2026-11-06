@@ -1,0 +1,2150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>groupBy and pivot | MyPhatshala</title>
+<meta name="description" content="Aggregations in PySpark 4.3.0 on 5 million orders: several aggregates in one groupBy, partial aggregation visible in the plan, null keys as a group, rollup and cube subtotals (7 vs 9 rows), pivot without values running 4 extra jobs (2.72 s vs 1.30 s) and dropping an empty REFUNDED column, the 10,000-value pivot limit, unpivot back to 24 rows, and collect_list / collect_set.">
+<meta name="mp:minutes" content="30">
+<link rel="canonical" href="https://myphatshala.in/courses/spark-pyspark/06-transformations/01-groupby-and-pivot/">
+<meta property="og:title" content="groupBy and pivot · MyPhatshala">
+<meta property="og:description" content="pivot() without a value list ran 4 extra jobs and silently dropped a column. groupBy and pivot in PySpark, measured on 5M orders.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "groupBy and pivot", "learningResourceType": "Lesson", "educationalLevel": "Beginner → Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Spark and PySpark", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="06-transformations/01-groupby-and-pivot" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Spark and PySpark syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Spark and PySpark</a><span>›</span><b>Lesson 6.1</b></nav>
+    <h1>groupBy and pivot</h1>
+    <p class="lead">Module 6 covers the transformations used in almost every pipeline. First: <b>aggregations</b>. This lesson builds a city report with <code>groupBy</code>, explains partial aggregation, subtotals with <code>rollup</code>/<code>cube</code>, and reshapes data with <code>pivot</code> and <code>unpivot</code>. <b>All outputs are real</b> (PySpark 4.3.0).</p>
+    <div class="lesson-meta"><span>Module 6 · Transformations</span><span>⏱ 30 min</span><span>Beginner → Intermediate</span><span>PySpark 4.3.0</span><span>5M orders</span><span>Pivot jobs counted</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“One row per city, one column per status”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> reduceByKey vs groupByKey in <a href="../../02-rdds/04-narrow-vs-wide-and-the-shuffle/">2.4</a>, nulls in <a href="../../04-dataframes/04-nulls-and-duplicates/">4.4</a>.</p></div>
+  <div class="story">
+    <p class="narration">The operations head wants a daily sheet: one row per city with orders, revenue, average bill, customers and cancellations, and a second sheet with delivered, cancelled and refunded revenue side by side. Riya wrote it with <code>groupBy</code> and <code>pivot</code>. It worked, but the REFUNDED column was missing and the job ran more Spark jobs than she expected.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="groupBy aggregates rows that share a key; pivot turns key values into columns and unpivot turns them back. We built TiffinGo’s city report from 5 million orders and timed pivot with and without a list of values.">
+        <text x="36.0" y="30" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">city</text><text x="80.0" y="30" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">status</text><text x="128.0" y="30" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">n</text><rect x="14" y="34" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="35.0" y="43.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Pune</text><rect x="58" y="34" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="79.0" y="43.5" text-anchor="middle" font-size="6.4" class="s-ink mono">DELIV</text><rect x="102" y="34" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="127.0" y="43.5" text-anchor="middle" font-size="6.4" class="s-ink mono">473,621</text><rect x="14" y="49" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="35.0" y="58.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Pune</text><rect x="58" y="49" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="79.0" y="58.5" text-anchor="middle" font-size="6.4" class="s-ink mono">CANC</text><rect x="102" y="49" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="127.0" y="58.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,025</text><rect x="14" y="64" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="35.0" y="73.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Delhi</text><rect x="58" y="64" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="79.0" y="73.5" text-anchor="middle" font-size="6.4" class="s-ink mono">DELIV</text><rect x="102" y="64" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="127.0" y="73.5" text-anchor="middle" font-size="6.4" class="s-ink mono">475,037</text><rect x="14" y="79" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="35.0" y="88.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Delhi</text><rect x="58" y="79" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="79.0" y="88.5" text-anchor="middle" font-size="6.4" class="s-ink mono">CANC</text><rect x="102" y="79" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="127.0" y="88.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,047</text><path d="M160 64L196 64" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M189.7 67.0L196 64L189.7 61.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><text x="178" y="56" text-anchor="middle" font-size="6.8" class="s-ink2">pivot</text><text x="224.0" y="38" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">city</text><text x="274.0" y="38" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">DELIVERED</text><text x="327.0" y="38" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">CANCELLED</text><rect x="202" y="42" width="42" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="223.0" y="51.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Pune</text><rect x="246" y="42" width="54" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="273.0" y="51.5" text-anchor="middle" font-size="6.4" class="s-ink mono">473,621</text><rect x="302" y="42" width="48" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="326.0" y="51.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,025</text><rect x="202" y="57" width="42" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="223.0" y="66.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Delhi</text><rect x="246" y="57" width="54" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="273.0" y="66.5" text-anchor="middle" font-size="6.4" class="s-ink mono">475,037</text><rect x="302" y="57" width="48" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="326.0" y="66.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,047</text><rect x="400" y="12" width="232" height="132" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="516" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured (5M orders)</text><text x="412" y="52" font-size="7.2" class="s-green mono">partial_sum before the shuffle</text><text x="412" y="68" font-size="7.2" class="s-acc mono">null city = its own group</text><text x="412" y="84" font-size="7.2" class="s-acc mono">pivot w/o values: 4 extra jobs</text><text x="412" y="100" font-size="7.2" class="s-green mono">…2.72 s vs 1.30 s with values</text><text x="412" y="116" font-size="7.2" class="s-red mono">pivot on order_id: > 10000 error</text><text x="412" y="132" font-size="7.2" class="s-green mono">unpivot: 8 x 3 = 24 rows</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Aggregate <tspan font-weight="700" class="s-acc">early</tspan>; give pivot its <tspan font-weight="700" class="s-acc">values</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, there are refunded orders in the app. Why no column?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Pivot without a value list first runs a query to find the distinct values, and in this data set there were none. Give the list yourself: the column is always there, and Spark skips that extra query.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>And groupBy on 5 million rows: is it one big shuffle?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>A smaller one than you think: Spark adds up inside each partition first. Today: aggregates, partial aggregation, null keys, rollup and cube, pivot and its limits, unpivot and collecting lists. All outputs are real (PySpark 4.3.0).</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Grouping, pivoting and unpivoting</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><code>groupBy</code> returns a <code>GroupedData</code> object whose <code>agg</code> computes aggregate functions over the rows of each group of equal key values; null keys form a group of their own. Spark executes most aggregations in two phases: a <b>partial aggregation</b> within each input partition, a shuffle by the grouping keys, and a final merge, so only partial results cross the network. <code>rollup</code> and <code>cube</code> compute additional grouping sets (hierarchical subtotals, or all combinations) with nulls marking the rolled-up columns. <code>pivot(col, values)</code> rotates distinct values of a column into output columns of an aggregation; if values are not given, Spark first computes them with a separate query and limits them to <code>spark.sql.pivotMaxValues</code> (10,000). <code>unpivot</code> (also <code>melt</code>) performs the reverse, turning columns into rows.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>groupBy puts rows with the same key together and computes totals, counts or averages per group. Spark adds things up inside each partition first, so the shuffle is small. pivot turns values into columns, unpivot turns columns back into rows. Give pivot its list of values.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>groupBy / agg</b><span>Group rows by keys and compute aggregates.</span></div>
+    <div class="term"><b>Partial aggregation</b><span>Per-partition pre-aggregation before the shuffle.</span></div>
+    <div class="term"><b>countDistinct</b><span>Number of different values in a group.</span></div>
+    <div class="term"><b>rollup</b><span>Subtotals along a hierarchy (city → status).</span></div>
+    <div class="term"><b>cube</b><span>Subtotals for every combination.</span></div>
+    <div class="term"><b>pivot</b><span>Values of a column become columns.</span></div>
+    <div class="term"><b>unpivot / melt</b><span>Columns become rows.</span></div>
+    <div class="term"><b>collect_list / set</b><span>Gather group values into an array.</span></div>
+  </div>
+
+  <h3>Common aggregate functions</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:600px">
+    <thead><tr><th>Function</th><th>Returns</th><th>Nulls</th></tr></thead>
+    <tbody><tr><td><code>count("*")</code> / <code>count(c)</code></td><td>rows / non-null values</td><td>counted / skipped</td></tr><tr><td><code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code></td><td>number</td><td>skipped</td></tr><tr><td><code>countDistinct</code> / <code>approx_count_distinct</code></td><td>distinct count</td><td>skipped</td></tr><tr><td><code>count_if(cond)</code></td><td>rows where cond is true</td><td>—</td></tr><tr><td><code>collect_list</code> / <code>collect_set</code></td><td>array (with / without duplicates)</td><td>skipped</td></tr><tr><td><code>first</code>, <code>last</code>, <code>max_by(c, ord)</code>, <code>min_by</code></td><td>a value from the group</td><td>first/last depend on order</td></tr><tr><td><code>percentile_approx</code>, <code>median</code></td><td>percentile</td><td>skipped</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Aggregation at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Counting votes</h4>
+      <ul>
+        <li>Each polling booth counts its own votes first, then sends only totals to the centre. That is partial aggregation.</li>
+        <li>A pivot is turning the result list (party, votes) into a table with one column per party.</li>
+        <li>Blank ballots still form a pile of their own: nulls are a group.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The API</h4>
+      <ul>
+        <li><code>df.groupBy(cols).agg(F.count, F.sum, F.avg, F.countDistinct, F.collect_list…)</code>; <code>rollup</code> and <code>cube</code> add subtotals.</li>
+        <li><code>groupBy(k).pivot(col, [values]).agg(…)</code>; <code>unpivot(ids, values, name, value)</code> (alias <code>melt</code>, Spark 3.4+).</li>
+        <li>Conditional counts: <code>F.sum(F.when(cond, 1).otherwise(0))</code> or <code>F.count_if(cond)</code>.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>The plan aggregated twice: <code>partial_sum</code> per partition, shuffle, final <code>sum</code>.</li>
+        <li>Pivot without values ran 4 extra jobs and took 2.72 s; with values, 0 extra jobs and 1.30 s, and the empty REFUNDED column existed.</li>
+        <li>Pivot on <code>order_id</code> failed: more than 10,000 distinct values (<code>spark.sql.pivotMaxValues</code>).</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “Why should you pass values to pivot?” Without them Spark runs an extra query over the data to find distinct values (4 extra jobs in our lab, 2.72 s vs 1.30 s), the output columns depend on the data (a missing status means a missing column), and more than 10,000 values fails. With a list, the schema is fixed and the extra pass disappears.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Grouping sets</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Method</th><th>Groups produced for (city, status)</th><th>Lab (Pune, Delhi × 2 statuses)</th></tr></thead>
+    <tbody><tr><td><code>groupBy</code></td><td>(city, status)</td><td>4 rows</td></tr><tr><td><code>rollup</code></td><td>(city, status), (city), ()</td><td>7 rows: + city totals + grand total</td></tr><tr><td><code>cube</code></td><td>(city, status), (city), (status), ()</td><td>9 rows: + status totals</td></tr><tr><td>SQL <code>GROUPING SETS</code></td><td>exactly the sets you list</td><td>any</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>In rollup and cube results a <code>NULL</code> in a key column means “all values” (a subtotal), but a real null key also shows as <code>NULL</code>. Use <code>F.grouping("city")</code> or <code>grouping_id()</code> to tell them apart, or replace null keys with <code>"unknown"</code> before grouping.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>The city report</h2>
+  <p>All outputs are real: PySpark 4.3.0, local mode with 4 cores, <code>orders_big</code> (5,000,000 orders), 8 shuffle partitions.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Many aggregates in one pass</h4>
+      <div class="code" data-lang="python" data-file="l61_group.py"><pre><code>o.groupBy(&quot;city&quot;).agg(F.count(&quot;*&quot;).alias(&quot;orders&quot;), F.sum(&quot;amount&quot;).alias(&quot;revenue&quot;),
+    F.round(F.avg(&quot;amount&quot;), 1).alias(&quot;avg&quot;), F.countDistinct(&quot;customer_id&quot;).alias(&quot;customers&quot;),
+    F.sum(F.when(F.col(&quot;status&quot;) == &quot;CANCELLED&quot;, 1).otherwise(0)).alias(&quot;cancelled&quot;)).orderBy(&quot;city&quot;).show()</code></pre><div class="output">== 1) groupBy + several aggregates
++-----------+-------+---------+-----+---------+---------+
+|       city| orders|  revenue|  avg|customers|cancelled|
++-----------+-------+---------+-----+---------+---------+
+|  Bengaluru|1000215|508795383|508.7|     3999|    50373|
+|    Chennai| 500931|255491091|510.0|     3999|    24893|
+|      Delhi| 500084|254673133|509.3|     3999|    25047|
+|  Hyderabad| 500552|254840418|509.1|     3999|    25035|
+|     Mumbai|1001205|510290994|509.7|     3999|    49775|
+|Navi Mumbai| 498281|253869032|509.5|     3999|    25020|
+|       Pune| 498646|254040203|509.5|     3999|    25025|
+|      Thane| 500086|254901021|509.7|     3999|    24832|
++-----------+-------+---------+-----+---------+---------+</div></div>
+      <span class="behind">One <code>agg</code> computed five figures per city in a single job. The conditional count is a <code>sum</code> of a <code>when</code>. Mumbai and Bengaluru have twice the orders of other cities, and every city served all 3,999 customers (a generated data set).</span></li>
+    <li><h4>Step 2 · Partial aggregation</h4>
+      <div class="code" data-lang="python" data-file="l61_group.py"><pre><code>o.groupBy(&quot;city&quot;).agg(F.sum(&quot;amount&quot;)).explain()</code></pre><div class="output">== 2) partial aggregation in the plan
+== Physical Plan ==
+AdaptiveSparkPlan isFinalPlan=false
++- HashAggregate(keys=[city], functions=[sum(amount)])
+   +- Exchange hashpartitioning(city, 8), ENSURE_REQUIREMENTS, [plan_id=126]
+      +- HashAggregate(keys=[city], functions=[partial_sum(amount)])
+         +- FileScan parquet [city,amount] Batched: true, DataFilters: [], Format: Parquet, Location: InMemoryFileIndex(1 paths)[file:/ro …</div></div>
+      <span class="behind">Read bottom-up: the scan reads two columns, the first <code>HashAggregate</code> computes <code>partial_sum</code> per city <b>inside each partition</b>, the <code>Exchange</code> shuffles only those partial sums (a few rows per partition instead of 5 million), and the top <code>HashAggregate</code> adds them up. This is why <code>groupBy().agg()</code> is far cheaper than <code>groupByKey</code> in Lesson 2.4.</span></li>
+    <li><h4>Step 3 · Null keys and subtotals</h4>
+      <div class="code" data-lang="python" data-file="l61_group.py"><pre><code>d.groupBy(&quot;city&quot;).sum(&quot;n&quot;).show()
+s = o.where(&quot;city IN (&#x27;Pune&#x27;, &#x27;Delhi&#x27;) AND status IN (&#x27;DELIVERED&#x27;, &#x27;CANCELLED&#x27;)&quot;)
+s.rollup(&quot;city&quot;, &quot;status&quot;).agg(F.count(&quot;*&quot;).alias(&quot;n&quot;)).show()
+s.cube(&quot;city&quot;, &quot;status&quot;).count().count(); s.rollup(&quot;city&quot;, &quot;status&quot;).count().count()</code></pre><div class="output">== 3) null keys form their own group
++----+------+
+|city|sum(n)|
++----+------+
+|NULL|     7|
+|Pune|    11|
++----+------+
+== 4) rollup and cube
++-----+---------+------+
+| city|   status|     n|
++-----+---------+------+
+|Delhi|CANCELLED| 25047|
+|Delhi|DELIVERED|475037|
+|Delhi|     NULL|500084|
+| Pune|CANCELLED| 25025|
+| Pune|DELIVERED|473621|
+| Pune|     NULL|498646|
+| NULL|     NULL|998730|
++-----+---------+------+
+cube rows: 9 | rollup rows: 7</div></div>
+      <span class="behind">Null keys were grouped together, not dropped. <code>rollup</code> added a total per city (status NULL) and a grand total (both NULL): 998,730 orders. <code>cube</code> also added totals per status across cities: 9 rows instead of 7. Note how a subtotal NULL looks exactly like a real null key.</span></li>
+    <li><h4>Step 4 · Pivot, with and without values</h4>
+      <div class="code" data-lang="python" data-file="l61_group.py"><pre><code>o.groupBy(&quot;city&quot;).pivot(&quot;status&quot;).agg(F.sum(&quot;amount&quot;))
+o.groupBy(&quot;city&quot;).pivot(&quot;status&quot;, [&quot;DELIVERED&quot;, &quot;CANCELLED&quot;, &quot;REFUNDED&quot;]).agg(F.sum(&quot;amount&quot;))
+# jobs counted with the REST API while building the DataFrame</code></pre><div class="output">== 5) pivot with and without values
+no values   : jobs while building 4, total 2.69 s, columns [&#x27;city&#x27;, &#x27;CANCELLED&#x27;, &#x27;DELIVERED&#x27;]
+values given: jobs while building 0, total 1.44 s, columns [&#x27;city&#x27;, &#x27;DELIVERED&#x27;, &#x27;CANCELLED&#x27;, &#x27;REFUNDED&#x27;]
++---------+---------+---------+--------+
+|     city|DELIVERED|CANCELLED|REFUNDED|
++---------+---------+---------+--------+
+|Bengaluru|483166030| 25629353|    NULL|
+|  Chennai|242708114| 12782977|    NULL|
+|    Delhi|241962159| 12710974|    NULL|
+|Hyderabad|242075595| 12764823|    NULL|
++---------+---------+---------+--------+
+only showing top 4 rows</div></div>
+      <span class="behind">Without values, merely <b>defining</b> the pivot ran 4 jobs to find the distinct statuses, and only two existed in this data, so the REFUNDED column did not appear. With a list: no extra jobs, half the time, and a stable schema where REFUNDED is simply null. Downstream code and dashboards should never depend on which values happened to occur.</span></li>
+    <li><h4>Step 5 · The pivot limit</h4>
+      <div class="code" data-lang="python" data-file="l61_group.py"><pre><code>o.groupBy(&quot;city&quot;).pivot(&quot;customer_id&quot;).count()          # 4,000 columns
+o.limit(20000).groupBy(&quot;city&quot;).pivot(&quot;order_id&quot;).count()</code></pre><div class="output">== 6) pivot limit
+pivot on customer_id: 4000 columns
+AnalysisException The pivot column order_id has more than 10000 distinct values, this could indicate an error. If this was intended, set  …</div></div>
+      <span class="behind">Pivoting on customers produced a <b>4,000-column</b> DataFrame without complaint; on order ids Spark stopped at 10,000 distinct values. Wide pivots are slow to plan and hard to use; if a column has thousands of values, keep the data long and aggregate.</span></li>
+    <li><h4>Step 6 · Unpivot and collecting values</h4>
+      <div class="code" data-lang="python" data-file="l61_group.py"><pre><code>wide.unpivot([&quot;city&quot;], [&quot;DELIVERED&quot;, &quot;CANCELLED&quot;, &quot;REFUNDED&quot;], &quot;status&quot;, &quot;revenue&quot;)
+o.where(&quot;customer_id = 1806&quot;).groupBy(&quot;customer_id&quot;).agg(F.count(&quot;*&quot;).alias(&quot;n&quot;),
+    F.collect_set(&quot;city&quot;).alias(&quot;cities&quot;), F.slice(F.sort_array(F.collect_list(&quot;amount&quot;), asc=False), 1, 3).alias(&quot;top3&quot;))</code></pre><div class="output">== 7) unpivot back
++---------+---------+---------+
+|     city|   status|  revenue|
++---------+---------+---------+
+|Bengaluru|CANCELLED| 25629353|
+|Bengaluru|DELIVERED|483166030|
+|Bengaluru| REFUNDED|     NULL|
+|  Chennai|CANCELLED| 12782977|
+|  Chennai|DELIVERED|242708114|
+|  Chennai| REFUNDED|     NULL|
++---------+---------+---------+
+only showing top 6 rows
+rows: 24
+== 8) collect_list / collect_set
++-----------+----+------------------------------------------------------------------------+---------------+
+|customer_id|n   |cities                                                                  |top3           |
++-----------+----+------------------------------------------------------------------------+---------------+
+|1806       |1238|[Thane, Pune, Hyderabad, Bengaluru, Navi Mumbai, Delhi, Mumbai, Chennai]|[959, 959, 959]|
++-----------+----+------------------------------------------------------------------------+---------------+</div></div>
+      <span class="behind"><code>unpivot</code> turned 8 rows × 3 status columns back into 24 long rows, including null REFUNDED values. <code>collect_set</code> gathered the 8 cities customer 1806 ordered in, and <code>collect_list</code> + <code>sort_array</code> + <code>slice</code> their three biggest bills. Collected arrays live in one row: never collect a group that can hold millions of values.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Summaries and reshaping</h2>
+  <p>Left: real outputs. Right: what Spark computes.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Summaries and reshaping <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">city   orders  revenue  cancelled</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">Pune   498646  254.0M   25025</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">Mumbai 1001205 510.3M   49775</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">HashAggregate sum</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">Exchange hashpartitioning(city)</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">HashAggregate partial_sum</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">rollup: 7 rows, cube: 9 rows</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">NULL = subtotal (or null key!)</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">pivot no values : 4 jobs, 2.72 s</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">pivot with values: 0 jobs, 1.30 s</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">REFUNDED column only with list</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">unpivot: 24 rows</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">pivot on order_id: &gt; 10000 values</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Five aggregates per city.</li>
+          <li>Two aggregation steps in the plan.</li>
+          <li>Subtotals from rollup and cube.</li>
+          <li>Values list: no extra jobs.</li>
+          <li>Back to long; very wide pivots fail.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What Spark computes">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One pass, many figures</text><rect x="8" y="50" width="96" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="56.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">5M rows</text><text x="56.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">orders</text><rect x="126" y="50" width="96" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="174.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">groupBy</text><text x="174.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">city</text><path d="M104 65.0L126 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M119.7 68.0L126 65.0L119.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="244" y="50" width="96" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="292.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">8 rows</text><text x="292.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">5 aggregates</text><path d="M222 65.0L244 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M237.7 68.0L244 65.0L237.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One job for the whole report.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Add up before shuffling</text><rect x="14" y="30" width="96" height="28" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="62.0" y="41" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">partition 1</text><text x="62.0" y="51" text-anchor="middle" font-size="6.4" class="s-ink2 mono">partial sums</text><path d="M110 44L200 66" style="fill:none;stroke:#8A94A0;stroke-width:1.0"/><path d="M193.2 67.5L200 66L194.6 61.5" style="fill:none;stroke:#8A94A0;stroke-width:1.0"/><rect x="14" y="64" width="96" height="28" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="62.0" y="75" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">partition 2</text><text x="62.0" y="85" text-anchor="middle" font-size="6.4" class="s-ink2 mono">partial sums</text><path d="M110 78L200 66" style="fill:none;stroke:#8A94A0;stroke-width:1.0"/><path d="M194.2 69.9L200 66L193.3 63.8" style="fill:none;stroke:#8A94A0;stroke-width:1.0"/><rect x="14" y="98" width="96" height="28" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="62.0" y="109" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">partition 3</text><text x="62.0" y="119" text-anchor="middle" font-size="6.4" class="s-ink2 mono">partial sums</text><path d="M110 112L200 66" style="fill:none;stroke:#8A94A0;stroke-width:1.0"/><path d="M195.8 71.6L200 66L193.0 66.2" style="fill:none;stroke:#8A94A0;stroke-width:1.0"/><rect x="204" y="50" width="110" height="32" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="259.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">final sum</text><text x="259.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">8 cities</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Only partial results cross the network.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Subtotals</text><text x="90.0" y="26" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">city</text><text x="150.0" y="26" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">status</text><text x="215.0" y="26" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">n</text><rect x="60" y="30" width="58" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="89.0" y="39.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Pune</text><rect x="120" y="30" width="58" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="149.0" y="39.5" text-anchor="middle" font-size="6.4" class="s-ink mono">DELIV</text><rect x="180" y="30" width="68" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="214.0" y="39.5" text-anchor="middle" font-size="6.4" class="s-ink mono">473,621</text><rect x="60" y="45" width="58" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="89.0" y="54.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Pune</text><rect x="120" y="45" width="58" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="149.0" y="54.5" text-anchor="middle" font-size="6.4" class="s-ink mono">NULL</text><rect x="180" y="45" width="68" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="214.0" y="54.5" text-anchor="middle" font-size="6.4" class="s-ink mono">498,646</text><rect x="60" y="60" width="58" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="89.0" y="69.5" text-anchor="middle" font-size="6.4" class="s-ink mono">NULL</text><rect x="120" y="60" width="58" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="149.0" y="69.5" text-anchor="middle" font-size="6.4" class="s-ink mono">NULL</text><rect x="180" y="60" width="68" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="214.0" y="69.5" text-anchor="middle" font-size="6.4" class="s-ink mono">998,730</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">NULL marks the rolled-up column.</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rows become columns</text><text x="36.0" y="30" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">city</text><text x="80.0" y="30" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">status</text><text x="128.0" y="30" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">n</text><rect x="14" y="34" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="35.0" y="43.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Pune</text><rect x="58" y="34" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="79.0" y="43.5" text-anchor="middle" font-size="6.4" class="s-ink mono">DELIV</text><rect x="102" y="34" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="127.0" y="43.5" text-anchor="middle" font-size="6.4" class="s-ink mono">473,621</text><rect x="14" y="49" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="35.0" y="58.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Pune</text><rect x="58" y="49" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="79.0" y="58.5" text-anchor="middle" font-size="6.4" class="s-ink mono">CANC</text><rect x="102" y="49" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="127.0" y="58.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,025</text><rect x="14" y="64" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="35.0" y="73.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Delhi</text><rect x="58" y="64" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="79.0" y="73.5" text-anchor="middle" font-size="6.4" class="s-ink mono">DELIV</text><rect x="102" y="64" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="127.0" y="73.5" text-anchor="middle" font-size="6.4" class="s-ink mono">475,037</text><rect x="14" y="79" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="35.0" y="88.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Delhi</text><rect x="58" y="79" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="79.0" y="88.5" text-anchor="middle" font-size="6.4" class="s-ink mono">CANC</text><rect x="102" y="79" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="127.0" y="88.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,047</text><path d="M160 64L196 64" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M189.7 67.0L196 64L189.7 61.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><text x="224.0" y="38" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">city</text><text x="274.0" y="38" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">DELIVERED</text><text x="327.0" y="38" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">CANCELLED</text><rect x="202" y="42" width="42" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="223.0" y="51.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Pune</text><rect x="246" y="42" width="54" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="273.0" y="51.5" text-anchor="middle" font-size="6.4" class="s-ink mono">473,621</text><rect x="302" y="42" width="48" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="326.0" y="51.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,025</text><rect x="202" y="57" width="42" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="223.0" y="66.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Delhi</text><rect x="246" y="57" width="54" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="273.0" y="66.5" text-anchor="middle" font-size="6.4" class="s-ink mono">475,037</text><rect x="302" y="57" width="48" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="326.0" y="66.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,047</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A value list fixes the columns.</text></g><g data-on="5"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">And back again</text><text x="36.0" y="38" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">city</text><text x="86.0" y="38" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">DELIVERED</text><text x="139.0" y="38" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">CANCELLED</text><rect x="14" y="42" width="42" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="35.0" y="51.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Pune</text><rect x="58" y="42" width="54" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="85.0" y="51.5" text-anchor="middle" font-size="6.4" class="s-ink mono">473,621</text><rect x="114" y="42" width="48" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="138.0" y="51.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,025</text><rect x="14" y="57" width="42" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="35.0" y="66.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Delhi</text><rect x="58" y="57" width="54" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="85.0" y="66.5" text-anchor="middle" font-size="6.4" class="s-ink mono">475,037</text><rect x="114" y="57" width="48" height="13" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="138.0" y="66.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,047</text><path d="M170 64L196 64" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M189.7 67.0L196 64L189.7 61.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><text x="224.0" y="30" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">city</text><text x="268.0" y="30" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">status</text><text x="316.0" y="30" text-anchor="middle" font-size="6.4" font-weight="700" class="s-ink2">n</text><rect x="202" y="34" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="223.0" y="43.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Pune</text><rect x="246" y="34" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="267.0" y="43.5" text-anchor="middle" font-size="6.4" class="s-ink mono">DELIV</text><rect x="290" y="34" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="315.0" y="43.5" text-anchor="middle" font-size="6.4" class="s-ink mono">473,621</text><rect x="202" y="49" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="223.0" y="58.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Pune</text><rect x="246" y="49" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="267.0" y="58.5" text-anchor="middle" font-size="6.4" class="s-ink mono">CANC</text><rect x="290" y="49" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="315.0" y="58.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,025</text><rect x="202" y="64" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="223.0" y="73.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Delhi</text><rect x="246" y="64" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="267.0" y="73.5" text-anchor="middle" font-size="6.4" class="s-ink mono">DELIV</text><rect x="290" y="64" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="315.0" y="73.5" text-anchor="middle" font-size="6.4" class="s-ink mono">475,037</text><rect x="202" y="79" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="223.0" y="88.5" text-anchor="middle" font-size="6.4" class="s-ink mono">Delhi</text><rect x="246" y="79" width="42" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="267.0" y="88.5" text-anchor="middle" font-size="6.4" class="s-ink mono">CANC</text><rect x="290" y="79" width="50" height="13" rx="2" class="s-card2" style="stroke:var(--line)"/><text x="315.0" y="88.5" text-anchor="middle" font-size="6.4" class="s-ink mono">25,047</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">unpivot: columns become rows.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>groupBy + agg in one job.</li>
+          <li>Partial aggregation per partition.</li>
+          <li>Grouping sets add totals.</li>
+          <li>Distinct values define columns.</li>
+          <li>unpivot reverses pivot.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a pivot column that disappeared, NULL meaning two things, and a skewed key.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-pivot">A column that disappeared</h3>
+  <p class="anim-intro">Stable pivot schemas. (Behaviour from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Pivot values <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Without a values list the pivot columns depend on the data; pass the list for a stable schema and no extra query">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Dashboard expects REFUNDED</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">pivot("status") without values</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Works most days.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A day with no refunds</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">column REFUNDED does not exist</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Dashboard query fails.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Schema depends on data</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">the extra distinct query decides</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Like our Step 4.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Pass the values</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">pivot("status", STATUSES)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same columns every day.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Fill nulls for display</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">na.fill(0) on the pivot result</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">0 refunds, not missing.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Dashboard.</li>
+          <li>No refunds.</li>
+          <li>Data decides.</li>
+          <li>List values.</li>
+          <li>Fill zeros.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-rollup">NULL meant two different things</h3>
+  <p class="anim-intro">Subtotals and null keys. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">rollup nulls <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Rollup uses NULL for subtotals, which collides with real null keys; use grouping_id or fill keys before grouping">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Finance report with rollup</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">rollup("region", "city")</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Subtotals per region.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Orders with no city</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">city is null for 2% of orders</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Also show as NULL.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Totals counted twice</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">analyst sums all NULL rows</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Wrong board numbers.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">grouping_id()</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">marks real subtotal rows</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or fill keys first.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Label subtotals</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">“All cities” instead of NULL</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Readable output.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Rollup.</li>
+          <li>Null keys.</li>
+          <li>Double count.</li>
+          <li>grouping_id.</li>
+          <li>Label.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-skew-agg">One key holds 40% of the data</h3>
+  <p class="anim-intro">Aggregations on skewed keys. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Skewed groupBy <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Partial aggregation makes sums cheap even on skewed keys, but collect_list must move every value to one task">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">groupBy("restaurant_id")</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">one chain = 40% of orders</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One reduce task is huge.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Partial aggregation helps</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">sums are combined per partition</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">For sum and count.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">But not collect_list</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">every value must travel</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One task, one giant array.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Aggregate, not collect</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">counts, sums, top-N with windows</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Small results per key.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Skew handling</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">salting, AQE skew join</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lesson 8.3.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Skew.</li>
+          <li>Partial agg.</li>
+          <li>collect_list.</li>
+          <li>Aggregate.</li>
+          <li>Salting.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Aggregations at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-blue">KPIs</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">daily</text></svg></div>
+    <div><h4>1. Daily KPI tables</h4>
+      <p>Orders, revenue, average bill and cancellations per city and day are one groupBy over the fact table.</p>
+      <div class="uc-flow"><span>Orders</span><i>→</i><span class="java">groupBy + agg</span><i>→</i><span>KPI table</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-green">pivot</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">sheets</text></svg></div>
+    <div><h4>2. Spreadsheet-style reports</h4>
+      <p>Status or month columns for finance sheets are pivots with a fixed value list.</p>
+      <div class="uc-flow"><span>Long table</span><i>→</i><span class="java">pivot(values)</span><i>→</i><span>Wide sheet</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">totals</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">rollup</text></svg></div>
+    <div><h4>3. Hierarchical totals</h4>
+      <p>Region → city → restaurant totals for management reports come from rollup or GROUPING SETS.</p>
+      <div class="uc-flow"><span>Facts</span><i>→</i><span class="java">rollup</span><i>→</i><span>Subtotals</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">ML</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">features</text></svg></div>
+    <div><h4>4. Customer features</h4>
+      <p>Per-customer counts, sums and favourite cities feed churn and recommendation models.</p>
+      <div class="uc-flow"><span>Orders</span><i>→</i><span class="java">groupBy customer</span><i>→</i><span>Features</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">melt</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">tidy</text></svg></div>
+    <div><h4>5. Tidying wide files</h4>
+      <p>Wide spreadsheets from partners (one column per month) are unpivoted into long tables.</p>
+      <div class="uc-flow"><span>Wide CSV</span><i>→</i><span class="java">unpivot</span><i>→</i><span>Long table</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: two-phase aggregation</h2>
+  <p>A model of the plan in Step 2. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># Partial aggregation: what crosses the network?
+partitions = [
+    [(&quot;Pune&quot;, 450), (&quot;Delhi&quot;, 300), (&quot;Pune&quot;, 520)],
+    [(&quot;Pune&quot;, 380), (&quot;Delhi&quot;, 610)],
+]
+partials = []
+for p in partitions:                      # step 1: inside each partition
+    acc = {}
+    for city, amount in p:
+        acc[city] = acc.get(city, 0) + amount
+    partials.append(acc)
+print(&quot;sent over the shuffle:&quot;, partials)
+
+final = {}
+for acc in partials:                      # step 2: after the shuffle
+    for city, s in acc.items():
+        final[city] = final.get(city, 0) + s
+print(&quot;final:&quot;, final)</code></pre><div class="output">sent over the shuffle: [{&#x27;Pune&#x27;: 970, &#x27;Delhi&#x27;: 300}, {&#x27;Pune&#x27;: 380, &#x27;Delhi&#x27;: 610}]
+final: {&#x27;Pune&#x27;: 1350, &#x27;Delhi&#x27;: 910}</div></div>
+  <ul class="anno"><li><code>for p in partitions:                      # step 1: inside each partition</code><span>HashAggregate(partial_sum) in the plan.</span></li><li><code>for acc in partials:                      # step 2: after the shuffle</code><span>The final HashAggregate after the Exchange.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Count rows before and after step 1.",
+   "code": "# Partial aggregation: what crosses the network?\npartitions = [\n    [(\"Pune\", 450), (\"Delhi\", 300), (\"Pune\", 520)],\n    [(\"Pune\", 380), (\"Delhi\", 610)],\n]\npartials = []\nfor p in partitions:                      # step 1: inside each partition\n    acc = {}\n    for city, amount in p:\n        acc[city] = acc.get(city, 0) + amount\n    partials.append(acc)\nprint(\"sent over the shuffle:\", partials)\n\nfinal = {}\nfor acc in partials:                      # step 2: after the shuffle\n    for city, s in acc.items():\n        final[city] = final.get(city, 0) + s\nprint(\"final:\", final)\n"
+  },
+  {
+   "label": "2 · Predict first: pivot columns",
+   "hint": "<b>Predict first:<\/b> statuses present are DELIVERED and CANCELLED. Columns without and with a value list?",
+   "code": "present = [\"DELIVERED\", \"CANCELLED\"]\ngiven = [\"DELIVERED\", \"CANCELLED\", \"REFUNDED\"]\nprint(\"no list:\", sorted(present), \"| with list:\", given)\n"
+  },
+  {
+   "label": "3 · Pivot by hand",
+   "hint": "Turn (city, status, n) rows into a table.",
+   "code": "rows = [(\"Pune\", \"DEL\", 473621), (\"Pune\", \"CAN\", 25025), (\"Delhi\", \"DEL\", 475037)]\nwide = {}\nfor c, s, n in rows:\n    wide.setdefault(c, {})[s] = n\nprint(wide)\n"
+  },
+  {
+   "label": "4 · Rollup rows",
+   "hint": "Groups produced by rollup(city, status).",
+   "code": "cities, statuses = 2, 2\nprint(cities * statuses + cities + 1, \"rows\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This pivot has no value list.",
+   "code": "code = 'df.groupBy(\"city\").pivot(\"status\").sum(\"amount\")'\nassert 'pivot(\"status\", [' in code, \"pass the values: stable columns and no extra distinct query\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: aggregation</h3>
+  <p>In the <code>pyspark</code> shell. <b>Outputs are real</b> (PySpark 4.3.0).</p>
+  <div class="pcrun"><h4>1 · Null key group</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>d.groupBy(&quot;city&quot;).sum(&quot;n&quot;).orderBy(&quot;city&quot;).collect()</code></pre><div class="output">[Row(city=None, sum(n)=7), Row(city=&#x27;Pune&#x27;, sum(n)=11)]</div></div>
+  <p class="muted">Nulls are a group.</p></div>
+  <div class="pcrun"><h4>2 · Pivot columns</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>o.groupBy(&quot;city&quot;).pivot(&quot;status&quot;).sum(&quot;amount&quot;).columns</code></pre><div class="output">[&#x27;city&#x27;, &#x27;CANCELLED&#x27;, &#x27;DELIVERED&#x27;]</div></div>
+  <p class="muted">Only values that occur.</p></div>
+  <div class="pcrun"><h4>3 · Unpivot</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>wide.unpivot([&quot;city&quot;], [&quot;DELIVERED&quot;, &quot;CANCELLED&quot;, &quot;REFUNDED&quot;], &quot;status&quot;, &quot;revenue&quot;).count()</code></pre><div class="output">24</div></div>
+  <p class="muted">8 cities × 3 statuses.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>rollup step by step</h2>
+  <p>Follow which groups rollup produces.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "rows = [(\"Pune\", \"DEL\", 3), (\"Pune\", \"CAN\", 1), (\"Delhi\", \"DEL\", 2)]",
+  "groups = {}",
+  "for city, status, n in rows:",
+  "    for key in ((city, status), (city, None), (None, None)):",
+  "        groups[key] = groups.get(key, 0) + n",
+  "print(groups)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>rows<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)"
+   ],
+   "newVar": "rows"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>groups<\/code> is created: → dict #5. A new dict object (#5) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (0)<\/b> {}"
+   ],
+   "newVar": "groups"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>city<\/code> is created: &#x27;Pune&#x27;. <code>status<\/code> is created: &#x27;DEL&#x27;. <code>n<\/code> is created: 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (0)<\/b> {}"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Grouping sets",
+   "note": "(city, status), (city), () for rollup. <code>key<\/code> is created: → tuple #6. A new tuple object (#6) is created: (&#x27;Pune&#x27;, &#x27;DEL&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "key",
+       "→ tuple #6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (0)<\/b> {}",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;)"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "NULL",
+   "note": "None marks the rolled-up level. Object #5 dict now holds {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "key",
+       "→ tuple #6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (1)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3}",
+    "<b>#6 tuple (2)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to → tuple #7. A new tuple object (#7) is created: (&#x27;Pune&#x27;, None)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "key",
+       "→ tuple #7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (1)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3}",
+    "<b>#7 tuple (2)<\/b> (&#x27;Pune&#x27;, None)"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #5 dict now holds {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 3}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "key",
+       "→ tuple #7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (2)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 3}",
+    "<b>#7 tuple (2)<\/b> (&#x27;Pune&#x27;, None)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to → tuple #8. A new tuple object (#8) is created: (None, None)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (2)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 3}",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #5 dict now holds {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 3, (None, None): 3}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (3)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 3, (None, None): 3}",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (3)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 3, (None, None): 3}",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>status<\/code> changes to &#x27;CAN&#x27;. <code>n<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'CAN'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (3)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 3, (None, None): 3}",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to → tuple #9. A new tuple object (#9) is created: (&#x27;Pune&#x27;, &#x27;CAN&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'CAN'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #9"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (3)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 3, (None, None): 3}",
+    "<b>#9 tuple (2)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;)"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #5 dict now holds {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 3, (None, None): 3, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'CAN'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #9"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (4)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 3, (None, None): 3, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1}",
+    "<b>#9 tuple (2)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to → tuple #10. A new tuple object (#10) is created: (&#x27;Pune&#x27;, None)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'CAN'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (4)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 3, (None, None): 3, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1}",
+    "<b>#10 tuple (2)<\/b> (&#x27;Pune&#x27;, None)"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #5 dict now holds {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 3, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'CAN'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (4)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 3, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1}",
+    "<b>#10 tuple (2)<\/b> (&#x27;Pune&#x27;, None)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to → tuple #8. A new tuple object (#8) is created: (None, None)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'CAN'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (4)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 3, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1}",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #5 dict now holds {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 4, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'CAN'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (4)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 4, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1}",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Pune'"
+      ],
+      [
+       "status",
+       "'CAN'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (4)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 4, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1}",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>city<\/code> changes to &#x27;Delhi&#x27;. <code>status<\/code> changes to &#x27;DEL&#x27;. <code>n<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Delhi'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (4)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 4, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1}",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to → tuple #11. A new tuple object (#11) is created: (&#x27;Delhi&#x27;, &#x27;DEL&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Delhi'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #11"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (4)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 4, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1}",
+    "<b>#11 tuple (2)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;)"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #5 dict now holds {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 4, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1, (&#x27;Delhi&#x27;, &#x27;D…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Delhi'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #11"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (5)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 4, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1, (&#x27;Delhi&#x27;, &#x27;D…",
+    "<b>#11 tuple (2)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to → tuple #12. A new tuple object (#12) is created: (&#x27;Delhi&#x27;, None)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Delhi'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #12"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (5)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 4, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1, (&#x27;Delhi&#x27;, &#x27;D…",
+    "<b>#12 tuple (2)<\/b> (&#x27;Delhi&#x27;, None)"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #5 dict now holds {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 4, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1, (&#x27;Delhi&#x27;, &#x27;D…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Delhi'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #12"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (6)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 4, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1, (&#x27;Delhi&#x27;, &#x27;D…",
+    "<b>#12 tuple (2)<\/b> (&#x27;Delhi&#x27;, None)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to → tuple #8. A new tuple object (#8) is created: (None, None)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Delhi'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (6)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 4, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1, (&#x27;Delhi&#x27;, &#x27;D…",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #5 dict now holds {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 6, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1, (&#x27;Delhi&#x27;, &#x27;D…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Delhi'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (6)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 6, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1, (&#x27;Delhi&#x27;, &#x27;D…",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Delhi'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (6)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 6, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1, (&#x27;Delhi&#x27;, &#x27;D…",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Delhi'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (6)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 6, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1, (&#x27;Delhi&#x27;, &#x27;D…",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "groups",
+       "→ dict #5"
+      ],
+      [
+       "city",
+       "'Delhi'"
+      ],
+      [
+       "status",
+       "'DEL'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;DEL&#x27;, 3)",
+    "<b>#3 tuple (3)<\/b> (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 1)",
+    "<b>#4 tuple (3)<\/b> (&#x27;Delhi&#x27;, &#x27;DEL&#x27;, 2)",
+    "<b>#5 dict (6)<\/b> {(&#x27;Pune&#x27;, &#x27;DEL&#x27;): 3, (&#x27;Pune&#x27;, None): 4, (None, None): 6, (&#x27;Pune&#x27;, &#x27;CAN&#x27;): 1, (&#x27;Delhi&#x27;, &#x27;D…",
+    "<b>#8 tuple (2)<\/b> (None, None)"
+   ],
+   "out": "{('Pune', 'DEL'): 3, ('Pune', None): 4, (None, None): 6, ('Pune', 'CAN'): 1, ('Delhi', 'DEL'): 2, ('Delhi', None): 2}\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three reports built with aggregation.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Aggregation · basics</span></div>
+    <h4>Daily KPIs per city</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Orders, revenue and cancellations per city and day.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>orders</pre></div><div><small>Expected output</small><pre>o.groupBy(&quot;city&quot;, &quot;order_date&quot;).agg(F.count(&quot;*&quot;).alias(&quot;orders&quot;),
+    F.sum(&quot;amount&quot;).alias(&quot;revenue&quot;), F.count_if(F.col(&quot;status&quot;) == &quot;CANCELLED&quot;).alias(&quot;cancelled&quot;))</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>groupBy city and order_date.</li><li>count, sum, count_if.</li><li>Round averages.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 1.",
+   "code": "print(\"\"\"o.groupBy(\"city\", \"order_date\").agg(F.count(\"*\").alias(\"orders\"),\n    F.sum(\"amount\").alias(\"revenue\"), F.count_if(F.col(\"status\") == \"CANCELLED\").alias(\"cancelled\"))\"\"\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print(\"\"\"o.groupBy(\"city\", \"order_date\").agg(F.count(\"*\").alias(\"orders\"),",
+  "    F.sum(\"amount\").alias(\"revenue\"), F.count_if(F.col(\"status\") == \"CANCELLED\").alias(\"cancelled\"))\"\"\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "o.groupBy(\"city\", \"order_date\").agg(F.count(\"*\").alias(\"orders\"),\n    F.sum(\"amount\").alias(\"revenue\"), F.count_if(F.col(\"status\") == \"CANCELLED\").alias(\"cancelled\"))\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Aggregation · reshape</span></div>
+    <h4>Revenue by status, fixed columns</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A sheet with one column per status, even if a status is absent.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>orders</pre></div><div><small>Expected output</small><pre>o.groupBy(&quot;city&quot;).pivot(&quot;status&quot;, [&#x27;DELIVERED&#x27;, &#x27;CANCELLED&#x27;, &#x27;REFUNDED&#x27;]).sum(&quot;amount&quot;).na.fill(0)</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Fixed value list.</li><li>pivot + sum.</li><li>na.fill(0).</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 4.",
+   "code": "STATUSES = [\"DELIVERED\", \"CANCELLED\", \"REFUNDED\"]\nprint(f'o.groupBy(\"city\").pivot(\"status\", {STATUSES}).sum(\"amount\").na.fill(0)')\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "STATUSES = [\"DELIVERED\", \"CANCELLED\", \"REFUNDED\"]",
+  "print(f'o.groupBy(\"city\").pivot(\"status\", {STATUSES}).sum(\"amount\").na.fill(0)')"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Contract",
+   "note": "The column list is part of the report’s schema. <code>STATUSES<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "STATUSES",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;DELIVERED&#x27;, &#x27;CANCELLED&#x27;, &#x27;REFUNDED&#x27;]"
+   ],
+   "newVar": "STATUSES"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "STATUSES",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [&#x27;DELIVERED&#x27;, &#x27;CANCELLED&#x27;, &#x27;REFUNDED&#x27;]"
+   ],
+   "out": "o.groupBy(\"city\").pivot(\"status\", ['DELIVERED', 'CANCELLED', 'REFUNDED']).sum(\"amount\").na.fill(0)\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Aggregation · design</span></div>
+    <h4>Totals for a management deck</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Revenue by region and city with subtotals and a grand total.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>orders with region</pre></div><div><small>Expected output</small><pre>o.na.fill({&quot;region&quot;: &quot;unknown&quot;, &quot;city&quot;: &quot;unknown&quot;})   .rollup(&quot;region&quot;, &quot;city&quot;).agg(F.sum(&quot;amount&quot;).alias(&quot;revenue&quot;), F.grouping_id().alias(&quot;level&quot;))</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Fill null keys first.</li><li>rollup(region, city).</li><li>Label with grouping_id.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 3.",
+   "code": "print(\"\"\"o.na.fill({\"region\": \"unknown\", \"city\": \"unknown\"}) \\\n  .rollup(\"region\", \"city\").agg(F.sum(\"amount\").alias(\"revenue\"), F.grouping_id().alias(\"level\"))\"\"\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print(\"\"\"o.na.fill({\"region\": \"unknown\", \"city\": \"unknown\"}) \\",
+  "  .rollup(\"region\", \"city\").agg(F.sum(\"amount\").alias(\"revenue\"), F.grouping_id().alias(\"level\"))\"\"\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Clean keys",
+   "note": "So NULL only means subtotal. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "o.na.fill({\"region\": \"unknown\", \"city\": \"unknown\"})   .rollup(\"region\", \"city\").agg(F.sum(\"amount\").alias(\"revenue\"), F.grouping_id().alias(\"level\"))\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: What does groupBy return before agg?",
+  "options": [
+   "A DataFrame",
+   "An RDD",
+   "GroupedData",
+   "A list"
+  ],
+  "answer": 2,
+  "why": "Call agg or an aggregate method."
+ },
+ {
+  "q": "Beginner: Are null keys dropped by groupBy?",
+  "options": [
+   "Yes",
+   "No, they form a group",
+   "Only in SQL",
+   "Error"
+  ],
+  "answer": 1,
+  "why": "NULL group with sum 7."
+ },
+ {
+  "q": "Beginner: Which adds subtotals along a hierarchy?",
+  "options": [
+   "rollup",
+   "cube",
+   "pivot",
+   "unpivot"
+  ],
+  "answer": 0,
+  "why": "rollup(city, status)."
+ },
+ {
+  "q": "Intermediate: What is partial_sum in a plan?",
+  "options": [
+   "A bug",
+   "Sampling",
+   "Cache",
+   "Per-partition pre-aggregation before the shuffle"
+  ],
+  "answer": 3,
+  "why": "Only partial results are shuffled."
+ },
+ {
+  "q": "Intermediate: Why give pivot a value list?",
+  "options": [
+   "Required",
+   "Sorts output",
+   "Avoids an extra query and fixes the columns",
+   "Uses less memory only"
+  ],
+  "answer": 2,
+  "why": "4 extra jobs without it."
+ },
+ {
+  "q": "Intermediate: How many rows does cube(city, status) give for 2 × 2 values?",
+  "options": [
+   "4",
+   "9",
+   "7",
+   "16"
+  ],
+  "answer": 1,
+  "why": "4 + 2 + 2 + 1."
+ },
+ {
+  "q": "Advanced: Default maximum distinct values for pivot?",
+  "options": [
+   "10,000",
+   "100",
+   "1,000",
+   "Unlimited"
+  ],
+  "answer": 0,
+  "why": "spark.sql.pivotMaxValues."
+ },
+ {
+  "q": "Advanced: Which aggregate does NOT benefit much from partial aggregation?",
+  "options": [
+   "sum",
+   "count",
+   "max",
+   "collect_list"
+  ],
+  "answer": 3,
+  "why": "Every value still travels."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 6.1 in one screen</h3>
+    <ul><li><code>groupBy(...).agg(...)</code>: many aggregates in one job; null keys form a group.</li><li>Two-phase plan: <code>partial_sum</code> per partition → shuffle → final sum.</li><li>Conditional counts: <code>sum(when(...))</code> or <code>count_if</code>.</li><li><code>rollup</code> (hierarchy) and <code>cube</code> (all combinations); NULL = subtotal; use <code>grouping_id</code>.</li><li>Pivot with a <b>value list</b>: no extra jobs (2.72 → 1.30 s), stable columns.</li><li>Pivot limit 10,000 values; <code>unpivot</code>/<code>melt</code> reverses.</li><li><code>collect_list</code>/<code>collect_set</code> for small groups only.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Is groupBy().agg() the same as SQL GROUP BY?</summary><p>Yes, they produce the same plan. Use whichever is clearer; spark.sql works on temp views.</p></details>
+    <details><summary>How do I aggregate with several conditions?</summary><p>Use several <code>count_if</code>/<code>sum(when())</code> expressions in one agg, or FILTER clauses in SQL: <code>count(*) FILTER (WHERE status = 'CANCELLED')</code>.</p></details>
+    <details><summary>Why are my aggregate column names like sum(amount)?</summary><p>Default names; use <code>.alias()</code> on each aggregate.</p></details>
+    <details><summary>Can I pivot on two columns?</summary><p>Pivot takes one column; combine two into one with concat_ws, or pivot then join.</p></details>
+    <details><summary>Is countDistinct expensive?</summary><p>Yes, it must shuffle distinct values. For dashboards consider approx_count_distinct (Lesson 4.5).</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs about grouping and reshaping.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Average bill</h4></div>
+      <p>Average from revenue and orders.</p>
+      <div class="prob__io"><div><small>Input</small><pre>Pune 254,040,203 / 498,646</pre></div><div><small>Expected output</small><pre>509.5</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(254_040_203 / 498_646, 1))</code></pre><div class="output">509.5</div></div>
+        <p><b>How it works:</b> Lab avg 509.5.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Cancel rate</h4></div>
+      <p>Cancellation rate for Pune.</p>
+      <div class="prob__io"><div><small>Input</small><pre>25,025 of 498,646</pre></div><div><small>Expected output</small><pre>5.0%</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{25025 / 498646:.1%}&quot;)</code></pre><div class="output">5.0%</div></div>
+        <p><b>How it works:</b> About 5%.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Group sums</h4></div>
+      <p>Sum per key.</p>
+      <div class="prob__io"><div><small>Input</small><pre>pairs</pre></div><div><small>Expected output</small><pre>{&#x27;Pune&#x27;: 11, None: 7}</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>pairs = [(&quot;Pune&quot;, 10), (None, 5), (&quot;Pune&quot;, 1), (None, 2)]
+s = {}
+for k, v in pairs:
+    s[k] = s.get(k, 0) + v
+print(s)</code></pre><div class="output">{&#x27;Pune&#x27;: 11, None: 7}</div></div>
+        <p><b>How it works:</b> None is a key too.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Shuffle saving</h4></div>
+      <p>Rows shuffled with and without partial aggregation.</p>
+      <div class="prob__io"><div><small>Input</small><pre>5M rows, 4 partitions, 8 cities</pre></div><div><small>Expected output</small><pre>without: 5000000 | with: 32</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;without:&quot;, 5_000_000, &quot;| with:&quot;, 4 * 8)</code></pre><div class="output">without: 5000000 | with: 32</div></div>
+        <p><b>How it works:</b> Partial sums only.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Unpivot</h4></div>
+      <p>Turn a wide row into long rows.</p>
+      <div class="prob__io"><div><small>Input</small><pre>{&quot;city&quot;: &quot;Pune&quot;, &quot;DEL&quot;: 473621, &quot;CAN&quot;: 25025}</pre></div><div><small>Expected output</small><pre>[(&#x27;Pune&#x27;, &#x27;DEL&#x27;, 473621), (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 25025)]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>w = {&quot;city&quot;: &quot;Pune&quot;, &quot;DEL&quot;: 473621, &quot;CAN&quot;: 25025}
+print([(w[&quot;city&quot;], k, v) for k, v in w.items() if k != &quot;city&quot;])</code></pre><div class="output">[(&#x27;Pune&#x27;, &#x27;DEL&#x27;, 473621), (&#x27;Pune&#x27;, &#x27;CAN&#x27;, 25025)]</div></div>
+        <p><b>How it works:</b> unpivot(["city"], ["DEL", "CAN"], ...).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Cube size</h4></div>
+      <p>Grouping sets in cube of 3 columns.</p>
+      <div class="prob__io"><div><small>Input</small><pre>2^n</pre></div><div><small>Expected output</small><pre>8</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(2 ** 3)</code></pre><div class="output">8</div></div>
+        <p><b>How it works:</b> Every subset of the columns.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Share of revenue</h4></div>
+      <p>Mumbai’s share of total revenue.</p>
+      <div class="prob__io"><div><small>Input</small><pre>510,290,994 of 2,546,901,275</pre></div><div><small>Expected output</small><pre>20.0%</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{510_290_994 / 2_546_901_275:.1%}&quot;)</code></pre><div class="output">20.0%</div></div>
+        <p><b>How it works:</b> Mumbai and Bengaluru ≈ 40%.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Refund column</h4></div>
+      <p>Report value for a status with no rows.</p>
+      <div class="prob__io"><div><small>Input</small><pre>after na.fill(0)</pre></div><div><small>Expected output</small><pre>{&#x27;REFUNDED&#x27;: 0}</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print({&quot;REFUNDED&quot;: 0})</code></pre><div class="output">{&#x27;REFUNDED&#x27;: 0}</div></div>
+        <p><b>How it works:</b> Explicit zero beats a missing column.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Aggregation questions are in every PySpark interview.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · PySpark</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“Total revenue per city”</h4>
+      <p class="scn__situation">Write PySpark for revenue and order count per city.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> basic groupBy?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p><code>df.groupBy("city").agg(F.sum("amount").alias("revenue"), F.count("*").alias("orders"))</code>. One agg computes several aggregates; I alias every result.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Calling groupBy twice and joining.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>groupBy vs groupByKey</h4>
+      <p class="scn__situation">Why is DataFrame groupBy efficient?</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know partial aggregation?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Catalyst plans partial aggregation per partition, then a shuffle of partial results.</li>
+          <li>The plan shows partial_sum before the Exchange.</li>
+          <li>groupByKey on RDDs ships every value.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> “Both shuffle everything.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Pivot in production</h4>
+      <p class="scn__situation">A daily pivot sometimes misses columns.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know pivot semantics?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Without values, columns come from the data.</li>
+          <li>Pass the value list; fill nulls.</li>
+          <li>Also saves an extra query (4 jobs in my test).</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Adding columns afterwards with withColumn if missing.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Analytics</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Subtotals</h4>
+      <p class="scn__situation">Produce region/city subtotals and a grand total in one query.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> grouping sets?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>rollup(region, city) or GROUPING SETS.</li>
+          <li>grouping_id to distinguish subtotal rows from null keys.</li>
+          <li>Fill null keys beforehand.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Three queries and a union.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Spark and PySpark syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/spark-pyspark.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+CREATE DATABASE IF NOT EXISTS tiffingo;
+USE tiffingo;
+CREATE EXTERNAL TABLE orders_ext (order_id INT, customer_id INT, restaurant_id INT, city STRING, order_ts TIMESTAMP, amount INT, payment STRING, status STRING) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' LOCATION 'file:///data/tiffingo/orders_ext';
+CREATE TABLE orders STORED AS ORC AS SELECT order_id, customer_id, restaurant_id, city, order_ts, CAST(order_ts AS DATE) AS order_date, CAST(amount AS DECIMAL(10,2)) AS amount, payment, status FROM orders_ext WHERE order_id IS NOT NULL AND amount IS NOT NULL AND order_ts IS NOT NULL;
+CREATE EXTERNAL TABLE customers (customer_id INT, name STRING, city STRING, state STRING, joined_on DATE, plan STRING) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' LOCATION 'file:///data/tiffingo/customers' TBLPROPERTIES ('skip.header.line.count'='1');
+CREATE EXTERNAL TABLE restaurants (restaurant_id INT, name STRING, city STRING, cuisine STRING, rating DECIMAL(2,1), tags ARRAY<STRING>, contact STRUCT<phone:STRING, email:STRING>) STORED AS JSONFILE LOCATION 'file:///data/tiffingo/restaurants';
+CREATE EXTERNAL TABLE order_items (order_id INT, dishes ARRAY<STRING>, prefs MAP<STRING,STRING>) ROW FORMAT DELIMITED FIELDS TERMINATED BY '|' COLLECTION ITEMS TERMINATED BY ',' MAP KEYS TERMINATED BY ':' LOCATION 'file:///data/tiffingo/order_items';
+SELECT COUNT(*) FROM orders;
+SELECT COUNT(*) FROM customers;
+SELECT * FROM restaurants LIMIT 2;
+SELECT * FROM order_items LIMIT 2;

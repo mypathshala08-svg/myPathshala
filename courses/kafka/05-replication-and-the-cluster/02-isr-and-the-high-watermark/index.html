@@ -1,0 +1,1021 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ISR and the high watermark | MyPhatshala</title>
+<meta name="description" content="The in-sync replica set (ISR), replica.lag.time.max.ms, the log end offset (LEO) and the high watermark (HW): why consumers only see committed records, and how acks and min.insync.replicas interact with a slow follower. Real Kafka 4.4 lab: a paused follower freezes the HW at 5, is removed from the ISR after about 10 s, and rejoins after it catches up.">
+<meta name="mp:minutes" content="22">
+<link rel="canonical" href="https://myphatshala.in/courses/kafka/05-replication-and-the-cluster/02-isr-and-the-high-watermark/">
+<meta property="og:title" content="ISR and the high watermark · MyPhatshala">
+<meta property="og:description" content="A frozen follower, a stuck high watermark, and an ISR that shrinks then heals: Kafka 4.4 lab.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "ISR and the high watermark", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Kafka", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="05-replication-and-the-cluster/02-isr-and-the-high-watermark" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Kafka syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Kafka</a><span>›</span><b>Lesson 5.2</b></nav>
+    <h1>ISR and the high watermark</h1>
+    <p class="lead">Why can a consumer not read a record the leader already has? We <b>pause a follower</b> and watch the <b>high watermark</b> stop, the <b>ISR</b> shrink and then heal. <b>All outputs are real.</b></p>
+    <div class="lesson-meta"><span>Module 5 · Replication and the cluster</span><span>⏱ 22 min</span><span>Intermediate</span><span>HW stuck at 5</span><span>ISR 1,2,3 → 1,2 → 1,2,3</span><span>LEO vs HW</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Ten records written, five visible</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> <a href="../01-brokers-and-replication/">5.1 Brokers and replication</a> and <a href="../../02-producers/04-acks-and-durability/">2.4 acks</a>.</p></div>
+  <div class="story">
+<div class="callout callout--exam" style="display:block"><p style="font-size:1.12rem;margin:0 0 6px"><b>🤔 The leader had 10 records. Consumers could see only 5. For almost ten seconds.</b></p><p style="margin:0 0 6px">We froze one follower and wrote 5 records with <code>acks=1</code>. The leader stored them instantly, but consumers were not allowed to read them: the <b>high watermark</b> waited for every in-sync replica. Only when Kafka kicked the frozen follower out of the <b>ISR</b> did the watermark jump. That one rule is why consumers never read data that could be lost.</p><ul style="margin:0 0 0 18px"><li>What the ISR is and how a replica falls out of it.</li><li>The difference between log end offset and high watermark.</li><li>Why a single slow follower can delay what consumers see.</li></ul></div>
+
+    <p class="narration">A TiffinGo engineer reports that records acknowledged to the producer are not visible to consumers for several seconds. One broker has been having trouble. Riya and Kabir investigate.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="The leader and follower k2 have offsets 0 to 9, but frozen follower k3 has only 0 to 4. The high watermark stays at 5, so consumers can read only offsets below 5 until k3 leaves the ISR.">
+        <rect x="40" y="30" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="47" text-anchor="middle" font-size="8" class="s-ink mono">0</text><rect x="84" y="30" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="104" y="47" text-anchor="middle" font-size="8" class="s-ink mono">1</text><rect x="128" y="30" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="148" y="47" text-anchor="middle" font-size="8" class="s-ink mono">2</text><rect x="172" y="30" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="192" y="47" text-anchor="middle" font-size="8" class="s-ink mono">3</text><rect x="216" y="30" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="236" y="47" text-anchor="middle" font-size="8" class="s-ink mono">4</text><rect x="260" y="30" width="40" height="26" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="280" y="47" text-anchor="middle" font-size="8" class="s-ink mono">5</text><rect x="304" y="30" width="40" height="26" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="324" y="47" text-anchor="middle" font-size="8" class="s-ink mono">6</text><rect x="348" y="30" width="40" height="26" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="368" y="47" text-anchor="middle" font-size="8" class="s-ink mono">7</text><rect x="392" y="30" width="40" height="26" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="412" y="47" text-anchor="middle" font-size="8" class="s-ink mono">8</text><rect x="436" y="30" width="40" height="26" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="456" y="47" text-anchor="middle" font-size="8" class="s-ink mono">9</text><text x="30" y="47" text-anchor="end" font-size="7.6" font-weight="700" class="s-ink">leader</text><rect x="40" y="66" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="83" text-anchor="middle" font-size="8" class="s-ink mono">0</text><rect x="84" y="66" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="104" y="83" text-anchor="middle" font-size="8" class="s-ink mono">1</text><rect x="128" y="66" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="148" y="83" text-anchor="middle" font-size="8" class="s-ink mono">2</text><rect x="172" y="66" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="192" y="83" text-anchor="middle" font-size="8" class="s-ink mono">3</text><rect x="216" y="66" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="236" y="83" text-anchor="middle" font-size="8" class="s-ink mono">4</text><rect x="260" y="66" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="280" y="83" text-anchor="middle" font-size="8" class="s-ink mono">5</text><rect x="304" y="66" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="324" y="83" text-anchor="middle" font-size="8" class="s-ink mono">6</text><rect x="348" y="66" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="368" y="83" text-anchor="middle" font-size="8" class="s-ink mono">7</text><rect x="392" y="66" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="412" y="83" text-anchor="middle" font-size="8" class="s-ink mono">8</text><rect x="436" y="66" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="456" y="83" text-anchor="middle" font-size="8" class="s-ink mono">9</text><text x="30" y="83" text-anchor="end" font-size="7.6" font-weight="700" class="s-ink">k2</text><rect x="40" y="102" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><rect x="84" y="102" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><rect x="128" y="102" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><rect x="172" y="102" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><rect x="216" y="102" width="40" height="26" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="30" y="119" text-anchor="end" font-size="7.6" font-weight="700" class="s-red">k3 ❄</text><path d="M258 22L258 136" style="fill:none;stroke:#D64545;stroke-width:2"/><path d="M255.0 129.7L258 136L261.0 129.7" style="fill:none;stroke:#D64545;stroke-width:2"/><text x="262" y="140" font-size="8" font-weight="700" class="s-red">high watermark = 5</text><text x="540" y="60" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">leader LEO 10</text><text x="540" y="76" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">k2 LEO 10</text><text x="540" y="92" text-anchor="middle" font-size="8" font-weight="700" class="s-red">k3 frozen at 5</text><text x="540" y="120" text-anchor="middle" font-size="8" font-weight="700" class="s-acc">consumers read &lt; 5</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Consumers stop at the <tspan font-weight="700" class="s-acc">high watermark</tspan>, not at the leader’s end.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, the producer got “OK” for 5 records, but my consumer doesn’t see them. Is my consumer broken?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>No. The producer used <code>acks=1</code>, so only the leader had to store them. But consumers may read only up to the <b>high watermark</b>: the point that every in-sync replica has reached.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>And one of our followers is stuck.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Exactly. Until Kafka removes it from the <b>ISR</b>, the watermark cannot move. Let’s freeze a follower and time it.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>ISR and the high watermark</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>The <b>in-sync replica set (ISR)</b> of a partition is the leader plus the followers that are sufficiently caught up; a follower that has not caught up within <code>replica.lag.time.max.ms</code>, or whose broker is fenced by the controller, is removed and is re-added once it catches up. The leader advances the <b>high watermark (HW)</b> to the minimum log end offset (LEO) across the ISR. Consumers can fetch only records below the HW, and acks=all produce requests complete only when the HW passes them, which guarantees that consumed and acknowledged records survive the loss of any ISR member except the last.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>The ISR is the list of copies that are up to date. The high watermark is the last position that every up-to-date copy has. Readers can only see data below it, so they never read something that might vanish if the leader dies.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>ISR</b><span>In-sync replicas.</span></div>
+    <div class="term"><b>LEO</b><span>Log end offset of a replica.</span></div>
+    <div class="term"><b>High watermark</b><span>Min LEO across the ISR.</span></div>
+    <div class="term"><b>ISR shrink</b><span>Replica removed from ISR.</span></div>
+    <div class="term"><b>ISR expand</b><span>Replica added back.</span></div>
+    <div class="term"><b>Under-replicated</b><span>ISR smaller than replicas.</span></div>
+    <div class="term"><b>Fenced broker</b><span>Broker cut off by the controller.</span></div>
+    <div class="term"><b>Leader epoch</b><span>Generation of leadership; used to truncate.</span></div>
+  </div>
+
+  <h3>Why, how, where</h3>
+  <div class="cards">
+    <div class="card"><h4>Why</h4><p>If consumers read a record that only the leader has, and the leader dies, that record vanishes after failover: consumers would have seen “ghost” data.</p><span class="tag">the problem it solves</span></div>
+    <div class="card"><h4>How</h4><p>The leader tracks each follower’s fetch position. Followers that keep up form the ISR. The high watermark is the smallest log end offset in the ISR; consumers can read only below it. Laggards are dropped from the ISR so they cannot block progress forever.</p><span class="tag">the mechanism</span></div>
+    <div class="card"><h4>Where</h4><p>Every replicated partition; monitoring “under-replicated partitions” and ISR shrink/expand events is standard operations.</p><span class="tag">in real systems</span></div>
+    <div class="card"><h4>When not</h4><p>A slow follower still in the ISR delays the high watermark (and acks=all) until it is removed.</p><span class="tag">know the limits</span></div>
+  </div>
+
+  <h3>Concept map: what depends on what</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 230" role="img" aria-label="Concept map. Beginner: ISR, follower lag, under-replicated. Intermediate: high watermark, log end offset, replica.lag.time.max.ms, broker fencing. Advanced: acks and min ISR, leader epoch truncation, eligible leader replicas.">
+        <rect x="14" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="112" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-green">Beginner</text><rect x="28" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="112.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">ISR</text><text x="112.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">caught-up replicas</text><rect x="28" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="112.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Follower lag</text><text x="112.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">falling behind</text><rect x="28" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="112.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Under-replicated</text><text x="112.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">ISR &lt; replicas</text><rect x="224" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="322" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-blue">Intermediate</text><rect x="238" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">High watermark</text><text x="322.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">consumer limit</text><a href="../../04-storage-internals/01-the-commit-log-and-segments/"><rect x="238" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Log end offset</text><text x="322.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">leader’s last + 1</text></a><rect x="238" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">replica.lag.time.max.ms</text><text x="322.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">30 s</text><rect x="238" y="150" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="161" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Broker fencing</text><text x="322.0" y="171" text-anchor="middle" font-size="6.4" class="s-ink2 mono">session timeout</text><rect x="434" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="532" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-violet">Advanced</text><a href="../../02-producers/04-acks-and-durability/"><rect x="448" y="36" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">acks + min ISR</text><text x="532.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 2.4</text></a><rect x="448" y="74" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Truncation by epoch</text><text x="532.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">after failover</text><a href="../../05-replication-and-the-cluster/03-leader-election/"><rect x="448" y="112" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">ELR</text><text x="532.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 5.3</text></a><path d="M196 51L238 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M231.7 54.0L238 51L231.7 48.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 89L238 127" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M231.3 125.0L238 127L235.4 120.5" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 89L238 165" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M232.3 161.0L238 165L237.6 158.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 142L112 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M118.7 109.9L112 112L117.8 115.9" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 66L322 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 67.7L322 74L325.0 67.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 51L448 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M441.7 54.0L448 51L441.7 48.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 51L448 127" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M441.1 128.1L448 127L442.8 122.3" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 51L448 89" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M441.3 87.0L448 89L445.4 82.5" style="fill:none;stroke:#8A94A0;stroke-width:1"/><text x="320" y="212" text-anchor="middle" font-size="8" class="s-ink2">Orange = this lesson · arrows = “you need this first” · click a box to jump</text>
+        
+        <text x="632" y="228" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>  <p class="muted"><b>Builds on:</b> <a href="../01-brokers-and-replication/">5.1</a>. <b>Next:</b> <a href="../03-leader-election/">5.3 Leader election</a>.</p>
+
+
+  <h3>Dissect the timeline</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 210" role="img" aria-label="Dissection of the high watermark timeline: before the pause HW 5 with ISR 1,2,3; at t plus 0 the leader has 10 records but HW stays 5; at t plus 9.6 seconds HW becomes 10 and ISR is 1,2; after unpausing ISR is 1,2,3 again.">
+        <text x="16" y="22" font-size="8.6" font-weight="700" class="s-ink">Timeline of partition hw-52b (real)</text><rect x="16" y="34" width="87.392" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="59.696" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">HW 5 · ISR 1,2,3</text><circle cx="18" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="18" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><rect x="107.392" y="34" width="49.696" height="22" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="132.24" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">pause k3</text><rect x="161.088" y="34" width="77.96799999999999" height="22" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="200.072" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">acks=1: LEO 10</text><circle cx="163.088" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="163.088" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><rect x="16" y="70" width="68.54399999999998" height="22" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="50.27199999999999" y="84.0" text-anchor="middle" font-size="7.6" class="s-ink mono">t+0.0 s HW 5</text><circle cx="18" cy="68" r="8" class="s-acc" style="fill:var(--track)"/><text x="18" y="71" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><rect x="88.54399999999998" y="70" width="120.37599999999999" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="148.73199999999997" y="84.0" text-anchor="middle" font-size="7.6" class="s-ink mono">t+9.6 s HW 10 · ISR 1,2</text><circle cx="90.54399999999998" cy="68" r="8" class="s-acc" style="fill:var(--track)"/><text x="90.54399999999998" y="71" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><rect x="212.91999999999996" y="70" width="101.528" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="263.68399999999997" y="84.0" text-anchor="middle" font-size="7.6" class="s-ink mono">unpause → ISR 1,2,3</text><circle cx="214.91999999999996" cy="68" r="8" class="s-acc" style="fill:var(--track)"/><text x="214.91999999999996" y="71" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">5</text><circle cx="24" cy="119" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="122" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><text x="38" y="122" font-size="8" font-weight="700" class="s-ink">Healthy</text><text x="136" y="122" font-size="7.6" class="s-ink2">all three replicas in sync; HW = LEO = 5</text><circle cx="24" cy="134" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="137" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><text x="38" y="137" font-size="8" font-weight="700" class="s-ink">Leader-only write</text><text x="136" y="137" font-size="7.6" class="s-ink2">acks=1 returned at once; leader LEO is 10</text><circle cx="24" cy="149" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="152" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><text x="38" y="152" font-size="8" font-weight="700" class="s-ink">Invisible</text><text x="136" y="152" font-size="7.6" class="s-ink2">consumers still limited to offsets &lt; 5</text><circle cx="24" cy="164" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="167" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><text x="38" y="167" font-size="8" font-weight="700" class="s-ink">Shrink</text><text x="136" y="167" font-size="7.6" class="s-ink2">k3 fenced after ~9 s session timeout → removed → HW jumps</text><circle cx="24" cy="179" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="182" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">5</text><text x="38" y="182" font-size="8" font-weight="700" class="s-ink">Expand</text><text x="136" y="182" font-size="7.6" class="s-ink2">k3 catches up and is added back</text>
+        <text x="320" y="200" text-anchor="middle" font-size="10.5" class="s-ink2">Real values from our lab run.</text>
+        <text x="632" y="208" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+  <h3>The offset ruler, replicated</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 214" role="img" aria-label="Log start 0, high watermark 5 (committed marker position), leader log end 10.">
+        <text x="20" y="22" font-size="8.6" font-weight="700" class="s-ink">Leader of hw-52b while k3 is frozen (HW plays the role of the green marker)</text><rect x="40" y="70" width="50" height="28" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="65.0" y="88" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">0</text><rect x="92" y="70" width="50" height="28" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="117.0" y="88" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">1</text><rect x="144" y="70" width="50" height="28" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="169.0" y="88" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">2</text><rect x="196" y="70" width="50" height="28" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="221.0" y="88" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">3</text><rect x="248" y="70" width="50" height="28" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="273.0" y="88" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">4</text><rect x="300" y="70" width="50" height="28" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="325.0" y="88" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">5</text><rect x="352" y="70" width="50" height="28" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="377.0" y="88" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">6</text><rect x="404" y="70" width="50" height="28" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="429.0" y="88" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">7</text><rect x="456" y="70" width="50" height="28" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="481.0" y="88" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">8</text><rect x="508" y="70" width="50" height="28" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="533.0" y="88" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">9</text><rect x="560" y="70" width="50" height="28" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="585.0" y="88" text-anchor="middle" font-size="9" class="s-ink2">…</text><path d="M39 44L39 68" style="fill:none;stroke:var(--blue);stroke-width:1.4"/><path d="M36.0 61.7L39 68L42.0 61.7" style="fill:none;stroke:var(--blue);stroke-width:1.4"/><text x="39" y="32" text-anchor="middle" font-size="8" font-weight="700" class="s-blue">log start</text><text x="39" y="42" text-anchor="middle" font-size="7.2" class="s-ink2">oldest kept</text><path d="M299 44L299 68" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M296.0 61.7L299 68L302.0 61.7" style="fill:none;stroke:var(--green);stroke-width:1.4"/><text x="299" y="32" text-anchor="middle" font-size="8" font-weight="700" class="s-green">committed</text><text x="299" y="42" text-anchor="middle" font-size="7.2" class="s-ink2">group’s bookmark</text><path d="M559 44L559 68" style="fill:none;stroke:#D64545;stroke-width:1.4"/><path d="M556.0 61.7L559 68L562.0 61.7" style="fill:none;stroke:#D64545;stroke-width:1.4"/><text x="559" y="32" text-anchor="middle" font-size="8" font-weight="700" class="s-red">log end</text><text x="559" y="42" text-anchor="middle" font-size="7.2" class="s-ink2">next write</text><rect x="300" y="104" width="258" height="14" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="430.0" y="114" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink">LAG = 10 − 5 = 5</text><path d="M40 150L600 150" style="fill:none;stroke:#8A94A0;stroke-width:2"/><path d="M593.7 153.0L600 150L593.7 147.0" style="fill:none;stroke:#8A94A0;stroke-width:2"/><text x="40" y="166" font-size="8" class="s-ink2">old</text><text x="600" y="166" text-anchor="end" font-size="8" class="s-ink2">new → producers append here</text><text x="320" y="190" text-anchor="middle" font-size="8" class="s-ink2">Retention deletes from the left (log start moves right); producers add on the right; each group keeps its own committed offset.</text>
+        
+        <text x="632" y="212" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+  <h3 id="levels">ISR and high watermark at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A class that waits</h4>
+      <ul>
+        <li>The teacher (leader) writes 10 lines on the board. Notes are “official” only up to the line that every listed student has copied. If one student falls asleep, the teacher waits a little, then removes them from the list and moves on.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The definitions</h4>
+      <ul>
+        <li><b>LEO</b> (log end offset): next offset a replica will write. <b>HW</b> (high watermark): the minimum LEO across the ISR. Consumers fetch only offsets &lt; HW.</li>
+        <li><b>ISR</b>: the leader plus followers that are caught up. A follower that has not caught up for <code>replica.lag.time.max.ms</code> (30 s) is removed; it is added back when it catches up.</li>
+        <li><b>Under-replicated partition</b>: ISR smaller than the replica list; the key replication health metric.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> KRaft details</h4>
+      <ul>
+        <li>In KRaft a broker that stops heartbeating to the controller is <b>fenced</b> after <code>broker.session.timeout.ms</code> (9 s), and removed from every ISR at once: that is why our frozen follower left after about 9.6 s, not 30 s.</li>
+        <li>With acks=all, the leader answers the producer only when the HW passes the batch: a stuck in-sync follower delays acks too.</li>
+        <li>After a leader change, followers truncate any data above the new leader’s log using <b>leader epochs</b> (leader-epoch-checkpoint), so replicas never diverge.</li>
+      </ul>
+
+    </div>
+  </div>
+<div class="callout callout--warn" style="display:block"><p style="margin:0 0 6px"><b>Myth vs reality: things many websites still say</b></p><ul style="margin:0 0 0 18px"><li><b>Myth:</b> Consumers can read everything the leader has.<br><b>Reality (Kafka 4.4):</b> Only up to the high watermark.<br><span class="muted">Proof: Step 2: offsets 5–9 hidden for 9.6 s.</span></li><li><b>Myth:</b> A follower leaves the ISR only after 30 s.<br><b>Reality (Kafka 4.4):</b> In KRaft, a fenced broker (9 s session) leaves at once.<br><span class="muted">Proof: Step 2: 9.6 s.</span></li><li><b>Myth:</b> acks=1 records are immediately readable.<br><b>Reality (Kafka 4.4):</b> They become readable once the ISR has them (HW).<br><span class="muted">Proof: Step 2.</span></li></ul></div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “What are ISR and high watermark?” ISR = leader + caught-up followers (lag < replica.lag.time.max.ms, broker not fenced). HW = min LEO of ISR; consumers read below HW; acks=all waits for HW; under-replicated = ISR < replicas.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Signals and settings</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:600px">
+    <thead><tr><th>Signal</th><th>Meaning</th><th>Action</th></tr></thead>
+    <tbody><tr><td>ISR shrink (log line / metric)</td><td>a follower fell behind or was fenced</td><td>check that broker: GC, disk, network</td></tr><tr><td>UnderReplicatedPartitions > 0</td><td>some partitions have fewer in-sync copies</td><td>alert; durability reduced</td></tr><tr><td>UnderMinIsrPartitionCount > 0</td><td>acks=all writes are failing there</td><td>urgent</td></tr><tr><td>OfflinePartitionsCount > 0</td><td>no leader at all</td><td>critical (Lesson 5.3)</td></tr></tbody>
+  </table>
+  </div>  <div class="table-wrap">
+  <table class="compare" style="min-width:560px">
+    <thead><tr><th>Setting</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody><tr><td>replica.lag.time.max.ms</td><td>30000</td><td>max time a follower may be behind and stay in ISR</td></tr><tr><td>broker.session.timeout.ms</td><td>9000</td><td>KRaft: missing heartbeats → broker fenced</td></tr><tr><td>num.replica.fetchers</td><td>1</td><td>parallel fetcher threads per source broker</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Do not “fix” ISR shrinks by raising <code>replica.lag.time.max.ms</code> a lot: you keep a slow replica in the ISR, so every acks=all write and the high watermark wait for it. Fix the slow broker (disk, GC, network) instead.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Freeze a follower, watch the watermark</h2>
+  <p>All outputs are real: Kafka 4.4.0, 3 brokers; topic <code>hw-52b</code> with replicas 1,2,3 (leader 1); follower k3 frozen with <code>docker pause</code>. Script: <code>jobs/m5/l52_hw.py</code>.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Healthy partition</h4>
+      <div class="code" data-lang="python" data-file="l52_hw.py"><pre><code>sh(&quot;kafka-topics.sh --create --topic hw-52b --replica-assignment 1:2:3&quot;)
+p.produce(T, value=...) x 5   # acks=1
+c.get_watermark_offsets(TopicPartition(T, 0))   # (low, high watermark)</code></pre><div class="output">== 1) healthy: 5 records, high watermark 5  ISR 1,2,3</div></div>
+      <span class="behind">Five records; every replica has them, so HW = 5 and ISR = 1,2,3.</span></li>
+    <li><h4>Step 2 · Freeze a follower, write with acks=1</h4>
+      <div class="code" data-lang="python" data-file="l52_hw.py"><pre><code>subprocess.run([&quot;docker&quot;, &quot;pause&quot;, &quot;k3&quot;])
+for i in range(5): p.produce(T, value=f&quot;during-{i}&quot;)    # acks=1
+p.flush()
+# poll the high watermark every 0.25 s</code></pre><div class="output">== 2) docker pause k3 (a follower). Write 5 more records with acks=1 (leader only)
+  acks=1 confirmed after 0.00 s: the leader has 10 records (log end offset 10)
+  t+ 0.0s  high watermark  5  (consumers can read offsets &lt; 5)
+  t+ 9.6s  high watermark 10  (consumers can read offsets &lt; 10)
+  ISR now 1,2</div></div>
+      <span class="behind">The producer got its OK immediately (leader only). The HW stayed at 5 for 9.6 s: consumers could not see offsets 5–9. Then the controller fenced the frozen broker, the ISR shrank to 1,2, and HW jumped to 10.</span></li>
+    <li><h4>Step 3 · Recovery</h4>
+      <div class="code" data-lang="bash" data-file="terminal"><pre><code>docker unpause k3
+kafka-topics.sh --describe --under-replicated-partitions</code></pre><div class="output">== 3) unpause k3: it catches up and rejoins the ISR
+  high watermark 10   ISR 1,2,3
+  under-replicated partitions now: none</div></div>
+      <span class="behind">k3 fetched the missing records and rejoined the ISR; no partition is under-replicated any more.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Two views of the same run</h2>
+  <p>Left: real lab output. Right: what happens inside.</p>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">Freeze a follower <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real outputs from the lab">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">HW 5   ISR 1,2,3</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">$ docker pause k3</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">acks=1 confirmed after 0.00 s</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">t+0.0s high watermark 5</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">t+9.6s high watermark 10</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">ISR now 1,2</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">$ docker unpause k3</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">HW 10   ISR 1,2,3</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">under-replicated: none</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Healthy.</li>
+          <li>Frozen.</li>
+          <li>Fenced.</li>
+          <li>Recovered.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Replica logs and HW">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Healthy: HW = 5</text><text x="14" y="50" font-size="7.4" font-weight="700" class="s-ink">L</text><rect x="34" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="14" y="74" font-size="7.4" font-weight="700" class="s-ink">k2</text><rect x="34" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="14" y="98" font-size="7.4" font-weight="700" class="s-ink">k3</text><rect x="34" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><path d="M182 32L182 112" style="fill:none;stroke:#D64545;stroke-width:1.6"/><path d="M179.0 105.7L182 112L185.0 105.7" style="fill:none;stroke:#D64545;stroke-width:1.6"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Healthy: HW = 5</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">k3 frozen: HW stuck at 5</text><text x="14" y="50" font-size="7.4" font-weight="700" class="s-ink">L</text><rect x="34" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="184" y="38" width="26" height="18" rx="2" class="s-soft-acc" style="stroke:#E0A100"/><rect x="214" y="38" width="26" height="18" rx="2" class="s-soft-acc" style="stroke:#E0A100"/><rect x="244" y="38" width="26" height="18" rx="2" class="s-soft-acc" style="stroke:#E0A100"/><rect x="274" y="38" width="26" height="18" rx="2" class="s-soft-acc" style="stroke:#E0A100"/><rect x="304" y="38" width="26" height="18" rx="2" class="s-soft-acc" style="stroke:#E0A100"/><text x="14" y="74" font-size="7.4" font-weight="700" class="s-ink">k2</text><rect x="34" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="184" y="62" width="26" height="18" rx="2" class="s-soft-acc" style="stroke:#E0A100"/><rect x="214" y="62" width="26" height="18" rx="2" class="s-soft-acc" style="stroke:#E0A100"/><rect x="244" y="62" width="26" height="18" rx="2" class="s-soft-acc" style="stroke:#E0A100"/><rect x="274" y="62" width="26" height="18" rx="2" class="s-soft-acc" style="stroke:#E0A100"/><rect x="304" y="62" width="26" height="18" rx="2" class="s-soft-acc" style="stroke:#E0A100"/><text x="14" y="98" font-size="7.4" font-weight="700" class="s-ink">k3</text><rect x="34" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><path d="M182 32L182 112" style="fill:none;stroke:#D64545;stroke-width:1.6"/><path d="M179.0 105.7L182 112L185.0 105.7" style="fill:none;stroke:#D64545;stroke-width:1.6"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">k3 frozen: HW stuck at 5</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">k3 fenced: HW jumps to 10</text><text x="14" y="50" font-size="7.4" font-weight="700" class="s-ink">L</text><rect x="34" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="184" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="214" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="244" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="274" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="304" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="14" y="74" font-size="7.4" font-weight="700" class="s-ink">k2</text><rect x="34" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="184" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="214" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="244" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="274" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="304" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="14" y="98" font-size="7.4" font-weight="700" class="s-ink">k3</text><rect x="34" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><path d="M332 32L332 112" style="fill:none;stroke:#D64545;stroke-width:1.6"/><path d="M329.0 105.7L332 112L335.0 105.7" style="fill:none;stroke:#D64545;stroke-width:1.6"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">k3 fenced: HW jumps to 10</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">k3 back in ISR</text><text x="14" y="50" font-size="7.4" font-weight="700" class="s-ink">L</text><rect x="34" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="184" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="214" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="244" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="274" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="304" y="38" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="14" y="74" font-size="7.4" font-weight="700" class="s-ink">k2</text><rect x="34" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="184" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="214" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="244" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="274" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="304" y="62" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="14" y="98" font-size="7.4" font-weight="700" class="s-ink">k3</text><rect x="34" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="94" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="124" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="154" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="184" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="214" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="244" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="274" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="304" y="86" width="26" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><path d="M332 32L332 112" style="fill:none;stroke:#D64545;stroke-width:1.6"/><path d="M329.0 105.7L332 112L335.0 105.7" style="fill:none;stroke:#D64545;stroke-width:1.6"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">k3 back in ISR</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>HW 5.</li>
+          <li>Waiting.</li>
+          <li>Shrink.</li>
+          <li>Expand.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Now peel how the leader moves the high watermark.</p>
+
+  <span class="live">Layer by layer</span>
+  <h3 id="scenario-peel">How the high watermark moves</h3>
+  <p class="anim-intro">Leader bookkeeping on every follower fetch. (Simplified.)</p>
+  <div class="anim anim--one" data-frames="6" data-delay="5000">
+    <div class="anim__title">Layers <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Each layer of the system, from your code down to the disk">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Follower fetch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Leader updates</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Compute HW</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Consumers</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Lagging follower</text><rect x="134" y="26" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="35.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Produce</text><text x="184" y="53" font-size="7.4" class="s-ink2">leader appends</text><text x="184" y="66" font-size="7.4" class="s-ink2">LEO 5 → 10</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Follower fetch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Leader updates</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Compute HW</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Consumers</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Lagging follower</text><rect x="134" y="48" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="57.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 40L149 48" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 41.7L149 48L152.0 41.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Follower fetch</text><text x="184" y="53" font-size="7.4" class="s-ink2">k2: “I have up to 10”</text><text x="184" y="66" font-size="7.4" class="s-ink2">k3: no fetch (frozen)</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Follower fetch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Leader updates</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Compute HW</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Consumers</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Lagging follower</text><rect x="134" y="70" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="79.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 62L149 70" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 63.7L149 70L152.0 63.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Leader updates</text><text x="184" y="53" font-size="7.4" class="s-ink2">remembers each</text><text x="184" y="66" font-size="7.4" class="s-ink2">follower’s LEO</text><text x="184" y="79" font-size="7.4" class="s-ink2">k2 = 10, k3 = 5</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Follower fetch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Leader updates</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Compute HW</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Consumers</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Lagging follower</text><rect x="134" y="92" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="101.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 84L149 92" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 85.7L149 92L152.0 85.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Compute HW</text><text x="184" y="53" font-size="7.4" class="s-ink2">HW = min LEO in ISR</text><text x="184" y="66" font-size="7.4" class="s-ink2">= 5 while k3 is in ISR</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="5"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Follower fetch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Leader updates</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Compute HW</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Consumers</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Lagging follower</text><rect x="134" y="114" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="123.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 106L149 114" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 107.7L149 114L152.0 107.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Consumers</text><text x="184" y="53" font-size="7.4" class="s-ink2">fetch only &lt; HW</text><text x="184" y="66" font-size="7.4" class="s-ink2">offsets 5–9 hidden</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="6"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Follower fetch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Leader updates</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Compute HW</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Consumers</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Lagging follower</text><rect x="134" y="136" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="145.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 128L149 136" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 129.7L149 136L152.0 129.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Lagging follower</text><text x="184" y="53" font-size="7.4" class="s-ink2">fenced or too slow →</text><text x="184" y="66" font-size="7.4" class="s-ink2">removed from ISR</text><text x="184" y="79" font-size="7.4" class="s-ink2">HW = 10</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Write.</li>
+          <li>Fetch.</li>
+          <li>Track.</li>
+          <li>HW.</li>
+          <li>Read.</li>
+          <li>Shrink.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios: GC pauses, long under-replication, and ghost reads.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-gc">A GC pause on one broker</h3>
+  <p class="anim-intro">ISR shrink and expand. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">ISR churn <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Frequent shrink/expand points to a struggling broker">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Broker 3 long GC pauses</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">stops fetching 10 s</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Repeatedly.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">ISR shrinks, expands</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">every few minutes</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Alerts flap.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">acks=all latency spikes</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">waiting for broker 3</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Users notice.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Tune heap / GC, check disk</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">fix the cause</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Not the timeout.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Stable ISR</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">no flapping</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fixed.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>GC.</li>
+          <li>Flap.</li>
+          <li>Latency.</li>
+          <li>Fix.</li>
+          <li>Stable.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-urp">Under-replicated for hours</h3>
+  <p class="anim-intro">Reduced durability. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Under-replicated partitions <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Alert immediately; one more failure may lose data">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Disk slow on broker 2</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">its replicas lag</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Out of ISR.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">URP = 120 partitions</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">only 2 copies in sync</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Risky.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Another broker fails</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">only 1 copy → under min ISR</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Writes stop.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Replace the disk</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">replicas catch up</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">URP 0.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Alert on URP > 0</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">page on-call</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Process.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Slow disk.</li>
+          <li>URP.</li>
+          <li>Second fault.</li>
+          <li>Fix.</li>
+          <li>Alert.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-ghost">Ghost reads prevented</h3>
+  <p class="anim-intro">Why HW protects consumers. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">High watermark <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Consumers never see data that could disappear in a failover">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Leader has offsets 5–9</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">followers do not yet</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">acks=1.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">If consumers read them…</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">and the leader dies</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Data gone.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">HW blocks reads</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">until replicated</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No ghosts.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">New leader truncates others</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">by leader epoch</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Consistent.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">acks=all also waits</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">for HW to pass</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Durable acks.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Leader only.</li>
+          <li>Risk.</li>
+          <li>HW.</li>
+          <li>Truncate.</li>
+          <li>acks=all.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>At work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">ops</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">URP</text></svg></div>
+    <div><h4>1. Replication monitoring</h4>
+      <p>Alert when under-replicated partitions > 0.</p>
+      <div class="uc-flow"><span>Metrics</span><i>→</i><span class="java">URP</span><i>→</i><span>Page</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green">acks</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">latency</text></svg></div>
+    <div><h4>2. Producer latency</h4>
+      <p>acks=all latency rises when an ISR member is slow.</p>
+      <div class="uc-flow"><span>Slow follower</span><i>→</i><span class="java">HW</span><i>→</i><span>Latency</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">fail</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">over</text></svg></div>
+    <div><h4>3. Safe failover</h4>
+      <p>Only ISR members can become leader cleanly (5.3).</p>
+      <div class="uc-flow"><span>Leader dies</span><i>→</i><span class="java">ISR</span><i>→</i><span>No loss</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">disk</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">health</text></svg></div>
+    <div><h4>4. Broker health</h4>
+      <p>ISR churn reveals bad disks and GC issues.</p>
+      <div class="uc-flow"><span>Churn</span><i>→</i><span class="java">investigate</span><i>→</i><span>Fix</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">read</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">safe</text></svg></div>
+    <div><h4>5. Consistent reads</h4>
+      <p>Consumers never see unreplicated data.</p>
+      <div class="uc-flow"><span>Fetch</span><i>→</i><span class="java">< HW</span><i>→</i><span>Safe</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified descriptions of common practice.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: computing the high watermark</h2>
+  <p>The HW rule in a few lines. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># High watermark = smallest LEO among ISR members
+leo = {1: 10, 2: 10, 3: 5}          # broker -&gt; log end offset
+isr = {1, 2, 3}
+lag_ms = {1: 0, 2: 0, 3: 35000}
+MAX_LAG = 30000                      # replica.lag.time.max.ms (Kafka 4.x default)
+
+def hw(isr):
+    return min(leo[b] for b in isr)
+
+print(&quot;HW with slow follower in ISR:&quot;, hw(isr))
+isr = {b for b in isr if lag_ms[b] &lt;= MAX_LAG}
+print(&quot;ISR after lag check:&quot;, sorted(isr))
+print(&quot;HW now:&quot;, hw(isr))</code></pre><div class="output">HW with slow follower in ISR: 5
+ISR after lag check: [1, 2]
+HW now: 10</div></div>
+  <ul class="anno"><li><code>    return min(leo[b] for b in isr)</code><span>Committed = copied by every ISR member.</span></li><li><code>isr = {b for b in isr if lag_ms[b] &lt;= MAX_LAG}</code><span>A lagging follower is removed: HW can move again.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Then set lag of 3 to 0.",
+   "code": "# High watermark = smallest LEO among ISR members\nleo = {1: 10, 2: 10, 3: 5}          # broker -> log end offset\nisr = {1, 2, 3}\nlag_ms = {1: 0, 2: 0, 3: 35000}\nMAX_LAG = 30000                      # replica.lag.time.max.ms (Kafka 4.x default)\n\ndef hw(isr):\n    return min(leo[b] for b in isr)\n\nprint(\"HW with slow follower in ISR:\", hw(isr))\nisr = {b for b in isr if lag_ms[b] <= MAX_LAG}\nprint(\"ISR after lag check:\", sorted(isr))\nprint(\"HW now:\", hw(isr))\n"
+  },
+  {
+   "label": "2 · Predict first: HW",
+   "hint": "<b>Predict first:<\/b> LEOs 8, 7, 9.",
+   "code": "print(min([8, 7, 9]))\n"
+  },
+  {
+   "label": "3 · Visible records",
+   "hint": "Consumer sees offsets below HW.",
+   "code": "hw = 5\nprint(list(range(hw)))\n"
+  },
+  {
+   "label": "4 · min ISR",
+   "hint": "acks=all with ISR 1 and min.insync 2.",
+   "code": "isr, min_isr = 1, 2\nprint(\"accepted\" if isr >= min_isr else \"NotEnoughReplicas\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "Write rejected.",
+   "code": "isr, min_isr = 1, 2\nif isr < min_isr:\n    raise RuntimeError(\"NOT_ENOUGH_REPLICAS: ISR 1 < min.insync.replicas 2\")\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: freeze a follower</h3>
+  <p>Needs the 3-broker Docker lab. <b>Outputs are real.</b></p>
+  <div class="pcrun"><h4>1 · Check ISR</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-topics.sh --bootstrap-server k1:9092 --describe --topic hw-52</code></pre><div class="output">Topic: hw-52  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3</div></div>
+  <p class="muted">All in sync.</p></div>
+  <div class="pcrun"><h4>2 · Pause a follower</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>docker pause k3</code></pre><div class="output">k3</div></div>
+  <p class="muted">Process frozen, no fetches.</p></div>
+  <div class="pcrun"><h4>3 · Watch ISR shrink</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-topics.sh --bootstrap-server k1:9092 --describe --topic hw-52</code></pre><div class="output">Topic: hw-52  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2</div></div>
+  <p class="muted">After ~9.6 s in our lab: k3 was fenced (9 s session timeout), faster than the 30 s lag rule.</p></div>
+  <div class="pcrun"><h4>4 · Heal</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>docker unpause k3; kafka-topics.sh --bootstrap-server k1:9092 --describe --under-replicated-partitions</code></pre></div>
+  <p class="muted">Empty output = no URP.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>One write, step by step</h2>
+  <p>LEO moves first, HW follows.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "leo = {1: 5, 2: 5, 3: 5}",
+  "leo[1] = 10",
+  "leo[2] = 10",
+  "hw = min(leo[b] for b in (1, 2, 3))",
+  "print(hw)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>leo<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "leo",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {1: 5, 2: 5, 3: 5}"
+   ],
+   "newVar": "leo"
+  },
+  {
+   "line": 2,
+   "phase": "Leader append",
+   "note": "LEO 10 on leader only. Object #1 dict now holds {1: 10, 2: 5, 3: 5}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "leo",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {1: 10, 2: 5, 3: 5}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Follower fetch",
+   "note": "Broker 2 catches up. Object #1 dict now holds {1: 10, 2: 10, 3: 5}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "leo",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {1: 10, 2: 10, 3: 5}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "HW",
+   "note": "Still 5 because broker 3 is behind. <code>hw<\/code> is created: 5.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "leo",
+       "→ dict #1"
+      ],
+      [
+       "hw",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {1: 10, 2: 10, 3: 5}"
+   ],
+   "newVar": "hw"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "leo",
+       "→ dict #1"
+      ],
+      [
+       "hw",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {1: 10, 2: 10, 3: 5}"
+   ],
+   "out": "5\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three ISR decisions.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">ISR · visibility</span></div>
+    <h4>Why the consumer waits</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Leader has offset 9, consumer only reads up to 4.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>LEO, HW</pre></div><div><small>Expected output</small><pre>visible: 5 hidden: 5</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>HW = 5.</li><li>Records ≥ HW are not committed.</li><li>Consumers read below HW.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Run task 3.",
+   "code": "leo, hw = 10, 5\nprint(\"visible:\", hw, \"hidden:\", leo - hw)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "leo, hw = 10, 5",
+  "print(\"visible:\", hw, \"hidden:\", leo - hw)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Safety",
+   "note": "Never read data that could vanish. <code>leo<\/code> is created: 10. <code>hw<\/code> is created: 5.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "leo",
+       "10"
+      ],
+      [
+       "hw",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "hw"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "leo",
+       "10"
+      ],
+      [
+       "hw",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "visible: 5 hidden: 5\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">ISR · durability</span></div>
+    <h4>acks=all vs acks=1</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>One follower is slow.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>acks</pre></div><div><small>Expected output</small><pre>{&#x27;acks=1&#x27;: &#x27;fast, risky&#x27;, &#x27;acks=all + min.insync=2&#x27;: &#x27;safe&#x27;}</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>acks=1: OK immediately (lab 0.00 s).</li><li>acks=all: waits for ISR.</li><li>After shrink, acks=all proceeds with ISR 2 ≥ min 2.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Scenario 2.",
+   "code": "print({\"acks=1\": \"fast, risky\", \"acks=all + min.insync=2\": \"safe\"})\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print({\"acks=1\": \"fast, risky\", \"acks=all + min.insync=2\": \"safe\"})"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Trade-off",
+   "note": "Latency vs durability. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "{'acks=1': 'fast, risky', 'acks=all + min.insync=2': 'safe'}\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">ISR · tuning</span></div>
+    <h4>Pick replica.lag.time.max.ms</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>ISR flaps during GC pauses.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>ms</pre></div><div><small>Expected output</small><pre>{&#x27;replica.lag.time.max.ms&#x27;: 30000}</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Default 30 s (4.x).</li><li>Too low → flapping.</li><li>Too high → slow writes wait longer.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Scenario 3.",
+   "code": "print({\"replica.lag.time.max.ms\": 30000})\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print({\"replica.lag.time.max.ms\": 30000})"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Balance",
+   "note": "Flapping vs stall. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "{'replica.lag.time.max.ms': 30000}\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: ISR stands for…",
+  "options": [
+   "Internal storage record",
+   "Index segment range",
+   "In-sync replicas",
+   "Input stream reader"
+  ],
+  "answer": 2,
+  "why": "Replicas caught up with the leader."
+ },
+ {
+  "q": "Beginner: Consumers read up to…",
+  "options": [
+   "LEO",
+   "High watermark",
+   "Segment end",
+   "Any offset"
+  ],
+  "answer": 1,
+  "why": "Only committed data."
+ },
+ {
+  "q": "Beginner: HW is…",
+  "options": [
+   "Min LEO in ISR",
+   "Max LEO",
+   "Average LEO",
+   "Leader LEO"
+  ],
+  "answer": 0,
+  "why": "Copied by all ISR."
+ },
+ {
+  "q": "Intermediate: In our lab, after pausing k3 the HW…",
+  "options": [
+   "Jumped to 10 immediately",
+   "Went to 0",
+   "Disappeared",
+   "Stayed 5 until ISR shrank"
+  ],
+  "answer": 3,
+  "why": "Moved to 10 after ~9.6 s."
+ },
+ {
+  "q": "Intermediate: A follower leaves the ISR when…",
+  "options": [
+   "It has fewer messages once",
+   "The consumer is slow",
+   "It lags longer than replica.lag.time.max.ms",
+   "The topic is compacted"
+  ],
+  "answer": 2,
+  "why": "Time-based."
+ },
+ {
+  "q": "Intermediate: acks=1 with a paused follower…",
+  "options": [
+   "Fails",
+   "Succeeds quickly",
+   "Blocks forever",
+   "Duplicates"
+  ],
+  "answer": 1,
+  "why": "Leader only."
+ },
+ {
+  "q": "Advanced: ISR 1 and min.insync.replicas 2 with acks=all gives…",
+  "options": [
+   "NotEnoughReplicas error",
+   "Success",
+   "Data loss",
+   "Rebalance"
+  ],
+  "answer": 0,
+  "why": "Write refused."
+ },
+ {
+  "q": "Advanced: URP means…",
+  "options": [
+   "Unread partitions",
+   "Unique record pointer",
+   "Unclean partition",
+   "Under-replicated partitions"
+  ],
+  "answer": 3,
+  "why": "ISR smaller than replicas."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 5.2 in one screen</h3>
+    <ul><li>LEO = next offset per replica; HW = min LEO across ISR; consumers read below HW.</li><li>Follower out of ISR after replica.lag.time.max.ms without catching up.</li><li>Lab: pause k3 → HW stays 5, ISR 1,2 after ~9.6 s, HW 10; unpause → ISR 1,2,3.</li><li>acks=all waits for ISR; min.insync.replicas sets the floor.</li><li>Monitor URP and IsrShrinksPerSec.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Does ISR shrink lose data?</summary><p>No; it removes a slow copy so writes can continue. Data is lost only if all ISR copies are lost.</p></details>
+    <details><summary>Who decides ISR changes?</summary><p>The partition leader proposes; in KRaft the controller records a PARTITION_CHANGE (AlterPartition).</p></details>
+    <details><summary>What is ELR?</summary><p>Eligible Leader Replicas (KIP-966): replicas that left ISR but are known to hold all committed data, so they can safely become leader.</p></details>
+    <details><summary>Why did our follower leave after 9.6 s, not 30 s?</summary><p>A paused broker also stops heartbeating to the controller; after broker.session.timeout.ms (9 s) it is fenced and removed from all ISRs at once. replica.lag.time.max.ms applies to a live but slow follower.</p></details>
+    <details><summary>Why does HW lag on followers?</summary><p>Followers learn the HW from the leader in the next fetch response, so it is a little behind.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">ISR and HW programs.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>HW</h4></div>
+      <p>HW for LEOs 12, 9, 11.</p>
+      <div class="prob__io"><div><small>Input</small><pre>list</pre></div><div><small>Expected output</small><pre>9</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(min([12, 9, 11]))</code></pre><div class="output">9</div></div>
+        <p><b>How it works:</b> 9.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Hidden</h4></div>
+      <p>Records leader has but consumers cannot see.</p>
+      <div class="prob__io"><div><small>Input</small><pre>numbers</pre></div><div><small>Expected output</small><pre>3</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(12 - 9)</code></pre><div class="output">3</div></div>
+        <p><b>How it works:</b> 3.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>URP?</h4></div>
+      <p>Replicas 3, ISR 2.</p>
+      <div class="prob__io"><div><small>Input</small><pre>numbers</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(2 &lt; 3)</code></pre><div class="output">True</div></div>
+        <p><b>How it works:</b> Under-replicated.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Lag filter</h4></div>
+      <p>Keep followers within 30 s.</p>
+      <div class="prob__io"><div><small>Input</small><pre>dict</pre></div><div><small>Expected output</small><pre>[2]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>lag = {2: 1000, 3: 45000}
+print([b for b, l in lag.items() if l &lt;= 30000])</code></pre><div class="output">[2]</div></div>
+        <p><b>How it works:</b> [2].</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Accept write?</h4></div>
+      <p>acks=all, ISR 2, min 2.</p>
+      <div class="prob__io"><div><small>Input</small><pre>numbers</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(2 &gt;= 2)</code></pre><div class="output">True</div></div>
+        <p><b>How it works:</b> Accepted.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>HW after shrink</h4></div>
+      <p>Remove broker 3 then HW.</p>
+      <div class="prob__io"><div><small>Input</small><pre>dict</pre></div><div><small>Expected output</small><pre>10</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>leo = {1: 10, 2: 10, 3: 5}
+print(min(v for b, v in leo.items() if b != 3))</code></pre><div class="output">10</div></div>
+        <p><b>How it works:</b> 10.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Tolerated failures</h4></div>
+      <p>RF 3, min ISR 2.</p>
+      <div class="prob__io"><div><small>Input</small><pre>numbers</pre></div><div><small>Expected output</small><pre>1 broker can fail with writes on</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(3 - 2, &quot;broker can fail with writes on&quot;)</code></pre><div class="output">1 broker can fail with writes on</div></div>
+        <p><b>How it works:</b> 1.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Alert</h4></div>
+      <p>Alert if any URP.</p>
+      <div class="prob__io"><div><small>Input</small><pre>list</pre></div><div><small>Expected output</small><pre>ALERT</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>urp = [&quot;orders-3&quot;]
+print(&quot;ALERT&quot; if urp else &quot;ok&quot;)</code></pre><div class="output">ALERT</div></div>
+        <p><b>How it works:</b> Page on-call.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">ISR interview questions.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · data</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is the high watermark?”</h4>
+      <p class="scn__situation">Explain.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> answer?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>The offset up to which all in-sync replicas have the data. Consumers read only below it, so they never see a record that could disappear after a leader change.</p>
+        <p class="scn__avoid"><b>Avoid:</b> “The biggest offset in the log.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Fintech</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Slow writes</h4>
+      <p class="scn__situation">acks=all latency spikes.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> cause?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>A slow follower still in ISR.</li><li>Check disk/network; ISR shrinks after lag time.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> Switching to acks=0.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>ISR flapping</h4>
+      <p class="scn__situation">IsrShrinks every minute.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> fix?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>GC or network stalls.</li><li>Tune JVM, check num.replica.fetchers, lag time.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> Lowering RF.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>NotEnoughReplicas</h4>
+      <p class="scn__situation">Producers fail after 2 brokers down.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> decide?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>Intended: protects durability.</li><li>Restore brokers; avoid lowering min ISR unless loss acceptable.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> Setting min.insync.replicas=1 silently.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Kafka syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/kafka.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

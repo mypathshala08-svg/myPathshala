@@ -1,0 +1,268 @@
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Just give it more memory”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> cache and storage levels in <a href="../../03-persistence-and-shared-variables/01-cache-and-persist/">3.1</a>, collect and the driver in <a href="../../04-dataframes/06-collect-topandas-and-arrow/">4.6</a>, skew in <a href="../03-data-skew-and-salting/">8.3</a>.</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s “all orders per city” export crashed with <code>java.lang.OutOfMemoryError</code>. The on-call engineer doubled executor memory, and it crashed again the next week. The ranking job never crashed, but the UI showed gigabytes of “spill”.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Spark divides each executor heap into reserved, user and unified memory; sorts, joins and aggregations use execution memory and spill to disk when it runs out. We ran the same sort and aggregation with 3 GB and 1 GB of memory and measured spill and an OutOfMemoryError.">
+        <rect x="14" y="40" width="360" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><rect x="14" y="40" width="36.0" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="32.0" y="64" text-anchor="middle" font-size="6.6" class="s-ink2">300M</text><rect x="50.0" y="40" width="129.6" height="40" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="114.8" y="58" text-anchor="middle" font-size="7" font-weight="700" class="s-ink">user memory</text><text x="114.8" y="70" text-anchor="middle" font-size="6.2" class="s-ink2">UDF objects, Python</text><rect x="179.6" y="40" width="97.2" height="40" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="228.2" y="58" text-anchor="middle" font-size="7" font-weight="700" class="s-ink">execution</text><text x="228.2" y="70" text-anchor="middle" font-size="6.2" class="s-ink2">sort, hash, agg</text><rect x="276.8" y="40" width="97.2" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="325.4" y="58" text-anchor="middle" font-size="7" font-weight="700" class="s-ink">storage</text><text x="325.4" y="70" text-anchor="middle" font-size="6.2" class="s-ink2">cache, broadcast</text><text x="194" y="30" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">one executor heap (spark.executor.memory)</text><text x="194" y="104" text-anchor="middle" font-size="7.2" class="s-ink2 mono">execution + storage = (heap − 300 MB) × 0.6</text><rect x="400" y="12" width="232" height="132" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="516" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured (5M wide rows)</text><text x="412" y="52" font-size="7.2" class="s-green mono">3g: sort, spill 0</text><text x="412" y="68" font-size="7.2" class="s-acc mono">1g: spill 736 MiB mem</text><text x="412" y="84" font-size="7.2" class="s-acc mono">    + 91 MiB to disk</text><text x="412" y="100" font-size="7.2" class="s-green mono">1g, 64 parts: spill 0</text><text x="412" y="116" font-size="7.2" class="s-red mono">collect_list/city: OOM</text><text x="412" y="132" font-size="7.2" class="s-green mono">…per customer: OK</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Spill is Spark <tspan font-weight="700" class="s-acc">saving itself</tspan>; OOM is when it cannot.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+K> Sir, what is spill? Is it an error?
+A> No. When a sort or aggregation fills its share of memory, Spark writes sorted chunks to local disk and merges them later. The job survives, only slower. <b>OOM</b> is when something must stay in memory as one piece and does not fit, like one giant list.
+R> So more memory is not the answer?
+A> Sometimes it is, but usually the fix is smaller pieces of work: more partitions, no giant groups, no <code>collect</code> to the driver. Today we shrink memory on purpose and watch spill and OOM happen. All outputs are real (PySpark 4.3.0).
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Unified memory, spill and OOM</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>Each executor JVM heap (<code>spark.executor.memory</code>) is split into 300 MB <b>reserved memory</b>, <b>user memory</b> for user data structures, and <b>unified memory</b> of <code>(heap − 300 MB) × spark.memory.fraction</code> (0.6). Unified memory is shared between <b>execution</b> (shuffles, sorts, hash joins and aggregations) and <b>storage</b> (cached blocks, broadcast variables); execution can evict cached blocks above <code>spark.memory.storageFraction</code>. When an operator cannot acquire more execution memory it <b>spills</b> its in-memory data to local disk and merges it later. An <b>OutOfMemoryError</b> happens when an object that cannot be spilled (a single huge row or group, a broadcast table, collected results on the driver) or non-heap usage exceeds the limits; containers can also be killed for exceeding <code>memoryOverhead</code>.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Spark gives each executor a heap and uses about 60% of it (after 300 MB) for its own work and cache. When a sort or aggregation runs out of that space, it writes parts to disk and continues: that is spill, slow but safe. An out-of-memory error happens when something must fit in memory at once and does not.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Executor memory</b><span>JVM heap per executor.</span></div>
+    <div class="term"><b>Memory overhead</b><span>Off-heap: Python, buffers.</span></div>
+    <div class="term"><b>Unified memory</b><span>(heap − 300 MB) × 0.6.</span></div>
+    <div class="term"><b>Execution memory</b><span>Sorts, joins, aggregations.</span></div>
+    <div class="term"><b>Storage memory</b><span>Cache and broadcasts.</span></div>
+    <div class="term"><b>Spill (memory)</b><span>Size of data before spilling.</span></div>
+    <div class="term"><b>Spill (disk)</b><span>Size written to disk (compressed).</span></div>
+    <div class="term"><b>OOM</b><span>OutOfMemoryError: heap exhausted.</span></div>
+  </div>
+
+  <h3>Where memory goes</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Region</th><th>Size (8 GB heap)</th><th>Used by</th><th>When full</th></tr></thead>
+    <tbody><tr><td>Reserved</td><td>300 MB</td><td>Spark internals</td><td>n/a</td></tr><tr><td>User</td><td>(8 GB − 300 MB) × 0.4 ≈ 3.1 GB</td><td>Your objects, UDF state</td><td>OOM</td></tr><tr><td>Execution</td><td>up to ≈ 4.6 GB (shared)</td><td>Sort, hash join, aggregation</td><td>Spill to disk</td></tr><tr><td>Storage</td><td>≥ 2.3 GB protected (shared)</td><td>cache(), broadcast</td><td>Evict blocks</td></tr><tr><td>Overhead (off-heap)</td><td>max(384 MB, 10%)</td><td>Python workers, netty, Arrow</td><td>Container killed</td></tr></tbody>
+  </table>
+  </div>
+LEVELS> Memory at three levels
+L1> A kitchen counter
+      <ul>
+        <li>The counter is memory, the store room is disk. When the counter fills, the cook moves trays to the store room and brings them back later: slower, but dinner is served (spill).</li>
+        <li>If one wedding cake is bigger than the whole counter, nothing helps: it falls (OOM).</li>
+      </ul>
+L2> The settings
+      <ul>
+        <li><code>spark.executor.memory</code> (heap), <code>spark.executor.memoryOverhead</code> (off-heap, Python workers; default 10%, min 384 MB), <code>spark.driver.memory</code>, <code>spark.driver.maxResultSize</code> (1g).</li>
+        <li><code>spark.memory.fraction</code> (0.6) for unified memory, <code>spark.memory.storageFraction</code> (0.5) protected for cache.</li>
+        <li>Spill shows as “Spill (Memory)” and “Spill (Disk)” in the stage page.</li>
+      </ul>
+L3> What the lab showed
+      <ul>
+        <li>Same sort: 3 GB no spill; 1 GB spilled 736 MiB (91 MiB on disk) and was slower.</li>
+        <li>With 64 partitions instead of 4, the 1 GB run did not spill at all.</li>
+        <li><code>collect_list</code> per city (8 groups of ~600K strings) killed the 1 GB JVM; per customer (3,999 groups) it passed.</li>
+      </ul>
+/LEVELS
+
+EXAM> “Difference between spill and OOM?” Spill: an operator (sort, aggregation, join) ran out of execution memory and wrote data to local disk to continue; the job succeeds but slower, visible as Spill (Memory/Disk) in the stage page. OOM: memory needed at once exceeded what is available, e.g. a huge group in <code>collect_list</code>, a large broadcast, or <code>collect()</code> on the driver; fix the cause (more partitions, smaller groups, no collect) before adding memory.
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Common OOMs and their fixes</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Symptom</th><th>Usual cause</th><th>Fix</th></tr></thead>
+    <tbody><tr><td>Driver OOM after <code>collect()</code> / <code>toPandas()</code></td><td>Result too big for the driver</td><td>Write to storage; limit; aggregate first (Lesson 4.6)</td></tr><tr><td>Driver OOM in a join</td><td>Broadcast of a big side</td><td>Remove hint / lower threshold (Lesson 8.2)</td></tr><tr><td>Executor OOM in one task</td><td>Skewed key, giant group (<code>collect_list</code>)</td><td>Salt, smaller groups, avoid lists (8.3)</td></tr><tr><td>Heavy spill, slow stage</td><td>Too few partitions for the data</td><td>More shuffle partitions / AQE</td></tr><tr><td>“Container killed … exceeding memory limits”</td><td>Off-heap: Python UDFs, Arrow, buffers</td><td>Raise <code>memoryOverhead</code>; fewer cores per executor</td></tr></tbody>
+  </table>
+  </div>
+WARN> Doubling <code>spark.executor.memory</code> hides the problem until the data doubles again. A single group that must be one Java object (one list, one row, one broadcast) grows with your data and will not fit at some point. Look for the <b>one big thing</b> first. Also note: bigger heaps mean longer garbage-collection pauses; executors of more than ~32–64 GB are rarely a good idea.
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Shrinking memory on purpose</h2>
+  <p>All outputs are real: PySpark 4.3.0, <code>local[2]</code> (in local mode the driver JVM is also the executor, so <code>spark.driver.memory</code> is the heap), AQE off, 4 shuffle partitions. 5,000,000 orders, each with an extra 100-character string column. Spill numbers come from the REST API stage metrics.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · How big is unified memory?</h4>
+      <div class="code" data-lang="python" data-file="l84_memory.py"><pre><code>heap = sc._jvm.java.lang.Runtime.getRuntime().maxMemory() / 2**20
+print(f&quot;JVM heap {heap:.0f} MiB -&gt; unified pool ~ (heap - 300) * 0.6 = {(heap-300)*0.6:.0f} MiB&quot;)</code></pre><div class="output">##### RUN A: driver 3g
+driver memory: 3g | memory.fraction: 0.6 (default) | storageFraction: 0.5 (default)
+JVM heap 3072 MiB -&gt; unified pool ~ (heap - 300) * 0.6 = 1663 MiB</div></div>
+      <span class="behind">With 3 GB the pool for execution and storage is about <b>1.6 GB</b>. With 1 GB it is only <b>434 MiB</b>, shared by 2 concurrent tasks. That is the budget every sort and aggregation competes for.</span></li>
+    <li><h4>Step 2 · The same sort at 3 GB and 1 GB</h4>
+      <div class="code" data-lang="python" data-file="l84_memory.py"><pre><code>wide = o.withColumn(&quot;pad&quot;, F.repeat(F.lit(&quot;x&quot;), 100))
+run(&quot;orderBy amount (4 partitions)&quot;, sink(wide.orderBy(&quot;amount&quot;)))</code></pre><div class="output"># driver 3g
+== 1) global sort of 5M wide rows
+orderBy amount (4 partitions)             :  9.09 s, tasks    8, spill mem    0.0 MiB disk   0.0 MiB
+orderBy amount (64 partitions)            :  6.33 s, tasks   68, spill mem    0.0 MiB disk   0.0 MiB
+# driver 1g
+== 1) global sort of 5M wide rows
+orderBy amount (4 partitions)             : 10.16 s, tasks    8, spill mem  736.0 MiB disk  91.4 MiB
+orderBy amount (64 partitions)            :  6.54 s, tasks   68, spill mem    0.0 MiB disk   0.0 MiB</div></div>
+      <span class="behind">At 3 GB: no spill. At 1 GB the same 4-partition sort <b>spilled 736 MiB</b> from memory, written as <b>91 MiB</b> on disk (spill files are compressed, so “memory” is always bigger than “disk”), and took 10.16 s instead of 9.09 s. With <b>64 partitions</b> each task sorted a 16x smaller piece, which fit: <b>no spill</b> even at 1 GB, and faster (6.54 s).</span></li>
+    <li><h4>Step 3 · An OutOfMemoryError</h4>
+      <div class="code" data-lang="python" data-file="l84_memory.py"><pre><code>wide.groupBy(&quot;city&quot;).agg(F.collect_list(&quot;pad&quot;).alias(&quot;l&quot;)) \
+    .write.format(&quot;noop&quot;).mode(&quot;overwrite&quot;).save()</code></pre><div class="output"># driver 1g
+== 2) collect_list per city (8 huge groups)
+java.lang.OutOfMemoryError: Java heap space
+FAILED: driver JVM died -&gt; [Errno 111] Connection refused</div></div>
+      <span class="behind">At 3 GB this passed. At 1 GB the JVM died with <b>Java heap space</b>, and Python lost its connection to it. Each city’s list (500K–1M strings of 100 characters, over 100 MB as Java objects) must exist as <b>one</b> value in one task, so it cannot be spilled. More partitions would not help: a group is never split.</span></li>
+    <li><h4>Step 4 · Fixing it without more memory</h4>
+      <div class="code" data-lang="python" data-file="l84b_fix.py"><pre><code>run(&quot;count + sum per city (no list)&quot;, sink(wide.groupBy(&quot;city&quot;).agg(F.count(&quot;*&quot;), F.sum(&quot;amount&quot;))))
+run(&quot;collect_list per customer&quot;,      sink(wide.groupBy(&quot;customer_id&quot;).agg(F.collect_list(&quot;pad&quot;))))
+run(&quot;top-5 per city via window&quot;,      sink(o.withColumn(&quot;r&quot;, F.row_number().over(w)).filter(&quot;r&lt;=5&quot;)))</code></pre><div class="output">== 3) fixes at 1g
+count + sum per city (no list)            :  3.44 s, tasks    6, spill mem    0.0 MiB disk   0.0 MiB
+collect_list per customer (3999 small groups):  5.49 s, tasks    6, spill mem  192.1 MiB disk   1.2 MiB
+top-5 per city via window, not list       :  5.62 s, tasks    6, spill mem  304.0 MiB disk  51.6 MiB</div></div>
+      <span class="behind">Same 1 GB. Asking what is actually needed fixed it: <b>count and sum</b> need no list (3.44 s, no spill). Lists per <b>customer</b> are 3,999 small groups, so they spilled safely (192 MiB) and finished. And “top 5 per city” is a window plus a filter, which spills instead of crashing. Memory was the symptom; the giant group was the cause.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>What fits, what spills, what crashes</h2>
+  <p>Left: real outputs. Right: Spark’s memory model.</p>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">What fits, what spills, what crashes <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">3g heap -&gt; unified ~1663 MiB</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">1g heap -&gt; unified ~434 MiB</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">3g sort : spill 0</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">1g sort : spill 736 MiB mem</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">          91.4 MiB disk</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">1g, 64 p: spill 0, 6.54 s</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">collect_list per city</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">java.lang.OutOfMemoryError:</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  Java heap space</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">sum per city   : 3.44 s, no spill</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">list per cust. : spill 192 MiB, OK</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">top-5 window   : spill 304 MiB, OK</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Memory budgets.</li>
+          <li>Spill.</li>
+          <li>OutOfMemoryError.</li>
+          <li>Fixes at 1 GB.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What Spark does">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One executor heap</text><rect x="20" y="46" width="320" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><rect x="20" y="46" width="32.0" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="36.0" y="70" text-anchor="middle" font-size="6.6" class="s-ink2">300M</text><rect x="52.0" y="46" width="115.19999999999999" height="40" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="109.6" y="64" text-anchor="middle" font-size="7" font-weight="700" class="s-ink">user memory</text><text x="109.6" y="76" text-anchor="middle" font-size="6.2" class="s-ink2">UDF objects, Python</text><rect x="167.2" y="46" width="86.4" height="40" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="210.39999999999998" y="64" text-anchor="middle" font-size="7" font-weight="700" class="s-ink">execution</text><text x="210.39999999999998" y="76" text-anchor="middle" font-size="6.2" class="s-ink2">sort, hash, agg</text><rect x="253.6" y="46" width="86.4" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="296.8" y="64" text-anchor="middle" font-size="7" font-weight="700" class="s-ink">storage</text><text x="296.8" y="76" text-anchor="middle" font-size="6.2" class="s-ink2">cache, broadcast</text><text x="180" y="110" text-anchor="middle" font-size="7.4" class="s-ink2 mono">unified = (heap − 300 MB) × 0.6</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Execution and storage share it.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Spill: sort in runs</text><rect x="8" y="50" width="96" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="56.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">fill memory</text><text x="56.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">sort run</text><rect x="120" y="50" width="96" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="168.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">write run</text><text x="168.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">local disk</text><path d="M104 65.0L120 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M113.7 68.0L120 65.0L113.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="232" y="50" width="96" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="280.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">merge runs</text><text x="280.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">output</text><path d="M216 65.0L232 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M225.7 68.0L232 65.0L225.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Slower, but it finishes.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">OOM: one thing too big</text><rect x="20" y="46" width="320" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><rect x="20" y="46" width="32.0" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="36.0" y="70" text-anchor="middle" font-size="6.6" class="s-ink2">300M</text><rect x="52.0" y="46" width="115.19999999999999" height="40" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="109.6" y="64" text-anchor="middle" font-size="7" font-weight="700" class="s-ink">user memory</text><text x="109.6" y="76" text-anchor="middle" font-size="6.2" class="s-ink2">UDF objects, Python</text><rect x="167.2" y="46" width="86.4" height="40" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="210.39999999999998" y="64" text-anchor="middle" font-size="7" font-weight="700" class="s-ink">execution</text><text x="210.39999999999998" y="76" text-anchor="middle" font-size="6.2" class="s-ink2">sort, hash, agg</text><rect x="253.6" y="46" width="86.4" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="296.8" y="64" text-anchor="middle" font-size="7" font-weight="700" class="s-ink">storage</text><text x="296.8" y="76" text-anchor="middle" font-size="6.2" class="s-ink2">cache, broadcast</text><rect x="150" y="40" width="200" height="52" rx="4" class="s-soft-acc" style="stroke:#D64545"/><text x="250" y="70" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">one city list > memory</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A group cannot be split or spilled.</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Make the pieces smaller</text><rect x="8" y="50" width="96" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="56.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">more</text><text x="56.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">partitions</text><rect x="120" y="50" width="96" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="168.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">smaller</text><text x="168.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">groups</text><path d="M104 65.0L120 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M113.7 68.0L120 65.0L113.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="232" y="50" width="96" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="280.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">no</text><text x="280.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">collect</text><path d="M216 65.0L232 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M225.7 68.0L232 65.0L225.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix the cause, then size memory.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Unified memory model.</li>
+          <li>External sort.</li>
+          <li>Unspillable objects.</li>
+          <li>Smaller units of work.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: heavy spill, a growing list, and a container killed for off-heap memory.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-spill">Gigabytes of spill</h3>
+  <p class="anim-intro">Reducing spill with partitions. (Typical; pattern from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Spill <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Heavy spill usually means tasks are too big; more partitions make each fit in memory">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Stage page: Spill 40 GB</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">shuffle read 6 GB, 200 tasks</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">≈ 200 MB spilled per task.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Tasks too big for memory</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">each sorts more than it can hold</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Spill = disk I/O.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Raise shuffle partitions</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">200 → 1,000 (or AQE advisory)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">4 → 64 removed spill in our lab.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Spill gone, stage 2x faster</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">same memory, same cluster</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Smaller pieces.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Some spill is fine</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">watch spill ≫ shuffle size</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Tune when it dominates.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Spill.</li>
+          <li>Too big.</li>
+          <li>Partitions.</li>
+          <li>Faster.</li>
+          <li>Balance.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-list">The list that kept growing</h3>
+  <p class="anim-intro">OOM from giant groups. (Typical; OOM reproduced in our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Giant group <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="collect_list on a few keys creates objects too big for memory; write partitioned output instead">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">“All orders per city” export</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">groupBy(city).agg(collect_list)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One row per city.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Executor OOM, retried 4x</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-red mono">Java heap space</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Job fails.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Memory doubled</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">works… until next month</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Data keeps growing.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Write partitioned files instead</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">write.partitionBy("city")</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One folder per city, no list.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Same output, any size</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">no giant objects in memory</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fixed for good.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Export.</li>
+          <li>OOM.</li>
+          <li>More memory.</li>
+          <li>Partition.</li>
+          <li>Fixed.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-overhead">Killed by the container, not the JVM</h3>
+  <p class="anim-intro">Off-heap memory and Python. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Overhead <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Python and Arrow memory is off-heap; raise memoryOverhead or reduce batch size">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Pandas UDF job killed</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">exceeding memory limits (YARN/K8s)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No Java OOM in logs.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">It is off-heap memory</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">Python workers + Arrow batches</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Counted in overhead.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Raise memoryOverhead</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">spark.executor.memoryOverhead=2g</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Not executor.memory.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Smaller Arrow batches</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">arrow.maxRecordsPerBatch</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Less per worker.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Fewer cores per executor</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">= fewer Python workers</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Memory per task rises.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Killed.</li>
+          <li>Off-heap.</li>
+          <li>Overhead.</li>
+          <li>Batches.</li>
+          <li>Cores.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Memory tuning at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-blue">spill</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">review</text></svg></div>
+    <div><h4>1. Spill reviews</h4>
+      <p>Stages where spill exceeds shuffle size get more partitions or a larger advisory size.</p>
+      <div class="uc-flow"><span>Spill metric</span><i>→</i><span class="java">more partitions</span><i>→</i><span>No spill</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green">sizing</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">executors</text></svg></div>
+    <div><h4>2. Executor sizing</h4>
+      <p>Platform teams pick 4–5 cores and 16–32 GB per executor so each task gets enough memory.</p>
+      <div class="uc-flow"><span>Node</span><i>→</i><span class="java">cores + memory</span><i>→</i><span>Executor shape</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">driver</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">safety</text></svg></div>
+    <div><h4>3. Driver protection</h4>
+      <p>maxResultSize stops accidental collects from killing shared notebooks.</p>
+      <div class="uc-flow"><span>collect()</span><i>→</i><span class="java">maxResultSize</span><i>→</i><span>Clear error</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">Python</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">overhead</text></svg></div>
+    <div><h4>4. Python-heavy jobs</h4>
+      <p>Pandas UDF jobs set memoryOverhead explicitly instead of relying on the 10% default.</p>
+      <div class="uc-flow"><span>Pandas UDF</span><i>→</i><span class="java">overhead 2–4 GB</span><i>→</i><span>Stable</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">cache</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">budget</text></svg></div>
+    <div><h4>5. Cache budgets</h4>
+      <p>Cached tables are checked in the Storage tab so they do not starve execution memory.</p>
+      <div class="uc-flow"><span>cache()</span><i>→</i><span class="java">Storage tab</span><i>→</i><span>Room for joins</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>

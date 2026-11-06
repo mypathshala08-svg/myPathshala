@@ -1,0 +1,3422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cache and persist: storage levels | MyPhatshala</title>
+<meta name="description" content="Caching in Spark 4.3.0, measured: cache() is lazy, DataFrames default to MEMORY_AND_DISK in a compressed columnar format (4.75 M orders in 47.5 MiB), PySpark RDDs to serialised MEMORY_ONLY; MEMORY_ONLY, MEMORY_AND_DISK and DISK_ONLY compared on a cluster (second query 6.7 s uncached vs 2.1–2.7 s cached, 651 MiB), the Storage tab, CACHE TABLE vs CACHE LAZY TABLE, and how caching four huge partitions killed every executor with exit code 52.">
+<meta name="mp:minutes" content="34">
+<link rel="canonical" href="https://myphatshala.in/courses/spark-pyspark/03-persistence-and-shared-variables/01-cache-and-persist/">
+<meta property="og:title" content="cache and persist: storage levels · MyPhatshala">
+<meta property="og:description" content="cache() made the report 3× faster, then crashed every executor with exit code 52. Storage levels, measured on a real Spark cluster.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "cache and persist: storage levels", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Spark and PySpark", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="03-persistence-and-shared-variables/01-cache-and-persist" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Spark and PySpark syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Spark and PySpark</a><span>›</span><b>Lesson 3.1</b></nav>
+    <h1>cache and persist: storage levels</h1>
+    <p class="lead">Module 3 is about keeping and sharing data across a Spark application. This lesson starts with <b>cache() and persist()</b>: what they really store, how each storage level performs on our cluster, how to read the Storage tab, and how careless caching can crash a job. <b>All outputs and screenshots are real</b> (Spark 4.3.0).</p>
+    <div class="lesson-meta"><span>Module 3 · Persistence and shared variables</span><span>⏱ 34 min</span><span>Intermediate</span><span>Spark 4.3.0 cluster</span><span>Every storage level timed</span><span>An OOM reproduced</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Just cache everything”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> Lesson <a href="../../02-rdds/03-lazy-evaluation-and-the-dag/">2.3</a> (why every action recomputes) and <a href="../../01-introduction/03-spark-architecture/">1.3</a> (executors).</p></div>
+  <div class="story">
+    <p class="narration">After Module 2, Kabir has a new habit: he adds <code>.cache()</code> to every DataFrame. His morning report on TiffinGo’s five million orders got faster. Then one night the job died with “Command exited with code 52” on every executor, and nobody could explain why caching, of all things, broke it.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Persisting keeps an RDD or DataFrame’s partitions on the executors after the first action, in memory, on local disk or both, so later actions skip recomputation. Our cluster measured each storage level and found a way to crash executors.">
+        <rect x="20" y="24" width="320" height="80" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180" y="38" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">executor</text><rect x="32" y="46" width="140" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="102.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">memory</text><text x="102.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">cached partitions</text><rect x="188" y="46" width="140" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="258.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">local disk</text><text x="258.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">spilled partitions</text><rect x="410" y="12" width="222" height="136" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="521" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured on the cluster</text><text x="422" y="52" font-size="7.2" class="s-acc mono">no cache, 2nd query  : 6.7 s</text><text x="422" y="68" font-size="7.2" class="s-green mono">MEMORY_ONLY, 2nd     : 2.7 s</text><text x="422" y="84" font-size="7.2" class="s-green mono">MEMORY_AND_DISK, 2nd : 2.2 s</text><text x="422" y="100" font-size="7.2" class="s-green mono">DISK_ONLY, 2nd       : 2.1 s</text><text x="422" y="116" font-size="7.2" class="s-ink mono">651 MiB in 32 partitions</text><text x="422" y="132" font-size="7.2" class="s-red mono">4 huge partitions: exit 52</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Cache what you <tspan font-weight="700" class="s-acc">reuse</tspan>, in a form that <tspan font-weight="700" class="s-acc">fits</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, caching made things faster. How can it crash a job?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Cached data takes executor memory, the same memory your tasks need to run. Spark offers several <b>storage levels</b>: memory only, memory and disk, disk only, serialised or not, replicated or not. Pick the wrong one, or cache data in partitions too big for the executor, and you trade speed for failures.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So when should we cache, and how?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Cache only what several actions reuse, choose a storage level that fits, check the Storage tab, and unpersist when done. Today we measure every level on our cluster with five million orders, look at the Storage tab, and reproduce Kabir’s crash. All outputs are real (Spark 4.3.0).</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Persistence and storage levels</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Persistence</b> (caching) instructs Spark to keep the computed partitions of an RDD or DataFrame on the executors after the first action that computes them, so later actions read them instead of recomputing the lineage. <code>persist(level)</code> chooses a <b>storage level</b>: whether to use memory, local disk or off-heap memory, whether to store objects serialised, and how many replicas to keep; <code>cache()</code> uses the default level (MEMORY_AND_DISK for DataFrames and Datasets, stored in Spark’s compressed in-memory columnar format; MEMORY_ONLY for RDDs). Cached blocks share executor memory with task execution and are evicted in least-recently-used order under pressure; with MEMORY_ONLY evicted partitions are recomputed, with MEMORY_AND_DISK they are written to local disk. Persistence is lazy, is lost with its executor, and should be released with <code>unpersist()</code>.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>cache() or persist() keeps data on the executors after it is first computed, so the next actions are faster. You choose where: memory, disk or both. It uses memory that tasks also need, so cache only what you reuse and remove it when finished.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>cache()</b><span>persist() with the default storage level.</span></div>
+    <div class="term"><b>persist(level)</b><span>Keep data with a chosen storage level.</span></div>
+    <div class="term"><b>Storage level</b><span>Memory / disk / off-heap, serialised or not, replicas.</span></div>
+    <div class="term"><b>Serialised</b><span>Stored as bytes: smaller, but costs CPU to read.</span></div>
+    <div class="term"><b>Eviction</b><span>Removing cached blocks when memory is needed (LRU).</span></div>
+    <div class="term"><b>Storage tab</b><span>Spark UI page listing cached data, sizes and fractions.</span></div>
+    <div class="term"><b>unpersist()</b><span>Remove cached data from executors.</span></div>
+    <div class="term"><b>Exit code 52</b><span>An executor JVM died from OutOfMemoryError.</span></div>
+  </div>
+
+  <h3>Storage levels</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:760px">
+    <thead><tr><th>Level</th><th>Memory</th><th>Disk</th><th>If memory is full</th><th>Use when</th></tr></thead>
+    <tbody><tr><td>MEMORY_ONLY</td><td>yes</td><td>no</td><td>Partitions not cached; recomputed when needed</td><td>Fits comfortably; cheap to recompute</td></tr><tr><td>MEMORY_AND_DISK (DataFrame default)</td><td>yes</td><td>yes</td><td>Overflow written to local disk</td><td>Expensive to recompute; most cases</td></tr><tr><td>DISK_ONLY</td><td>no</td><td>yes</td><td>—</td><td>Large, expensive results; memory needed for tasks</td></tr><tr><td>MEMORY_ONLY_2, MEMORY_AND_DISK_2</td><td>yes</td><td>(yes)</td><td>Two copies on two executors</td><td>Fast recovery matters (spot nodes)</td></tr><tr><td>OFF_HEAP</td><td>off-heap</td><td>no</td><td>Needs off-heap memory enabled</td><td>Reduce GC pressure; advanced</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Caching at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Keeping cooked food on the counter</h4>
+      <ul>
+        <li>Without caching, every new order cooks the dish from scratch.</li>
+        <li><code>cache()</code> keeps a cooked batch on the counter (memory); if the counter is full, some goes to the fridge (disk).</li>
+        <li>An overfull counter leaves no room to cook: the kitchen stops.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The API</h4>
+      <ul>
+        <li><code>df.cache()</code> = <code>persist()</code> with the default level: <b>MEMORY_AND_DISK</b> for DataFrames (deserialised, columnar), <b>MEMORY_ONLY</b> serialised for PySpark RDDs.</li>
+        <li><code>persist(StorageLevel.X)</code>: MEMORY_ONLY, MEMORY_AND_DISK, DISK_ONLY, the <code>_2</code> variants (two replicas), OFF_HEAP.</li>
+        <li>Caching is <b>lazy</b>: the first action fills it. SQL <code>CACHE TABLE</code> is eager; <code>CACHE LAZY TABLE</code> is not. Release with <code>unpersist()</code>, <code>UNCACHE TABLE</code> or <code>spark.catalog.clearCache()</code>.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>The second query took 6.7 s uncached and 2.1–2.7 s with any storage level; filling the cache made the first query slower (21–29 s vs 15 s).</li>
+        <li>5,000,000 rows with 128-character notes needed 651 MiB of cache over 32 partitions.</li>
+        <li>The same data in only 4 partitions killed every 1 GiB executor while caching (exit code 52 = OutOfMemoryError); the job was aborted after 4 attempts.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “cache() vs persist()?” cache() is persist() with the default level (MEMORY_AND_DISK for DataFrames, MEMORY_ONLY for RDDs). persist() lets you choose: MEMORY_ONLY, MEMORY_AND_DISK, DISK_ONLY, replicated _2 levels or OFF_HEAP. Both are lazy and need an action to fill; release with unpersist().</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>When to cache, and when not to</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Situation</th><th>Cache?</th><th>Why</th></tr></thead>
+    <tbody><tr><td>Same DataFrame used by several actions or reports</td><td>Yes</td><td>Avoid repeated reads and transformations</td></tr><tr><td>Iterative algorithms (ML, graphs)</td><td>Yes</td><td>Many passes over the same data</td></tr><tr><td>Interactive exploration in a notebook</td><td>Yes, then unpersist</td><td>Many small queries on one dataset</td></tr><tr><td>Used once</td><td>No</td><td>Filling the cache only costs time and memory</td></tr><tr><td>Cheap to recompute (simple filter on Parquet)</td><td>Usually no</td><td>Reading Parquet can be as fast as reading the cache</td></tr><tr><td>Bigger than the cluster’s memory</td><td>DISK_ONLY or write to Parquet</td><td>Avoid eviction storms and OOM</td></tr><tr><td>Must survive executor loss or long lineage</td><td>Checkpoint (3.3) or write out</td><td>Cache is lost with its executor</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>A cache is not free. In our lab, the first query <b>with</b> caching took 21–29 s against 15 s without, because Spark had to build the cache. If a dataset is used once, or is as cheap to read from Parquet as from the cache, caching makes the job slower and steals memory from tasks.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Measuring every storage level</h2>
+  <p>All outputs are real: PySpark 4.3.0 in local mode (Steps 1–3, 6) and on our standalone cluster with two executors of 2 cores and 1 GiB (Steps 4–5). Data: <code>orders_big</code>, 5,000,000 orders.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · cache() is lazy, and has a default level</h4>
+      <div class="code" data-lang="python" data-file="basics.py"><pre><code>df = orders.where(&quot;status = &#x27;DELIVERED&#x27;&quot;).cache()
+print(df.storageLevel)
+print(len(storage()))           # entries in the UI&#x27;s /storage/rdd API
+df.count()
+s = storage()[0]
+print(s[&quot;numCachedPartitions&quot;], s[&quot;numPartitions&quot;], s[&quot;memoryUsed&quot;])</code></pre><div class="output">1) DataFrame cache() level : Disk Memory Deserialized 1x Replicated
+   cached blocks before any action: 0
+   after count(): 2 of 2 partitions, 47.5 MiB in memory
+   storage name: *(1) Filter (isnotnull(status#5) AND (status#5 = DELIVERED))…</div></div>
+      <span class="behind">Calling <code>cache()</code> stored nothing: zero cached entries until <code>count()</code> ran. A DataFrame’s default level is <b>Disk Memory Deserialized</b> (MEMORY_AND_DISK). The 4.75 million delivered orders took only <b>47.5 MiB</b>: DataFrames are cached in a compressed columnar format, much smaller than Python objects would be.</span></li>
+    <li><h4>Step 2 · RDD defaults and persist()</h4>
+      <div class="code" data-lang="python" data-file="basics.py"><pre><code>rdd = sc.parallelize(range(10)).cache()
+print(rdd.getStorageLevel())
+p = orders.persist(StorageLevel.DISK_ONLY)
+print(p.storageLevel)</code></pre><div class="output">2) RDD cache() level       : Memory Serialized 1x Replicated
+3) persist(DISK_ONLY)      : Disk Serialized 1x Replicated</div></div>
+      <span class="behind">For PySpark RDDs, <code>cache()</code> means MEMORY_ONLY with <b>serialised</b> (pickled) data: Python objects are always stored as bytes on the JVM side. <code>persist()</code> takes any <code>StorageLevel</code>; here DISK_ONLY writes the partitions to the executors’ local disks.</span></li>
+    <li><h4>Step 3 · The Storage tab</h4>
+      <div class="code" data-lang="python" data-file="storage_tab.py"><pre><code>d = o.where(&quot;status = &#x27;DELIVERED&#x27;&quot;).cache(); d.count()
+c = o.groupBy(&quot;city&quot;, &quot;order_date&quot;).agg(F.sum(&quot;amount&quot;).alias(&quot;rev&quot;)).persist(StorageLevel.DISK_ONLY); c.count()</code></pre><div class="output">Spark UI → Storage</div></div>  <figure style="margin:18px 0">
+    <img src="ui-storage.webp" width="1280" height="520" loading="lazy" alt="Spark UI Storage tab listing a cached DataFrame of 47.5 MiB and a disk-only aggregated DataFrame with 200 partitions" style="max-width:100%;height:auto;border:1px solid var(--line);border-radius:8px">
+    <figcaption class="muted" style="font-size:.9em;margin-top:6px">Real screenshot: the Storage tab. The filtered orders (MEMORY_AND_DISK, 2 partitions, 100% cached, 47.5 MiB in memory) and an aggregation persisted with DISK_ONLY (200 partitions, 118.8 KiB on disk).</figcaption>
+  </figure>
+
+      <span class="behind">Every cached dataset appears with its level, number of cached partitions, <b>fraction cached</b> and sizes in memory and on disk. A fraction below 100% means some partitions did not fit and will be recomputed (MEMORY_ONLY) or read from disk. The aggregated DataFrame kept 200 partitions, the default <code>spark.sql.shuffle.partitions</code>, all tiny: worth a <code>coalesce</code> before caching.</span></li>
+    <li><h4>Step 4 · Every level on the cluster</h4>
+      <div class="code" data-lang="python" data-file="cache_levels.py (cluster)"><pre><code>base = (spark.read.parquet(&quot;/data/orders_big&quot;).repartition(32)
+        .withColumn(&quot;note&quot;, F.concat(F.sha2(F.col(&quot;order_id&quot;).cast(&quot;string&quot;), 256),
+                                     F.sha2(F.concat_ws(&quot;-&quot;, &quot;order_id&quot;, &quot;customer_id&quot;), 256))))
+def q(df):
+    return df.where(&quot;status = &#x27;DELIVERED&#x27;&quot;).groupBy(&quot;city&quot;).agg(F.sum(&quot;amount&quot;)).collect()
+for name in [&quot;MEMORY_ONLY&quot;, &quot;MEMORY_AND_DISK&quot;, &quot;DISK_ONLY&quot;]:
+    df = base.persist(getattr(StorageLevel, name))
+    q(df); q(df)                      # fill, then reuse (both timed)
+    df.unpersist(blocking=True)</code></pre><div class="output">NONE                   1st  15.3 s  2nd   6.7 s
+MEMORY_ONLY            1st  29.0 s  2nd   2.7 s  cached 32/32 partitions  memory   651.2 MiB  disk     0.0 MiB
+MEMORY_AND_DISK        1st  21.5 s  2nd   2.2 s  cached 32/32 partitions  memory   651.2 MiB  disk     0.0 MiB
+DISK_ONLY              1st  20.7 s  2nd   2.1 s  cached 32/32 partitions  memory     0.0 MiB  disk   651.2 MiB</div></div>
+      <span class="behind">We added a 128-character note per order (random-looking hashes, so it does not compress) to make the data realistic in size: <b>651 MiB</b> cached over 32 partitions. Without a cache, the second query re-read and re-hashed everything (6.7 s). With any level, it took 2.1–2.7 s. DISK_ONLY was as fast as memory here because the lab’s disks are fast and the data was read sequentially; on busy clusters memory usually wins. Filling a cache always cost extra the first time.</span></li>
+    <li><h4>Step 5 · How caching crashed every executor</h4>
+      <div class="code" data-lang="python" data-file="cache_levels.py (cluster), without repartition(32)"><pre><code>base = spark.read.parquet(&quot;/data/orders_big&quot;).withColumn(&quot;note&quot;, …)    # only 4 partitions
+df = base.persist(StorageLevel.MEMORY_ONLY)
+q(df)</code></pre><div class="output">NONE                   1st   8.4 s  2nd   1.9 s
+SparkException: Job aborted due to stage failure: Task 3 in stage 8.0 failed 4 times, most recent failure: Lost task 3.4 in stage 8.0 (TID 29) (172.19.0.4 executor 2): ExecutorLostFailure (executor 2 exited caused by one of the running tasks) Reason: Command exited with code 52
+ERROR TaskSchedulerImpl: Lost executor 0 on 172.19.0.5: Command exited with code 52
+ERROR TaskSchedulerImpl: Lost executor 1 on 172.19.0.4: Command exited with code 52
+ERROR TaskSchedulerImpl: Lost executor 2 on 172.19.0.4: Command exited with code 52
+ERROR TaskSchedulerImpl: Lost executor 3 on 172.19.0.5: Command exited with code 52
+ERROR TaskSetManager: Task 3 in stage 8.0 failed 4 times; aborting job</div></div>
+      <span class="behind">Kabir’s crash, reproduced. With the same data in only <b>4 partitions</b> (1,250,000 rows each), every task had to build a cached block of about 160 MiB inside a 1 GiB executor, next to Parquet decoding and hashing. Executors died with <b>exit code 52</b>, Spark’s code for OutOfMemoryError; replacements died too, and after 4 failed attempts the job was aborted. Smaller partitions (Step 4), a disk level, more executor memory or not caching at all would each have avoided it.</span></li>
+    <li><h4>Step 6 · SQL caching and cleaning up</h4>
+      <div class="code" data-lang="python" data-file="basics.py"><pre><code>spark.sql(&quot;CACHE TABLE delivered AS SELECT * FROM parquet.`orders_big` WHERE status = &#x27;DELIVERED&#x27;&quot;)
+spark.sql(&quot;CACHE LAZY TABLE lazy_t AS SELECT city FROM parquet.`orders_big`&quot;)
+spark.catalog.isCached(&quot;delivered&quot;)
+df.unpersist(); p.unpersist(); spark.sql(&quot;UNCACHE TABLE delivered&quot;); spark.catalog.clearCache()</code></pre><div class="output">   storage name: *(1) Filter (isnotnull(status#5) AND (status#5 = DELIVERED))…
+4) CACHE TABLE (eager): cached entries now 2
+   CACHE LAZY TABLE: cached entries now 2
+   isCached(&#x27;delivered&#x27;): True
+5) after unpersist/clearCache: cached entries 0</div></div>
+      <span class="behind">Unlike <code>cache()</code>, SQL <code>CACHE TABLE</code> is <b>eager</b>: it runs immediately (one new cached entry). <code>CACHE LAZY TABLE</code> waits for the first query. Release caches explicitly: <code>unpersist()</code> for DataFrames and RDDs, <code>UNCACHE TABLE</code> for tables, <code>clearCache()</code> for everything. Unused caches otherwise stay until memory pressure evicts them.</span></li>
+  </ol>
+</section>
+
+<section class="part" id="all-levels"><span class="part-label"><b>+</b> Going deeper</span><h2>Every StorageLevel, side by side</h2>
+<p>Lab mein humne PySpark 4.3 ke saare StorageLevel constants print kiye. Dhyaan do: PySpark mein koi <code>_SER</code> level nahi hai — Python data hamesha serialized hi store hota hai.</p><div class="code" data-lang="python" data-file="levels.py"><pre><code>from pyspark import StorageLevel
+df.persist(StorageLevel.MEMORY_AND_DISK_2)
+print(df.storageLevel)
+custom = StorageLevel(True, True, False, False, 3)</code></pre><div class="output">== 1) every StorageLevel constant in PySpark 4.3 (useDisk, useMemory, useOffHeap, deserialized, replication)
+  DISK_ONLY                disk=True  memory=False offHeap=False deserialized=False replication=1
+  DISK_ONLY_2              disk=True  memory=False offHeap=False deserialized=False replication=2
+  DISK_ONLY_3              disk=True  memory=False offHeap=False deserialized=False replication=3
+  MEMORY_AND_DISK          disk=True  memory=True  offHeap=False deserialized=False replication=1
+  MEMORY_AND_DISK_2        disk=True  memory=True  offHeap=False deserialized=False replication=2
+  MEMORY_AND_DISK_DESER    disk=True  memory=True  offHeap=False deserialized=True  replication=1
+  MEMORY_ONLY              disk=False memory=True  offHeap=False deserialized=False replication=1
+  MEMORY_ONLY_2            disk=False memory=True  offHeap=False deserialized=False replication=2
+  NONE                     disk=False memory=False offHeap=False deserialized=False replication=1
+  OFF_HEAP                 disk=True  memory=True  offHeap=True  deserialized=False replication=1
+  *_SER levels (MEMORY_ONLY_SER, MEMORY_AND_DISK_SER …): none in PySpark; Python data is always stored serialized
+== 2) persist(MEMORY_AND_DISK_2) then df.storageLevel: Disk Memory Serialized 2x Replicated
+== 3) a custom level StorageLevel(True, True, False, False, 3): Disk Memory Serialized 3x Replicated
+  RDD in PySpark, MEMORY_ONLY -&gt; getStorageLevel(): Memory Serialized 1x Replicated | deserialized: False</div></div>  <div class="table-wrap">
+  <table class="compare" style="min-width:320px">
+    <thead><tr><th>Level</th><th>Kab use karein</th></tr></thead>
+    <tbody><tr><td>MEMORY_AND_DISK</td><td>Default for DataFrame; safe choice</td></tr><tr><td>MEMORY_ONLY</td><td>Chhota data, recompute sasta</td></tr><tr><td>DISK_ONLY</td><td>Bada data, memory tight</td></tr><tr><td>*_2 / *_3</td><td>Executor loss pe recompute avoid karna ho</td></tr><tr><td>OFF_HEAP</td><td>GC pressure kam karna ho (off-heap enable chahiye)</td></tr></tbody>
+  </table>
+  </div>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Keep what you reuse</h2>
+  <p>Left: real outputs. Right: inside the executor.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Keep what you reuse <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">df = orders.where(…).cache()</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">cached entries: 0</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">df.count()</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">2 of 2 partitions, 47.5 MiB</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">DataFrame: Disk Memory Deserialized</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">RDD      : Memory Serialized</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">DISK_ONLY: Disk Serialized</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">NONE            2nd 6.7 s</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">MEMORY_ONLY     2nd 2.7 s</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">MEMORY_AND_DISK 2nd 2.2 s</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">DISK_ONLY       2nd 2.1 s</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">4 partitions, MEMORY_ONLY</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Lost executor 0: exited with code 52</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Lost executor 1: exited with code 52</text><text x="26" y="92" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Task failed 4 times; aborting job</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">CACHE TABLE delivered …   (eager)</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">CACHE LAZY TABLE lazy_t … (lazy)</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">clearCache() → 0 entries</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>cache() did nothing until count().</li>
+          <li>Defaults differ for DataFrames and RDDs.</li>
+          <li>Every level made the second query faster.</li>
+          <li>Four huge cached partitions killed every executor.</li>
+          <li>SQL caching is eager; clean up explicitly.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Inside the executor">
+          <g data-on="1"><text x="180" y="12" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lazy until an action</text><rect x="20" y="24" width="320" height="80" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180" y="38" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">executor</text><rect x="32" y="46" width="140" height="34" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="102.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">memory</text><text x="102.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">empty, then 47.5 MiB</text><rect x="188" y="46" width="140" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="258.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">local disk</text><text x="258.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">—</text><rect x="10" y="116" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="134.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The first action fills the cache.</text></g><g data-on="2"><text x="180" y="12" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Where and how</text><rect x="20" y="24" width="320" height="80" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180" y="38" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">executor</text><rect x="32" y="46" width="140" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="102.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">memory</text><text x="102.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">DataFrame: columnar</text><rect x="188" y="46" width="140" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="258.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">local disk</text><text x="258.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">DISK_ONLY: bytes</text><rect x="10" y="116" width="340" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="134.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Pick the level per dataset.</text></g><g data-on="3"><text x="180" y="12" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Reuse instead of recompute</text><rect x="20" y="24" width="320" height="80" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180" y="38" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">executor</text><rect x="32" y="46" width="140" height="34" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="102.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">memory</text><text x="102.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">32 cached partitions</text><rect x="188" y="46" width="140" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="258.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">local disk</text><text x="258.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">651 MiB (DISK_ONLY)</text><rect x="10" y="116" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="134.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The 2nd query reads the cache.</text></g><g data-on="4"><text x="180" y="12" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Caching competes for memory</text><rect x="20" y="24" width="320" height="80" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180" y="38" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">executor</text><rect x="32" y="46" width="140" height="34" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="102.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">memory</text><text x="102.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">160 MiB block + task</text><rect x="188" y="46" width="140" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="258.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">local disk</text><text x="258.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">—</text><text x="180" y="96" text-anchor="middle" font-size="6.8" class="s-ink2">one 1 GiB JVM</text><rect x="10" y="116" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="134.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Huge partitions → OutOfMemory.</text></g><g data-on="5"><text x="180" y="12" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Release what you no longer need</text><rect x="20" y="24" width="320" height="80" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180" y="38" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">executor</text><rect x="32" y="46" width="140" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="102.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">memory</text><text x="102.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">free</text><rect x="188" y="46" width="140" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="258.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">local disk</text><text x="258.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">free</text><rect x="10" y="116" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="134.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">unpersist · UNCACHE · clearCache.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Spark marks the plan; tasks fill the blocks.</li>
+          <li>Python RDD data is always stored serialised.</li>
+          <li>Reading cached blocks skips Parquet and hashing.</li>
+          <li>Exit code 52 = OutOfMemoryError in the executor.</li>
+          <li>Freed memory goes back to tasks.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: the exit-code-52 night, a notebook that caches everything, and caching on spot nodes.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-code52">The night caching crashed the job</h3>
+  <p class="anim-intro">Kabir’s incident, as we reproduced it. (Real behaviour from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Cache and OOM <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Huge cached partitions exhaust executor memory; repartition, use a disk level or stop caching data used once">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly job: exit code 52</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">on every executor</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">After adding cache().</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check partition sizes</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">4 partitions × 1.25 M rows</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">~160 MiB cached per task.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">More, smaller partitions</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">repartition(32) before caching</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">651 MiB fits across executors.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or a disk level</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">persist(StorageLevel.DISK_ONLY)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Memory left for tasks.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Or no cache at all</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">used once? remove it</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The cheapest fix.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Executors die.</li>
+          <li>Partitions too big.</li>
+          <li>Repartition.</li>
+          <li>Use disk.</li>
+          <li>Or remove the cache.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-notebookcache">A notebook that caches everything</h3>
+  <p class="anim-intro">Why caches need cleaning. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Cache hygiene <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Too many caches evict each other and starve tasks; cache one reused dataset and unpersist the rest">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Notebook gets slower all day</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">20 DataFrames cached, never released</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Memory fills up.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Storage tab</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">fraction cached: 40% · 60% · …</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Evictions everywhere.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Unpersist old results</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">df.unpersist() · clearCache()</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Free executor memory.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cache one base dataset</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">not every intermediate step</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Reuse it.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Fast again</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">fraction cached: 100%</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">And tasks have room.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Slow notebook.</li>
+          <li>Partial caches.</li>
+          <li>Release.</li>
+          <li>Cache less.</li>
+          <li>Fast again.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-replicated">Caching on machines that can disappear</h3>
+  <p class="anim-intro">Choosing a storage level for reliability. (Typical practice.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Replicated levels <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Replicated storage levels keep a second copy so one lost executor does not force recomputation; checkpoints survive everything">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">ML training on spot nodes</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">features cached, 50 iterations</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Executors can disappear.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One node lost</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">its cached partitions recomputed</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Slow iteration.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MEMORY_AND_DISK_2</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">a second copy on another executor</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Survives one loss.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cost</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">double the cache memory</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Only for expensive data.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Or checkpoint</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">reliable storage (Lesson 3.3)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Survives everything.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Spot nodes.</li>
+          <li>Loss forces recompute.</li>
+          <li>Two copies.</li>
+          <li>Twice the memory.</li>
+          <li>Or checkpoint.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Caching at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-blue">reports</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">one base</text></svg></div>
+    <div><h4>1. One base, many reports</h4>
+      <p>A cleaned, filtered dataset is cached once and feeds several aggregations in the same job.</p>
+      <div class="uc-flow"><span>Clean</span><i>→</i><span class="java">cache</span><i>→</i><span>Reports</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-green">ML</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">iterations</text></svg></div>
+    <div><h4>2. Machine learning</h4>
+      <p>Training data is cached before iterative algorithms make many passes over it.</p>
+      <div class="uc-flow"><span>Features</span><i>→</i><span class="java">cache</span><i>→</i><span>Training</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-violet">BI</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">warm tables</text></svg></div>
+    <div><h4>3. Warm tables for dashboards</h4>
+      <p>Long-running Spark SQL servers CACHE TABLE hot tables so dashboards answer quickly.</p>
+      <div class="uc-flow"><span>Hot table</span><i>→</i><span class="java">CACHE TABLE</span><i>→</i><span>Fast queries</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc">review</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">cache()</text></svg></div>
+    <div><h4>4. Code reviews</h4>
+      <p>Reviewers ask “is this reused?” for every cache() and “where is the unpersist?”.</p>
+      <div class="uc-flow"><span>cache()</span><i>→</i><span class="java">review</span><i>→</i><span>Kept or removed</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="9" font-weight="700" class="s-acc">incidents</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">OOM</text></svg></div>
+    <div><h4>5. Memory incidents</h4>
+      <p>Exit code 52 and evictions in the Storage tab are classic signs of over-caching.</p>
+      <div class="uc-flow"><span>OOM</span><i>→</i><span class="java">Storage tab</span><i>→</i><span>Fix</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: should I cache?</h2>
+  <p>A small cost model with the timings measured in Step 4: caching costs extra once and saves time on every reuse. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># When does caching pay off? A cost model using the lab&#x27;s timings
+read_and_compute = 6.7     # s: a query without cache (2nd run, lab)
+from_cache = 2.4           # s: a query reading the cache (lab: 2.1-2.7)
+fill_extra = 6.2           # s: extra time to build the cache on first use (lab: 21.5 vs 15.3)
+
+for uses in (1, 2, 3, 5, 10):
+    no_cache = uses * read_and_compute
+    cached = (read_and_compute + fill_extra) + (uses - 1) * from_cache
+    better = &quot;cache&quot; if cached &lt; no_cache else &quot;no cache&quot;
+    print(f&quot;{uses:2} uses: no cache {no_cache:5.1f} s | cache {cached:5.1f} s -&gt; {better}&quot;)</code></pre><div class="output"> 1 uses: no cache   6.7 s | cache  12.9 s -&gt; no cache
+ 2 uses: no cache  13.4 s | cache  15.3 s -&gt; no cache
+ 3 uses: no cache  20.1 s | cache  17.7 s -&gt; cache
+ 5 uses: no cache  33.5 s | cache  22.5 s -&gt; cache
+10 uses: no cache  67.0 s | cache  34.5 s -&gt; cache</div></div>
+  <ul class="anno"><li><code>fill_extra = 6.2           # s: extra time to build the cache on first use (lab: 21.5 vs 15.3)</code><span>The first query with MEMORY_AND_DISK took 21.5 s against 15.3 s without caching.</span></li><li><code>    cached = (read_and_compute + fill_extra) + (uses - 1) * from_cache</code><span>Pay once to fill, then cheap reads.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Find the break-even",
+   "hint": "Press <b>Run<\/b>. From how many uses does caching win?",
+   "code": "# When does caching pay off? A cost model using the lab's timings\nread_and_compute = 6.7     # s: a query without cache (2nd run, lab)\nfrom_cache = 2.4           # s: a query reading the cache (lab: 2.1-2.7)\nfill_extra = 6.2           # s: extra time to build the cache on first use (lab: 21.5 vs 15.3)\n\nfor uses in (1, 2, 3, 5, 10):\n    no_cache = uses * read_and_compute\n    cached = (read_and_compute + fill_extra) + (uses - 1) * from_cache\n    better = \"cache\" if cached < no_cache else \"no cache\"\n    print(f\"{uses:2} uses: no cache {no_cache:5.1f} s | cache {cached:5.1f} s -> {better}\")\n"
+  },
+  {
+   "label": "2 · Predict first: memory needed",
+   "hint": "<b>Predict first:<\/b> does 651 MiB fit in two executors with about 434 MiB storage memory each?",
+   "code": "cache_mib, executors, storage_mib = 651, 2, 434\nprint(\"fits\" if cache_mib <= executors * storage_mib else \"does not fit\", f\"({cache_mib} of {executors * storage_mib} MiB)\")\n"
+  },
+  {
+   "label": "3 · Partition size",
+   "hint": "Size of one cached partition for 4 and 32 partitions.",
+   "code": "total = 651\nfor parts in (4, 32):\n    print(parts, \"partitions ->\", round(total / parts), \"MiB each\")\n"
+  },
+  {
+   "label": "4 · Choose a level",
+   "hint": "Pick a storage level for each case.",
+   "code": "cases = {\"small lookup, reused 20x\": \"MEMORY_ONLY\",\n         \"large, expensive, reused 3x\": \"MEMORY_AND_DISK\",\n         \"huge result, memory needed by tasks\": \"DISK_ONLY\",\n         \"spot nodes, expensive to rebuild\": \"MEMORY_AND_DISK_2\"}\nfor k, v in cases.items():\n    print(f\"{v:18} <- {k}\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This code caches a DataFrame that is used only once.",
+   "code": "uses = {\"orders_clean\": 1}\nfor name, n in uses.items():\n    assert n > 1, f\"{name} is used {n} time(s): caching only adds cost\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: inspect caches</h3>
+  <p>In the <code>pyspark</code> shell. <b>Outputs are real</b> (PySpark 4.3.0).</p>
+  <div class="pcrun"><h4>1 · Storage level of a DataFrame</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>df = spark.read.parquet(&quot;orders_big&quot;).where(&quot;status = &#x27;DELIVERED&#x27;&quot;).cache()
+df.storageLevel</code></pre><div class="output">StorageLevel(True, True, False, True, 1)   # Disk Memory Deserialized 1x Replicated</div></div>
+  <p class="muted">useDisk, useMemory, useOffHeap, deserialized, replication.</p></div>
+  <div class="pcrun"><h4>2 · Cached datasets through the REST API</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>curl -s http://localhost:4040/api/v1/applications/&lt;app-id&gt;/storage/rdd</code></pre><div class="output">[ { &quot;id&quot; : 6, &quot;name&quot; : &quot;*(1) Filter (isnotnull(status#5) AND (status#5 = DELIVERED)) …&quot;,
+    &quot;numPartitions&quot; : 2, &quot;numCachedPartitions&quot; : 2,
+    &quot;storageLevel&quot; : &quot;Disk Memory Deserialized 1x Replicated&quot;,
+    &quot;memoryUsed&quot; : 49771776, &quot;diskUsed&quot; : 0 } ]   (shortened)</div></div>
+  <p class="muted">memoryUsed 49,771,776 bytes = 47.5 MiB, as in the Storage tab.</p></div>
+  <div class="pcrun"><h4>3 · Is a table cached?</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>spark.sql(&quot;CACHE TABLE delivered AS SELECT * FROM parquet.`orders_big` WHERE status = &#x27;DELIVERED&#x27;&quot;)
+spark.catalog.isCached(&quot;delivered&quot;)</code></pre><div class="output">True</div></div>
+  <p class="muted">CACHE TABLE runs at once; add LAZY to wait for the first query.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>How MEMORY_ONLY and MEMORY_AND_DISK handle a full memory</h2>
+  <p>Follow what happens to partitions when memory runs out.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "memory_mib, part_mib = 100, 30",
+  "partitions = [\"p0\", \"p1\", \"p2\", \"p3\", \"p4\"]",
+  "for level in (\"MEMORY_ONLY\", \"MEMORY_AND_DISK\"):",
+  "    used, mem, disk, missing = 0, [], [], []",
+  "    for p in partitions:",
+  "        if used + part_mib <= memory_mib:",
+  "            mem.append(p); used += part_mib",
+  "        elif level == \"MEMORY_AND_DISK\":",
+  "            disk.append(p)",
+  "        else:",
+  "            missing.append(p)",
+  "    print(level, \"memory:\", mem, \"disk:\", disk, \"recompute:\", missing)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>memory_mib<\/code> is created: 100. <code>part_mib<\/code> is created: 30.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "part_mib"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>partitions<\/code> is created: → list #1. A new list object (#1) is created: [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]"
+   ],
+   "newVar": "partitions"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>level<\/code> is created: &#x27;MEMORY_ONLY&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]"
+   ],
+   "newVar": "level"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>used<\/code> is created: 0. <code>mem<\/code> is created: → list #2. <code>disk<\/code> is created: → list #3. <code>missing<\/code> is created: → list #4. A new list object (#2) is created: [] A new list object (#3) is created: [] A new list object (#4) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "0"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (0)<\/b> []",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ],
+   "newVar": "missing"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>p<\/code> is created: &#x27;p0&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "0"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (0)<\/b> []",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 6,
+   "phase": "Fits",
+   "note": "Kept in memory. The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "0"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (0)<\/b> []",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>used<\/code> changes to 30. Object #2 list now holds [&#x27;p0&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "30"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;p0&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ],
+   "newVar": "used"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;p1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "30"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;p0&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "30"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (1)<\/b> [&#x27;p0&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>used<\/code> changes to 60. Object #2 list now holds [&#x27;p0&#x27;, &#x27;p1&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "60"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ],
+   "newVar": "used"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;p2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "60"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "60"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>used<\/code> changes to 90. Object #2 list now holds [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ],
+   "newVar": "used"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;p3&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Spill",
+   "note": "MEMORY_AND_DISK writes the rest to local disk. The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "Object #4 list now holds [&#x27;p3&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (1)<\/b> [&#x27;p3&#x27;]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;p4&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (1)<\/b> [&#x27;p3&#x27;]"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (1)<\/b> [&#x27;p3&#x27;]"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (1)<\/b> [&#x27;p3&#x27;]"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "Object #4 list now holds [&#x27;p3&#x27;, &#x27;p4&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (2)<\/b> [&#x27;p3&#x27;, &#x27;p4&#x27;]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (2)<\/b> [&#x27;p3&#x27;, &#x27;p4&#x27;]"
+   ]
+  },
+  {
+   "line": 12,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_ONLY'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (2)<\/b> [&#x27;p3&#x27;, &#x27;p4&#x27;]"
+   ],
+   "out": "MEMORY_ONLY memory: ['p0', 'p1', 'p2'] disk: [] recompute: ['p3', 'p4']\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>level<\/code> changes to &#x27;MEMORY_AND_DISK&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #2"
+      ],
+      [
+       "disk",
+       "→ list #3"
+      ],
+      [
+       "missing",
+       "→ list #4"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#2 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#3 list (0)<\/b> []",
+    "<b>#4 list (2)<\/b> [&#x27;p3&#x27;, &#x27;p4&#x27;]"
+   ],
+   "newVar": "level"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>used<\/code> changes to 0. <code>mem<\/code> changes to → list #5. <code>disk<\/code> changes to → list #6. <code>missing<\/code> changes to → list #7. A new list object (#5) is created: [] A new list object (#6) is created: [] A new list object (#7) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "0"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "missing"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;p0&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "0"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "0"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>used<\/code> changes to 30. Object #5 list now holds [&#x27;p0&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "30"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;p0&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "used"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;p1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "30"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;p0&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "30"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;p0&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>used<\/code> changes to 60. Object #5 list now holds [&#x27;p0&#x27;, &#x27;p1&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "60"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "used"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;p2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "60"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "60"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>used<\/code> changes to 90. Object #5 list now holds [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "used"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;p3&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "Object #6 list now holds [&#x27;p3&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;p3&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;p4&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;p3&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "p"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;p3&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;p3&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "Object #6 list now holds [&#x27;p3&#x27;, &#x27;p4&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 12,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "out": "MEMORY_AND_DISK memory: ['p0', 'p1', 'p2'] disk: ['p3', 'p4'] recompute: []\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "memory_mib",
+       "100"
+      ],
+      [
+       "part_mib",
+       "30"
+      ],
+      [
+       "partitions",
+       "→ list #1"
+      ],
+      [
+       "level",
+       "'MEMORY_AND_DISK'"
+      ],
+      [
+       "used",
+       "90"
+      ],
+      [
+       "mem",
+       "→ list #5"
+      ],
+      [
+       "disk",
+       "→ list #6"
+      ],
+      [
+       "missing",
+       "→ list #7"
+      ],
+      [
+       "p",
+       "'p4'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;, &#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#5 list (3)<\/b> [&#x27;p0&#x27;, &#x27;p1&#x27;, &#x27;p2&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;p3&#x27;, &#x27;p4&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three caching decisions from real jobs.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Performance · caching</span></div>
+    <h4>Cache a reused base</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Three reports use the same filtered orders. Cache it properly.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>orders_big</pre></div><div><small>Expected output</small><pre>base = orders.where(&quot;status = &#x27;DELIVERED&#x27;&quot;).cache()
+base.count()                       # fill the cache
+report_city(base); report_day(base); report_top(base)
+base.unpersist()</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Cache the filtered base.</li><li>Trigger it once.</li><li>Unpersist at the end.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Check the Storage tab: 100% cached, 47.5 MiB.",
+   "code": "print(\"\"\"base = orders.where(\"status = 'DELIVERED'\").cache()\nbase.count()                       # fill the cache\nreport_city(base); report_day(base); report_top(base)\nbase.unpersist()\"\"\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print(\"\"\"base = orders.where(\"status = 'DELIVERED'\").cache()",
+  "base.count()                       # fill the cache",
+  "report_city(base); report_day(base); report_top(base)",
+  "base.unpersist()\"\"\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "base = orders.where(\"status = 'DELIVERED'\").cache()\nbase.count()                       # fill the cache\nreport_city(base); report_day(base); report_top(base)\nbase.unpersist()\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Reliability · memory</span></div>
+    <h4>Fix an exit-code-52 job</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A job caching a wide DataFrame kills executors with exit code 52.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>4 partitions, 651 MiB cached, 1 GiB executors</pre></div><div><small>Expected output</small><pre>163 MiB per cached partition in a 1024 MiB executor
+fix: repartition(32) -&gt; 20 MiB each, or persist(DISK_ONLY)</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Check partition sizes.</li><li>Repartition to more partitions or use DISK_ONLY.</li><li>Remove the cache if used once.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Our cluster ran fine with 32 partitions (Step 4).",
+   "code": "total_mib, parts, exec_heap_mib = 651, 4, 1024\nper_part = total_mib / parts\nprint(f\"{per_part:.0f} MiB per cached partition in a {exec_heap_mib} MiB executor\")\nprint(\"fix: repartition(32) ->\", round(total_mib / 32), \"MiB each, or persist(DISK_ONLY)\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "total_mib, parts, exec_heap_mib = 651, 4, 1024",
+  "per_part = total_mib / parts",
+  "print(f\"{per_part:.0f} MiB per cached partition in a {exec_heap_mib} MiB executor\")",
+  "print(\"fix: repartition(32) ->\", round(total_mib / 32), \"MiB each, or persist(DISK_ONLY)\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>total_mib<\/code> is created: 651. <code>parts<\/code> is created: 4. <code>exec_heap_mib<\/code> is created: 1024.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "total_mib",
+       "651"
+      ],
+      [
+       "parts",
+       "4"
+      ],
+      [
+       "exec_heap_mib",
+       "1024"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "exec_heap_mib"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>per_part<\/code> is created: 162.75.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "total_mib",
+       "651"
+      ],
+      [
+       "parts",
+       "4"
+      ],
+      [
+       "exec_heap_mib",
+       "1024"
+      ],
+      [
+       "per_part",
+       "162.75"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "per_part"
+  },
+  {
+   "line": 3,
+   "phase": "Rule",
+   "note": "Keep partitions to tens or low hundreds of MB, well below executor memory. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "total_mib",
+       "651"
+      ],
+      [
+       "parts",
+       "4"
+      ],
+      [
+       "exec_heap_mib",
+       "1024"
+      ],
+      [
+       "per_part",
+       "162.75"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "163 MiB per cached partition in a 1024 MiB executor\n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "total_mib",
+       "651"
+      ],
+      [
+       "parts",
+       "4"
+      ],
+      [
+       "exec_heap_mib",
+       "1024"
+      ],
+      [
+       "per_part",
+       "162.75"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "fix: repartition(32) -> 20 MiB each, or persist(DISK_ONLY)\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Architecture · reuse</span></div>
+    <h4>Cache, checkpoint or write?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A cleaned dataset is used by two jobs on different days.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>cleaned orders</pre></div><div><small>Expected output</small><pre>within one application, reused  -&gt; cache()/persist()
+very long lineage, one app       -&gt; checkpoint() (Lesson 3.3)
+used by other jobs or days       -&gt; write Parquet/Delta/Iceberg table</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Cache lives only in one application.</li><li>Checkpoint is for lineage, not sharing.</li><li>Write a table.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Module 5 covers writing tables; Lesson 11.5 lakehouse tables.",
+   "code": "print(\"within one application, reused  -> cache()/persist()\")\nprint(\"very long lineage, one app       -> checkpoint() (Lesson 3.3)\")\nprint(\"used by other jobs or days       -> write Parquet/Delta/Iceberg table\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print(\"within one application, reused  -> cache()/persist()\")",
+  "print(\"very long lineage, one app       -> checkpoint() (Lesson 3.3)\")",
+  "print(\"used by other jobs or days       -> write Parquet/Delta/Iceberg table\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Scope",
+   "note": "Cached data disappears when the application ends. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "within one application, reused  -> cache()/persist()\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "very long lineage, one app       -> checkpoint() (Lesson 3.3)\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "used by other jobs or days       -> write Parquet/Delta/Iceberg table\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: When is a cache filled?",
+  "options": [
+   "When cache() is called",
+   "At start-up",
+   "At the first action that computes the data",
+   "Never"
+  ],
+  "answer": 2,
+  "why": "0 cached entries until count()."
+ },
+ {
+  "q": "Beginner: What is a DataFrame’s default storage level?",
+  "options": [
+   "MEMORY_ONLY",
+   "MEMORY_AND_DISK",
+   "DISK_ONLY",
+   "OFF_HEAP"
+  ],
+  "answer": 1,
+  "why": "Shown as Disk Memory Deserialized."
+ },
+ {
+  "q": "Beginner: How do you release a cached DataFrame?",
+  "options": [
+   "df.unpersist()",
+   "del df",
+   "df.cache(False)",
+   "restart Python"
+  ],
+  "answer": 0,
+  "why": "Or UNCACHE TABLE / clearCache()."
+ },
+ {
+  "q": "Intermediate: How are PySpark RDDs cached by default?",
+  "options": [
+   "Deserialised in memory",
+   "On disk",
+   "Off-heap",
+   "Serialised in memory (MEMORY_ONLY)"
+  ],
+  "answer": 3,
+  "why": "Python objects are stored as bytes."
+ },
+ {
+  "q": "Intermediate: What does CACHE TABLE do differently from cache()?",
+  "options": [
+   "Nothing",
+   "It writes to disk only",
+   "It caches eagerly, immediately",
+   "It replicates"
+  ],
+  "answer": 2,
+  "why": "CACHE LAZY TABLE waits for a query."
+ },
+ {
+  "q": "Intermediate: Why was the first cached query slower than the uncached one?",
+  "options": [
+   "Bug",
+   "Building the cache costs extra time",
+   "Fewer partitions",
+   "Disk failure"
+  ],
+  "answer": 1,
+  "why": "21.5 s vs 15.3 s."
+ },
+ {
+  "q": "Advanced: What does executor exit code 52 indicate?",
+  "options": [
+   "OutOfMemoryError in the executor JVM",
+   "Network error",
+   "Python crash",
+   "Normal exit"
+  ],
+  "answer": 0,
+  "why": "Caching 4 huge partitions caused it."
+ },
+ {
+  "q": "Advanced: With MEMORY_ONLY, what happens to partitions that do not fit?",
+  "options": [
+   "Written to disk",
+   "The job fails",
+   "Compressed",
+   "Not cached; recomputed when needed"
+  ],
+  "answer": 3,
+  "why": "MEMORY_AND_DISK would spill them."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 3.1 in one screen</h3>
+    <ul><li><code>cache()</code> = <code>persist()</code> with the default level; both are <b>lazy</b> (filled by the first action).</li><li>Defaults: DataFrame MEMORY_AND_DISK (compressed columnar; 4.75 M rows = 47.5 MiB); PySpark RDD MEMORY_ONLY serialised.</li><li>Levels: MEMORY_ONLY (recompute if evicted), MEMORY_AND_DISK (spill), DISK_ONLY, <code>_2</code> (two replicas), OFF_HEAP.</li><li>Lab (651 MiB, 32 partitions): 2nd query 6.7 s uncached vs 2.1–2.7 s cached; filling costs extra the first time.</li><li>Storage tab: level, cached partitions, <b>fraction cached</b>, memory and disk sizes.</li><li>Caching 4 huge partitions in 1 GiB executors → exit code 52 (OOM) → job aborted.</li><li><code>CACHE TABLE</code> is eager, <code>CACHE LAZY TABLE</code> is lazy; clean up with unpersist / UNCACHE / clearCache.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Is cache() the same as persist()?</summary><p>Yes, cache() is persist() with the default storage level. Use persist() when you want a different level, such as DISK_ONLY.</p></details>
+    <details><summary>Does caching survive the end of the application?</summary><p>No. Cached blocks live in executors and disappear when the application stops or an executor is lost. To reuse data across jobs, write it to storage.</p></details>
+    <details><summary>Why is a cached DataFrame so much smaller than the raw data?</summary><p>Spark caches DataFrames in a columnar format with compression per column, so repeated values (cities, statuses) take very little space. Random strings, like our hashes, do not compress.</p></details>
+    <details><summary>How much memory can caches use?</summary><p>Executors share one unified region between execution and storage (spark.memory.fraction, 0.6 of the heap minus 300 MB by default). Caches can use most of it when tasks do not need it, and are evicted when tasks do (Lesson 8.4).</p></details>
+    <details><summary>Should I cache before a write?</summary><p>Only if the same DataFrame is also used by another action. A single write does not benefit from caching.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs about cache sizes, levels and break-even points.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Speed-up</h4></div>
+      <p>Speed-up of the second query from caching.</p>
+      <div class="prob__io"><div><small>Input</small><pre>6.7 s vs 2.2 s</pre></div><div><small>Expected output</small><pre>3.0 x</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(6.7 / 2.2, 1), &quot;x&quot;)</code></pre><div class="output">3.0 x</div></div>
+        <p><b>How it works:</b> MEMORY_AND_DISK in Step 4.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>MiB from bytes</h4></div>
+      <p>Convert memoryUsed to MiB.</p>
+      <div class="prob__io"><div><small>Input</small><pre>49,771,776 bytes</pre></div><div><small>Expected output</small><pre>47.5 MiB</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(49771776 / 2**20, 1), &quot;MiB&quot;)</code></pre><div class="output">47.5 MiB</div></div>
+        <p><b>How it works:</b> The Storage tab shows the same 47.5 MiB.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Fraction cached</h4></div>
+      <p>Fraction of cached partitions.</p>
+      <div class="prob__io"><div><small>Input</small><pre>24 of 32</pre></div><div><small>Expected output</small><pre>75%</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{24 / 32:.0%}&quot;)</code></pre><div class="output">75%</div></div>
+        <p><b>How it works:</b> Below 100% means some partitions are recomputed or read from disk.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Break-even uses</h4></div>
+      <p>Minimum uses for caching to win.</p>
+      <div class="prob__io"><div><small>Input</small><pre>6.7 s plain, 2.4 s cached, 6.2 s extra fill</pre></div><div><small>Expected output</small><pre>3 uses</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>n = 1
+while 6.7 * n &lt;= 6.7 + 6.2 + 2.4 * (n - 1):
+    n += 1
+print(n, &quot;uses&quot;)</code></pre><div class="output">3 uses</div></div>
+        <p><b>How it works:</b> Below that, caching costs more than it saves.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Partitions for a target size</h4></div>
+      <p>Partitions so each cached block is about 20 MiB.</p>
+      <div class="prob__io"><div><small>Input</small><pre>651 MiB</pre></div><div><small>Expected output</small><pre>33</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+print(math.ceil(651 / 20))</code></pre><div class="output">33</div></div>
+        <p><b>How it works:</b> repartition(33) or the nearest round number such as 32.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Replicated cost</h4></div>
+      <p>Memory needed for MEMORY_AND_DISK_2.</p>
+      <div class="prob__io"><div><small>Input</small><pre>651 MiB</pre></div><div><small>Expected output</small><pre>1302 MiB across the cluster</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(651 * 2, &quot;MiB across the cluster&quot;)</code></pre><div class="output">1302 MiB across the cluster</div></div>
+        <p><b>How it works:</b> Two copies: twice the memory.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Daily savings</h4></div>
+      <p>Cluster minutes saved per day with caching.</p>
+      <div class="prob__io"><div><small>Input</small><pre>40 reports × 4.5 s saved</pre></div><div><small>Expected output</small><pre>3.0 minutes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(40 * 4.5 / 60, &quot;minutes&quot;)</code></pre><div class="output">3.0 minutes</div></div>
+        <p><b>How it works:</b> Small per report, real at scale.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Cost of an OOM night</h4></div>
+      <p>Rerun cost after a failed nightly job.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 h job fails at 2.5 h, rerun 3 h</pre></div><div><small>Expected output</small><pre>5.5 hours of cluster time instead of 3</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(2.5 + 3, &quot;hours of cluster time instead of 3&quot;)</code></pre><div class="output">5.5 hours of cluster time instead of 3</div></div>
+        <p><b>How it works:</b> A wrong cache can almost double a night’s compute.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Caching questions test practical judgement, not just API knowledge.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Spark</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>cache vs persist</h4>
+      <p class="scn__situation">What is the difference between cache() and persist()?</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know storage levels?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>cache() is persist() with the default storage level: MEMORY_AND_DISK for DataFrames, MEMORY_ONLY for RDDs. persist() lets me choose MEMORY_ONLY, MEMORY_AND_DISK, DISK_ONLY, replicated _2 levels or OFF_HEAP. Both are lazy: the first action fills the cache. I release it with unpersist().</p>
+        <p class="scn__avoid"><b>Avoid:</b> Saying cache() writes to disk permanently.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>When not to cache</h4>
+      <p class="scn__situation">A colleague caches every DataFrame. Is that good?</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know the costs?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Caching costs time to fill and memory that tasks need.</li>
+          <li>Cache only data reused by several actions; unpersist after.</li>
+          <li>For data used once, or cheap to reread from Parquet, caching makes jobs slower.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> “Caching is always good.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Executors exit with code 52</h4>
+      <p class="scn__situation">After adding cache(), executors die with exit code 52.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you diagnose memory problems?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Exit code 52 = OutOfMemoryError in the executor JVM.</li>
+          <li>Check cached size and partition sizes in the Storage/Stages tabs.</li>
+          <li>Repartition to smaller partitions, use DISK_ONLY or MEMORY_AND_DISK, add executor memory, or drop the cache.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Only increasing executor memory without looking.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Architecture</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Caching strategy for a shared cluster</h4>
+      <p class="scn__situation">Many teams share a cluster; caches cause evictions and failures.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you set guidelines?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Cache only reused datasets; unpersist in finally blocks; prefer writing intermediate tables for cross-job reuse.</li>
+          <li>Size partitions sensibly; choose disk levels for large data; monitor fraction cached.</li>
+          <li>Isolate interactive and batch workloads; set executor memory per workload.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Banning caching completely.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Spark and PySpark syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/spark-pyspark.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

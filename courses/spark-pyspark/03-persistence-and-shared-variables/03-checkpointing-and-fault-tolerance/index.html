@@ -1,0 +1,2300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checkpointing and fault tolerance | MyPhatshala</title>
+<meta name="description" content="How Spark survives failures and when to checkpoint, measured with PySpark 4.3.0: a lineage growing to 92 lines through unions and cut to 2 by a checkpoint, the extra job that computes an uncached RDD twice (20,000 vs 10,000 calls), localCheckpoint, a 400-step DataFrame loop going from 9.9 s to 5.7 s with periodic checkpoints, and a worker stopped on the cluster: a cached RDD recomputed 200,000 expensive calls while a checkpointed one recomputed none.">
+<meta name="mp:minutes" content="34">
+<link rel="canonical" href="https://myphatshala.in/courses/spark-pyspark/03-persistence-and-shared-variables/03-checkpointing-and-fault-tolerance/">
+<meta property="og:title" content="Checkpointing and fault tolerance · MyPhatshala">
+<meta property="og:description" content="We stopped a worker twice: the cached RDD redid 200,000 expensive calls, the checkpointed one redid none. Checkpointing and fault tolerance, measured.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Checkpointing and fault tolerance", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Spark and PySpark", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="03-persistence-and-shared-variables/03-checkpointing-and-fault-tolerance" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Spark and PySpark syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Spark and PySpark</a><span>›</span><b>Lesson 3.3</b></nav>
+    <h1>Checkpointing and fault tolerance</h1>
+    <p class="lead">Spark recovers from failures by recomputing from lineage, but recomputation can be slow and lineages can grow too long. This lesson shows when a <b>checkpoint</b> helps, what it costs, and how it compares with a cache when a worker really disappears on our cluster. <b>All outputs are real</b> (Spark 4.3.0).</p>
+    <div class="lesson-meta"><span>Module 3 · Persistence and shared variables</span><span>⏱ 34 min</span><span>Intermediate → Advanced</span><span>Spark 4.3.0 cluster</span><span>Worker killed: cache vs checkpoint</span><span>Lineage 92 → 2 lines</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“The lost worker took two hours with it”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> lineage in <a href="../../02-rdds/03-lazy-evaluation-and-the-dag/">2.3</a>, worker loss in <a href="../../01-introduction/03-spark-architecture/">1.3</a> and caching in <a href="../01-cache-and-persist/">3.1</a>.</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s fraud model scores every order with an expensive Python function, then joins the scores with ten other datasets. One night a cloud node was reclaimed during the joins. The cached scores on that node vanished and Spark quietly recomputed them: the job finished, two hours late.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Checkpointing saves an RDD or DataFrame to reliable storage and cuts its lineage, so it no longer needs to be recomputed from its sources. We compared cache and checkpoint when a worker disappeared mid-job.">
+        <rect x="8" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="33.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 0</text><rect x="66" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="91.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 1</text><path d="M58 53L66 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M59.7 56.0L66 53L59.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="124" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="149.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 2</text><path d="M116 53L124 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M117.7 56.0L124 53L117.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="182" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="207.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 3</text><path d="M174 53L182 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M175.7 56.0L182 53L175.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="240" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="265.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 4</text><text x="265.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">ckpt</text><path d="M232 53L240 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M233.7 56.0L240 53L233.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="298" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="323.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 5</text><path d="M290 53L298 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M291.7 56.0L298 53L291.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><line x1="236" y1="30" x2="236" y2="76" stroke="#D64545" stroke-width="2" stroke-dasharray="4 3"/><rect x="220" y="86" width="130" height="28" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="285.0" y="97" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">reliable storage</text><text x="285.0" y="107" text-anchor="middle" font-size="6.4" class="s-ink2 mono">HDFS · S3 · shared disk</text><rect x="410" y="12" width="222" height="136" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="521" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured</text><text x="422" y="52" font-size="7.2" class="s-acc mono">30 unions: lineage 92 lines</text><text x="422" y="68" font-size="7.2" class="s-green mono">after checkpoint: 2 lines</text><text x="422" y="84" font-size="7.2" class="s-red mono">no cache: computed twice</text><text x="422" y="100" font-size="7.2" class="s-green mono">400-step plan: 9.9 s → 5.7 s</text><text x="422" y="116" font-size="7.2" class="s-acc mono">worker lost, cache: +200,000 calls</text><text x="422" y="132" font-size="7.2" class="s-green mono">worker lost, checkpoint: +0</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Cache is <tspan font-weight="700" class="s-acc">fast but fragile</tspan>; a checkpoint is <tspan font-weight="700" class="s-acc">slower but durable</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, Spark recovered. Isn’t that what fault tolerance means?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>It is. Spark rebuilds lost partitions from their <b>lineage</b>, as we saw in Lessons 1.3 and 2.3. But if rebuilding means re-running expensive work, or the lineage has grown very long, recovery is slow. A <b>checkpoint</b> writes the data to reliable storage and cuts the lineage there.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So should we checkpoint instead of caching?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>They solve different problems, and a checkpoint has its own costs. Today we grow a lineage until it is long, checkpoint it, count how often the work runs, speed up a 400-step DataFrame, and stop a worker to compare cache with checkpoint. All outputs are real (Spark 4.3.0).</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Checkpointing and Spark’s fault tolerance</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>Spark achieves <b>fault tolerance</b> mainly through lineage: failed tasks are retried (up to <code>spark.task.maxFailures</code>, 4 by default), lost shuffle outputs and cached partitions are recomputed from their parent RDDs. <b>Checkpointing</b> saves the partitions of an RDD or DataFrame to files in a reliable checkpoint directory and replaces its lineage with a reference to those files, so later recovery reads the files instead of recomputing the chain. Reliable checkpoints of RDDs are lazy: they are written by an additional job after the first action, which recomputes the RDD unless it is persisted. <b>Local checkpoints</b> truncate lineage using executor-local storage and therefore do not survive executor loss. Checkpointing is used for very long lineages (iterative algorithms, loops of unions or joins), for expensive results that must survive failures, and in Structured Streaming to store progress and state.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Spark recovers from failures by redoing lost work using lineage. A checkpoint saves data to safe storage and forgets the lineage, so recovery reads the saved files instead of redoing everything. It costs an extra write, so use it when lineages are long or recomputing is expensive.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Checkpoint directory</b><span><code>sc.setCheckpointDir()</code>: reliable storage for checkpoints.</span></div>
+    <div class="term"><b>checkpoint()</b><span>Save to the checkpoint dir and cut the lineage.</span></div>
+    <div class="term"><b>ReliableCheckpointRDD</b><span>What a checkpointed RDD reads from afterwards.</span></div>
+    <div class="term"><b>localCheckpoint()</b><span>Cut lineage using executor storage (not fault tolerant).</span></div>
+    <div class="term"><b>Task retry</b><span>A failed task is re-run, up to spark.task.maxFailures times.</span></div>
+    <div class="term"><b>Stage retry</b><span>Map stages re-run when their shuffle output is lost.</span></div>
+    <div class="term"><b>Eager checkpoint</b><span>DataFrame checkpoint(eager=True) runs immediately.</span></div>
+    <div class="term"><b>Speculation</b><span>Optional: start copies of slow tasks elsewhere.</span></div>
+  </div>
+
+  <h3>Cache, checkpoint or local checkpoint?</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:740px">
+    <thead><tr><th></th><th>cache() / persist()</th><th>checkpoint()</th><th>localCheckpoint()</th></tr></thead>
+    <tbody><tr><td>Stored in</td><td>Executor memory / local disk</td><td>Reliable storage (HDFS, S3, shared)</td><td>Executor storage</td></tr><tr><td>Lineage</td><td>Kept</td><td>Cut</td><td>Cut</td></tr><tr><td>After executor loss</td><td>Recomputed from lineage</td><td>Read from files</td><td>Lost: job fails</td></tr><tr><td>Cost</td><td>Fill once (memory)</td><td>Extra write job (recompute unless cached)</td><td>Like a cache</td></tr><tr><td>Lives until</td><td>Application ends / unpersist</td><td>Files deleted</td><td>Application ends</td></tr><tr><td>Lab</td><td>+200,000 calls after worker loss</td><td>+0 calls, 0.8 s</td><td>lineage cut, 0 files</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Checkpointing at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Saving your game</h4>
+      <ul>
+        <li>Lineage is the list of moves from the start of the game; if you lose, you replay every move.</li>
+        <li>A cache is a quick save in memory: fast, but lost if the machine restarts.</li>
+        <li>A checkpoint is a save to the cloud: slower to make, but you restart from there, not from the beginning.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The API</h4>
+      <ul>
+        <li><code>sc.setCheckpointDir(path)</code> on reliable storage (HDFS, S3, shared disk), then <code>rdd.checkpoint()</code> or <code>df.checkpoint()</code>.</li>
+        <li>RDD checkpoints are lazy and run as an <b>extra job</b> after the first action, recomputing the RDD unless it is cached. DataFrame <code>checkpoint()</code> is eager by default and returns a new DataFrame.</li>
+        <li><code>localCheckpoint()</code> cuts lineage using executor storage only: fast, but not fault tolerant.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>30 unions grew a lineage to 92 lines; after a checkpoint, 2 lines pointing at a <code>ReliableCheckpointRDD</code> of 34 files.</li>
+        <li>Without cache, checkpointing ran the work function 20,000 times for 10,000 elements; with cache 10,000.</li>
+        <li>After a worker was stopped, a cached RDD recomputed 200,000 expensive calls; a checkpointed one recomputed <b>none</b> and answered in 0.8 s.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “Cache vs checkpoint?” Cache keeps data on executors and keeps the lineage; it is fast but lost with the executor and recomputed from lineage. Checkpoint writes to reliable storage and truncates the lineage; it costs a write but survives failures and stops lineages from growing. Cache before checkpointing an RDD to avoid computing it twice.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Fault-tolerance mechanisms in Spark</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:720px">
+    <thead><tr><th>Failure</th><th>What Spark does</th><th>Seen in this course</th></tr></thead>
+    <tbody><tr><td>A task throws an error</td><td>Retries it up to 4 times (spark.task.maxFailures)</td><td>Lesson 3.2: flaky task succeeded on retry</td></tr><tr><td>An executor or worker dies</td><td>Re-runs its tasks elsewhere; recomputes lost shuffle files and cached blocks</td><td>Lesson 1.3 and Step 6 here</td></tr><tr><td>Shuffle files unreachable</td><td>FetchFailed → re-runs the map stage</td><td>Lesson 1.3 (77 s stall)</td></tr><tr><td>Task much slower than others</td><td>Optional speculative copy (spark.speculation)</td><td>—</td></tr><tr><td>Driver dies</td><td>Application fails (cluster mode can restart it on some managers)</td><td>Lesson 1.3</td></tr><tr><td>Streaming query restarts</td><td>Resumes from checkpointed offsets and state</td><td>Module 9</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>A checkpoint is not a backup or a table. Files in the checkpoint directory are written in Spark’s internal format for this application; they are not meant to be read by other jobs and are not cleaned up automatically by default (<code>spark.cleaner.referenceTracking.cleanCheckpoints</code> is false). Put the directory on reliable storage, give it a lifecycle rule, and write real outputs as tables.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Long lineages, checkpoints and a lost worker</h2>
+  <p>All outputs are real: PySpark 4.3.0 in local mode (Steps 1–5) and on our standalone cluster with a checkpoint directory on storage shared by all containers (Step 6).</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Watching a lineage grow</h4>
+      <div class="code" data-lang="python" data-file="ckpt.py"><pre><code>r = sc.parallelize(range(100_000), 4).map(lambda x: (x % 100, 1))
+for i in range(30):
+    r = r.mapValues(lambda v: v + 1)
+print(len(r.toDebugString().decode().splitlines()))
+
+day = sc.parallelize([(0, 1)], 1)
+for i in range(30):                      # append one small batch per day
+    r = r.union(day)
+print(len(r.toDebugString().decode().splitlines()), r.getNumPartitions())</code></pre><div class="output">30 x mapValues   -&gt; lineage lines: 2 (PySpark fuses narrow Python steps)
++ 30 x union     -&gt; lineage lines: 92 | partitions: 34</div></div>
+      <span class="behind">Thirty <code>mapValues</code> did not grow the lineage at all: PySpark fused them into one Python step (Lesson 2.3). Thirty <code>union</code>s did: <b>92 lines</b> and 34 partitions. Loops that union, join or reduce in every iteration (daily appends, graph algorithms, iterative ML) grow lineages like this. Long lineages make scheduling slower and recovery expensive.</span></li>
+    <li><h4>Step 2 · Checkpoint: lazy, then cut</h4>
+      <div class="code" data-lang="python" data-file="ckpt.py"><pre><code>sc.setCheckpointDir(&quot;/root/lab/spark/data/ckpt&quot;)
+r.checkpoint()
+print(r.isCheckpointed())
+r.count()
+print(r.isCheckpointed(), r.getCheckpointFile())
+print(r.toDebugString().decode())</code></pre><div class="output">checkpoint() called; isCheckpointed: False
+after count();     isCheckpointed: True | file: &lt;ckpt&gt;/&lt;uuid&gt;/rdd-62
+lineage now:
+(34) UnionRDD[62] at union at DirectMethodHandleAccessor.java:103 []
+ |   ReliableCheckpointRDD[64] at count at l33_ckpt.py:20 []
+files: &lt;ckpt&gt;/&lt;uuid&gt;/rdd-62/part-00000 … part-00033  (34 files)</div></div>
+      <span class="behind"><code>checkpoint()</code> only marked the RDD. The next action computed it and wrote <b>one file per partition</b> (34) into a sub-folder with a random id for this SparkContext. The lineage now ends at a <code>ReliableCheckpointRDD</code>: 92 lines became 2. Any later action or recovery reads those files.</span></li>
+    <li><h4>Step 3 · A checkpoint computes the RDD twice, unless cached</h4>
+      <div class="code" data-lang="python" data-file="ckpt.py"><pre><code>calls = sc.accumulator(0)
+def work(x):
+    calls.add(1); return x * 2
+a = sc.parallelize(range(10_000), 4).map(work); a.checkpoint(); a.count()
+b = sc.parallelize(range(10_000), 4).map(work).cache(); b.checkpoint(); b.count()</code></pre><div class="output">no cache  : work() calls = 20000
+with cache: work() calls = 10000</div></div>
+      <span class="behind">The action computed the RDD once for <code>count()</code>, then Spark started a <b>separate job</b> to write the checkpoint and computed it again: 20,000 calls for 10,000 elements. With <code>cache()</code> first, the checkpoint job read the cached partitions: 10,000 calls. The documentation’s advice, confirmed: persist an RDD before checkpointing it.</span></li>
+    <li><h4>Step 4 · localCheckpoint: fast, but not safe</h4>
+      <div class="code" data-lang="python" data-file="ckpt.py"><pre><code>c = sc.parallelize(range(1000), 2).map(lambda x: x + 1)
+c.localCheckpoint(); c.count()
+print(c.toDebugString().decode())</code></pre><div class="output">lineage: (2) PythonRDD[74] at RDD at PythonRDD.scala:59 [Disk Memory Deserialized 1x Replicated] | new files: 0</div></div>
+      <span class="behind">The lineage was cut, but <b>no files</b> were written: the data sits in executor storage with a disk-and-memory level. Good for cutting very long lineages in iterative algorithms when speed matters more than surviving executor loss; if an executor dies, its locally checkpointed partitions cannot be rebuilt and the job fails.</span></li>
+    <li><h4>Step 5 · A DataFrame built in a loop</h4>
+      <div class="code" data-lang="python" data-file="ckpt.py"><pre><code>def build(n, ck_every=None):
+    df = spark.range(200_000).withColumn(&quot;v&quot;, F.lit(0))
+    for i in range(n):
+        df = df.withColumn(&quot;v&quot;, F.col(&quot;v&quot;) + F.col(&quot;id&quot;) % 7)
+        if ck_every and (i + 1) % ck_every == 0:
+            df = df.checkpoint()          # eager: writes now, returns a new DataFrame
+    return df</code></pre><div class="output">100 steps, checkpoint every None:   6.1 s  plan lines  102  sum 59999400
+200 steps, checkpoint every None:   4.6 s  plan lines  202  sum 119998800
+400 steps, checkpoint every None:   9.9 s  plan lines  402  sum 239997600
+400 steps, checkpoint every 50  :   5.7 s  plan lines    1  sum 239997600</div></div>
+      <span class="behind">Each <code>withColumn</code> added a node to the logical plan: 400 steps meant a 402-line plan that Catalyst had to analyse and optimise again and again, <b>9.9 s</b> in total. Checkpointing every 50 steps kept the plan at one line (a scan of the checkpoint) and took <b>5.7 s</b>, writes included. For small loops the checkpoint was not worth it; that is why it is a tool for long chains, not a habit.</span></li>
+    <li><h4>Step 6 · A worker dies: cache vs checkpoint</h4>
+      <div class="code" data-lang="python" data-file="ckpt_failover.py (cluster, run twice)"><pre><code>sc.setCheckpointDir(&quot;/data/ckpt_cluster&quot;)          # shared by all containers
+calls = sc.accumulator(0)
+r = sc.parallelize(range(400_000), 8).map(expensive).cache()
+if mode == &quot;checkpoint&quot;:
+    r.checkpoint()
+r.count()                         # 1st action
+# … docker stop sparklab-spark-worker-2-1 …
+r.count()                         # 2nd action, one executor fewer</code></pre><div class="output">cache: first count 400000 in 6.4 s, expensive() calls 400000
+ERROR TaskSchedulerImpl: Lost executor 0 on 172.19.0.5: worker lost: 172.19.0.5:46785 got disassociated
+cache: after worker loss count 400000 in 1.9 s, extra expensive() calls 200000
+
+checkpoint: first count 400000 in 7.8 s, expensive() calls 400000
+ERROR TaskSchedulerImpl: Lost executor 0 on 172.19.0.5: worker lost: 172.19.0.5:36421 got disassociated
+checkpoint: after worker loss count 400000 in 0.8 s, extra expensive() calls 0</div></div>
+      <span class="behind">Both runs lost executor 0 with half of the cached partitions. The <b>cached-only</b> RDD rebuilt those 4 partitions from lineage: <b>200,000</b> extra calls to the expensive function. The <b>checkpointed</b> RDD read its files from shared storage: <b>0</b> extra calls, 0.8 s. The first run with a checkpoint was slower (7.8 s vs 6.4 s) because of the extra write. Pay that when recomputation is expensive or workers are unreliable.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Save the data, forget the past</h2>
+  <p>Left: real outputs. Right: what happens to the lineage.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Save the data, forget the past <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">30 x mapValues -&gt; 2 lines (fused)</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">+ 30 x union   -&gt; 92 lines</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">partitions: 34</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">checkpoint(); isCheckpointed: False</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">count(); isCheckpointed: True</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">UnionRDD → ReliableCheckpointRDD</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">34 part files</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">no cache  : work() calls = 20000</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">with cache: work() calls = 10000</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">400 steps, no checkpoint : 9.9 s</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">400 steps, every 50      : 5.7 s</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">plan lines 402 → 1</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">worker stopped</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">cache     : +200000 calls, 1.9 s</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">checkpoint: +0 calls, 0.8 s</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Unions grew the lineage to 92 lines.</li>
+          <li>After the first action, the lineage was 2 lines.</li>
+          <li>Without cache, the work ran twice.</li>
+          <li>Checkpointing kept a 400-step plan small.</li>
+          <li>The checkpointed RDD survived the lost worker.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="The lineage">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lineage grows with each step</text><rect x="8" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="33.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 0</text><rect x="66" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="91.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 1</text><path d="M58 53L66 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M59.7 56.0L66 53L59.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="124" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="149.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 2</text><path d="M116 53L124 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M117.7 56.0L124 53L117.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="182" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="207.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 3</text><path d="M174 53L182 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M175.7 56.0L182 53L175.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="240" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="265.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 4</text><path d="M232 53L240 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M233.7 56.0L240 53L233.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="298" y="40" width="50" height="26" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="323.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 5</text><path d="M290 53L298 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M291.7 56.0L298 53L291.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="10" y="112" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="130.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Longer graph, costlier recovery.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Checkpoint cuts the chain</text><rect x="8" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="33.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 0</text><rect x="66" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="91.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 1</text><path d="M58 53L66 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M59.7 56.0L66 53L59.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="124" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="149.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 2</text><path d="M116 53L124 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M117.7 56.0L124 53L117.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="182" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="207.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 3</text><path d="M174 53L182 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M175.7 56.0L182 53L175.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="240" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="265.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 4</text><text x="265.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">ckpt</text><path d="M232 53L240 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M233.7 56.0L240 53L233.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="298" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="323.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 5</text><path d="M290 53L298 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M291.7 56.0L298 53L291.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><line x1="236" y1="30" x2="236" y2="76" stroke="#D64545" stroke-width="2" stroke-dasharray="4 3"/><rect x="220" y="86" width="130" height="28" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="285.0" y="97" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">reliable storage</text><text x="285.0" y="107" text-anchor="middle" font-size="6.4" class="s-ink2 mono">HDFS · S3 · shared disk</text><rect x="10" y="124" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="142.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Later reads start from the files.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">An extra job writes the files</text><rect x="8" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="33.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 0</text><rect x="66" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="91.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 1</text><path d="M58 53L66 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M59.7 56.0L66 53L59.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="124" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="149.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 2</text><path d="M116 53L124 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M117.7 56.0L124 53L117.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="182" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="207.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 3</text><path d="M174 53L182 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M175.7 56.0L182 53L175.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="240" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="265.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 4</text><text x="265.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">ckpt</text><path d="M232 53L240 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M233.7 56.0L240 53L233.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="298" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="323.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 5</text><path d="M290 53L298 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M291.7 56.0L298 53L291.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><line x1="236" y1="30" x2="236" y2="76" stroke="#D64545" stroke-width="2" stroke-dasharray="4 3"/><rect x="220" y="86" width="130" height="28" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="285.0" y="97" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">reliable storage</text><text x="285.0" y="107" text-anchor="middle" font-size="6.4" class="s-ink2 mono">HDFS · S3 · shared disk</text><rect x="10" y="124" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="142.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cache first, or compute twice.</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Plans grow too</text><rect x="8" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="33.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 0</text><rect x="66" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="91.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 1</text><path d="M58 53L66 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M59.7 56.0L66 53L59.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="124" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="149.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 2</text><path d="M116 53L124 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M117.7 56.0L124 53L117.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="182" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="207.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 3</text><path d="M174 53L182 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M175.7 56.0L182 53L175.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="240" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="265.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 4</text><text x="265.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">ckpt</text><path d="M232 53L240 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M233.7 56.0L240 53L233.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="298" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="323.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 5</text><path d="M290 53L298 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M291.7 56.0L298 53L291.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><line x1="236" y1="30" x2="236" y2="76" stroke="#D64545" stroke-width="2" stroke-dasharray="4 3"/><rect x="220" y="86" width="130" height="28" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="285.0" y="97" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">reliable storage</text><text x="285.0" y="107" text-anchor="middle" font-size="6.4" class="s-ink2 mono">HDFS · S3 · shared disk</text><rect x="10" y="124" width="340" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="142.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A checkpoint resets the plan.</text></g><g data-on="5"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Recovery from files, not work</text><rect x="8" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="33.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 0</text><rect x="66" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="91.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 1</text><path d="M58 53L66 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M59.7 56.0L66 53L59.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="124" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="149.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 2</text><path d="M116 53L124 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M117.7 56.0L124 53L117.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="182" y="40" width="50" height="26" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="207.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 3</text><path d="M174 53L182 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M175.7 56.0L182 53L175.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="240" y="40" width="50" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="265.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 4</text><text x="265.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">ckpt</text><path d="M232 53L240 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M233.7 56.0L240 53L233.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="298" y="40" width="50" height="26" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="323.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RDD 5</text><path d="M290 53L298 53" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M291.7 56.0L298 53L291.7 50.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><line x1="236" y1="30" x2="236" y2="76" stroke="#D64545" stroke-width="2" stroke-dasharray="4 3"/><rect x="220" y="86" width="130" height="28" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="285.0" y="97" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">reliable storage</text><text x="285.0" y="107" text-anchor="middle" font-size="6.4" class="s-ink2 mono">HDFS · S3 · shared disk</text><rect x="10" y="124" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="142.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lost executor, nothing recomputed.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Narrow Python steps fuse; unions and joins add nodes.</li>
+          <li>Files in the checkpoint dir replace the parents.</li>
+          <li>The checkpoint job recomputes unpersisted RDDs.</li>
+          <li>Catalyst re-analyses long plans on every step.</li>
+          <li>Cached blocks die with executors; files do not.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: expensive results on spot nodes, an iterative graph job, and a growing checkpoint folder.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-spot2">Expensive results on unreliable nodes</h3>
+  <p class="anim-intro">Why checkpoints exist. (Typical; behaviour from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Durable intermediate results <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Cached data dies with executors; checkpoint expensive results to reliable storage so recovery reads files instead of recomputing">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fraud scores take 2 hours</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">then joined with 10 datasets</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cached, on spot nodes.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A node is reclaimed</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">cached scores on it are lost</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Recomputed from lineage.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Checkpoint the scores</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">scores.cache(); scores.checkpoint()</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">To S3 or HDFS.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Next loss</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">read files, +0 scoring calls</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Like our Step 6.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Or write a table</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">if other jobs need the scores</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Checkpoints are internal.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Expensive step.</li>
+          <li>Node lost.</li>
+          <li>Checkpoint it.</li>
+          <li>Recovery is cheap.</li>
+          <li>Or a real table.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-iter">An iterative job that slows down every round</h3>
+  <p class="anim-intro">Lineage truncation in iterative algorithms. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Long lineages <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Iterations that join or union grow the lineage; periodic checkpoints keep scheduling and recovery fast">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Graph algorithm, 100 rounds</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">ranks = ranks.join(links)… each round</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lineage grows every round.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Round 60: driver crawls</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">StackOverflowError on serialising</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A very deep DAG.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Checkpoint every 10 rounds</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">ranks.cache(); ranks.checkpoint()</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lineage stays short.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or localCheckpoint</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">faster, not fault tolerant</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Acceptable for short jobs.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Stable run time per round</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">like 9.9 s → 5.7 s in Step 5</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">And safe recovery.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Many rounds.</li>
+          <li>Deep DAG.</li>
+          <li>Checkpoint periodically.</li>
+          <li>Or local.</li>
+          <li>Stable again.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-cleanup">The checkpoint folder nobody cleans</h3>
+  <p class="anim-intro">Operating checkpoints in production. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Checkpoint housekeeping <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Batch checkpoints are not cleaned automatically; use per-run directories and lifecycle rules, but keep streaming checkpoints">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Storage bill keeps rising</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">s3://…/checkpoints: 40 TB</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nobody deletes them.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Why</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">cleanCheckpoints is false by default</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Files outlive applications.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Per-run directories</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">checkpoints/&lt;job&gt;/&lt;run-date&gt;/</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Easy to clean.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lifecycle rule</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">delete after 7 days</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bucket policy.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Except streaming</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">never delete a live query’s checkpoint</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Module 9.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Bill rises.</li>
+          <li>No automatic cleanup.</li>
+          <li>Per-run folders.</li>
+          <li>Lifecycle rule.</li>
+          <li>Not for streaming.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Checkpoints at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">graphs</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">iterations</text></svg></div>
+    <div><h4>1. Iterative algorithms</h4>
+      <p>PageRank-style and connected-component jobs checkpoint every few iterations to keep lineage short.</p>
+      <div class="uc-flow"><span>Round n</span><i>→</i><span class="java">checkpoint</span><i>→</i><span>Round n+1</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-green">ML</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">features</text></svg></div>
+    <div><h4>2. Expensive feature steps</h4>
+      <p>Costly feature computations are cached and checkpointed before long training or joining phases.</p>
+      <div class="uc-flow"><span>Features</span><i>→</i><span class="java">checkpoint</span><i>→</i><span>Training</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">stream</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">state</text></svg></div>
+    <div><h4>3. Streaming queries</h4>
+      <p>Every Structured Streaming query keeps offsets and state in a checkpoint location to restart exactly where it stopped.</p>
+      <div class="uc-flow"><span>Kafka</span><i>→</i><span class="java">checkpoint</span><i>→</i><span>Restart safely</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">spot</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">clusters</text></svg></div>
+    <div><h4>4. Cheap, unreliable compute</h4>
+      <p>Jobs on spot instances checkpoint expensive intermediate results so reclaimed nodes cost minutes, not hours.</p>
+      <div class="uc-flow"><span>Spot loss</span><i>→</i><span class="java">read files</span><i>→</i><span>Continue</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">plans</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">loops</text></svg></div>
+    <div><h4>5. DataFrame loops</h4>
+      <p>Code that builds DataFrames in loops checkpoints periodically to keep Catalyst’s plans small.</p>
+      <div class="uc-flow"><span>Loop</span><i>→</i><span class="java">df.checkpoint()</span><i>→</i><span>Small plan</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: what recovery costs</h2>
+  <p>A model of Step 6: 8 partitions, 4 lost with a worker. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># Recovery cost after losing half the executors: cache vs checkpoint (lab numbers)
+partitions, lost = 8, 4
+calls_per_partition = 50_000          # expensive() calls to build one partition
+read_s_per_partition = 0.1            # reading a checkpoint file (approx.)
+
+for strategy in (&quot;cache only&quot;, &quot;cache + checkpoint&quot;):
+    if strategy == &quot;cache only&quot;:
+        extra_calls = lost * calls_per_partition
+    else:
+        extra_calls = 0
+    print(f&quot;{strategy:20} extra expensive calls after the loss: {extra_calls:,}&quot;)</code></pre><div class="output">cache only           extra expensive calls after the loss: 200,000
+cache + checkpoint   extra expensive calls after the loss: 0</div></div>
+  <ul class="anno"><li><code>        extra_calls = lost * calls_per_partition</code><span>Cached blocks are lost with the executor and rebuilt from lineage: 200,000 calls in our lab.</span></li><li><code>        extra_calls = 0</code><span>Checkpoint files on shared storage are simply read again.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Then make each call ten times more expensive: does the answer change?",
+   "code": "# Recovery cost after losing half the executors: cache vs checkpoint (lab numbers)\npartitions, lost = 8, 4\ncalls_per_partition = 50_000          # expensive() calls to build one partition\nread_s_per_partition = 0.1            # reading a checkpoint file (approx.)\n\nfor strategy in (\"cache only\", \"cache + checkpoint\"):\n    if strategy == \"cache only\":\n        extra_calls = lost * calls_per_partition\n    else:\n        extra_calls = 0\n    print(f\"{strategy:20} extra expensive calls after the loss: {extra_calls:,}\")\n"
+  },
+  {
+   "label": "2 · Predict first: twice computed",
+   "hint": "<b>Predict first:<\/b> checkpoint() on an uncached RDD of 10,000 elements. How many work() calls?",
+   "code": "elements = 10_000\nprint(\"no cache  :\", elements * 2, \"(action + checkpoint job)\")\nprint(\"with cache:\", elements)\n"
+  },
+  {
+   "label": "3 · Lineage growth",
+   "hint": "Lines in toDebugString after n unions (about 3 per union, as in the lab).",
+   "code": "base = 2\nfor n in (10, 30, 100):\n    print(n, \"unions ->\", base + 3 * n, \"lines\")\n"
+  },
+  {
+   "label": "4 · When to checkpoint a loop",
+   "hint": "Checkpoint every k steps: count checkpoints and maximum plan length.",
+   "code": "steps, k = 400, 50\nprint(\"checkpoints:\", steps // k, \"| longest plan between them:\", k, \"steps\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This plan uses localCheckpoint on spot nodes for a 6-hour job.",
+   "code": "plan = {\"method\": \"localCheckpoint\", \"nodes\": \"spot\", \"hours\": 6}\nassert not (plan[\"method\"] == \"localCheckpoint\" and plan[\"nodes\"] == \"spot\"), \"local checkpoints die with executors: use checkpoint() on reliable storage\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: checkpoints</h3>
+  <p>In the <code>pyspark</code> shell. <b>Outputs are real</b> (PySpark 4.3.0).</p>
+  <div class="pcrun"><h4>1 · Checkpoint an RDD</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>sc.setCheckpointDir(&quot;ckpt&quot;)
+r.checkpoint(); r.count()
+r.isCheckpointed(), r.getCheckpointFile()</code></pre><div class="output">(True, &#x27;file:/…/ckpt/&lt;uuid&gt;/rdd-62&#x27;)</div></div>
+  <p class="muted">The uuid folder belongs to this SparkContext.</p></div>
+  <div class="pcrun"><h4>2 · The cut lineage</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>print(r.toDebugString().decode())</code></pre><div class="output">(34) UnionRDD[62] at union at DirectMethodHandleAccessor.java:103 []
+ |   ReliableCheckpointRDD[64] at count at l33_ckpt.py:20 []</div></div>
+  <p class="muted">92 lines before the checkpoint.</p></div>
+  <div class="pcrun"><h4>3 · Checkpoint a DataFrame</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>df = df.checkpoint()           # eager by default
+len(df._jdf.queryExecution().analyzed().toString().splitlines())</code></pre><div class="output">1</div></div>
+  <p class="muted">The plan becomes a single scan of the checkpoint.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>What Spark reads after a lost executor</h2>
+  <p>Follow how a partition is obtained in each strategy.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "lost = {\"p4\", \"p5\", \"p6\", \"p7\"}",
+  "def get(p, strategy):",
+  "    if p not in lost:",
+  "        return \"cached block\"",
+  "    if strategy == \"checkpoint\":",
+  "        return \"checkpoint file\"",
+  "    return \"recompute from lineage\"",
+  "for s in (\"cache\", \"checkpoint\"):",
+  "    print(s, [get(p, s) for p in (\"p0\", \"p4\")])"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>lost<\/code> is created: → set #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ],
+   "newVar": "lost"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>get<\/code> is created: function get().",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ],
+   "newVar": "get"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>s<\/code> is created: &#x27;cache&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'cache'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ],
+   "newVar": "s"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>get()<\/code> is called: a new frame is pushed with <code>p<\/code> = &#x27;p0&#x27;, <code>strategy<\/code> = &#x27;cache&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'cache'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p0'"
+      ],
+      [
+       "strategy",
+       "'cache'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ],
+   "newVar": "strategy"
+  },
+  {
+   "line": 3,
+   "phase": "Alive",
+   "note": "Partitions on surviving executors are still cached. The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'cache'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p0'"
+      ],
+      [
+       "strategy",
+       "'cache'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'cache'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p0'"
+      ],
+      [
+       "strategy",
+       "'cache'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Return",
+   "note": "<code>get()<\/code> returns <b>&#x27;cached block&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'cache'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>get()<\/code> is called: a new frame is pushed with <code>p<\/code> = &#x27;p4&#x27;, <code>strategy<\/code> = &#x27;cache&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'cache'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p4'"
+      ],
+      [
+       "strategy",
+       "'cache'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ],
+   "newVar": "strategy"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'cache'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p4'"
+      ],
+      [
+       "strategy",
+       "'cache'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Checkpoint",
+   "note": "Files on reliable storage survive executor loss. The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'cache'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p4'"
+      ],
+      [
+       "strategy",
+       "'cache'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Lineage",
+   "note": "Without a checkpoint, the parent RDDs are recomputed. The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'cache'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p4'"
+      ],
+      [
+       "strategy",
+       "'cache'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Return",
+   "note": "<code>get()<\/code> returns <b>&#x27;recompute from lineage&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'cache'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'cache'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ],
+   "out": "cache ['cached block', 'recompute from lineage']\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>s<\/code> changes to &#x27;checkpoint&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ],
+   "newVar": "s"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>get()<\/code> is called: a new frame is pushed with <code>p<\/code> = &#x27;p0&#x27;, <code>strategy<\/code> = &#x27;checkpoint&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p0'"
+      ],
+      [
+       "strategy",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ],
+   "newVar": "strategy"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p0'"
+      ],
+      [
+       "strategy",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p0'"
+      ],
+      [
+       "strategy",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Return",
+   "note": "<code>get()<\/code> returns <b>&#x27;cached block&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>get()<\/code> is called: a new frame is pushed with <code>p<\/code> = &#x27;p4&#x27;, <code>strategy<\/code> = &#x27;checkpoint&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p4'"
+      ],
+      [
+       "strategy",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ],
+   "newVar": "strategy"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p4'"
+      ],
+      [
+       "strategy",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p4'"
+      ],
+      [
+       "strategy",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    },
+    {
+     "frame": "get()",
+     "vars": [
+      [
+       "p",
+       "'p4'"
+      ],
+      [
+       "strategy",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Return",
+   "note": "<code>get()<\/code> returns <b>&#x27;checkpoint file&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ],
+   "out": "checkpoint ['cached block', 'checkpoint file']\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lost",
+       "→ set #1"
+      ],
+      [
+       "get",
+       "function get()"
+      ],
+      [
+       "s",
+       "'checkpoint'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;p4&#x27;, &#x27;p5&#x27;, &#x27;p6&#x27;, &#x27;p7&#x27;}"
+   ]
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three fault-tolerance decisions from real pipelines.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Reliability · basics</span></div>
+    <h4>Checkpoint correctly</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Checkpoint an expensive RDD without computing it twice.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>scores RDD</pre></div><div><small>Expected output</small><pre>sc.setCheckpointDir(&quot;hdfs:///checkpoints/fraud/2026-11-04&quot;)
+scores = orders.map(score).cache()
+scores.checkpoint()
+scores.count()</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Set a reliable checkpoint dir.</li><li>cache(), then checkpoint().</li><li>Trigger with an action.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 3: 20,000 vs 10,000 calls.",
+   "code": "print(\"\"\"sc.setCheckpointDir(\"hdfs:///checkpoints/fraud/2026-11-04\")\nscores = orders.map(score).cache()\nscores.checkpoint()\nscores.count()\"\"\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print(\"\"\"sc.setCheckpointDir(\"hdfs:///checkpoints/fraud/2026-11-04\")",
+  "scores = orders.map(score).cache()",
+  "scores.checkpoint()",
+  "scores.count()\"\"\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "sc.setCheckpointDir(\"hdfs:///checkpoints/fraud/2026-11-04\")\nscores = orders.map(score).cache()\nscores.checkpoint()\nscores.count()\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Performance · loops</span></div>
+    <h4>Checkpoint a long loop</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A DataFrame is built in 400 steps and gets slower each step.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>loop of withColumn / union</pre></div><div><small>Expected output</small><pre>8 checkpoints at [51, 101, 151] ...
+lab: 9.9 s -&gt; 5.7 s</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Checkpoint every n steps.</li><li>Measure plan length.</li><li>Prefer select with many columns at once.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Lesson 4.3 shows select vs withColumn chains.",
+   "code": "steps, every = 400, 50\ncuts = [i + 1 for i in range(0, steps, every)][1:] + [steps]\n# at each cut: df = df.checkpoint()\nprint(len(cuts), \"checkpoints at\", cuts[:3], \"...\")\nprint(\"lab: 9.9 s -> 5.7 s\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "steps, every = 400, 50",
+  "cuts = [i + 1 for i in range(0, steps, every)][1:] + [steps]",
+  "# at each cut: df = df.checkpoint()",
+  "print(len(cuts), \"checkpoints at\", cuts[:3], \"...\")",
+  "print(\"lab: 9.9 s -> 5.7 s\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>steps<\/code> is created: 400. <code>every<\/code> is created: 50.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "every"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>cuts<\/code> is created: → list #1. A new list object (#1) is created: [51, 101, 151, 201, 251, 301, 351, 400]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ],
+      [
+       "cuts",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [51, 101, 151, 201, 251, 301, 351, 400]"
+   ],
+   "newVar": "cuts"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ],
+      [
+       "cuts",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [51, 101, 151, 201, 251, 301, 351, 400]"
+   ],
+   "out": "8 checkpoints at [51, 101, 151] ...\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "400"
+      ],
+      [
+       "every",
+       "50"
+      ],
+      [
+       "cuts",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [51, 101, 151, 201, 251, 301, 351, 400]"
+   ],
+   "out": "lab: 9.9 s -> 5.7 s\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Architecture · reliability</span></div>
+    <h4>Choose recovery per stage</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Plan recovery for a pipeline on spot nodes.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>parse → score (expensive) → join → write</pre></div><div><small>Expected output</small><pre>parse  -&gt; lineage
+score  -&gt; cache + checkpoint (S3)
+join   -&gt; lineage
+write  -&gt; table (Parquet/Delta)</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Cheap stages: rely on lineage.</li><li>Expensive stage: cache + checkpoint.</li><li>Final result: write a table.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Driver on on-demand nodes (Lesson 1.3).",
+   "code": "plan = {\"parse\": \"lineage\", \"score\": \"cache + checkpoint (S3)\", \"join\": \"lineage\",\n        \"write\": \"table (Parquet/Delta)\"}\nfor k, v in plan.items():\n    print(f\"{k:6} -> {v}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "plan = {\"parse\": \"lineage\", \"score\": \"cache + checkpoint (S3)\", \"join\": \"lineage\",",
+  "        \"write\": \"table (Parquet/Delta)\"}",
+  "for k, v in plan.items():",
+  "    print(f\"{k:6} -> {v}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Expensive",
+   "note": "Only the step that would hurt to redo needs a checkpoint.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>plan<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;parse&#x27;: &#x27;lineage&#x27;, &#x27;score&#x27;: &#x27;cache + checkpoint (S3)&#x27;, &#x27;join&#x27;: &#x27;lineage&#x27;, &#x27;write&#x27;: &#x27;tab…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;parse&#x27;: &#x27;lineage&#x27;, &#x27;score&#x27;: &#x27;cache + checkpoint (S3)&#x27;, &#x27;join&#x27;: &#x27;lineage&#x27;, &#x27;write&#x27;: &#x27;tab…"
+   ],
+   "newVar": "plan"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>k<\/code> is created: &#x27;parse&#x27;. <code>v<\/code> is created: &#x27;lineage&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'parse'"
+      ],
+      [
+       "v",
+       "'lineage'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;parse&#x27;: &#x27;lineage&#x27;, &#x27;score&#x27;: &#x27;cache + checkpoint (S3)&#x27;, &#x27;join&#x27;: &#x27;lineage&#x27;, &#x27;write&#x27;: &#x27;tab…"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'parse'"
+      ],
+      [
+       "v",
+       "'lineage'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;parse&#x27;: &#x27;lineage&#x27;, &#x27;score&#x27;: &#x27;cache + checkpoint (S3)&#x27;, &#x27;join&#x27;: &#x27;lineage&#x27;, &#x27;write&#x27;: &#x27;tab…"
+   ],
+   "out": "parse  -> lineage\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to &#x27;score&#x27;. <code>v<\/code> changes to &#x27;cache + checkpoint (S3)&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'score'"
+      ],
+      [
+       "v",
+       "'cache + checkpoint (S3)'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;parse&#x27;: &#x27;lineage&#x27;, &#x27;score&#x27;: &#x27;cache + checkpoint (S3)&#x27;, &#x27;join&#x27;: &#x27;lineage&#x27;, &#x27;write&#x27;: &#x27;tab…"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'score'"
+      ],
+      [
+       "v",
+       "'cache + checkpoint (S3)'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;parse&#x27;: &#x27;lineage&#x27;, &#x27;score&#x27;: &#x27;cache + checkpoint (S3)&#x27;, &#x27;join&#x27;: &#x27;lineage&#x27;, &#x27;write&#x27;: &#x27;tab…"
+   ],
+   "out": "score  -> cache + checkpoint (S3)\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to &#x27;join&#x27;. <code>v<\/code> changes to &#x27;lineage&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'join'"
+      ],
+      [
+       "v",
+       "'lineage'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;parse&#x27;: &#x27;lineage&#x27;, &#x27;score&#x27;: &#x27;cache + checkpoint (S3)&#x27;, &#x27;join&#x27;: &#x27;lineage&#x27;, &#x27;write&#x27;: &#x27;tab…"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'join'"
+      ],
+      [
+       "v",
+       "'lineage'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;parse&#x27;: &#x27;lineage&#x27;, &#x27;score&#x27;: &#x27;cache + checkpoint (S3)&#x27;, &#x27;join&#x27;: &#x27;lineage&#x27;, &#x27;write&#x27;: &#x27;tab…"
+   ],
+   "out": "join   -> lineage\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to &#x27;write&#x27;. <code>v<\/code> changes to &#x27;table (Parquet/Delta)&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'write'"
+      ],
+      [
+       "v",
+       "'table (Parquet/Delta)'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;parse&#x27;: &#x27;lineage&#x27;, &#x27;score&#x27;: &#x27;cache + checkpoint (S3)&#x27;, &#x27;join&#x27;: &#x27;lineage&#x27;, &#x27;write&#x27;: &#x27;tab…"
+   ],
+   "newVar": "v"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'write'"
+      ],
+      [
+       "v",
+       "'table (Parquet/Delta)'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;parse&#x27;: &#x27;lineage&#x27;, &#x27;score&#x27;: &#x27;cache + checkpoint (S3)&#x27;, &#x27;join&#x27;: &#x27;lineage&#x27;, &#x27;write&#x27;: &#x27;tab…"
+   ],
+   "out": "write  -> table (Parquet/Delta)\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plan",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'write'"
+      ],
+      [
+       "v",
+       "'table (Parquet/Delta)'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;parse&#x27;: &#x27;lineage&#x27;, &#x27;score&#x27;: &#x27;cache + checkpoint (S3)&#x27;, &#x27;join&#x27;: &#x27;lineage&#x27;, &#x27;write&#x27;: &#x27;tab…"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: How does Spark mainly recover lost data?",
+  "options": [
+   "Replicas",
+   "Asking the user",
+   "Recomputing from lineage",
+   "From HDFS logs"
+  ],
+  "answer": 2,
+  "why": "Checkpoints add a second way."
+ },
+ {
+  "q": "Beginner: Where should the checkpoint directory be?",
+  "options": [
+   "Driver memory",
+   "Reliable storage such as HDFS or S3",
+   "Executor /tmp",
+   "Python list"
+  ],
+  "answer": 1,
+  "why": "It must survive executor loss."
+ },
+ {
+  "q": "Beginner: What does checkpoint() do to the lineage?",
+  "options": [
+   "Cuts it at the checkpoint",
+   "Doubles it",
+   "Nothing",
+   "Prints it"
+  ],
+  "answer": 0,
+  "why": "92 lines → 2 lines."
+ },
+ {
+  "q": "Intermediate: Why did checkpointing compute the RDD twice?",
+  "options": [
+   "Bug",
+   "Two executors",
+   "AQE",
+   "The checkpoint is written by a separate job that recomputes uncached data"
+  ],
+  "answer": 3,
+  "why": "cache() first: 10,000 calls."
+ },
+ {
+  "q": "Intermediate: What is localCheckpoint’s weakness?",
+  "options": [
+   "It is slow",
+   "It writes to S3",
+   "Its data is lost with the executor",
+   "It keeps the lineage"
+  ],
+  "answer": 2,
+  "why": "Lineage cut, but no reliable copy."
+ },
+ {
+  "q": "Intermediate: How many times does Spark retry a failed task by default?",
+  "options": [
+   "Never",
+   "Up to 4 attempts in total",
+   "10",
+   "Forever"
+  ],
+  "answer": 1,
+  "why": "spark.task.maxFailures = 4."
+ },
+ {
+  "q": "Advanced: After a worker was stopped, how many extra expensive calls did the checkpointed RDD need?",
+  "options": [
+   "0",
+   "200,000",
+   "400,000",
+   "1"
+  ],
+  "answer": 0,
+  "why": "It read the checkpoint files."
+ },
+ {
+  "q": "Advanced: Why did a 400-step DataFrame loop speed up with checkpoints?",
+  "options": [
+   "Less data",
+   "More executors",
+   "Caching",
+   "Catalyst no longer had to analyse a 400-node plan"
+  ],
+  "answer": 3,
+  "why": "9.9 s → 5.7 s."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 3.3 in one screen</h3>
+    <ul><li>Fault tolerance: task retries (maxFailures 4), recompute lost shuffle output and cached blocks from <b>lineage</b>.</li><li><code>sc.setCheckpointDir()</code> on reliable storage; <code>checkpoint()</code> writes files and <b>cuts the lineage</b> (92 → 2 lines).</li><li>RDD checkpoints are lazy and use an extra job: <b>cache first</b> (20,000 → 10,000 calls).</li><li><code>localCheckpoint()</code>: lineage cut, no files, not fault tolerant.</li><li>DataFrame <code>checkpoint()</code> is eager and resets long plans (400 steps: 9.9 s → 5.7 s).</li><li>Worker lost: cache-only recomputed 200,000 calls; checkpointed recomputed 0 (0.8 s).</li><li>Checkpoint files are internal and not cleaned by default; write real outputs as tables.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Is a checkpoint the same as saving a table?</summary><p>No. A checkpoint is for the running application: internal format, tied to a SparkContext, used to cut lineage and speed up recovery. To share data with other jobs, write a table (Parquet, Delta, Iceberg).</p></details>
+    <details><summary>Does Structured Streaming use the same checkpoints?</summary><p>It uses a checkpoint location for a different purpose: offsets, commits and state for exactly-once processing. That directory must never be deleted while the query is in use (Module 9).</p></details>
+    <details><summary>Should I always checkpoint?</summary><p>No. A checkpoint costs a full write and, without cache, a recomputation. Use it for long lineages and expensive results on unreliable infrastructure.</p></details>
+    <details><summary>Can I read a checkpoint after restarting the application?</summary><p>Not through the public RDD API in a new application; reliable checkpoints are meant for the application that wrote them. That is another reason to write tables for reuse.</p></details>
+    <details><summary>What is speculative execution?</summary><p>With spark.speculation=true, Spark starts a copy of tasks that run much slower than others and uses whichever finishes first. It helps with slow nodes, not with failures.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs about lineage, checkpoints and recovery.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Lineage shrink</h4></div>
+      <p>Percent shorter lineage after the checkpoint.</p>
+      <div class="prob__io"><div><small>Input</small><pre>92 → 2 lines</pre></div><div><small>Expected output</small><pre>98%</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{1 - 2 / 92:.0%}&quot;)</code></pre><div class="output">98%</div></div>
+        <p><b>How it works:</b> The chain is replaced by a reference to files.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Extra calls</h4></div>
+      <p>Extra calls when checkpointing without cache.</p>
+      <div class="prob__io"><div><small>Input</small><pre>10,000 elements</pre></div><div><small>Expected output</small><pre>10000</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(20000 - 10000)</code></pre><div class="output">10000</div></div>
+        <p><b>How it works:</b> One full extra computation.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Attempts</h4></div>
+      <p>Maximum attempts for one task by default.</p>
+      <div class="prob__io"><div><small>Input</small><pre>spark.task.maxFailures</pre></div><div><small>Expected output</small><pre>4</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(4)</code></pre><div class="output">4</div></div>
+        <p><b>How it works:</b> After 4 failures the job is aborted.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Lost work</h4></div>
+      <p>Calls to recompute after losing executors.</p>
+      <div class="prob__io"><div><small>Input</small><pre>8 partitions, 3 lost, 50,000 calls each</pre></div><div><small>Expected output</small><pre>150000</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(3 * 50_000)</code></pre><div class="output">150000</div></div>
+        <p><b>How it works:</b> Zero with a reliable checkpoint.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Checkpoint frequency</h4></div>
+      <p>Pick a checkpoint interval for 120 iterations.</p>
+      <div class="prob__io"><div><small>Input</small><pre>at most 15 steps between checkpoints</pre></div><div><small>Expected output</small><pre>8 checkpoints</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+print(math.ceil(120 / 15), &quot;checkpoints&quot;)</code></pre><div class="output">8 checkpoints</div></div>
+        <p><b>How it works:</b> Balance write cost against lineage length.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Recovery choice</h4></div>
+      <p>Choose recovery for each dataset.</p>
+      <div class="prob__io"><div><small>Input</small><pre>cost and reuse</pre></div><div><small>Expected output</small><pre>parsed lineage
+scores cache + checkpoint</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for name, cost in {&quot;parsed&quot;: &quot;cheap&quot;, &quot;scores&quot;: &quot;expensive&quot;}.items():
+    print(name, &quot;lineage&quot; if cost == &quot;cheap&quot; else &quot;cache + checkpoint&quot;)</code></pre><div class="output">parsed lineage
+scores cache + checkpoint</div></div>
+        <p><b>How it works:</b> Checkpoint only what hurts to recompute.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Hours saved</h4></div>
+      <p>Hours saved per incident by checkpointing scores.</p>
+      <div class="prob__io"><div><small>Input</small><pre>2 h recompute vs 5 min read, 6 incidents/month</pre></div><div><small>Expected output</small><pre>11.5 hours per month</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round((2 - 5 / 60) * 6, 1), &quot;hours per month&quot;)</code></pre><div class="output">11.5 hours per month</div></div>
+        <p><b>How it works:</b> On spot clusters incidents are frequent.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Checkpoint storage</h4></div>
+      <p>Monthly storage if checkpoints are never deleted.</p>
+      <div class="prob__io"><div><small>Input</small><pre>300 GB per run, 30 runs</pre></div><div><small>Expected output</small><pre>9.0 TB</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(300 * 30 / 1000, &quot;TB&quot;)</code></pre><div class="output">9.0 TB</div></div>
+        <p><b>How it works:</b> Add a lifecycle rule.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Fault-tolerance questions show whether you know how Spark really recovers.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Spark</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“How is Spark fault tolerant?”</h4>
+      <p class="scn__situation">Explain Spark’s fault tolerance.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know lineage and retries?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>Failed tasks are retried; lost partitions, including shuffle output and cached data, are recomputed from lineage, the record of transformations. Checkpointing saves data to reliable storage and cuts the lineage so recovery reads files. In our test, a checkpointed RDD needed no recomputation after a worker was lost.</p>
+        <p class="scn__avoid"><b>Avoid:</b> “Spark replicates all data three times like HDFS.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Cache vs checkpoint</h4>
+      <p class="scn__situation">When do you use cache, checkpoint, or both?</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you choose by goal?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Cache: reuse within the application, fast, lost with executors.</li>
+          <li>Checkpoint: cut long lineages, make expensive results survive failures; extra write.</li>
+          <li>Both: cache then checkpoint, so the checkpoint does not recompute.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Checkpointing every DataFrame.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Loop gets slower each iteration</h4>
+      <p class="scn__situation">A loop building a DataFrame slows down and the driver uses lots of CPU.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you recognise plan growth?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Each iteration adds nodes; Catalyst re-analyses a growing plan.</li>
+          <li>Checkpoint every n iterations, or restructure into fewer, wider steps.</li>
+          <li>Measure: our 400-step loop went from 9.9 to 5.7 s.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Adding executors (the driver is the bottleneck).</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Recovery design on spot capacity</h4>
+      <p class="scn__situation">Nightly jobs on spot nodes often finish hours late.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you design for failure?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Driver on on-demand capacity; executors on spot.</li>
+          <li>Checkpoint expensive intermediate results to S3/HDFS; enable decommissioning to migrate blocks.</li>
+          <li>Write final results as tables; monitor recomputed tasks and stage retries.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Moving everything to on-demand without analysis.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Spark and PySpark syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/spark-pyspark.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,314 @@
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“The bug was in line 4, but Spark complained in line 20”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> Lessons <a href="../02-transformations-and-actions/">2.2</a> (operations) and <a href="../../01-introduction/04-how-a-spark-job-runs/">1.4</a> (jobs, stages, tasks).</p></div>
+  <div class="story">
+    <p class="narration">Riya wrote a word count over three months of TiffinGo reviews. Line 4 had a bug in a <code>map</code>, but the error only appeared at line 20, the <code>count()</code>. Then she added a second report on the same words and the job took twice as long. Kabir says Spark is “lazy”, which sounds like an insult.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Spark records RDD operations as a lineage graph and only runs it when an action needs a result. Narrow steps are pipelined into one stage; a shuffle starts the next. The numbers show what laziness costs and what Spark reuses.">
+        <rect x="10" y="26" width="170" height="74" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="95" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage A</text><rect x="18" y="50" width="50" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="43.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">textFile</text><rect x="72" y="50" width="50" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="97.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">flatMap</text><rect x="126" y="50" width="50" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="151.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">map</text><text x="95" y="92" text-anchor="middle" font-size="6.4" class="s-ink2">pipelined, one task per partition</text><path d="M182 61L214 61" style="fill:none;stroke:var(--track);stroke-width:1.8"/><path d="M207.7 64.0L214 61L207.7 58.0" style="fill:none;stroke:var(--track);stroke-width:1.8"/><text x="198" y="54" text-anchor="middle" font-size="6.2" class="s-ink2">shuffle</text><rect x="216" y="26" width="136" height="74" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="284" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage B</text><rect x="224" y="50" width="70" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="259.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">reduceByKey</text><rect x="298" y="50" width="48" height="22" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="322.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">action</text><rect x="410" y="12" width="222" height="136" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="521" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured</text><text x="422" y="52" font-size="7.2" class="s-red mono">bug in map: silent until count()</text><text x="422" y="68" font-size="7.2" class="s-ink mono">lineage: +-(3) marks the shuffle</text><text x="422" y="84" font-size="7.2" class="s-acc mono">2 actions, no cache: 48,000 calls</text><text x="422" y="100" font-size="7.2" class="s-green mono">2 actions, cached: 24,000 calls</text><text x="422" y="116" font-size="7.2" class="s-green mono">job A 14.0 s, job B 0.2 s</text><text x="422" y="132" font-size="7.2" class="s-green mono">map stage skipped: shuffle reused</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Nothing runs until an action; <tspan font-weight="700" class="s-acc">everything</tspan> reruns unless something is kept.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+R> Sir, why did Spark not stop at the line with the bug?
+A> Because nothing on that line ran. A transformation only adds a node to the <b>lineage graph</b>, a DAG. When an action needs a result, Spark walks the graph, cuts it into stages at shuffles and runs it. Errors inside your functions appear only then.
+K> And the second report took as long as the first?
+A> Every action walks the lineage again from the start, unless something is kept along the way: a <b>cache</b>, or <b>shuffle files</b> that Spark reuses on its own. Today we look at the DAG as text and in the UI, count how often our functions really run, and find out what Spark reuses. All outputs are real (PySpark 4.3.0).
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Lazy evaluation and the lineage DAG</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Lazy evaluation</b> means that RDD transformations are not executed when they are called; Spark records each new RDD with its dependencies on parent RDDs, forming a <b>lineage graph</b> (a directed acyclic graph, DAG). When an <b>action</b> is invoked, the DAGScheduler builds stages from the graph, splitting at shuffle (wide) dependencies and pipelining narrow transformations within each stage, and submits tasks. Each action re-evaluates the lineage from its sources, except where results are already available: RDDs persisted with <code>cache()</code>/<code>persist()</code>, and shuffle outputs from earlier stages, which allow those stages to be <b>skipped</b>. Errors in user functions surface only when the action runs the corresponding tasks. The lineage also provides fault tolerance by allowing lost partitions to be recomputed.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Spark writes down your steps instead of doing them. When you ask for a result, it plans and runs everything needed. Each new request runs the steps again, unless results were kept in memory (cache) or Spark can reuse earlier shuffle data.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Lazy evaluation</b><span>Transformations are recorded, not run, until an action.</span></div>
+    <div class="term"><b>Lineage</b><span>The chain of parent RDDs; <code>toDebugString()</code> shows it.</span></div>
+    <div class="term"><b>DAG</b><span>Directed acyclic graph: steps with arrows, no cycles.</span></div>
+    <div class="term"><b>DAGScheduler</b><span>The driver part that cuts the DAG into stages.</span></div>
+    <div class="term"><b>Pipelining</b><span>Running several narrow steps in one pass over a partition.</span></div>
+    <div class="term"><b>Skipped stage</b><span>A stage whose shuffle output already exists.</span></div>
+    <div class="term"><b>cache()</b><span>Keep an RDD’s partitions in memory after first use.</span></div>
+    <div class="term"><b>Storage level</b><span>Where and how cached data is kept (memory, disk, serialised).</span></div>
+  </div>
+
+  <h3>Laziness in RDDs and DataFrames</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th></th><th>RDD</th><th>DataFrame</th></tr></thead>
+    <tbody><tr><td>Transformations run</td><td>At the action</td><td>At the action</td></tr><tr><td>Errors in your code appear</td><td>At the action (Python worker error)</td><td>Column/type errors at once (analysis); data errors at the action</td></tr><tr><td>Optimisation before running</td><td>None: steps run as written</td><td>Catalyst rewrites the whole plan</td></tr><tr><td>See the plan</td><td><code>rdd.toDebugString()</code></td><td><code>df.explain()</code></td></tr><tr><td>Reuse between actions</td><td>cache, shuffle files</td><td>cache, shuffle files, AQE reuse</td></tr></tbody>
+  </table>
+  </div>
+LEVELS> Laziness and the DAG at three levels
+L1> A to-do list, not a done list
+      <ul>
+        <li>Transformations write steps on a to-do list. An action says “do the list now”.</li>
+        <li>If a step is wrong, you find out only when someone tries to do it.</li>
+        <li>Doing the list twice means doing the work twice, unless you keep the results.</li>
+      </ul>
+L2> How Spark uses the DAG
+      <ul>
+        <li>Each RDD points to its parents; together they form a <b>directed acyclic graph</b> (DAG) of the computation.</li>
+        <li>At an action, the <b>DAGScheduler</b> cuts the graph into stages at shuffle dependencies; narrow steps inside a stage are <b>pipelined</b> (one pass per partition).</li>
+        <li>Laziness lets Spark combine steps, skip work that is not needed (<code>take</code> reads only some partitions) and recompute lost partitions.</li>
+      </ul>
+L3> What the lab showed
+      <ul>
+        <li>A <code>map(lambda l: len(l) / 0)</code> was accepted; <code>count()</code> raised <code>ZeroDivisionError</code> from a Python worker.</li>
+        <li>Without cache, two actions ran the tokenizer 48,000 times on 24,000 lines; with <code>cache()</code>, 24,000.</li>
+        <li>On the cluster, a second action on the same reduced RDD <b>skipped</b> the map stage: Spark reused the shuffle files (14.0 s → 0.2 s of task time).</li>
+      </ul>
+/LEVELS
+
+EXAM> “What is lazy evaluation and why does Spark use it?” Transformations only build a lineage DAG; actions trigger execution. Spark can then pipeline narrow operations into stages, avoid unnecessary work, optimise (for DataFrames), and recover lost partitions from lineage. The cost: each action recomputes the lineage unless data is cached or shuffle output is reused.
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>What Spark reuses, and what it recomputes</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Situation</th><th>Recomputed on the next action?</th><th>Seen in the lab</th></tr></thead>
+    <tbody><tr><td>Plain RDD, narrow steps only</td><td>Yes, from the source</td><td>tokenize ran 48,000 times for 2 actions</td></tr><tr><td>After <code>cache()</code> (once filled)</td><td>No, read from executor memory</td><td>24,000 calls; job D 0.3 s</td></tr><tr><td>Before a shuffle that already ran</td><td>No, shuffle files reused (stage skipped)</td><td>Job B: stage 2 skipped</td></tr><tr><td>Cached partition lost (executor died)</td><td>Only that partition, from lineage</td><td>Lesson 1.3</td></tr><tr><td>After <code>checkpoint()</code></td><td>No; lineage is cut and saved to storage</td><td>Lesson 3.3</td></tr></tbody>
+  </table>
+  </div>
+WARN> Reused shuffle files are a bonus, not a plan: they disappear when executors are lost or the shuffle data is cleaned up, and they only cover work <b>before</b> the shuffle. If you will use an RDD several times, <code>cache()</code> it deliberately and <code>unpersist()</code> it afterwards.
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Watching laziness happen</h2>
+  <p>All outputs are real: PySpark 4.3.0 in local mode (Steps 1–4) and on the standalone cluster (Steps 5–6). Data: three months of TiffinGo reviews, 24,000 lines in 3 files.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · A bug that waits for an action</h4>
+      <div class="code" data-lang="python" data-file="lazy.py"><pre><code>lines = sc.textFile(&quot;reviews&quot;)
+bad = lines.map(lambda l: len(l) / 0)
+print(&quot;defined bad RDD, no error yet:&quot;, bad)
+bad.count()</code></pre><div class="output">   defined bad RDD, no error yet: PythonRDD[2] at RDD at PythonRDD.scala:59
+ERROR Executor: Exception in task 1.0 in stage 0.0 (TID 1)
+org.apache.spark.api.python.PythonException: [PYTHON_EXCEPTION] An exception was thrown from the Python worker: …
+  File &quot;lazy.py&quot;, line 8, in &lt;lambda&amp;gt;
+    bad = lines.map(lambda l: len(l) / 0)
+ZeroDivisionError: division by zero
+   at count(): ZeroDivisionError: division by zero</div></div>
+      <span class="behind">Defining <code>bad</code> was accepted: Spark cannot check what a Python lambda will do. The error appeared at <code>count()</code>, raised inside a <b>Python worker</b> on an executor and reported with the original line. In long pipelines, the line where the error is reported is the action, not the bug. Test functions on a small sample with <code>take()</code> while developing.</span></li>
+    <li><h4>Step 2 · Read the lineage</h4>
+      <div class="code" data-lang="python" data-file="lazy.py"><pre><code>counts = (lines.flatMap(lambda l: l.split())
+               .map(lambda w: (w, 1))
+               .reduceByKey(lambda a, b: a + b)
+               .filter(lambda kv: kv[1] &gt; 5000))
+print(counts.toDebugString().decode())</code></pre><div class="output">(3) PythonRDD[8]
+ |  MapPartitionsRDD[7]
+ |  ShuffledRDD[6]
+ +-(3) PairwiseRDD[5]
+    |  PythonRDD[4]
+    |  reviews MapPartitionsRDD[1]
+    |  reviews HadoopRDD[0]</div></div>
+      <span class="behind">Read bottom-up. <code>HadoopRDD</code> and <code>MapPartitionsRDD</code> come from <code>textFile</code>. PySpark <b>fused</b> <code>flatMap</code> and <code>map</code> into one <code>PythonRDD[4]</code>: pipelining in action. <code>+-(3)</code> marks a <b>shuffle boundary</b>: everything indented below it is one stage (3 tasks), everything above is the next stage, starting with <code>ShuffledRDD</code>. The <code>filter</code> after <code>reduceByKey</code> was fused into the final <code>PythonRDD[8]</code>.</span></li>
+    <li><h4>Step 3 · Every action recomputes</h4>
+      <div class="code" data-lang="python" data-file="lazy.py"><pre><code>calls = sc.accumulator(0)
+def tokenize(l):
+    calls.add(1)
+    return l.split()
+words = lines.flatMap(tokenize)
+words.count(); words.distinct().count()
+print(&quot;no cache:&quot;, calls.value)
+
+calls.value = 0
+words_c = lines.flatMap(tokenize).cache()
+words_c.count(); words_c.distinct().count()
+print(&quot;cached  :&quot;, calls.value, words_c.getStorageLevel())</code></pre><div class="output">   tokenize() calls for 2 actions, no cache: 48000 (24,000 lines x 2)
+   tokenize() calls for 2 actions, cached  : 24000
+   storage level: Memory Serialized 1x Replicated</div></div>
+      <span class="behind">Two actions on an uncached RDD ran <code>tokenize</code> <b>48,000 times</b> for 24,000 lines: the whole lineage was executed twice, file reading included. After <code>cache()</code>, the first action filled the cache and the second read from memory: 24,000 calls. RDD <code>cache()</code> in PySpark stores <b>serialised</b> data in memory (“Memory Serialized 1x Replicated”).</span></li>
+    <li><h4>Step 4 · Laziness lets Spark do less</h4>
+      <div class="code" data-lang="python" data-file="take.py"><pre><code>lines.map(lambda l: l.upper()).take(5)     # only as many partitions as needed
+lines.map(lambda l: l.upper()).count()     # every partition
+# jobs and tasks read from the UI&#x27;s REST API (port 4040)</code></pre><div class="output">take(5): 1 job(s), tasks [1]
+count() : 1 job(s), tasks [3]</div></div>
+      <span class="behind">Because nothing runs early, Spark knows what the action actually needs. <code>take(5)</code> ran only on the first partition; <code>count()</code> on all three. The same idea lets DataFrames push filters into file scans (Lesson 7.3). With RDDs, Spark cannot reorder your lambdas, but it still avoids running what no action asked for.</span></li>
+    <li><h4>Step 5 · The DAG on the cluster: stages and skipping</h4>
+      <div class="code" data-lang="python" data-file="rdd_dag.py (cluster)"><pre><code>counts = lines.flatMap(lambda l: l.split()).map(lambda w: (w, 1)).reduceByKey(add)
+sc.setJobDescription(&quot;A: top words (no cache)&quot;);      counts.takeOrdered(3, key=lambda kv: -kv[1])
+sc.setJobDescription(&quot;B: count() again, no cache&quot;);   counts.count()
+counts.cache()
+sc.setJobDescription(&quot;C: count after cache() - fills the cache&quot;); counts.count()
+sc.setJobDescription(&quot;D: filter on the cached RDD&quot;);  counts.filter(lambda kv: kv[1] &gt; 5000).count()</code></pre><div class="output">[(&#x27;and&#x27;, 24000), (&#x27;was&#x27;, 24000), (&#x27;masala&#x27;, 4924)]
+40
+40
+2
+
+job 0: stage 0 complete + stage 1 complete    task time 14.0 s | A: top words (no cache)
+job 1: stage 2 skipped + stage 3 complete     task time  0.2 s | B: count() again, no cache
+job 2: stage 4 skipped + stage 5 complete     task time  0.7 s | C: count after cache() - fills the cache
+job 3: stage 6 skipped + stage 7 complete     task time  0.3 s | D: filter on the cached RDD</div></div>  <figure style="margin:18px 0">
+    <img src="ui-rdd-skipped.webp" width="1280" height="700" loading="lazy" alt="Job details DAG with stage 2 skipped and stage 3 run" style="max-width:100%;height:auto;border:1px solid var(--line);border-radius:8px">
+    <figcaption class="muted" style="font-size:.9em;margin-top:6px">Real screenshot: job B, the second <code>count()</code> without cache. Stage 2 (textFile, flatMap, map) is grey and <b>skipped</b>: Spark reused the shuffle files written by job A.</figcaption>
+  </figure>
+
+      <span class="behind">Job A ran both stages: 14.0 s of task time, mostly reading and tokenising. Job B, without any cache, <b>skipped</b> the map stage and took 0.2 s: the shuffle files from job A were still on the executors, so Spark started from them. Only the work <b>after</b> the shuffle reran. “and” and “was” top the list because every review contains them; Lesson 2.5 filters such words out.</span></li>
+    <li><h4>Step 6 · A cached RDD in the DAG</h4>
+      <div class="code" data-lang="text" data-file="Jobs → job 3 → DAG Visualization"><pre><code>stage 6 skipped (shuffle files reused)
+stage 7: partitionBy → mapPartitions → ● cached RDD → filter → count</code></pre></div>  <figure style="margin:18px 0">
+    <img src="ui-rdd-cached.webp" width="1280" height="700" loading="lazy" alt="Job details DAG with a green dot marking a cached RDD in stage 7" style="max-width:100%;height:auto;border:1px solid var(--line);border-radius:8px">
+    <figcaption class="muted" style="font-size:.9em;margin-top:6px">Real screenshot: job D after <code>cache()</code>. The green dot in stage 7 marks the cached RDD; the filter ran on it directly.</figcaption>
+  </figure>
+
+      <span class="behind">After <code>cache()</code>, job C computed the reduced RDD once more and stored it; job D found it in memory (the <b>green dot</b>) and only ran the filter. The Storage tab would list the RDD with its size and fraction cached. Lesson 3.1 compares storage levels and their costs.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>A plan that runs on demand</h2>
+  <p>Left: real outputs. Right: the DAG underneath.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">A plan that runs on demand <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">bad = lines.map(lambda l: len(l) / 0)</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">defined bad RDD, no error yet</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">bad.count()</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">ZeroDivisionError: division by zero</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">(3) PythonRDD[8]</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve"> |  ShuffledRDD[6]</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve"> +-(3) PairwiseRDD[5]   ← shuffle</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">    |  textFile</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">no cache: tokenize() calls 48000</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">cached  : tokenize() calls 24000</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">Memory Serialized 1x Replicated</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">job A: stage 0 + stage 1   14.0 s</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">job B: stage 2 skipped      0.2 s</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">shuffle files reused</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">counts.cache(); counts.count()</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">job D: filter on cached RDD 0.3 s</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">green dot in the DAG</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A broken map was accepted; count() failed.</li>
+          <li>The lineage shows one shuffle boundary.</li>
+          <li>Without cache, the tokenizer ran twice per line.</li>
+          <li>The second action skipped the map stage.</li>
+          <li>The cached RDD served the last action.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="The DAG underneath">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nothing runs at definition</text><rect x="10" y="26" width="170" height="74" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="95" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage A</text><rect x="18" y="50" width="50" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="43.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">textFile</text><rect x="72" y="50" width="50" height="22" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="97.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">flatMap</text><rect x="126" y="50" width="50" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="151.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">map</text><text x="95" y="92" text-anchor="middle" font-size="6.4" class="s-ink2">pipelined, one task per partition</text><path d="M182 61L214 61" style="fill:none;stroke:var(--track);stroke-width:1.8"/><path d="M207.7 64.0L214 61L207.7 58.0" style="fill:none;stroke:var(--track);stroke-width:1.8"/><text x="198" y="54" text-anchor="middle" font-size="6.2" class="s-ink2">shuffle</text><rect x="216" y="26" width="136" height="74" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="284" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage B</text><rect x="224" y="50" width="70" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="259.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">reduceByKey</text><rect x="298" y="50" width="48" height="22" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="322.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">action</text><rect x="10" y="112" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="130.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Errors appear when tasks run.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Shuffles cut stages</text><rect x="10" y="26" width="170" height="74" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="95" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage A</text><rect x="18" y="50" width="50" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="43.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">textFile</text><rect x="72" y="50" width="50" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="97.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">flatMap</text><rect x="126" y="50" width="50" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="151.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">map</text><text x="95" y="92" text-anchor="middle" font-size="6.4" class="s-ink2">pipelined, one task per partition</text><path d="M182 61L214 61" style="fill:none;stroke:var(--track);stroke-width:1.8"/><path d="M207.7 64.0L214 61L207.7 58.0" style="fill:none;stroke:var(--track);stroke-width:1.8"/><text x="198" y="54" text-anchor="middle" font-size="6.2" class="s-ink2">shuffle</text><rect x="216" y="26" width="136" height="74" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="284" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage B</text><rect x="224" y="50" width="70" height="22" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="259.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">reduceByKey</text><rect x="298" y="50" width="48" height="22" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="322.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">action</text><rect x="10" y="112" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="130.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">+-(3) in toDebugString = new stage.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each action walks the graph</text><rect x="10" y="26" width="170" height="74" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="95" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage A</text><rect x="18" y="50" width="50" height="22" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="43.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">textFile</text><rect x="72" y="50" width="50" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="97.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">flatMap</text><rect x="126" y="50" width="50" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="151.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">map</text><text x="95" y="92" text-anchor="middle" font-size="6.4" class="s-ink2">pipelined, one task per partition</text><path d="M182 61L214 61" style="fill:none;stroke:var(--track);stroke-width:1.8"/><path d="M207.7 64.0L214 61L207.7 58.0" style="fill:none;stroke:var(--track);stroke-width:1.8"/><text x="198" y="54" text-anchor="middle" font-size="6.2" class="s-ink2">shuffle</text><rect x="216" y="26" width="136" height="74" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="284" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage B</text><rect x="224" y="50" width="70" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="259.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">reduceByKey</text><rect x="298" y="50" width="48" height="22" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="322.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">action</text><rect x="10" y="112" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="130.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Unless a result is kept.</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Shuffle output is reused</text><rect x="10" y="26" width="170" height="74" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="95" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage A (skipped)</text><rect x="18" y="50" width="50" height="22" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="43.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">textFile</text><rect x="72" y="50" width="50" height="22" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="97.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">flatMap</text><rect x="126" y="50" width="50" height="22" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="151.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">map</text><text x="95" y="92" text-anchor="middle" font-size="6.4" class="s-ink2">pipelined, one task per partition</text><path d="M182 61L214 61" style="fill:none;stroke:var(--track);stroke-width:1.8"/><path d="M207.7 64.0L214 61L207.7 58.0" style="fill:none;stroke:var(--track);stroke-width:1.8"/><text x="198" y="54" text-anchor="middle" font-size="6.2" class="s-ink2">shuffle</text><rect x="216" y="26" width="136" height="74" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="284" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage B</text><rect x="224" y="50" width="70" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="259.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">reduceByKey</text><rect x="298" y="50" width="48" height="22" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">action</text><rect x="10" y="112" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="130.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Stage A skipped on the 2nd action.</text></g><g data-on="5"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cache cuts the walk short</text><rect x="10" y="26" width="170" height="74" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="95" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage A (skipped)</text><rect x="18" y="50" width="50" height="22" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="43.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">textFile</text><rect x="72" y="50" width="50" height="22" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="97.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">flatMap</text><rect x="126" y="50" width="50" height="22" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="151.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">map</text><text x="95" y="92" text-anchor="middle" font-size="6.4" class="s-ink2">pipelined, one task per partition</text><path d="M182 61L214 61" style="fill:none;stroke:var(--track);stroke-width:1.8"/><path d="M207.7 64.0L214 61L207.7 58.0" style="fill:none;stroke:var(--track);stroke-width:1.8"/><text x="198" y="54" text-anchor="middle" font-size="6.2" class="s-ink2">shuffle</text><rect x="216" y="26" width="136" height="74" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="284" y="40" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">Stage B</text><rect x="224" y="50" width="70" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="259.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">reduceByKey</text><rect x="298" y="50" width="48" height="22" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="66" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">action</text><circle cx="259" cy="82" r="5" fill="#7BD35C" stroke="#3A8A2A"/><text x="270" y="85" font-size="6.4" class="s-green">cached</text><rect x="10" y="112" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="130.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Read from memory, run the rest.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Transformations only add nodes to the DAG.</li>
+          <li>flatMap and map were pipelined into one PythonRDD.</li>
+          <li>Lineage is evaluated from the source per action.</li>
+          <li>Shuffle files from job A were still there.</li>
+          <li>Only the filter ran on cached data.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: an error far from its cause, reports that repeat work, and a lineage that grows too long.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-lazyerror">An error reported far from its cause</h3>
+  <p class="anim-intro">What laziness means for debugging. (Typical; behaviour from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Lazy errors <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Errors in lambdas surface at the action; read the Python traceback, reproduce with take() and test functions outside Spark">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly job fails at write()</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">ValueError in a Python worker</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The bug is 40 lines earlier.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Read the Python traceback</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">File "job.py", line 12, in parse</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">It names the real line.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Reproduce on a sample</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">rdd.map(parse).take(100)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fast feedback.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Find the bad record</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">try/except → tag bad rows</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Do not crash on one line.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Test functions alone</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">pytest on parse() without Spark</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lesson 11.4.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Fails at the end.</li>
+          <li>Traceback points back.</li>
+          <li>Sample it.</li>
+          <li>Handle bad records.</li>
+          <li>Unit-test functions.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-reports">Three reports that each parse everything</h3>
+  <p class="anim-intro">The cost of forgetting laziness. (Typical; counts from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Reuse with cache <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Each action recomputes the lineage; cache the shared RDD once, verify it in the Storage tab and unpersist afterwards">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Three reports, one RDD</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">top dishes · complaints · counts</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each 10 minutes.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Look at the DAG</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">parsing stage runs 3 times</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Like our 48,000 calls.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">cache() the parsed RDD</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">parsed = raw.map(parse).cache()</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Parse once.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check the Storage tab</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">fraction cached: 100%</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fits in memory?</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">unpersist() at the end</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">10 + 2 + 2 minutes</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Instead of 30.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Three actions.</li>
+          <li>Parsing three times.</li>
+          <li>Cache once.</li>
+          <li>Verify.</li>
+          <li>Release.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-lineage">When the lineage gets too long</h3>
+  <p class="anim-intro">Why iterative jobs need checkpoints. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Long lineage <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Iterative jobs grow the lineage each loop; checkpointing saves the data and cuts the graph">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Iterative job, 200 loops</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">rdd = rdd.map(update) in a loop</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lineage grows every loop.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Driver slows, then fails</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">StackOverflowError in the scheduler</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A 200-step graph.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A lost partition</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">recompute all 200 steps</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Very slow recovery.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">checkpoint() every 20 loops</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink mono">sc.setCheckpointDir(…); rdd.checkpoint()</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Saves data, cuts lineage.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Short lineage again</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">Lesson 3.3</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fast recovery, stable driver.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Lineage grows.</li>
+          <li>Scheduler struggles.</li>
+          <li>Recovery is slow.</li>
+          <li>Checkpoint.</li>
+          <li>Short graph.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Laziness at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">sample</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">first</text></svg></div>
+    <div><h4>1. Developing on samples</h4>
+      <p>Engineers test each step with take() on a few rows before running the full action on terabytes.</p>
+      <div class="uc-flow"><span>Code</span><i>→</i><span class="java">take(10)</span><i>→</i><span>Full run</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green">cache</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">reuse</text></svg></div>
+    <div><h4>2. Shared intermediate data</h4>
+      <p>One parsed dataset feeds several reports; it is cached once and released after the last report.</p>
+      <div class="uc-flow"><span>Parse</span><i>→</i><span class="java">cache</span><i>→</i><span>Reports</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-violet">DAG</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">review</text></svg></div>
+    <div><h4>3. Reading DAGs in reviews</h4>
+      <p>toDebugString and the DAG view show unintended shuffles and repeated stages before a job ships.</p>
+      <div class="uc-flow"><span>Job</span><i>→</i><span class="java">DAG</span><i>→</i><span>Fix</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">ML</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">iterations</text></svg></div>
+    <div><h4>4. Iterative algorithms</h4>
+      <p>Graph and ML algorithms cache their working set and checkpoint periodically to keep lineage short.</p>
+      <div class="uc-flow"><span>Loop</span><i>→</i><span class="java">cache + checkpoint</span><i>→</i><span>Converge</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">debug</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">workers</text></svg></div>
+    <div><h4>5. Debugging Python workers</h4>
+      <p>PythonException tracebacks in executor logs point to the line in your function that failed.</p>
+      <div class="uc-flow"><span>Action fails</span><i>→</i><span class="java">traceback</span><i>→</i><span>Fix line</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>

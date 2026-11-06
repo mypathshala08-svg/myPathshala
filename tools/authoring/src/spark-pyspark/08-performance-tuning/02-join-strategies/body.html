@@ -1,0 +1,282 @@
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Same join, four times faster”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> join types in <a href="../../06-transformations/02-joins/">6.2</a>, plans in <a href="../../07-spark-sql/03-catalyst-and-explain/">7.3</a>, AQE in <a href="../../07-spark-sql/04-adaptive-query-execution/">7.4</a>.</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s loyalty job joins every order with the customer tier table. After someone set <code>spark.sql.autoBroadcastJoinThreshold=-1</code> to “fix” an out-of-memory error elsewhere, the job silently became 4x slower.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Spark joins two tables using one of several physical strategies. We forced each strategy with hints on 5 million orders joined to 4,000 customers and timed them, then compared a bucketed join with a normal one.">
+        <rect x="14" y="30" width="100" height="40" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="64.0" y="41" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">orders</text><text x="64.0" y="51" text-anchor="middle" font-size="6.4" class="s-ink2 mono">5M rows</text><rect x="14" y="96" width="100" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="64.0" y="107" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">customers</text><text x="64.0" y="117" text-anchor="middle" font-size="6.4" class="s-ink2 mono">4,000 rows</text><path d="M116 116L176 80" style="fill:none;stroke:var(--green);stroke-width:1.2"/><path d="M172.2 85.9L176 80L169.0 80.6" style="fill:none;stroke:var(--green);stroke-width:1.2"/><text x="150" y="108" text-anchor="middle" font-size="7" class="s-green">copy</text><path d="M116 50L176 62" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M169.2 63.7L176 62L170.4 57.8" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="180" y="54" width="190" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="275.0" y="65" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">BroadcastHashJoin</text><text x="275.0" y="75" text-anchor="middle" font-size="6.4" class="s-ink2 mono">no shuffle of orders</text><rect x="400" y="12" width="232" height="132" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="516" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured (5M orders)</text><text x="412" y="52" font-size="7.2" class="s-green mono">broadcast   : 1.55 s,   8 tasks</text><text x="412" y="68" font-size="7.2" class="s-acc mono">shuffle_hash: 4.53 s, 208 tasks</text><text x="412" y="84" font-size="7.2" class="s-red mono">sort-merge  : 6.73 s, 208 tasks</text><text x="412" y="100" font-size="7.2" class="s-green mono">bucketed SMJ: 1.68 s, 0 Exchange</text><text x="412" y="116" font-size="7.2" class="s-acc mono">plain SMJ   : 5.31 s, 2 Exchange</text><text x="412" y="132" font-size="7.2" class="s-red mono">5M broadcast: works, risky</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">The fastest join is the one that <tspan font-weight="700" class="s-acc">does not shuffle</tspan> the big table.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+K> Sir, a join is a join. How can the same join be 4x slower?
+A> Spark has several <b>physical join strategies</b>. If one side is small, it copies it to every executor and never moves the big table. Otherwise it shuffles both sides by the key, and then either sorts them or builds hash tables.
+R> And we can choose?
+A> Spark chooses using size estimates and thresholds, and you can override it with <b>hints</b>. Today we force each strategy, time it, read the plans, and see how <b>bucketing</b> removes the shuffle for repeated joins. All outputs are real (PySpark 4.3.0).
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Physical join strategies</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>Spark SQL implements equi-joins with three main physical operators. A <b>broadcast hash join</b> (BHJ) sends the smaller relation to every executor and builds a hash table there, so the larger side is not shuffled; it is chosen when a side’s estimated size is below <code>spark.sql.autoBroadcastJoinThreshold</code> (10 MB) or a broadcast hint is given. A <b>sort-merge join</b> (SMJ) shuffles both sides by the join key, sorts each partition and merges them; it is the default for large inputs. A <b>shuffled hash join</b> (SHJ) shuffles both sides and builds a hash table from the smaller side per partition, avoiding the sort. Non-equi joins use a <b>broadcast nested loop join</b> or a <b>cartesian product</b>. Hints (<code>BROADCAST</code>, <code>MERGE</code>, <code>SHUFFLE_HASH</code>, <code>SHUFFLE_REPLICATE_NL</code>) override the choice; bucketed tables can skip the shuffle.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Spark can join by copying a small table to every machine (broadcast), or by moving both tables so matching keys meet and then sorting (sort-merge) or hashing (shuffled hash). Broadcast avoids moving the big table and is usually fastest; the others work for any size. Hints let you choose.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>BHJ</b><span>Broadcast hash join: small side copied.</span></div>
+    <div class="term"><b>SMJ</b><span>Sort-merge join: shuffle + sort both.</span></div>
+    <div class="term"><b>SHJ</b><span>Shuffled hash join: shuffle + hash.</span></div>
+    <div class="term"><b>BNLJ</b><span>Broadcast nested loop: non-equi joins.</span></div>
+    <div class="term"><b>Join hint</b><span>Tells Spark which strategy to use.</span></div>
+    <div class="term"><b>autoBroadcastJoinThreshold</b><span>10 MB default; -1 disables.</span></div>
+    <div class="term"><b>BroadcastExchange</b><span>Plan node that ships the small side.</span></div>
+    <div class="term"><b>Bucketing</b><span>Pre-shuffled, pre-sorted table files.</span></div>
+  </div>
+
+  <h3>The strategies side by side</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:660px">
+    <thead><tr><th>Strategy</th><th>Shuffles</th><th>Best when</th><th>Lab (5M × 4,000)</th></tr></thead>
+    <tbody><tr><td>Broadcast hash</td><td>Neither side (small side copied)</td><td>One side small (≤ ~10–100 MB)</td><td>1.55 s, 8 tasks</td></tr><tr><td>Shuffled hash</td><td>Both</td><td>One side much smaller, fits in memory per partition</td><td>4.53 s, 208 tasks</td></tr><tr><td>Sort-merge</td><td>Both (+ sort)</td><td>Both sides large</td><td>6.73 s, 208 tasks</td></tr><tr><td>Cartesian / BNLJ</td><td>Varies</td><td>Non-equi conditions only</td><td>hint gave CartesianProduct</td></tr><tr><td>Bucketed SMJ</td><td>None (pre-bucketed)</td><td>Same big join repeated</td><td>1.68 s vs 5.31 s</td></tr></tbody>
+  </table>
+  </div>
+LEVELS> Join strategies at three levels
+L1> Matching guests to tables
+      <ul>
+        <li>Broadcast: give every waiter a copy of the short guest list. Nobody moves.</li>
+        <li>Sort-merge: both long lists are sorted by name and walked together.</li>
+        <li>Shuffle hash: split both lists by first letter, then use a lookup table per letter.</li>
+      </ul>
+L2> The API
+      <ul>
+        <li><code>F.broadcast(df)</code> or <code>df.hint("broadcast")</code>, <code>"merge"</code>, <code>"shuffle_hash"</code>, <code>"shuffle_replicate_nl"</code>; SQL <code>/*+ BROADCAST(c) */</code>.</li>
+        <li><code>spark.sql.autoBroadcastJoinThreshold</code> (10 MB), <code>spark.sql.join.preferSortMergeJoin</code> (true).</li>
+        <li><code>df.write.bucketBy(n, "key").sortBy("key").saveAsTable(...)</code>.</li>
+      </ul>
+L3> What the lab showed
+      <ul>
+        <li>Broadcast 1.55 s (8 tasks), shuffled hash 4.53 s, sort-merge 6.73 s (208 tasks each).</li>
+        <li>The broadcast plan had 0 hash Exchanges; sort-merge had 2.</li>
+        <li>Bucketed tables: sort-merge with 0 Exchanges, 1.68 s vs 5.31 s.</li>
+      </ul>
+/LEVELS
+
+EXAM> “Explain Spark join strategies.” Broadcast hash join copies the small side to all executors and avoids shuffling the big side; it is chosen below <code>autoBroadcastJoinThreshold</code> (10 MB) or with a hint. Sort-merge join shuffles and sorts both sides and is the default for large tables. Shuffled hash join shuffles both and hashes the smaller side per partition. Non-equi joins use broadcast nested loop or cartesian joins. Bucketing on the join key lets sort-merge skip the shuffle.
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Hints in DataFrame and SQL</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Hint</th><th>DataFrame</th><th>SQL</th><th>Plan in our lab</th></tr></thead>
+    <tbody><tr><td>Broadcast</td><td><code>F.broadcast(c)</code> / <code>c.hint("broadcast")</code></td><td><code>/*+ BROADCAST(c) */</code></td><td>BroadcastHashJoin</td></tr><tr><td>Merge</td><td><code>c.hint("merge")</code></td><td><code>/*+ MERGE(c) */</code></td><td>SortMergeJoin</td></tr><tr><td>Shuffle hash</td><td><code>c.hint("shuffle_hash")</code></td><td><code>/*+ SHUFFLE_HASH(c) */</code></td><td>ShuffledHashJoin</td></tr><tr><td>Replicate NL</td><td><code>c.hint("shuffle_replicate_nl")</code></td><td><code>/*+ SHUFFLE_REPLICATE_NL(c) */</code></td><td>CartesianProduct</td></tr></tbody>
+  </table>
+  </div>
+WARN> A broadcast hint is an order, not a suggestion: Spark will try to collect the side on the driver and send it to every executor, even a huge one. Our forced broadcast of 5 million rows worked on a 3 GB driver (5.32 s), but on a cluster a mis-estimated side causes driver OOM or a broadcast timeout. Setting the threshold to <code>-1</code> everywhere is the opposite mistake: every small dimension join becomes a shuffle.
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Forcing each strategy</h2>
+  <p>All outputs are real: PySpark 4.3.0, <code>local[4]</code>, AQE off (so the plan does not change at run time), 5,000,000 orders joined on <code>customer_id</code> to 4,000 customers. Strategies are read from the executed plan; timings are warm runs.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Spark’s automatic choice</h4>
+      <div class="code" data-lang="python" data-file="l82_joins.py"><pre><code>cust = spark.range(1, 4001).select(F.col(&quot;id&quot;).cast(&quot;int&quot;).alias(&quot;customer_id&quot;), (F.col(&quot;id&quot;) % 5).alias(&quot;tier&quot;))
+print(strat(o.join(cust, &quot;customer_id&quot;)))
+spark.conf.set(&quot;spark.sql.autoBroadcastJoinThreshold&quot;, -1)
+print(strat(o.join(cust, &quot;customer_id&quot;)))</code></pre><div class="output">default autoBroadcastJoinThreshold: 10485760b
+== 1) auto choice
+small dim (4000 rows) -&gt; BroadcastHashJoin
+threshold -1 -&gt; SortMergeJoin</div></div>
+      <span class="behind">The customer side is tiny, far below 10 MB, so Spark picked a <b>broadcast hash join</b> by itself. Disabling the threshold with <code>-1</code> forced it back to <b>sort-merge</b>, the default for “big” joins.</span></li>
+    <li><h4>Step 2 · Hints and timings</h4>
+      <div class="code" data-lang="python" data-file="l82_joins.py"><pre><code>for h in (&quot;broadcast&quot;, &quot;merge&quot;, &quot;shuffle_hash&quot;, &quot;shuffle_replicate_nl&quot;):
+    print(h, strat(o.join(cust.hint(h), &quot;customer_id&quot;)))
+for h in (&quot;broadcast&quot;, &quot;merge&quot;, &quot;shuffle_hash&quot;):
+    run(f&quot;join with {h}&quot;, sink(o.join(cust.hint(h), &quot;customer_id&quot;)))</code></pre><div class="output">== 2) hints (threshold -1, so only hint decides)
+hint broadcast             -&gt; BroadcastHashJoin
+hint merge                 -&gt; SortMergeJoin
+hint shuffle_hash          -&gt; ShuffledHashJoin
+hint shuffle_replicate_nl  -&gt; CartesianProduct
+join with broadcast                       :  1.55 s, tasks    8, spill mem    0.0 MiB disk   0.0 MiB
+join with merge                           :  6.73 s, tasks  208, spill mem    0.0 MiB disk   0.0 MiB
+join with shuffle_hash                    :  4.53 s, tasks  208, spill mem    0.0 MiB disk   0.0 MiB</div></div>
+      <span class="behind">Each hint produced exactly the requested operator. Broadcast: <b>1.55 s</b> with 8 tasks (just scanning orders). Shuffled hash: <b>4.53 s</b>. Sort-merge: <b>6.73 s</b>, 4.3x slower, with 208 tasks because both sides were shuffled into 200 partitions and sorted. <code>shuffle_replicate_nl</code> on an equi-join gave a <b>CartesianProduct</b>: never use it for normal keys.</span></li>
+    <li><h4>Step 3 · Read the plan, count Exchanges</h4>
+      <div class="code" data-lang="python" data-file="l82_joins.py"><pre><code>for h in (&quot;broadcast&quot;, &quot;merge&quot;):
+    p = o.join(cust.hint(h), &quot;customer_id&quot;)._jdf.queryExecution().executedPlan().toString()
+    print(h, p.count(&quot;Exchange hashpartitioning&quot;), p.count(&quot;BroadcastExchange&quot;))</code></pre><div class="output">== 3) exchanges in plan
+broadcast -&gt; Exchange hashpartitioning: 0 | BroadcastExchange: 1
+merge -&gt; Exchange hashpartitioning: 2 | BroadcastExchange: 0</div></div>
+      <span class="behind">The quickest way to understand a join’s cost: count <code>Exchange hashpartitioning</code> nodes. Each is a full shuffle of one side. Broadcast had <b>0</b> (plus one cheap BroadcastExchange of 4,000 rows); sort-merge had <b>2</b>, moving all 5 million orders across the network.</span></li>
+    <li><h4>Step 4 · Forcing a broadcast of a big side</h4>
+      <div class="code" data-lang="python" data-file="l82_joins.py"><pre><code>o2 = o.select(&quot;order_id&quot;, &quot;amount&quot;)          # 5,000,000 rows
+run(&quot;broadcast 5M-row side&quot;, sink(o.join(F.broadcast(o2), &quot;order_id&quot;)))
+run(&quot;sort-merge same join&quot;,  sink(o.join(o2, &quot;order_id&quot;)))</code></pre><div class="output">== 4) forcing broadcast of a BIG side (5M rows)
+broadcast 5M-row side                     :  5.32 s, tasks    8, spill mem    0.0 MiB disk   0.0 MiB
+sort-merge same join                      :  7.62 s, tasks  208, spill mem    0.0 MiB disk   0.0 MiB</div></div>
+      <span class="behind">It worked here and was even faster (5.32 s vs 7.62 s), because we run in one process with a 3 GB driver. On a cluster the driver collects the side, builds the hash table and ships it to every executor: a few hundred MB per executor, times every concurrent job. Spark refuses broadcasts above 8 GB and fails on driver memory or <code>spark.sql.broadcastTimeout</code> (300 s) long before that.</span></li>
+    <li><h4>Step 5 · Bucketing removes the shuffle</h4>
+      <div class="code" data-lang="python" data-file="l82_joins.py"><pre><code>o.write.bucketBy(16, &quot;customer_id&quot;).sortBy(&quot;customer_id&quot;).saveAsTable(&quot;ob&quot;)
+cust.write.bucketBy(16, &quot;customer_id&quot;).sortBy(&quot;customer_id&quot;).saveAsTable(&quot;cb&quot;)
+b = spark.table(&quot;ob&quot;).join(spark.table(&quot;cb&quot;), &quot;customer_id&quot;)   # threshold -1</code></pre><div class="output">== 5) bucketed tables: join without shuffle
+bucketed join: SortMergeJoin | Exchange count: 0
+plain join: SortMergeJoin | Exchange count: 2
+bucketed SMJ                              :  1.68 s, tasks   16, spill mem    0.0 MiB disk   0.0 MiB
+plain SMJ                                 :  5.31 s, tasks  208, spill mem    0.0 MiB disk   0.0 MiB</div></div>
+      <span class="behind">Both tables were written in 16 buckets hashed by <code>customer_id</code>. The join is still a sort-merge join, but with <b>0 Exchanges</b>: bucket 3 of orders only needs bucket 3 of customers. <b>1.68 s vs 5.31 s</b>. The shuffle was paid once at write time, so bucketing pays off when the same big join runs many times. Both sides need the same bucket column and compatible bucket counts.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Who moves, and how much</h2>
+  <p>Left: real outputs. Right: how each strategy moves data.</p>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">Who moves, and how much <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">small dim -&gt; BroadcastHashJoin</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">threshold -1 -&gt; SortMergeJoin</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">broadcast   : 1.55 s,   8 tasks</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">shuffle_hash: 4.53 s, 208 tasks</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">merge       : 6.73 s, 208 tasks</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">broadcast: Exchange 0, Broadcast 1</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">merge    : Exchange 2, Broadcast 0</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">bucketed SMJ: Exchange 0, 1.68 s</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">plain SMJ   : Exchange 2, 5.31 s</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Automatic choice.</li>
+          <li>Forced by hints.</li>
+          <li>Exchanges in the plan.</li>
+          <li>Bucketing.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What Spark does">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Size decides</text><rect x="20" y="40" width="110" height="32" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="75.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">customers</text><text x="75.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">≈ 60 KB</text><path d="M132 56L226 56" style="fill:none;stroke:var(--green);stroke-width:1.1"/><path d="M219.7 59.0L226 56L219.7 53.0" style="fill:none;stroke:var(--green);stroke-width:1.1"/><text x="180" y="50" text-anchor="middle" font-size="8" class="s-ink2">≤ 10 MB ?</text><rect x="230" y="40" width="110" height="32" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="285.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">broadcast</text><text x="285.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">yes</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Else: sort-merge by default.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Broadcast: big side stays put</text><text x="80" y="38" text-anchor="middle" font-size="7" class="s-blue">orders partitions (stay)</text><rect x="30" y="46" width="22" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="58" y="46" width="22" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="86" y="46" width="22" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="114" y="46" width="22" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="36" y="80" width="10" height="10" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="64" y="80" width="10" height="10" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="92" y="80" width="10" height="10" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="120" y="80" width="10" height="10" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="260" y="62" text-anchor="middle" font-size="7.2" class="s-green">copy of dim</text><text x="260" y="92" text-anchor="middle" font-size="7.2" class="s-green">per executor</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">8 tasks, no shuffle.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Sort-merge: both move</text><rect x="8" y="50" width="72" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="44.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">orders</text><text x="44.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">shuffle</text><rect x="94" y="50" width="72" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="130.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">customers</text><text x="130.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">shuffle</text><path d="M80 65.0L94 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M87.7 68.0L94 65.0L87.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="180" y="50" width="72" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="216.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">sort</text><text x="216.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">both</text><path d="M166 65.0L180 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M173.7 68.0L180 65.0L173.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="266" y="50" width="72" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="302.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">merge</text><text x="302.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">walk</text><path d="M252 65.0L266 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M259.7 68.0L266 65.0L259.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">2 Exchanges, 208 tasks.</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bucketed: pre-shuffled</text><rect x="20" y="46" width="74" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="57.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">bucket 0</text><text x="57.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">o ⋈ c</text><rect x="104" y="46" width="74" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="141.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">bucket 1</text><text x="141.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">o ⋈ c</text><rect x="188" y="46" width="74" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="225.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">bucket 2</text><text x="225.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">o ⋈ c</text><rect x="272" y="46" width="74" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="309.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">bucket 3</text><text x="309.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">o ⋈ c</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Matching buckets join locally.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Threshold check.</li>
+          <li>Broadcast hash join.</li>
+          <li>Sort-merge join.</li>
+          <li>Bucketed join.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a global threshold mistake, a wrong size estimate, and a repeated big-to-big join.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-threshold">The global -1</h3>
+  <p class="anim-intro">Broadcast threshold regressions. (Typical; timings from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Broadcast threshold <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A global broadcast threshold of -1 made every dimension join a sort-merge join">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Threshold set to -1</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">to stop one OOM elsewhere</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Global setting.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Every dim join shuffles</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">1.55 s → 6.73 s in our lab</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">4x slower, silently.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Restore the default</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">10 MB (or a bit higher)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Small sides broadcast again.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix the real OOM locally</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">hint("merge") on that one join</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Targeted, not global.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Check plans in CI</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">expect BroadcastHashJoin</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Catch regressions.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>-1.</li>
+          <li>Slow.</li>
+          <li>Default.</li>
+          <li>Local fix.</li>
+          <li>CI check.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-hint">When the optimizer guesses wrong</h3>
+  <p class="anim-intro">Broadcast hints. (Typical; behaviour from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Broadcast hint <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Use AQE or a broadcast hint when a side is small after filtering">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Dim filtered at run time</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">estimate 2 GB, real 3 MB</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Optimizer guesses wrong.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Plan: sort-merge</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">big fact table shuffled</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Slow.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Option 1: AQE</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">switches at run time (7.4)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Automatic.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Option 2: hint</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">F.broadcast(dim_filtered)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">You know it is small.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Verify in the SQL tab</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">BroadcastHashJoin in final plan</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Measure.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Wrong estimate.</li>
+          <li>SMJ.</li>
+          <li>AQE.</li>
+          <li>Hint.</li>
+          <li>Verify.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-bucket">The hourly big-to-big join</h3>
+  <p class="anim-intro">Bucketing to avoid repeated shuffles. (Typical; timings from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Bucketing <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Bucket both tables on the join key so repeated sort-merge joins skip the shuffle">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Orders ⋈ deliveries, hourly</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">both 500 GB, same key</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Two full shuffles every hour.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bucket both by order_id</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">bucketBy(512, "order_id")</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Shuffle paid once at write.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Join plan: no Exchange</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">1.68 s vs 5.31 s in our lab</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each hour saves the shuffle.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Catch: bucket rules</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">same key; table must be read as a table</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Not just a parquet path.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Modern alternative</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">Iceberg/Delta clustering + SPJ</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Storage-partitioned joins.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Big × big.</li>
+          <li>Bucket.</li>
+          <li>No shuffle.</li>
+          <li>Rules.</li>
+          <li>Alternatives.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Join strategies at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-blue">star</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">schema</text></svg></div>
+    <div><h4>1. Fact-to-dimension joins</h4>
+      <p>Orders joined to cities, restaurants and plans: every dimension under the threshold is broadcast.</p>
+      <div class="uc-flow"><span>Fact</span><i>→</i><span class="java">broadcast dims</span><i>→</i><span>No shuffle</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-green">big×big</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">SMJ</text></svg></div>
+    <div><h4>2. Large-to-large joins</h4>
+      <p>Sessions joined to clickstream use sort-merge; tuning focuses on partitions and skew.</p>
+      <div class="uc-flow"><span>Big</span><i>→</i><span class="java">sort-merge</span><i>→</i><span>Big</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">bucket</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">tables</text></svg></div>
+    <div><h4>3. Repeated joins</h4>
+      <p>Tables joined many times a day on the same key are bucketed or clustered once.</p>
+      <div class="uc-flow"><span>Write once</span><i>→</i><span class="java">bucketBy</span><i>→</i><span>Join many</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">range</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">joins</text></svg></div>
+    <div><h4>4. Range joins</h4>
+      <p>Matching GPS pings to time windows uses non-equi conditions; keep one side small to get a broadcast nested loop join.</p>
+      <div class="uc-flow"><span>ts BETWEEN</span><i>→</i><span class="java">BNLJ (small side)</span><i>→</i><span>Matches</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">hint</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">review</text></svg></div>
+    <div><h4>5. Code reviews</h4>
+      <p>Teams require a comment on every broadcast hint explaining why the side is small.</p>
+      <div class="uc-flow"><span>Hint</span><i>→</i><span class="java">size proof</span><i>→</i><span>Safe merge</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>

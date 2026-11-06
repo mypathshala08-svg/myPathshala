@@ -1,0 +1,1517 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Idempotent producer and retries | MyPhatshala</title>
+<meta name="description" content="How Kafka retries create duplicates and how the idempotent producer prevents them with a producer id, epoch and per-partition sequence numbers. Real Kafka 4.4 lab: a frozen follower delays acks=all, the producer retries, and one payment is stored three times with idempotence off but once with it on, proven with kafka-dump-log. Plus ordering with in-flight requests, retry backoff and what idempotence cannot cover.">
+<meta name="mp:minutes" content="26">
+<link rel="canonical" href="https://myphatshala.in/courses/kafka/02-producers/05-idempotent-producer-and-retries/">
+<meta property="og:title" content="Idempotent producer and retries · MyPhatshala">
+<meta property="og:description" content="We made Kafka store one payment three times, then fixed it with idempotence: PID and sequence numbers proven on disk.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Idempotent producer and retries", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Kafka", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="02-producers/05-idempotent-producer-and-retries" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Kafka syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Kafka</a><span>›</span><b>Lesson 2.5</b></nav>
+    <h1>Idempotent producer and retries</h1>
+    <p class="lead">Retries keep data safe but can <b>duplicate</b> it. We create a real duplicate on a Kafka 4.4 cluster, read the <b>producer id and sequence numbers</b> on disk, and prevent it with the <b>idempotent producer</b>. <b>All outputs are real.</b></p>
+    <div class="lesson-meta"><span>Module 2 · Producers</span><span>⏱ 26 min</span><span>Intermediate</span><span>Real duplicate created</span><span>PID + sequence on disk</span><span>Limits explained</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>One payment, stored three times</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> <a href="../04-acks-and-durability/">2.4 acks and durability</a> (ISR, acks=all).</p></div>
+  <div class="story">
+<div class="callout callout--exam" style="display:block"><p style="font-size:1.12rem;margin:0 0 6px"><b>🤔 One ₹75,000 payment was stored three times. Kafka did nothing wrong. Then we flipped one setting.</b></p><p style="margin:0 0 6px">We froze one follower so acknowledgements were late. The producer thought its request was lost and retried: with idempotence <b>off</b>, the same payment landed at offsets 0, 1 and 2. With idempotence <b>on</b>, the broker recognised the retry and stored it once. You will see the producer id and sequence numbers that make the difference.</p><ul style="margin:0 0 0 18px"><li>Why retries create duplicates in the first place.</li><li>The three numbers (producer id, epoch, sequence) the broker checks.</li><li>What idempotence does <b>not</b> protect you from.</li></ul></div>
+
+    <p class="narration">A TiffinGo customer complains of a triple charge. The logs show the payment service called <code>produce()</code> only once. Kabir has to explain how Kafka ended up with three copies.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Left: with idempotence off, payment t045 was stored three times at offsets 0, 1 and 2 with producerId -1. Right: with idempotence on, it was stored once at offset 0 with producerId 7001 and sequence 0. Both runs had the same failure: a frozen follower delayed the acknowledgement and the producer retried.">
+        <text x="160" y="18" text-anchor="middle" font-size="9" font-weight="700" class="s-red">idempotence OFF</text><text x="34" y="47.0" text-anchor="end" font-size="8" font-weight="700" class="s-ink">P0</text><rect x="40" y="32" width="58" height="24" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="69.0" y="47.0" text-anchor="middle" font-size="7" class="s-ink mono">t045</text><rect x="100" y="32" width="58" height="24" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="129.0" y="47.0" text-anchor="middle" font-size="7" class="s-ink mono">t045</text><rect x="160" y="32" width="58" height="24" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="189.0" y="47.0" text-anchor="middle" font-size="7" class="s-ink mono">t045</text><text x="160" y="78" text-anchor="middle" font-size="8" class="s-red">offsets 0, 1, 2: three copies</text><text x="160" y="98" text-anchor="middle" font-size="7.8" class="s-ink2 mono">producerId: -1  (no sequence)</text><text x="480" y="18" text-anchor="middle" font-size="9" font-weight="700" class="s-green">idempotence ON</text><text x="374" y="47.0" text-anchor="end" font-size="8" font-weight="700" class="s-ink">P0</text><rect x="380" y="32" width="58" height="24" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="409.0" y="47.0" text-anchor="middle" font-size="7" class="s-ink mono">t045</text><text x="480" y="78" text-anchor="middle" font-size="8" class="s-green">offset 0: one copy</text><text x="480" y="98" text-anchor="middle" font-size="7.8" class="s-ink2 mono">producerId: 7001  baseSequence: 0</text><rect x="14" y="110" width="612" height="24" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="320" y="126" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink">Same failure both times: follower frozen → late ack → producer timeout → retry</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Retries are safe only with <tspan font-weight="700" class="s-acc">idempotence</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, how can a payment be stored three times? The producer sent it once.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>The producer sent it once, did not get an answer in time, and sent it again. And again. The broker had stored every attempt; only the <i>answers</i> were late.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>So should we turn retries off?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Then a short network blip loses payments. The real fix is <b>idempotence</b>: the broker remembers who sent what, using a producer id and sequence numbers, and ignores copies. Let’s create the duplicate for real, then prevent it.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Idempotent producer and retries</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>An <b>idempotent producer</b> (<code>enable.idempotence=true</code>, default since Kafka 3.0) guarantees that retries do not introduce duplicates or reorder records within a partition for the lifetime of the producer session. The broker assigns a <b>producer id</b> and <b>epoch</b>; the producer attaches a monotonically increasing <b>sequence number</b> per partition to each batch. The partition leader tracks the most recent sequences per producer and rejects or acknowledges-without-append any batch whose sequence it has already written. Idempotence requires acks=all, retries enabled and at most 5 in-flight requests per connection.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>The broker remembers which producer sent which numbered batch. If the same numbered batch arrives again because of a retry, the broker says “OK, got it” but does not store it a second time.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Retry</b><span>Resending after an error/timeout.</span></div>
+    <div class="term"><b>Idempotent</b><span>Doing it twice = doing it once.</span></div>
+    <div class="term"><b>Producer id (PID)</b><span>Id given to a producer session.</span></div>
+    <div class="term"><b>Epoch</b><span>Version of that producer id.</span></div>
+    <div class="term"><b>Sequence number</b><span>Per-partition batch counter.</span></div>
+    <div class="term"><b>In-flight requests</b><span>Sent but not yet answered.</span></div>
+    <div class="term"><b>OUT_OF_ORDER_SEQUENCE</b><span>Gap in sequences detected.</span></div>
+    <div class="term"><b>Zombie producer</b><span>Old instance still writing.</span></div>
+  </div>
+
+  <h3>Why, how, where</h3>
+  <div class="cards">
+    <div class="card"><h4>Why</h4><p>Networks lose responses, not just requests. A producer that retries cannot know whether the first attempt was stored, so without help it may store the record twice.</p><span class="tag">the problem it solves</span></div>
+    <div class="card"><h4>How</h4><p>The broker gives each producer an id; the producer numbers every batch per partition. The broker keeps the last sequences and silently drops a batch it already has.</p><span class="tag">the mechanism</span></div>
+    <div class="card"><h4>Where</h4><p>On by default in every modern Kafka client: payments, orders, CDC, anything where a duplicate costs money.</p><span class="tag">in real systems</span></div>
+    <div class="card"><h4>When not</h4><p>It does not deduplicate across producer restarts or when your app calls produce() twice for the same business event: use transactions or business keys.</p><span class="tag">know the limits</span></div>
+  </div>
+
+  <h3>Concept map: what depends on what</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 230" role="img" aria-label="Concept map. Beginner: retry, duplicate, enable.idempotence. Intermediate: producer id, epoch, sequence numbers, max.in.flight and ordering, retry timeouts. Advanced: transactions, exactly-once, application-level deduplication.">
+        <rect x="14" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="112" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-green">Beginner</text><rect x="28" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="112.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Retries</text><text x="112.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">resend on error</text><rect x="28" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="112.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Duplicates</text><text x="112.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">same record twice</text><rect x="28" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="112.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">enable.idempotence</text><text x="112.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">default true</text><rect x="224" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="322" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-blue">Intermediate</text><rect x="238" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Producer id + epoch</text><text x="322.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">who is writing</text><rect x="238" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Sequence numbers</text><text x="322.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">per partition</text><rect x="238" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">max.in.flight ≤ 5</text><text x="322.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">ordering</text><a href="../../02-producers/01-how-a-producer-sends-a-message/"><rect x="238" y="150" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="161" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Retry timing</text><text x="322.0" y="171" text-anchor="middle" font-size="6.4" class="s-ink2 mono">backoff + deadline</text></a><rect x="434" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="532" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-violet">Advanced</text><a href="../../03-consumers/05-transactions-and-exactly-once/"><rect x="448" y="36" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Transactions</text><text x="532.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 3.5</text></a><a href="../../03-consumers/04-delivery-guarantees/"><rect x="448" y="74" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Exactly-once</text><text x="532.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">end to end</text></a><rect x="448" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">App-level dedup</text><text x="532.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">restarts, re-sends</text><path d="M112 66L112 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M109.0 67.7L112 74L115.0 67.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M112 104L112 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M109.0 105.7L112 112L115.0 105.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 127L238 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M237.6 58.0L238 51L232.3 55.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 66L322 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 67.7L322 74L325.0 67.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 104L322 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 105.7L322 112L325.0 105.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 51L448 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M441.7 54.0L448 51L441.7 48.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M532 66L532 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M529.0 67.7L532 74L535.0 67.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 89L448 127" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M441.3 125.0L448 127L445.4 120.5" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 51L238 165" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M233.0 160.1L238 165L238.7 158.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><text x="320" y="212" text-anchor="middle" font-size="8" class="s-ink2">Orange = this lesson · arrows = “you need this first” · click a box to jump</text>
+        
+        <text x="632" y="228" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>  <p class="muted"><b>Builds on:</b> <a href="../04-acks-and-durability/">2.4 acks</a>. <b>Next:</b> Module 3, <a href="../../03-consumers/01-consumers-and-consumer-groups/">3.1 Consumers and consumer groups</a>.</p>
+
+
+  <h3>Dissect the evidence</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 230" role="img" aria-label="Dissection of two kafka-dump-log lines. Without idempotence: producerId -1, baseSequence -1, three batches. With idempotence: producerId 7001, producerEpoch 0, baseSequence 0, one batch.">
+        <text x="16" y="22" font-size="8.6" font-weight="700" class="s-red">kafka-dump-log, idempotence OFF (3 batches)</text><rect x="16" y="32" width="110.952" height="22" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="71.476" y="46.0" text-anchor="middle" font-size="7.6" class="s-ink mono">baseOffset: 0 / 1 / 2</text><circle cx="18" cy="30" r="8" class="s-acc" style="fill:var(--track)"/><text x="18" y="33" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><rect x="130.952" y="32" width="87.392" height="22" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="174.648" y="46.0" text-anchor="middle" font-size="7.6" class="s-ink mono">baseSequence: -1</text><circle cx="132.952" cy="30" r="8" class="s-acc" style="fill:var(--track)"/><text x="132.952" y="33" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><rect x="222.344" y="32" width="77.96799999999999" height="22" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="261.328" y="46.0" text-anchor="middle" font-size="7.6" class="s-ink mono">producerId: -1</text><rect x="304.312" y="32" width="92.104" height="22" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="350.36400000000003" y="46.0" text-anchor="middle" font-size="7.6" class="s-ink mono">producerEpoch: -1</text><text x="16" y="78" font-size="8.6" font-weight="700" class="s-green">kafka-dump-log, idempotence ON (1 batch)</text><rect x="16" y="88" width="73.256" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="52.628" y="102.0" text-anchor="middle" font-size="7.6" class="s-ink mono">baseOffset: 0</text><rect x="93.256" y="88" width="82.67999999999999" height="22" rx="3" class="s-soft-violet" style="stroke:var(--violet)"/><text x="134.596" y="102.0" text-anchor="middle" font-size="7.6" class="s-ink mono">baseSequence: 0</text><circle cx="95.256" cy="86" r="8" class="s-acc" style="fill:var(--track)"/><text x="95.256" y="89" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><rect x="179.93599999999998" y="88" width="87.392" height="22" rx="3" class="s-soft-violet" style="stroke:var(--violet)"/><text x="223.63199999999998" y="102.0" text-anchor="middle" font-size="7.6" class="s-ink mono">producerId: 7001</text><circle cx="181.93599999999998" cy="86" r="8" class="s-acc" style="fill:var(--track)"/><text x="181.93599999999998" y="89" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><rect x="271.328" y="88" width="87.392" height="22" rx="3" class="s-soft-violet" style="stroke:var(--violet)"/><text x="315.024" y="102.0" text-anchor="middle" font-size="7.6" class="s-ink mono">producerEpoch: 0</text><circle cx="273.328" cy="86" r="8" class="s-acc" style="fill:var(--track)"/><text x="273.328" y="89" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">5</text><circle cx="24" cy="141" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="144" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><text x="38" y="144" font-size="8" font-weight="700" class="s-ink">Three batches</text><text x="126" y="144" font-size="7.6" class="s-ink2">each retry was appended as a new batch: duplicates</text><circle cx="24" cy="156" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="159" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><text x="38" y="159" font-size="8" font-weight="700" class="s-ink">No sequence</text><text x="126" y="159" font-size="7.6" class="s-ink2">the broker has nothing to compare, so it cannot detect a repeat</text><circle cx="24" cy="171" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="174" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><text x="38" y="174" font-size="8" font-weight="700" class="s-ink">Sequence 0</text><text x="126" y="174" font-size="7.6" class="s-ink2">first batch of this producer for this partition</text><circle cx="24" cy="186" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="189" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><text x="38" y="189" font-size="8" font-weight="700" class="s-ink">Producer id</text><text x="126" y="189" font-size="7.6" class="s-ink2">assigned by the cluster when the producer started</text><circle cx="24" cy="201" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="204" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">5</text><text x="38" y="204" font-size="8" font-weight="700" class="s-ink">Epoch</text><text x="126" y="204" font-size="7.6" class="s-ink2">bumps when a producer is re-initialised; fences zombies</text>
+        <text x="320" y="220" text-anchor="middle" font-size="10.5" class="s-ink2">Real dump-log fields from our two runs.</text>
+        <text x="632" y="228" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+  <h3 id="levels">Idempotence at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Numbered cheques</h4>
+      <ul>
+        <li>Each cheque from your chequebook has a number. If the bank receives cheque no. 17 twice, it pays only once. The producer id is your account; the sequence is the cheque number.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How it works</h4>
+      <ul>
+        <li>On start, the producer gets a <b>producer id (PID)</b> and <b>epoch</b> from the broker (InitProducerId).</li>
+        <li>For every partition it numbers batches with a <b>sequence</b> 0, 1, 2 … The leader stores PID, epoch and sequences with each batch.</li>
+        <li>If a batch arrives with a sequence already stored, the leader returns success <i>without</i> appending again. A gap in sequences gives <code>OUT_OF_ORDER_SEQUENCE_NUMBER</code>.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Rules and limits</h4>
+      <ul>
+        <li>Requires <code>acks=all</code>, <code>retries &gt; 0</code> and <code>max.in.flight.requests.per.connection ≤ 5</code>; brokers keep state for the last 5 batches per producer per partition, which also keeps order on retries.</li>
+        <li>Without idempotence, <code>max.in.flight &gt; 1</code> plus retries can <b>reorder</b> records (batch 2 succeeds, batch 1 retried later).</li>
+        <li>A restarted producer gets a <b>new PID</b>, so re-sending after a crash is not deduplicated. For read-process-write pipelines use <b>transactions</b> (<code>transactional.id</code>, Lesson 3.5), which also fence old “zombie” producers via the epoch.</li>
+        <li>Retry pacing: <code>retry.backoff.ms</code> (100 ms) growing to <code>retry.backoff.max.ms</code> (1 s) with exponential backoff (KIP-580); everything stops at the delivery timeout.</li>
+      </ul>
+
+    </div>
+  </div>
+<div class="callout callout--warn" style="display:block"><p style="margin:0 0 6px"><b>Myth vs reality: things many websites still say</b></p><ul style="margin:0 0 0 18px"><li><b>Myth:</b> Duplicates only happen if the app sends twice.<br><b>Reality (Kafka 4.4):</b> Producer retries after a lost or late response also duplicate.<br><span class="muted">Proof: Step 2: one produce(), three copies.</span></li><li><b>Myth:</b> Idempotence uses a “request id”.<br><b>Reality (Kafka 4.4):</b> It uses a producer id, epoch and per-partition sequence numbers.<br><span class="muted">Proof: Step 3: producerId 7001, baseSequence 0.</span></li><li><b>Myth:</b> Idempotence gives exactly-once end to end.<br><b>Reality (Kafka 4.4):</b> Only within one producer session; restarts and consumers need more.<br><span class="muted">Proof: Types table: restarts get a new PID.</span></li></ul></div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “How does the idempotent producer work?” Broker assigns PID/epoch; producer numbers batches per partition; leader keeps last 5 sequences per PID and drops duplicates; requires acks=all, retries>0, max.in.flight ≤5; default since 3.0; covers retries within a session, not restarts (use transactions).</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Settings and limits</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th>Setting</th><th>Default (Kafka 3.0+)</th><th>Effect</th></tr></thead>
+    <tbody><tr><td>enable.idempotence</td><td>true</td><td>PID + sequences; no duplicates from retries</td></tr><tr><td>acks</td><td>all</td><td>required for idempotence</td></tr><tr><td>retries</td><td>2147483647 (Java)</td><td>retry until the delivery timeout</td></tr><tr><td>max.in.flight.requests.per.connection</td><td>5</td><td>≤ 5 keeps order with idempotence</td></tr><tr><td>retry.backoff.ms / retry.backoff.max.ms</td><td>100 ms / 1000 ms</td><td>exponential pause between retries</td></tr><tr><td>delivery.timeout.ms (Java) / message.timeout.ms</td><td>120 s / 300 s</td><td>stop retrying, report error</td></tr></tbody>
+  </table>
+  </div>  <div class="table-wrap">
+  <table class="compare" style="min-width:560px">
+    <thead><tr><th>Duplicate source</th><th>Fixed by idempotence?</th><th>Use instead</th></tr></thead>
+    <tbody><tr><td>Producer retry after a lost response</td><td>yes</td><td>—</td></tr><tr><td>Producer app restarts and re-sends</td><td>no (new PID)</td><td>transactions or business-key dedup</td></tr><tr><td>App calls produce() twice for one event</td><td>no</td><td>dedup in app (e.g. payment id)</td></tr><tr><td>Consumer re-processes after a crash</td><td>no</td><td>idempotent consumer / transactions (Module 3)</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>If you explicitly set <code>acks=1</code> or <code>max.in.flight.requests.per.connection</code> above 5 in the Java client, idempotence cannot work. If you <i>also</i> set <code>enable.idempotence=true</code> explicitly, the producer fails at startup with a config error; if you left it at the default, it is silently turned off. Check effective configs, not just what you think you set.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Create a duplicate, then prevent it</h2>
+  <p>All outputs are real: Kafka 4.4.0, 3 brokers; Python <code>confluent-kafka</code>; one-partition topics with replicas on brokers 1, 2, 3; follower k3 frozen with <code>docker pause</code>. Script: <code>jobs/m2/l25_dup.py</code>.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Freeze a follower, idempotence OFF</h4>
+      <div class="code" data-lang="python" data-file="l25_dup.py"><pre><code>p = Producer({&quot;bootstrap.servers&quot;: &quot;k1:9092&quot;, &quot;acks&quot;: &quot;all&quot;, &quot;enable.idempotence&quot;: False,
+              &quot;retries&quot;: 10, &quot;request.timeout.ms&quot;: 3000, &quot;retry.backoff.ms&quot;: 500})
+p.produce(topic, key=&quot;user3@upi&quot;, value=&quot;pay Rs 75000 (t045)&quot;)
+# meanwhile: docker pause k3  (a follower of this partition)</code></pre><div class="output">== 1) idempotence OFF
+  Topic: idem-off	Partition: 0	Leader: 1	Replicas: 1,2,3	Isr: 1,2,3
+  $ docker pause k3   (follower frozen; leader waits for it before acks=all)
+  enable.idempotence=False: delivered after 8 s -&gt; [&#x27;offset 2&#x27;]</div></div>
+      <span class="behind">Leader 1 appends at once but must wait for follower 3 (acks=all). Our request timed out after 3 s, so the producer retried, twice. About 8 s later the controller fenced the frozen broker (its session timed out), the ISR shrank and the leader finally answered “offset 2”.</span></li>
+    <li><h4>Step 2 · Look inside: three copies</h4>
+      <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-console-consumer.sh --topic idem-off --from-beginning --formatter-property print.offset=true
+kafka-dump-log.sh --files /var/lib/kafka/data/idem-off-0/00000000000000000000.log</code></pre><div class="output">  records in the partition:
+    Offset:0	pay Rs 75000 (t045)
+    Offset:1	pay Rs 75000 (t045)
+    Offset:2	pay Rs 75000 (t045)
+  batches on disk (kafka-dump-log):
+    baseOffset: 0 baseSequence: -1 lastSequence: -1 producerId: -1 producerEpoch: -1
+    baseOffset: 1 baseSequence: -1 lastSequence: -1 producerId: -1 producerEpoch: -1
+    baseOffset: 2 baseSequence: -1 lastSequence: -1 producerId: -1 producerEpoch: -1</div></div>
+      <span class="behind">Offsets 0, 1, 2 all contain the same payment. The batches carry <code>producerId: -1</code> and no sequence, so the broker had no way to know they were the same.</span></li>
+    <li><h4>Step 3 · Same failure, idempotence ON</h4>
+      <div class="code" data-lang="python" data-file="l25_dup.py"><pre><code>Producer({..., &quot;enable.idempotence&quot;: True, ...})   # the default since Kafka 3.0</code></pre><div class="output">== 2) idempotence ON (the default since Kafka 3.0)
+  Topic: idem-on	Partition: 0	Leader: 1	Replicas: 1,2,3	Isr: 1,2,3
+  $ docker pause k3   (follower frozen; leader waits for it before acks=all)
+  enable.idempotence=True: delivered after 9 s -&gt; [&#x27;offset 0&#x27;]
+  records in the partition:
+    Offset:0	pay Rs 75000 (t045)
+  batches on disk (kafka-dump-log):
+    baseOffset: 0 baseSequence: 0 lastSequence: 0 producerId: 7001 producerEpoch: 0</div></div>
+      <span class="behind">The producer again waited and retried, but now each attempt carried <code>producerId 7001, sequence 0</code>. The leader saw sequence 0 was already stored, answered success, and appended nothing new: <b>one copy</b>.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Two views of the same run</h2>
+  <p>Left: real lab output. Right: what happens inside.</p>
+  <div class="anim" data-frames="3">
+    <div class="anim__title">Retry without duplicates <span>3 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real outputs from the lab">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">idempotence=False</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">$ docker pause k3</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">delivered after 8 s -&gt; offset 2</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Offset:0  pay Rs 75000 (t045)</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Offset:1  pay Rs 75000 (t045)</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Offset:2  pay Rs 75000 (t045)</text><text x="26" y="92" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">producerId: -1</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">idempotence=True -&gt; offset 0</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Offset:0  pay Rs 75000 (t045)</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">producerId: 7001  baseSequence: 0</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Retry.</li>
+          <li>Duplicates.</li>
+          <li>Idempotent.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What the leader decides">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Ack is late, producer retries</text><rect x="10" y="40" width="80" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="50.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">producer</text><text x="50.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">no PID</text><rect x="260" y="40" width="90" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="305.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">leader</text><path d="M90 48L260 48" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M253.7 51.0L260 48L253.7 45.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><text x="175" y="44" text-anchor="middle" font-size="7" class="s-ink2">try 1</text><path d="M260 64L90 64" style="fill:none;stroke:#D64545;stroke-width:1"/><path d="M96.3 61.0L90 64L96.3 67.0" style="fill:none;stroke:#D64545;stroke-width:1"/><text x="175" y="76" text-anchor="middle" font-size="7" class="s-red">ack late → timeout</text><path d="M90 96L260 96" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M253.7 99.0L260 96L253.7 93.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><text x="175" y="92" text-anchor="middle" font-size="7" class="s-ink2">retry</text><text x="300" y="116" text-anchor="middle" font-size="7.6" font-weight="700" class="s-red">appended again</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Retry looks like a new record.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Three copies stored</text><text x="64" y="65.0" text-anchor="end" font-size="8" font-weight="700" class="s-ink">P0</text><rect x="70" y="50" width="60" height="24" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="100.0" y="65.0" text-anchor="middle" font-size="7" class="s-ink mono">t045</text><rect x="132" y="50" width="60" height="24" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="162.0" y="65.0" text-anchor="middle" font-size="7" class="s-ink mono">t045</text><rect x="194" y="50" width="60" height="24" rx="3" class="s-soft-acc" style="stroke:#D64545"/><text x="224.0" y="65.0" text-anchor="middle" font-size="7" class="s-ink mono">t045</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No PID: no way to detect.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Same retry, PID + sequence</text><rect x="10" y="40" width="80" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="50.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">producer</text><text x="50.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">PID 7001</text><rect x="260" y="40" width="90" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="305.0" y="56" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">leader</text><path d="M90 48L260 48" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M253.7 51.0L260 48L253.7 45.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><text x="175" y="44" text-anchor="middle" font-size="7" class="s-ink2">try 1</text><path d="M260 64L90 64" style="fill:none;stroke:#D64545;stroke-width:1"/><path d="M96.3 61.0L90 64L96.3 67.0" style="fill:none;stroke:#D64545;stroke-width:1"/><text x="175" y="76" text-anchor="middle" font-size="7" class="s-red">ack late → timeout</text><path d="M90 96L260 96" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M253.7 99.0L260 96L253.7 93.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><text x="175" y="92" text-anchor="middle" font-size="7" class="s-ink2">retry (seq 0)</text><text x="300" y="116" text-anchor="middle" font-size="7.6" font-weight="700" class="s-green">seq 0 seen → skip</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Deduplicated by the broker.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Timeout.</li>
+          <li>Three copies.</li>
+          <li>Skip.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Now peel the retry with idempotence.</p>
+
+  <span class="live">Layer by layer</span>
+  <h3 id="scenario-peel">Retry of payment t045 with idempotence</h3>
+  <p class="anim-intro">From startup to the duplicate check. (Our run.)</p>
+  <div class="anim anim--one" data-frames="6" data-delay="5000">
+    <div class="anim__title">Layers <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Each layer of the system, from your code down to the disk">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. InitProducerId</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Number batch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. First attempt</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Timeout + retry</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Leader check</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Answer</text><rect x="134" y="26" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="35.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">InitProducerId</text><text x="184" y="53" font-size="7.4" class="s-ink2">cluster assigns</text><text x="184" y="66" font-size="7.4" class="s-ink2">PID 7001, epoch 0</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. InitProducerId</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Number batch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. First attempt</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Timeout + retry</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Leader check</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Answer</text><rect x="134" y="48" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="57.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 40L149 48" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 41.7L149 48L152.0 41.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Number batch</text><text x="184" y="53" font-size="7.4" class="s-ink2">first batch for P0</text><text x="184" y="66" font-size="7.4" class="s-ink2">gets sequence 0</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. InitProducerId</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Number batch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. First attempt</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Timeout + retry</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Leader check</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Answer</text><rect x="134" y="70" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="79.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 62L149 70" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 63.7L149 70L152.0 63.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">First attempt</text><text x="184" y="53" font-size="7.4" class="s-ink2">leader appends offset 0</text><text x="184" y="66" font-size="7.4" class="s-ink2">waits for ISR (k3 frozen)</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. InitProducerId</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Number batch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. First attempt</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Timeout + retry</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Leader check</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Answer</text><rect x="134" y="92" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="101.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 84L149 92" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 85.7L149 92L152.0 85.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Timeout + retry</text><text x="184" y="53" font-size="7.4" class="s-ink2">no answer in 3 s</text><text x="184" y="66" font-size="7.4" class="s-ink2">resend: PID 7001, seq 0</text><text x="184" y="79" font-size="7.4" class="s-ink2">same numbers</text></g><g data-on="5"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. InitProducerId</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Number batch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. First attempt</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Timeout + retry</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Leader check</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Answer</text><rect x="134" y="114" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="123.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 106L149 114" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 107.7L149 114L152.0 107.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Leader check</text><text x="184" y="53" font-size="7.4" class="s-ink2">PID 7001 seq 0</text><text x="184" y="66" font-size="7.4" class="s-ink2">already at offset 0</text><text x="184" y="79" font-size="7.4" class="s-ink2">→ do not append</text></g><g data-on="6"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. InitProducerId</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Number batch</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. First attempt</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Timeout + retry</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Leader check</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Answer</text><rect x="134" y="136" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="145.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 128L149 136" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 129.7L149 136L152.0 129.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Answer</text><text x="184" y="53" font-size="7.4" class="s-ink2">success, offset 0</text><text x="184" y="66" font-size="7.4" class="s-ink2">one copy on disk</text><text x="184" y="79" font-size="7.4" class="s-ink2">proved by dump-log</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>PID.</li>
+          <li>Number.</li>
+          <li>Send.</li>
+          <li>Retry.</li>
+          <li>Check.</li>
+          <li>Once.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios: double charges, crash re-sends, and reordering.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-double">Double-charged customers</h3>
+  <p class="anim-intro">Retries without idempotence. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Idempotence <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Keep enable.idempotence=true (the default)">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Old config copied</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">enable.idempotence=false</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">From a 2018 blog.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Network blip</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">responses delayed</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Retries.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Payments duplicated</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">billing charges twice</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Refunds.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Remove the override</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">default true</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">acks=all.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Same blip, no dupes</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">like Step 3</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fixed.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Config.</li>
+          <li>Blip.</li>
+          <li>Double.</li>
+          <li>Fix.</li>
+          <li>Safe.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-restart">Duplicates after a crash</h3>
+  <p class="anim-intro">What idempotence cannot catch. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Beyond idempotence <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Restarts get a new producer id; use transactions or business-key dedup">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Producer sent t045</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">app crashed before callback</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Unsure.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">App restarts, re-sends</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">new PID 7002</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Not a retry.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Broker stores it again</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">different PID</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Duplicate.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Consumer dedups by txn id</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">or transactions</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lesson 3.5.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Design for it</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">idempotent consumers</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">End-to-end.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Crash.</li>
+          <li>Re-send.</li>
+          <li>Dupe.</li>
+          <li>Dedup.</li>
+          <li>Design.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-order">Reordered events</h3>
+  <p class="anim-intro">Retries with many in-flight requests. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Ordering on retry <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Idempotence keeps order with up to 5 in-flight requests">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">PLACED then PAID</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">two batches in flight</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same partition.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">PLACED batch fails</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">PAID succeeds</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Retry later.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Without idempotence</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">PAID before PLACED</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Wrong state.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">With idempotence</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">sequence gap → broker waits</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Order kept.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Rule</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">idempotence + in-flight ≤ 5</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Defaults.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Two batches.</li>
+          <li>Failure.</li>
+          <li>Reorder.</li>
+          <li>Kept.</li>
+          <li>Rule.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Idempotence at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green">pay</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">charges</text></svg></div>
+    <div><h4>1. Payments</h4>
+      <p>Retries during network blips never double-charge.</p>
+      <div class="uc-flow"><span>Payment</span><i>→</i><span class="java">PID + seq</span><i>→</i><span>Once</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">order</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">status</text></svg></div>
+    <div><h4>2. Order status</h4>
+      <p>PLACED, PAID, DELIVERED stay in order despite retries.</p>
+      <div class="uc-flow"><span>Events</span><i>→</i><span class="java">in-flight ≤ 5</span><i>→</i><span>Ordered</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">CDC</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">changes</text></svg></div>
+    <div><h4>3. Database change capture</h4>
+      <p>Connectors rely on idempotent producers (Module 7).</p>
+      <div class="uc-flow"><span>DB</span><i>→</i><span class="java">idempotent</span><i>→</i><span>No dupes</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">bank</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">ledger</text></svg></div>
+    <div><h4>4. Ledgers</h4>
+      <p>Add business-key dedup for app restarts.</p>
+      <div class="uc-flow"><span>Txn id</span><i>→</i><span class="java">dedup</span><i>→</i><span>Exact</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">stream</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">EOS</text></svg></div>
+    <div><h4>5. Stream processing</h4>
+      <p>Kafka Streams builds exactly-once on idempotence + transactions.</p>
+      <div class="uc-flow"><span>Input</span><i>→</i><span class="java">transactions</span><i>→</i><span>Output</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified descriptions of common patterns.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: dedup by sequence</h2>
+  <p>The leader’s check in a few lines. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># A leader that deduplicates by (producer id, sequence)
+log, seen = [], {}            # seen[(pid, partition)] = last sequence written
+
+def append(pid, seq, value, idempotent=True):
+    if idempotent and seen.get(pid, -1) &gt;= seq:
+        return f&quot;duplicate seq {seq}: not stored again&quot;
+    log.append(value)
+    if idempotent:
+        seen[pid] = seq
+    return f&quot;stored at offset {len(log) - 1}&quot;
+
+for attempt in range(3):                       # first try + 2 retries
+    print(&quot;idempotent off:&quot;, append(None, -1, &quot;t045&quot;, idempotent=False))
+log.clear()
+for attempt in range(3):
+    print(&quot;idempotent on :&quot;, append(7001, 0, &quot;t045&quot;))
+print(&quot;copies stored:&quot;, log.count(&quot;t045&quot;))</code></pre><div class="output">idempotent off: stored at offset 0
+idempotent off: stored at offset 1
+idempotent off: stored at offset 2
+idempotent on : stored at offset 0
+idempotent on : duplicate seq 0: not stored again
+idempotent on : duplicate seq 0: not stored again
+copies stored: 1</div></div>
+  <ul class="anno"><li><code>    if idempotent and seen.get(pid, -1) &gt;= seq:</code><span>Already have this producer’s sequence? Then it is a retry.</span></li><li><code>for attempt in range(3):                       # first try + 2 retries</code><span>Same record sent three times, like our lab.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Then send seq 1 after seq 0.",
+   "code": "# A leader that deduplicates by (producer id, sequence)\nlog, seen = [], {}            # seen[(pid, partition)] = last sequence written\n\ndef append(pid, seq, value, idempotent=True):\n    if idempotent and seen.get(pid, -1) >= seq:\n        return f\"duplicate seq {seq}: not stored again\"\n    log.append(value)\n    if idempotent:\n        seen[pid] = seq\n    return f\"stored at offset {len(log) - 1}\"\n\nfor attempt in range(3):                       # first try + 2 retries\n    print(\"idempotent off:\", append(None, -1, \"t045\", idempotent=False))\nlog.clear()\nfor attempt in range(3):\n    print(\"idempotent on :\", append(7001, 0, \"t045\"))\nprint(\"copies stored:\", log.count(\"t045\"))\n"
+  },
+  {
+   "label": "2 · Predict first: restart",
+   "hint": "<b>Predict first:<\/b> app restarts with PID 7002 and re-sends seq 0. Stored again?",
+   "code": "seen = {7001: 0}\nprint(\"stored again:\", seen.get(7002, -1) < 0)\n"
+  },
+  {
+   "label": "3 · Gap",
+   "hint": "Sequence jumps from 0 to 2.",
+   "code": "last, got = 0, 2\nprint(\"OUT_OF_ORDER_SEQUENCE\" if got > last + 1 else \"ok\")\n"
+  },
+  {
+   "label": "4 · Backoff",
+   "hint": "Exponential backoff 100 ms doubling, max 1000.",
+   "code": "b = 100\nfor i in range(6):\n    print(min(b, 1000)); b *= 2\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "Conflicting config.",
+   "code": "conf = {\"enable.idempotence\": True, \"acks\": \"1\"}\nif conf[\"enable.idempotence\"] and conf[\"acks\"] != \"all\":\n    raise ValueError(\"ConfigException: idempotence requires acks=all\")\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: see PID and sequence</h3>
+  <p>Produce with defaults, then dump the log. <b>Outputs are real.</b></p>
+  <div class="pcrun"><h4>1 · Produce</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>python l25_dup.py idem-on on</code></pre><div class="output">enable.idempotence=True: delivered after 9 s -&gt; [&#x27;offset 0&#x27;]</div></div>
+  <p class="muted">Pause a follower first to force retries.</p></div>
+  <div class="pcrun"><h4>2 · Dump</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-dump-log.sh --files /var/lib/kafka/data/idem-on-0/00000000000000000000.log</code></pre><div class="output">baseOffset: 0 … baseSequence: 0 lastSequence: 0 producerId: 7001 producerEpoch: 0</div></div>
+  <p class="muted">Proof.</p></div>
+  <div class="pcrun"><h4>3 · Java config</h4>
+  <div class="code" data-lang="bash" data-file="Java"><pre><code>props.put(&quot;enable.idempotence&quot;, &quot;true&quot;); props.put(&quot;acks&quot;, &quot;all&quot;);</code></pre><div class="output">(defaults since Kafka 3.0)</div></div>
+  <p class="muted">Explicit is clearer.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Retry with a sequence</h2>
+  <p>Second attempt is recognised.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "stored = {}",
+  "for attempt in (1, 2):",
+  "    key = (7001, 0)",
+  "    if key in stored:",
+  "        print(\"attempt\", attempt, \"duplicate\")",
+  "    else:",
+  "        stored[key] = \"t045\"",
+  "        print(\"attempt\", attempt, \"stored\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>stored<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stored",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (0)<\/b> {}"
+   ],
+   "newVar": "stored"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>attempt<\/code> is created: 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stored",
+       "→ dict #1"
+      ],
+      [
+       "attempt",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (0)<\/b> {}"
+   ],
+   "newVar": "attempt"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>key<\/code> is created: → tuple #2. A new tuple object (#2) is created: (7001, 0)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stored",
+       "→ dict #1"
+      ],
+      [
+       "attempt",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (0)<\/b> {}",
+    "<b>#2 tuple (2)<\/b> (7001, 0)"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 4,
+   "phase": "Check",
+   "note": "PID + sequence already present? The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stored",
+       "→ dict #1"
+      ],
+      [
+       "attempt",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (0)<\/b> {}",
+    "<b>#2 tuple (2)<\/b> (7001, 0)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "First",
+   "note": "Stored once. Object #1 dict now holds {(7001, 0): &#x27;t045&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stored",
+       "→ dict #1"
+      ],
+      [
+       "attempt",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {(7001, 0): &#x27;t045&#x27;}",
+    "<b>#2 tuple (2)<\/b> (7001, 0)"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stored",
+       "→ dict #1"
+      ],
+      [
+       "attempt",
+       "1"
+      ],
+      [
+       "key",
+       "→ tuple #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {(7001, 0): &#x27;t045&#x27;}",
+    "<b>#2 tuple (2)<\/b> (7001, 0)"
+   ],
+   "out": "attempt 1 stored\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>attempt<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stored",
+       "→ dict #1"
+      ],
+      [
+       "attempt",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {(7001, 0): &#x27;t045&#x27;}",
+    "<b>#2 tuple (2)<\/b> (7001, 0)"
+   ],
+   "newVar": "attempt"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stored",
+       "→ dict #1"
+      ],
+      [
+       "attempt",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {(7001, 0): &#x27;t045&#x27;}",
+    "<b>#2 tuple (2)<\/b> (7001, 0)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stored",
+       "→ dict #1"
+      ],
+      [
+       "attempt",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {(7001, 0): &#x27;t045&#x27;}",
+    "<b>#2 tuple (2)<\/b> (7001, 0)"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stored",
+       "→ dict #1"
+      ],
+      [
+       "attempt",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {(7001, 0): &#x27;t045&#x27;}",
+    "<b>#2 tuple (2)<\/b> (7001, 0)"
+   ],
+   "out": "attempt 2 duplicate\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "stored",
+       "→ dict #1"
+      ],
+      [
+       "attempt",
+       "2"
+      ],
+      [
+       "key",
+       "→ tuple #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {(7001, 0): &#x27;t045&#x27;}",
+    "<b>#2 tuple (2)<\/b> (7001, 0)"
+   ]
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three duplicate-prevention decisions.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Idempotence · config</span></div>
+    <h4>Audit producer configs</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Find services that disabled idempotence.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>configs</pre></div><div><small>Expected output</small><pre>[&#x27;pay&#x27;]</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Search for enable.idempotence=false.</li><li>Search acks=1/0 on critical topics.</li><li>Fix.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Scenario 1.",
+   "code": "configs = {\"pay\": {\"enable.idempotence\": False}, \"orders\": {}}\nprint([s for s, c in configs.items() if c.get(\"enable.idempotence\") is False])\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "configs = {\"pay\": {\"enable.idempotence\": False}, \"orders\": {}}",
+  "print([s for s, c in configs.items() if c.get(\"enable.idempotence\") is False])"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Audit",
+   "note": "Old overrides cause dupes. <code>configs<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "configs",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;pay&#x27;: → dict #2, &#x27;orders&#x27;: → dict #3}",
+    "<b>#2 dict (1)<\/b> {&#x27;enable.idempotence&#x27;: False}",
+    "<b>#3 dict (0)<\/b> {}"
+   ],
+   "newVar": "configs"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "configs",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;pay&#x27;: → dict #2, &#x27;orders&#x27;: → dict #3}",
+    "<b>#2 dict (1)<\/b> {&#x27;enable.idempotence&#x27;: False}",
+    "<b>#3 dict (0)<\/b> {}"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "configs",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;pay&#x27;: → dict #2, &#x27;orders&#x27;: → dict #3}",
+    "<b>#2 dict (1)<\/b> {&#x27;enable.idempotence&#x27;: False}",
+    "<b>#3 dict (0)<\/b> {}"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "configs",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;pay&#x27;: → dict #2, &#x27;orders&#x27;: → dict #3}",
+    "<b>#2 dict (1)<\/b> {&#x27;enable.idempotence&#x27;: False}",
+    "<b>#3 dict (0)<\/b> {}"
+   ],
+   "out": "['pay']\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Idempotence · consumer</span></div>
+    <h4>Dedup by business key</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Restarts may re-send payments.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>txn ids</pre></div><div><small>Expected output</small><pre>process t045
+process t046
+skip t045</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Every event carries txn_id.</li><li>Consumer keeps processed ids.</li><li>Skip repeats.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Scenario 2.",
+   "code": "done = set()\nfor txn in [\"t045\", \"t046\", \"t045\"]:\n    if txn in done: print(\"skip\", txn); continue\n    done.add(txn); print(\"process\", txn)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "done = set()",
+  "for txn in [\"t045\", \"t046\", \"t045\"]:",
+  "    if txn in done: print(\"skip\", txn); continue",
+  "    done.add(txn); print(\"process\", txn)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "End to end",
+   "note": "Covers what idempotence misses. <code>done<\/code> is created: → set #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "done",
+       "→ set #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (0)<\/b> {}"
+   ],
+   "newVar": "done"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>txn<\/code> is created: &#x27;t045&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "done",
+       "→ set #1"
+      ],
+      [
+       "txn",
+       "'t045'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (0)<\/b> {}"
+   ],
+   "newVar": "txn"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "done",
+       "→ set #1"
+      ],
+      [
+       "txn",
+       "'t045'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (0)<\/b> {}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #1 set now holds {&#x27;t045&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "done",
+       "→ set #1"
+      ],
+      [
+       "txn",
+       "'t045'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (1)<\/b> {&#x27;t045&#x27;}"
+   ],
+   "out": "process t045\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>txn<\/code> changes to &#x27;t046&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "done",
+       "→ set #1"
+      ],
+      [
+       "txn",
+       "'t046'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (1)<\/b> {&#x27;t045&#x27;}"
+   ],
+   "newVar": "txn"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "done",
+       "→ set #1"
+      ],
+      [
+       "txn",
+       "'t046'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (1)<\/b> {&#x27;t045&#x27;}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #1 set now holds {&#x27;t045&#x27;, &#x27;t046&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "done",
+       "→ set #1"
+      ],
+      [
+       "txn",
+       "'t046'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (2)<\/b> {&#x27;t045&#x27;, &#x27;t046&#x27;}"
+   ],
+   "out": "process t046\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>txn<\/code> changes to &#x27;t045&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "done",
+       "→ set #1"
+      ],
+      [
+       "txn",
+       "'t045'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (2)<\/b> {&#x27;t045&#x27;, &#x27;t046&#x27;}"
+   ],
+   "newVar": "txn"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "done",
+       "→ set #1"
+      ],
+      [
+       "txn",
+       "'t045'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (2)<\/b> {&#x27;t045&#x27;, &#x27;t046&#x27;}"
+   ],
+   "out": "skip t045\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "done",
+       "→ set #1"
+      ],
+      [
+       "txn",
+       "'t045'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (2)<\/b> {&#x27;t045&#x27;, &#x27;t046&#x27;}"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Idempotence · transactions</span></div>
+    <h4>When to use transactional.id</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Read payments, write alerts, commit offsets atomically.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>pipeline</pre></div><div><small>Expected output</small><pre>init_transactions -&gt; begin_transaction -&gt; produce(alert) -&gt; send_offsets_to_transaction -&gt; commit_transaction</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Set transactional.id (stable per instance).</li><li>begin, produce, send offsets, commit.</li><li>Consumers use read_committed.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Types table.",
+   "code": "steps = [\"init_transactions\", \"begin_transaction\", \"produce(alert)\", \"send_offsets_to_transaction\", \"commit_transaction\"]\nprint(\" -> \".join(steps))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "steps = [\"init_transactions\", \"begin_transaction\", \"produce(alert)\", \"send_offsets_to_transaction\", \"commit_transaction\"]",
+  "print(\" -> \".join(steps))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "EOS",
+   "note": "Lesson 3.5 in depth. <code>steps<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;init_transactions&#x27;, &#x27;begin_transaction&#x27;, &#x27;produce(alert)&#x27;, &#x27;send_offsets_to_transaction…"
+   ],
+   "newVar": "steps"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;init_transactions&#x27;, &#x27;begin_transaction&#x27;, &#x27;produce(alert)&#x27;, &#x27;send_offsets_to_transaction…"
+   ],
+   "out": "init_transactions -> begin_transaction -> produce(alert) -> send_offsets_to_transaction -> commit_transaction\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: Why can retries duplicate records?",
+  "options": [
+   "Kafka bug",
+   "Compression",
+   "The first write succeeded but its response was lost/late",
+   "Partitions"
+  ],
+  "answer": 2,
+  "why": "Step 1."
+ },
+ {
+  "q": "Beginner: Idempotence default since Kafka 3.0 is…",
+  "options": [
+   "false",
+   "true",
+   "only in Java",
+   "removed"
+  ],
+  "answer": 1,
+  "why": "With acks=all."
+ },
+ {
+  "q": "Beginner: With idempotence on, our payment was stored…",
+  "options": [
+   "once",
+   "3 times",
+   "never",
+   "twice"
+  ],
+  "answer": 0,
+  "why": "Step 3."
+ },
+ {
+  "q": "Intermediate: The broker detects duplicates using…",
+  "options": [
+   "Message value",
+   "Timestamp",
+   "Key",
+   "Producer id + sequence number"
+  ],
+  "answer": 3,
+  "why": "PID 7001, seq 0."
+ },
+ {
+  "q": "Intermediate: Idempotence requires…",
+  "options": [
+   "acks=0",
+   "one partition",
+   "acks=all and in-flight ≤ 5",
+   "compression"
+  ],
+  "answer": 2,
+  "why": "Rules."
+ },
+ {
+  "q": "Intermediate: dump-log showed producerId -1 because…",
+  "options": [
+   "Error",
+   "Idempotence was off",
+   "acks=0",
+   "Old Kafka"
+  ],
+  "answer": 1,
+  "why": "No PID."
+ },
+ {
+  "q": "Advanced: A producer restart then re-send is…",
+  "options": [
+   "Not deduplicated (new PID)",
+   "Deduplicated",
+   "Rejected",
+   "Reordered"
+  ],
+  "answer": 0,
+  "why": "Use transactions/business keys."
+ },
+ {
+  "q": "Advanced: Without idempotence, in-flight > 1 with retries can cause…",
+  "options": [
+   "Compression",
+   "Faster acks",
+   "Nothing",
+   "Reordering"
+  ],
+  "answer": 3,
+  "why": "Batch 2 before batch 1."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 2.5 in one screen</h3>
+    <ul><li>Retries + lost/late response = duplicates (lab: offsets 0, 1, 2).</li><li>Idempotence: PID + epoch + per-partition sequence; leader skips seen sequences.</li><li>Lab: producerId 7001, baseSequence 0, one copy.</li><li>Needs acks=all, retries, in-flight ≤ 5; default since 3.0; keeps order on retry.</li><li>Not covered: producer restarts, app double-sends, consumer re-processing → transactions / business-key dedup.</li><li>Backoff 100 ms → 1 s; stop at delivery timeout.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Does idempotence slow the producer?</summary><p>Very little; the extra fields are a few bytes per batch and the broker check is cheap. It is on by default for that reason.</p></details>
+    <details><summary>How long does the broker remember a producer id?</summary><p>Until producer state expires (transactional.id.expiration.ms / producer.id.expiration.ms, about a day by default) if the producer stays idle.</p></details>
+    <details><summary>Is idempotence per topic?</summary><p>Per producer session and per partition: sequences are tracked separately for each partition the producer writes.</p></details>
+    <details><summary>What is a zombie producer?</summary><p>An old instance (e.g. after a network split) that keeps writing. Transactions bump the epoch so the broker rejects the zombie.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Retry and dedup programs.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Count copies</h4></div>
+      <p>Copies of t045 in a log.</p>
+      <div class="prob__io"><div><small>Input</small><pre>log</pre></div><div><small>Expected output</small><pre>3</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print([&quot;t045&quot;, &quot;t045&quot;, &quot;t045&quot;].count(&quot;t045&quot;))</code></pre><div class="output">3</div></div>
+        <p><b>How it works:</b> 3 without idempotence.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Retries in deadline</h4></div>
+      <p>Attempts in 120 s with 30 s timeout.</p>
+      <div class="prob__io"><div><small>Input</small><pre>numbers</pre></div><div><small>Expected output</small><pre>4</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(120 // 30)</code></pre><div class="output">4</div></div>
+        <p><b>How it works:</b> About 4.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Sequence next</h4></div>
+      <p>Next sequence after 41.</p>
+      <div class="prob__io"><div><small>Input</small><pre>41</pre></div><div><small>Expected output</small><pre>42</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(41 + 1)</code></pre><div class="output">42</div></div>
+        <p><b>How it works:</b> 42.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Dedup set</h4></div>
+      <p>Keep first occurrence only.</p>
+      <div class="prob__io"><div><small>Input</small><pre>list</pre></div><div><small>Expected output</small><pre>[&#x27;a&#x27;, &#x27;b&#x27;, &#x27;c&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>seen, out = set(), []
+for x in [&quot;a&quot;, &quot;b&quot;, &quot;a&quot;, &quot;c&quot;, &quot;b&quot;]:
+    if x not in seen: seen.add(x); out.append(x)
+print(out)</code></pre><div class="output">[&#x27;a&#x27;, &#x27;b&#x27;, &#x27;c&#x27;]</div></div>
+        <p><b>How it works:</b> Consumer-side dedup.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Backoff total</h4></div>
+      <p>Total wait for 5 retries with doubling from 100 ms, max 1000.</p>
+      <div class="prob__io"><div><small>Input</small><pre>numbers</pre></div><div><small>Expected output</small><pre>2500</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(sum(min(100 * 2 ** i, 1000) for i in range(5)))</code></pre><div class="output">2500</div></div>
+        <p><b>How it works:</b> 1,500 ms.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Gap check</h4></div>
+      <p>Detect sequence gaps.</p>
+      <div class="prob__io"><div><small>Input</small><pre>[0,1,3]</pre></div><div><small>Expected output</small><pre>[3]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>s = [0, 1, 3]
+print([b for a, b in zip(s, s[1:]) if b != a + 1])</code></pre><div class="output">[3]</div></div>
+        <p><b>How it works:</b> Gap at 3.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Refund cost</h4></div>
+      <p>0.1% of 1,00,000 payments duplicated × Rs 500.</p>
+      <div class="prob__io"><div><small>Input</small><pre>numbers</pre></div><div><small>Expected output</small><pre>Rs 50000</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;Rs&quot;, int(100000 * 0.001 * 500))</code></pre><div class="output">Rs 50000</div></div>
+        <p><b>How it works:</b> Rs 50,000 in refunds.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Throughput impact</h4></div>
+      <p>Idempotence overhead ~1% on 37k/s.</p>
+      <div class="prob__io"><div><small>Input</small><pre>37133</pre></div><div><small>Expected output</small><pre>36762</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(37133 * 0.99))</code></pre><div class="output">36762</div></div>
+        <p><b>How it works:</b> Negligible.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Idempotence interview questions.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · data</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is an idempotent producer?”</h4>
+      <p class="scn__situation">Explain.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> answer?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>A producer whose retries cannot create duplicates: the broker assigns a producer id and the producer numbers batches per partition; the leader ignores a batch whose sequence it already wrote. Default since Kafka 3.0.</p>
+        <p class="scn__avoid"><b>Avoid:</b> “It uses unique message ids generated by the app.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Fintech</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Duplicates</h4>
+      <p class="scn__situation">Duplicate payments appear during network issues.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> diagnose?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>Check enable.idempotence and acks.</li><li>dump-log: producerId -1 means off.</li><li>Fix config; add business-key dedup.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> Setting retries=0.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Restarts</h4>
+      <p class="scn__situation">Duplicates appear after producer restarts.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> explain?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>New PID after restart.</li><li>Idempotence is per session.</li><li>Transactions or consumer dedup.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> “Idempotence is broken.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Exactly-once</h4>
+      <p class="scn__situation">Design exactly-once from payments to alerts.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> design?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>Idempotent producer + transactional.id.</li><li>Offsets committed in the transaction.</li><li>read_committed consumers; idempotent sinks.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> “Kafka is exactly-once by default.”</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Kafka syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/kafka.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

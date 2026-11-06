@@ -1,0 +1,636 @@
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Build it so that it can run every night without me”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> the problem and the design are in <a href="../01-problem-and-dataset/">Lesson 12.1</a>. This lesson uses window functions (<a href="../../03-querying/06-window-functions/">3.6</a>), dynamic partitions (<a href="../../05-partitioning-and-bucketing/02-dynamic-partitions-and-msck/">5.2</a>) and MERGE with SCD (<a href="../../07-acid-and-iceberg/02-merge-and-scd/">7.2</a>).</p></div>
+  <div class="story">
+    <p class="narration">Kabir has the design from Lesson 12.1. Now he must turn it into tables and one nightly script, load all of October, and give the CEO numbers that finance can check.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="The capstone warehouse: raw tables feed silver tables (staging with quarantine, an ACID fact table upserted with MERGE, an SCD type 2 customer dimension, deliveries and small dimensions), which feed a gold table that answers the CEO: Mumbai earned 38.4 lakh rupees net, not 42.8 lakh.">
+        <rect x="14" y="14" width="120" height="120" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="74" y="32" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">raw</text><text x="74" y="48" text-anchor="middle" font-size="7" class="s-ink2 mono">4 external tables</text><text x="74" y="62" text-anchor="middle" font-size="7" class="s-ink2 mono">48,871 order rows</text><path d="M136 74L176 74" style="fill:none;stroke:var(--track);stroke-width:1.8"/><path d="M169.7 77.0L176 74L169.7 71.0" style="fill:none;stroke:var(--track);stroke-width:1.8"/><rect x="180" y="14" width="150" height="120" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="255" y="32" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">silver</text><text x="255" y="50" text-anchor="middle" font-size="7" class="s-ink2 mono">stg + quarantine (112)</text><text x="255" y="64" text-anchor="middle" font-size="7" class="s-ink2 mono">fact_orders 47,553</text><text x="255" y="78" text-anchor="middle" font-size="7" class="s-ink2 mono">dim_customer SCD 2</text><text x="255" y="92" text-anchor="middle" font-size="7" class="s-ink2 mono">fact_deliveries</text><text x="255" y="106" text-anchor="middle" font-size="7" class="s-ink2 mono">dim_restaurant · dim_date</text><path d="M332 74L372 74" style="fill:none;stroke:var(--track);stroke-width:1.8"/><path d="M365.7 77.0L372 74L365.7 71.0" style="fill:none;stroke:var(--track);stroke-width:1.8"/><rect x="376" y="14" width="120" height="120" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="436" y="32" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">gold</text><text x="436" y="50" text-anchor="middle" font-size="7" class="s-ink2 mono">gold_city_daily</text><text x="436" y="64" text-anchor="middle" font-size="7" class="s-ink2 mono">186 rows</text><rect x="512" y="14" width="120" height="120" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="572" y="32" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">CEO answer</text><text x="572" y="52" text-anchor="middle" font-size="7.2" class="s-ink mono">Mumbai ₹38.4 L</text><text x="572" y="66" text-anchor="middle" font-size="6.8" class="s-ink2 mono">(raw said ₹42.8 L)</text><text x="572" y="84" text-anchor="middle" font-size="7" class="s-green mono">gold = fact</text><text x="572" y="98" text-anchor="middle" font-size="7" class="s-green mono">re-run safe</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">One script, run every night, <tspan font-weight="700" class="s-acc">safe to run twice</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+A> The design is done. Today you build it. One rule above all: the nightly job must be <b>idempotent</b>. If it fails at step 6 and the on-call engineer simply runs it again, nothing may be counted twice.
+K> So no plain <code>INSERT INTO</code> for facts, only <code>INSERT OVERWRITE</code> of a partition or <code>MERGE</code>?
+A> Exactly. And after building, we <b>test</b> it: re-run old days, reconcile gold with silver and silver with raw. I promise you, the tests will find bugs.
+R> Real bugs, Sir?
+A> Real ones. Today’s lab found three: a weekend flag that was always false, a type 2 dimension that broke when an old day was re-run, and a query that hit an engine limit. You will see each one and its fix.
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>An idempotent, incremental Hive ETL pipeline</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>An <b>ETL pipeline</b> extracts data from sources, transforms it (typing, validation, de-duplication, conforming, modelling) and loads it into target tables. An <b>incremental</b> pipeline processes only one load (here one <code>load_date</code>) per run, and an <b>idempotent</b> pipeline produces the same final state whether a run executes once or several times. In Hive this is achieved by writing recomputable data with <code>INSERT OVERWRITE</code> of the affected partitions and changing data with key-based <code>MERGE</code> on transactional tables, guarded by conditions such as “only newer versions”, and verified by <b>reconciliation</b>: matching counts and totals between layers.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Each night the script handles only that night’s files, puts everything in the right place, and can be run again safely. Then we prove the numbers match from raw to gold.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Idempotent</b><span>Running twice gives the same result as running once.</span></div>
+    <div class="term"><b>Upsert</b><span>Update the row if the key exists, insert it if not: MERGE.</span></div>
+    <div class="term"><b>Quarantine</b><span>A table of rejected rows with the reason.</span></div>
+    <div class="term"><b>Backfill</b><span>Running the pipeline for past dates, here 31 loads.</span></div>
+    <div class="term"><b>Reconciliation</b><span>Checking that counts and sums agree between layers.</span></div>
+    <div class="term"><b>Point-in-time join</b><span>Join to the dimension version valid at the event time.</span></div>
+    <div class="term"><b>hivevar</b><span>A variable passed to a script: --hivevar load_date=2026-10-05.</span></div>
+    <div class="term"><b>Touched dates</b><span>Event dates that received rows in this load.</span></div>
+  </div>
+
+  <h3>The nightly script, step by step</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:780px">
+    <thead><tr><th>#</th><th>Step</th><th>Hive technique</th><th>Idempotent because…</th></tr></thead>
+    <tbody><tr><td>0</td><td>Register today’s folders</td><td><code>ALTER TABLE … ADD IF NOT EXISTS PARTITION</code></td><td>IF NOT EXISTS</td></tr><tr><td>1</td><td>Restaurants (SCD 1)</td><td><code>INSERT OVERWRITE TABLE</code></td><td>Full overwrite</td></tr><tr><td>2</td><td>Type and validate</td><td><code>INSERT OVERWRITE</code> stg with <code>CASE … reject_reason</code></td><td>Overwrite</td></tr><tr><td>3</td><td>Quarantine</td><td><code>INSERT OVERWRITE … PARTITION (load_date)</code></td><td>Overwrite one partition</td></tr><tr><td>4</td><td>Orders upsert</td><td><code>MERGE</code> + <code>ROW_NUMBER()</code>, “only newer”</td><td>Older or equal versions are ignored</td></tr><tr><td>5</td><td>Customers SCD 2</td><td><code>MERGE</code> with the UNION ALL trick, “only newer”</td><td>Fixed in Step 7 below</td></tr><tr><td>6</td><td>Delivery events</td><td>Pivot with <code>MAX(IF(…))</code>, overwrite partition</td><td>Overwrite one partition</td></tr><tr><td>7</td><td>Gold</td><td>Dynamic-partition overwrite of touched <code>order_date</code>s</td><td>Recomputed from silver</td></tr><tr><td>8</td><td>Audit</td><td><code>INSERT INTO</code> with <code>LATERAL VIEW STACK</code></td><td>Append-only by design: shows every run</td></tr></tbody>
+  </table>
+  </div>
+LEVELS> Building the warehouse at three levels
+L1> A kitchen that runs every night
+      <ul>
+        <li>Each night new ingredients arrive (files). The script washes them (types and checks), throws spoiled ones into a labelled bin (quarantine), updates the stock list (MERGE) and plates the dishes (gold).</li>
+        <li>If the cook repeats a step by mistake, the dishes must not double: that is <b>idempotence</b>.</li>
+      </ul>
+L2> The Hive tools used, all from earlier modules
+      <ul>
+        <li><code>INSERT OVERWRITE … PARTITION</code> for anything that can be recomputed per load (staging, quarantine, deliveries, gold).</li>
+        <li><code>MERGE</code> on ACID tables for rows that change over time: <code>fact_orders</code> (upsert) and <code>dim_customer</code> (SCD type 2).</li>
+        <li>Window functions to pick the newest version, <code>--hivevar</code> to pass the load date, <code>STACK</code> for the audit rows, <code>EXPLAIN DEPENDENCY</code> to prove pruning.</li>
+      </ul>
+L3> What makes it production-grade
+      <ul>
+        <li>Every step is idempotent and proven so by re-running 15 and 3 October: every count and sum unchanged.</li>
+        <li>Three-way reconciliation: raw valid orders = fact rows (47,553), fact net revenue = gold net revenue (₹1,53,95,190), rejects = 112.</li>
+        <li>Late data handled by rebuilding exactly the order dates a load touched.</li>
+      </ul>
+/LEVELS
+
+EXAM> “How do you make a Hive load re-runnable?” Overwrite partitions instead of appending; use MERGE with a business key for changing rows; ignore versions that are not newer; never use plain <code>INSERT INTO</code> on a fact table unless a re-run deletes the previous output first.
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Load patterns and when to use each</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:780px">
+    <thead><tr><th>Pattern</th><th>Hive statement</th><th>Good for</th><th>Used here</th></tr></thead>
+    <tbody><tr><td>Full refresh</td><td><code>INSERT OVERWRITE TABLE t SELECT …</code></td><td>Small reference data</td><td><code>dim_restaurant</code></td></tr><tr><td>Partition overwrite (static)</td><td><code>INSERT OVERWRITE … PARTITION (load_date='…')</code></td><td>Per-load outputs</td><td>Quarantine, deliveries</td></tr><tr><td>Partition overwrite (dynamic)</td><td><code>INSERT OVERWRITE … PARTITION (order_date) SELECT …, order_date</code></td><td>Recomputing a set of event dates</td><td>Gold</td></tr><tr><td>Append</td><td><code>INSERT INTO</code></td><td>Logs, audits</td><td><code>etl_audit</code></td></tr><tr><td>Upsert</td><td><code>MERGE … WHEN MATCHED … WHEN NOT MATCHED</code></td><td>Changing facts (status updates)</td><td><code>fact_orders</code></td></tr><tr><td>SCD type 2</td><td><code>MERGE</code> with a staged UNION ALL</td><td>History of attributes</td><td><code>dim_customer</code></td></tr><tr><td>Delete + insert</td><td><code>DELETE</code> then <code>INSERT</code> (ACID)</td><td>Replacing one key range</td><td>Not needed</td></tr></tbody>
+  </table>
+  </div>  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Orchestration option</th><th>What it is</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>Shell loop + Beeline</td><td><code>beeline --hivevar load_date=… -f daily_load.hql</code></td><td>What we use; easy to test</td></tr><tr><td>Apache Airflow</td><td>Python DAGs with a Hive operator, retries, backfills</td><td>Most common open-source scheduler today</td></tr><tr><td>Cloud schedulers</td><td>Managed Airflow, AWS Step Functions, Dataproc Workflows</td><td>Lesson 11.2’s platforms</td></tr><tr><td>Apache Oozie</td><td>XML workflows on Hadoop</td><td>Moved to the Apache Attic in 2025; legacy only</td></tr></tbody>
+  </table>
+  </div>
+WARN> <code>INSERT INTO</code> on a fact table is the most common cause of doubled numbers after a re-run. If you must append, record the load in an audit table and make the job refuse to run twice for the same date.
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Building, loading and testing the warehouse</h2>
+  <p>All outputs are real (Hive 4.2.1, Tez local mode). The complete script <code>daily_load.hql</code> is in the course’s lab folder; each step shows the part that matters.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Silver, gold and control tables</h4>
+      <div class="code" data-lang="sql" data-file="beeline (02_model.hql)"><pre><code>USE tiffingo_dw;
+CREATE TABLE dim_restaurant (restaurant_id INT, name STRING, city STRING, cuisine STRING,
+  rating DECIMAL(2,1), tags ARRAY&lt;STRING&gt;, onboarded DATE) STORED AS ORC;
+CREATE TABLE dim_customer (customer_id INT, name STRING, city STRING, plan STRING,
+  valid_from TIMESTAMP, valid_to TIMESTAMP, is_current BOOLEAN)
+STORED AS ORC TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;);
+CREATE TABLE fact_orders (order_id BIGINT, customer_id INT, restaurant_id INT, order_ts TIMESTAMP,
+  amount DECIMAL(10,2), payment STRING, status STRING, updated_at TIMESTAMP, load_date DATE)
+PARTITIONED BY (order_date DATE)
+STORED AS ORC TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;);
+CREATE TABLE fact_deliveries (order_id BIGINT, picked_up_ts TIMESTAMP, delivered_ts TIMESTAMP, rider_id INT)
+PARTITIONED BY (load_date DATE) STORED AS ORC;
+CREATE TABLE stg_orders (order_id BIGINT, customer_id INT, restaurant_id INT, order_ts TIMESTAMP,
+  amount DECIMAL(10,2), payment STRING, status STRING, updated_at TIMESTAMP, order_date DATE,
+  raw_line STRING, reject_reason STRING) STORED AS ORC;
+CREATE TABLE rejected_orders (raw_line STRING, reject_reason STRING)
+PARTITIONED BY (load_date DATE) STORED AS ORC;
+CREATE TABLE gold_city_daily (city STRING, orders BIGINT, delivered BIGINT, cancelled BIGINT,
+  refunded BIGINT, gmv DECIMAL(14,2), net_revenue DECIMAL(14,2), upi_share DECIMAL(5,2),
+  avg_delivery_min DECIMAL(6,1), p90_delivery_min DECIMAL(6,1))
+PARTITIONED BY (order_date DATE) STORED AS ORC;
+CREATE TABLE etl_audit (load_date DATE, step STRING, row_count BIGINT, run_ts TIMESTAMP) STORED AS ORC;
+SHOW TABLES;</code></pre><div class="output">+------------------+
+|     tab_name     |
++------------------+
+| dim_customer     |
+| dim_date         |
+| dim_restaurant   |
+| etl_audit        |
+| fact_deliveries  |
+| fact_orders      |
+| gold_city_daily  |
+| raw_customers    |
+| raw_deliveries   |
+| raw_orders       |
+| raw_restaurants  |
+| rejected_orders  |
+| stg_orders       |
++------------------+</div></div>
+      <span class="behind">Two tables are <b>ACID</b> because their rows change: <code>fact_orders</code> (refunds) and <code>dim_customer</code> (SCD 2). Everything else is plain ORC and is overwritten partition by partition, which is cheaper and needs no compaction. The fact is partitioned by <code>order_date</code>, the per-load tables by <code>load_date</code>, as decided in Lesson 12.1.</span></li>
+    <li><h4>Step 2 · A date dimension, and our first bug</h4>
+      <div class="code" data-lang="sql" data-file="beeline"><pre><code>-- first version
+CREATE TABLE dim_date STORED AS ORC AS
+SELECT d AS date_key, YEAR(d) AS yr, MONTH(d) AS mon, DAY(d) AS dom,
+       DATE_FORMAT(d, &#x27;EEEE&#x27;) AS day_name, DATE_FORMAT(d, &#x27;u&#x27;) IN (&#x27;6&#x27;, &#x27;7&#x27;) AS is_weekend
+FROM (SELECT DATE_ADD(DATE &#x27;2026-01-01&#x27;, pos) AS d
+      FROM (SELECT POSEXPLODE(SPLIT(SPACE(729), &#x27; &#x27;)) AS (pos, x)) g) t;
+
+-- the weekend report showed 31 weekdays and 0 weekend days, so we test the expression
+SELECT DATE_FORMAT(DATE &#x27;2026-10-03&#x27;, &#x27;u&#x27;) AS u_pattern, DATE_FORMAT(DATE &#x27;2026-10-03&#x27;, &#x27;E&#x27;) AS e_pattern,
+       DAYOFWEEK(DATE &#x27;2026-10-03&#x27;) AS dayofweek_sat, DAYOFWEEK(DATE &#x27;2026-10-04&#x27;) AS dayofweek_sun;
+
+-- fixed: DAYOFWEEK(d) IN (1, 7) AS is_weekend   (1 = Sunday, 7 = Saturday)
+DROP TABLE dim_date;  CREATE TABLE dim_date … ;
+SELECT * FROM dim_date WHERE date_key BETWEEN DATE &#x27;2026-10-01&#x27; AND DATE &#x27;2026-10-04&#x27;;</code></pre><div class="output">+------------+------------+----------------+----------------+
+| u_pattern  | e_pattern  | dayofweek_sat  | dayofweek_sun  |
++------------+------------+----------------+----------------+
+| 2026       | Sat        | 7              | 1              |
++------------+------------+----------------+----------------+
+
++--------------------+--------------+---------------+---------------+--------------------+----------------------+
+| dim_date.date_key  | dim_date.yr  | dim_date.mon  | dim_date.dom  | dim_date.day_name  | dim_date.is_weekend  |
++--------------------+--------------+---------------+---------------+--------------------+----------------------+
+| 2026-10-01         | 2026         | 10            | 1             | Thursday           | false                |
+| 2026-10-02         | 2026         | 10            | 2             | Friday             | false                |
+| 2026-10-03         | 2026         | 10            | 3             | Saturday           | true                 |
+| 2026-10-04         | 2026         | 10            | 4             | Sunday             | true                 |
++--------------------+--------------+---------------+---------------+--------------------+----------------------+</div></div>
+      <span class="behind">The weekend report said “weekday, 31 days”. Testing the expression showed why: in Hive 4, <code>DATE_FORMAT</code> follows Java’s <code>DateTimeFormatter</code>, where <code>u</code> means <b>year</b>, not day of week (older Hive used <code>SimpleDateFormat</code>, where it was the day number). <code>DAYOFWEEK</code> returns 1 for Sunday and 7 for Saturday and does not depend on patterns. Lesson: test every derived column of a dimension with known dates.</span></li>
+    <li><h4>Step 3 · The nightly script and a 31-day backfill</h4>
+      <div class="code" data-lang="bash" data-file="run_load.sh"><pre><code>d=2026-10-01
+while [[ &quot;$d&quot; &lt; &quot;2026-11-01&quot; ]]; do
+  beeline -u jdbc:hive2://localhost:10000/tiffingo_dw -n hive --silent=true \
+          --hivevar load_date=$d -f daily_load.hql &gt; logs/load_$d.log 2&gt;&amp;1
+  echo &quot;$d rc=$?&quot;
+  d=$(date -I -d &quot;$d + 1 day&quot;)
+done</code></pre><div class="output">2026-10-01 rc=0 27.7s
+2026-10-02 rc=0 28.9s
+2026-10-03 rc=0 27.2s
+…
+2026-10-30 rc=0 27.4s
+2026-10-31 rc=0 29.1s
+
+31 loads, 901 s in total, 29 s per load on average</div></div>
+      <span class="behind">One script, one variable. <code>${hivevar:load_date}</code> inside the script is replaced before each statement is compiled. Every load returned exit code 0. About 29 seconds per night is mostly fixed overhead (one Tez DAG per statement in local mode); on a cluster, the same script would scale with the data, not with the number of statements.</span></li>
+    <li><h4>Step 4 · Type, validate and quarantine</h4>
+      <div class="code" data-lang="sql" data-file="daily_load.hql, steps 2–3"><pre><code>-- 2. type, validate and tag every raw row of this load
+INSERT OVERWRITE TABLE stg_orders
+SELECT CAST(o.order_id AS BIGINT), CAST(o.customer_id AS INT), CAST(o.restaurant_id AS INT),
+       CAST(o.order_ts AS TIMESTAMP), CAST(o.amount AS DECIMAL(10,2)), o.payment, o.status,
+       CAST(o.updated_at AS TIMESTAMP), TO_DATE(CAST(o.order_ts AS TIMESTAMP)),
+       CONCAT_WS(&#x27;,&#x27;, o.order_id, o.customer_id, o.restaurant_id, o.order_ts, o.amount, o.payment, o.status, o.updated_at),
+       CASE WHEN CAST(o.order_id AS BIGINT) IS NULL              THEN &#x27;bad order_id&#x27;
+            WHEN CAST(o.customer_id AS INT) IS NULL              THEN &#x27;missing customer&#x27;
+            WHEN CAST(o.order_ts AS TIMESTAMP) IS NULL           THEN &#x27;bad order_ts&#x27;
+            WHEN CAST(o.amount AS DECIMAL(10,2)) IS NULL         THEN &#x27;bad amount&#x27;
+            WHEN CAST(o.amount AS DECIMAL(10,2)) &lt;= 0            THEN &#x27;non-positive amount&#x27;
+            WHEN r.restaurant_id IS NULL                         THEN &#x27;unknown restaurant&#x27;
+            WHEN o.status NOT IN (&#x27;DELIVERED&#x27;, &#x27;CANCELLED&#x27;, &#x27;REFUNDED&#x27;) THEN &#x27;bad status&#x27;
+       END
+FROM raw_orders o
+LEFT JOIN dim_restaurant r ON CAST(o.restaurant_id AS INT) = r.restaurant_id
+WHERE o.load_date = &#x27;${hivevar:load_date}&#x27;;
+
+-- 3. quarantine (idempotent: overwrite this load&#x27;s partition)
+INSERT OVERWRITE TABLE rejected_orders PARTITION (load_date=&#x27;${hivevar:load_date}&#x27;)
+SELECT raw_line, reject_reason FROM stg_orders WHERE reject_reason IS NOT NULL;
+
+-- after the backfill:
+SELECT reject_reason, COUNT(*) AS n FROM rejected_orders GROUP BY reject_reason ORDER BY n DESC;
+SELECT load_date, reject_reason, raw_line FROM rejected_orders WHERE load_date = DATE &#x27;2026-10-02&#x27;;</code></pre><div class="output">+----------------------+-----+
+|    reject_reason     |  n  |
++----------------------+-----+
+| bad amount           | 31  |
+| missing customer     | 31  |
+| unknown restaurant   | 31  |
+| bad order_ts         | 11  |
+| non-positive amount  | 8   |
++----------------------+-----+
+
++-------------+----------------------+----------------------------------------------------+
+|  load_date  |    reject_reason     |                      raw_line                      |
++-------------+----------------------+----------------------------------------------------+
+| 2026-10-02  | non-positive amount  | 5903095,2843,12,2026-10-02 13:40:00,-90.00,UPI,DELIVERED,2026-10-02 13:50:00 |
+| 2026-10-02  | missing customer     | 5903093,,9,2026-10-02 12:00:00,180.00,Card,DELIVERED,2026-10-02 13:00:00 |
+| 2026-10-02  | unknown restaurant   | 5903091,2785,999,2026-10-02 11:40:00,240.00,UPI,DELIVERED,2026-10-02 12:40:00 |
+| 2026-10-02  | bad amount           | 5903092,295,7,2026-10-02 11:50:00,NA,UPI,DELIVERED,2026-10-02 12:50:00 |
++-------------+----------------------+----------------------------------------------------+</div></div>
+      <span class="behind">Each raw row is cast once, and a <code>CASE</code> gives the <b>first</b> rule it breaks. The original line is kept in <code>raw_line</code>, so the source team sees exactly what they sent. The quarantine counts match the profile of Lesson 12.1 exactly (31, 31, 31, 11, 8 = 112). The <code>LEFT JOIN</code> to <code>dim_restaurant</code> is how a foreign-key check is written in Hive, which has no enforced foreign keys.</span></li>
+    <li><h4>Step 5 · Upsert orders with MERGE</h4>
+      <div class="code" data-lang="sql" data-file="daily_load.hql, step 4 · then checks"><pre><code>-- 4. upsert orders: newest version per order wins; resends and duplicates change nothing
+MERGE INTO fact_orders t
+USING (SELECT * FROM (SELECT s.*, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY updated_at DESC) AS rn
+                      FROM stg_orders s WHERE reject_reason IS NULL) x WHERE rn = 1) s
+ON t.order_id = s.order_id
+WHEN MATCHED AND s.updated_at &gt; t.updated_at THEN
+  UPDATE SET status = s.status, amount = s.amount, updated_at = s.updated_at, load_date = DATE &#x27;${hivevar:load_date}&#x27;
+WHEN NOT MATCHED THEN
+  INSERT VALUES (s.order_id, s.customer_id, s.restaurant_id, s.order_ts, s.amount, s.payment, s.status,
+                 s.updated_at, DATE &#x27;${hivevar:load_date}&#x27;, s.order_date);
+
+SELECT COUNT(*) AS orders, COUNT(DISTINCT order_id) AS distinct_ids, SUM(IF(status=&#x27;DELIVERED&#x27;,1,0)) AS delivered,
+       SUM(IF(status=&#x27;CANCELLED&#x27;,1,0)) AS cancelled, SUM(IF(status=&#x27;REFUNDED&#x27;,1,0)) AS refunded FROM fact_orders;
+-- reconcile with raw: distinct order ids that pass every rule
+SELECT COUNT(DISTINCT order_id) AS valid_raw_orders FROM raw_orders o JOIN raw_restaurants r
+  ON CAST(o.restaurant_id AS INT) = r.restaurant_id
+WHERE CAST(o.amount AS DECIMAL(10,2)) &gt; 0 AND CAST(o.order_ts AS TIMESTAMP) IS NOT NULL
+  AND CAST(o.customer_id AS INT) IS NOT NULL;
+SELECT order_id, order_date, status, updated_at, load_date FROM fact_orders WHERE order_id IN (5006782, 5007134);</code></pre><div class="output">+---------+---------------+------------+------------+-----------+
+| orders  | distinct_ids  | delivered  | cancelled  | refunded  |
++---------+---------------+------------+------------+-----------+
+| 47553   | 47553         | 43531      | 3362       | 660       |
++---------+---------------+------------+------------+-----------+
+
++-------------------+
+| valid_raw_orders  |
++-------------------+
+| 47553             |
++-------------------+
+
++-----------+-------------+-----------+------------------------+-------------+
+| order_id  | order_date  |  status   |       updated_at       |  load_date  |
++-----------+-------------+-----------+------------------------+-------------+
+| 5006782   | 2026-10-05  | REFUNDED  | 2026-10-09 14:47:00.0  | 2026-10-09  |
+| 5007134   | 2026-10-05  | REFUNDED  | 2026-10-09 14:40:00.0  | 2026-10-09  |
++-----------+-------------+-----------+------------------------+-------------+</div></div>
+      <span class="behind"><code>ROW_NUMBER()</code> keeps one row per order inside a load (a file contains duplicates, and Hive’s MERGE fails if two source rows match one target row). <code>s.updated_at &gt; t.updated_at</code> makes re-sent rows harmless. Result: 47,553 orders, all unique, exactly the number of valid distinct orders in raw (47,665 − 112). The two orders from Lesson 12.1 are REFUNDED, still in their <code>order_date</code> partition 5 October, with <code>load_date</code> 9 October showing which load changed them.</span></li>
+    <li><h4>Step 6 · Customers as SCD type 2</h4>
+      <div class="code" data-lang="sql" data-file="daily_load.hql, step 5 (final version)"><pre><code>-- 5. customers: SCD type 2 (close the old version, insert the new one)
+MERGE INTO dim_customer t
+USING (
+  SELECT c.customer_id AS join_key, c.* FROM
+    (SELECT * FROM (SELECT CAST(customer_id AS INT) AS customer_id, name, city, plan, CAST(updated_at AS TIMESTAMP) AS updated_at,
+                           ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY updated_at DESC) AS rn
+                    FROM raw_customers WHERE load_date = &#x27;${hivevar:load_date}&#x27;) z WHERE rn = 1) c
+  UNION ALL
+  SELECT NULL AS join_key, c.* FROM
+    (SELECT * FROM (SELECT CAST(customer_id AS INT) AS customer_id, name, city, plan, CAST(updated_at AS TIMESTAMP) AS updated_at,
+                           ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY updated_at DESC) AS rn
+                    FROM raw_customers WHERE load_date = &#x27;${hivevar:load_date}&#x27;) z WHERE rn = 1) c
+  JOIN dim_customer d ON d.customer_id = c.customer_id AND d.is_current
+  WHERE c.updated_at &gt; d.valid_from                     -- only changes newer than what we hold
+    AND (d.city &lt;&gt; c.city OR d.plan &lt;&gt; c.plan OR d.name &lt;&gt; c.name)
+) s
+ON t.customer_id = s.join_key
+WHEN MATCHED AND t.is_current AND s.updated_at &gt; t.valid_from
+               AND (t.city &lt;&gt; s.city OR t.plan &lt;&gt; s.plan OR t.name &lt;&gt; s.name) THEN
+  UPDATE SET valid_to = s.updated_at, is_current = false
+WHEN NOT MATCHED THEN
+  INSERT VALUES (s.customer_id, s.name, s.city, s.plan, s.updated_at, TIMESTAMP &#x27;9999-12-31 00:00:00&#x27;, true);
+
+SELECT customer_id, city, plan, valid_from, valid_to, is_current FROM dim_customer
+WHERE customer_id IN (1033, 1380) ORDER BY customer_id, valid_from;</code></pre><div class="output">+--------------+--------------+---------+------------------------+------------------------+-------------+
+| customer_id  |     city     |  plan   |       valid_from       |        valid_to        | is_current  |
++--------------+--------------+---------+------------------------+------------------------+-------------+
+| 1033         | Bengaluru    | Basic   | 2026-09-30 23:00:00.0  | 2026-10-11 21:08:00.0  | false       |
+| 1033         | Navi Mumbai  | Basic   | 2026-10-11 21:08:00.0  | 2026-10-25 17:31:00.0  | false       |
+| 1033         | Navi Mumbai  | Silver  | 2026-10-25 17:31:00.0  | 9999-12-31 00:00:00.0  | true        |
+| 1380         | Bengaluru    | Silver  | 2026-09-30 23:00:00.0  | 2026-10-14 17:39:00.0  | false       |
+| 1380         | Mumbai       | Silver  | 2026-10-14 17:39:00.0  | 2026-10-28 21:05:00.0  | false       |
+| 1380         | Navi Mumbai  | Silver  | 2026-10-28 21:05:00.0  | 9999-12-31 00:00:00.0  | true        |
++--------------+--------------+---------+------------------------+------------------------+-------------+</div></div>
+      <span class="behind">The classic Hive SCD 2 trick: the source is used twice. Rows with <code>join_key</code> = customer id <b>match</b> the current row and close it (<code>valid_to</code>, <code>is_current = false</code>). The same changed rows with <code>join_key</code> = NULL <b>never match</b>, so they are inserted as the new current version. New customers are inserted by the first half. Rohan (1033) now has three versions, each valid until the next begins.</span></li>
+    <li><h4>Step 7 · The re-run test finds a bug</h4>
+      <div class="code" data-lang="sql" data-file="re-run 15 October with the first version of step 5"><pre><code>-- before: fact_rows, fact_net, dim_rows, gold_net, rejected
+$ run_load.sh 2026-10-15
+
+SELECT customer_id, city, plan, valid_from, valid_to, is_current FROM dim_customer
+WHERE customer_id IN (SELECT customer_id FROM dim_customer GROUP BY customer_id
+                      HAVING SUM(IF(valid_to &lt; valid_from, 1, 0)) &gt; 0)
+ORDER BY customer_id, valid_from LIMIT 8;</code></pre><div class="output">+------------+--------------+-----------+--------------+-----------+
+| fact_rows  |   fact_net   | dim_rows  |   gold_net   | rejected  |
++------------+--------------+-----------+--------------+-----------+
+| 47553      | 15395190.00  | 4166      | 15395190.00  | 112       |
++------------+--------------+-----------+--------------+-----------+
+
++------------+--------------+-----------+--------------+-----------+
+| fact_rows  |   fact_net   | dim_rows  |   gold_net   | rejected  |
++------------+--------------+-----------+--------------+-----------+
+| 47553      | 15395190.00  | 4171      | 15395190.00  | 112       |
++------------+--------------+-----------+--------------+-----------+
+
++--------------+--------------+---------+------------------------+------------------------+-------------+
+| customer_id  |     city     |  plan   |       valid_from       |        valid_to        | is_current  |
++--------------+--------------+---------+------------------------+------------------------+-------------+
+| 1380         | Bengaluru    | Silver  | 2026-09-30 23:00:00.0  | 2026-10-14 17:39:00.0  | false       |
+| 1380         | Mumbai       | Silver  | 2026-10-14 17:39:00.0  | 2026-10-28 21:05:00.0  | false       |
+| 1380         | Mumbai       | Silver  | 2026-10-14 17:39:00.0  | 9999-12-31 00:00:00.0  | true        |
+| 1380         | Navi Mumbai  | Silver  | 2026-10-28 21:05:00.0  | 2026-10-14 17:39:00.0  | false       |
+| 2762         | Bengaluru    | Silver  | 2026-09-30 23:00:00.0  | 2026-10-14 11:09:00.0  | false       |
+| 2762         | Thane        | Silver  | 2026-10-14 11:09:00.0  | 2026-10-19 12:54:00.0  | false       |
+| 2762         | Thane        | Silver  | 2026-10-14 11:09:00.0  | 9999-12-31 00:00:00.0  | true        |
+| 2762         | Thane        | Gold    | 2026-10-19 12:54:00.0  | 2026-10-14 11:09:00.0  | false       |
++--------------+--------------+---------+------------------------+------------------------+-------------+</div></div>
+      <span class="behind">Orders, gold and quarantine survived the re-run unchanged, but <code>dim_customer</code> grew from 4,166 to 4,171 rows. Customer 1380 moved to Mumbai on 14 October and to Navi Mumbai on 28 October. Re-running 15 October compared the <b>old</b> file with the <b>current</b> version, saw a “change”, closed the newer version with an <b>earlier</b> <code>valid_to</code> and inserted the old Mumbai row as current. The fix is the two <code>updated_at &gt; valid_from</code> conditions you saw in Step 6: only versions newer than what we hold may change the dimension.</span></li>
+    <li><h4>Step 8 · Rebuild and prove idempotence</h4>
+      <div class="code" data-lang="sql" data-file="rebuild dim_customer with the fixed MERGE, then re-run two old days"><pre><code>TRUNCATE TABLE dim_customer;   -- then replay step 5 for 1–31 October
+SELECT SUM(IF(valid_to &lt; valid_from, 1, 0)) AS negative_intervals, SUM(IF(is_current, 1, 0)) AS current_rows,
+       COUNT(DISTINCT customer_id) AS customers FROM dim_customer;
+$ run_load.sh 2026-10-15
+$ run_load.sh 2026-10-03
+-- fact_rows, fact_net, dim_rows, gold_net, rejected</code></pre><div class="output">+---------------------+---------------+------------+
+| negative_intervals  | current_rows  | customers  |
++---------------------+---------------+------------+
+| 0                   | 3664          | 3664       |
++---------------------+---------------+------------+
+
+2026-10-15 rc=0 31.1s
+2026-10-03 rc=0 31.0s
+
++------------+--------------+-----------+--------------+-----------+
+| fact_rows  |   fact_net   | dim_rows  |   gold_net   | rejected  |
++------------+--------------+-----------+--------------+-----------+
+| 47553      | 15395190.00  | 4166      | 15395190.00  | 112       |
++------------+--------------+-----------+--------------+-----------+</div></div>
+      <span class="behind">Replaying one MERGE per day rebuilt the dimension: 4,166 versions, one current row for each of 3,664 customers, no negative intervals. (Raw has 4,167 customer rows: customer 2311 appears twice in the 20 October file and only the newer row counts.) After re-running two old loads, every number is identical. This is what “idempotent” means in practice, and this test belongs in every pipeline’s release checklist.</span></li>
+    <li><h4>Step 9 · Gold: rebuild only the dates a load touched</h4>
+      <div class="code" data-lang="sql" data-file="daily_load.hql, step 7 · then checks"><pre><code>-- 7. gold: rebuild only the order dates this load touched (late rows and refunds touch old dates)
+INSERT OVERWRITE TABLE gold_city_daily PARTITION (order_date)
+SELECT r.city, COUNT(*),
+       SUM(IF(f.status = &#x27;DELIVERED&#x27;, 1, 0)), SUM(IF(f.status = &#x27;CANCELLED&#x27;, 1, 0)), SUM(IF(f.status = &#x27;REFUNDED&#x27;, 1, 0)),
+       SUM(IF(f.status &lt;&gt; &#x27;CANCELLED&#x27;, f.amount, 0)),
+       SUM(IF(f.status = &#x27;DELIVERED&#x27;, f.amount, 0)),
+       ROUND(100 * AVG(IF(f.payment = &#x27;UPI&#x27;, 1, 0)), 2),
+       ROUND(AVG((UNIX_TIMESTAMP(d.delivered_ts) - UNIX_TIMESTAMP(f.order_ts)) / 60), 1),
+       ROUND(PERCENTILE_APPROX((UNIX_TIMESTAMP(d.delivered_ts) - UNIX_TIMESTAMP(f.order_ts)) / 60, 0.9), 1),
+       f.order_date
+FROM fact_orders f
+JOIN dim_restaurant r ON r.restaurant_id = f.restaurant_id
+LEFT JOIN fact_deliveries d ON d.order_id = f.order_id
+WHERE f.order_date IN (SELECT DISTINCT order_date FROM stg_orders WHERE reject_reason IS NULL)
+GROUP BY r.city, f.order_date;
+
+SELECT step, row_count FROM etl_audit WHERE load_date = DATE &#x27;2026-10-10&#x27; ORDER BY step;
+SELECT g.total AS gold_net, f.total AS fact_net, g.total - f.total AS diff
+FROM (SELECT SUM(net_revenue) AS total FROM gold_city_daily) g
+CROSS JOIN (SELECT SUM(amount) AS total FROM fact_orders WHERE status = &#x27;DELIVERED&#x27;) f;</code></pre><div class="output">+----------------------+------------+
+|         step         | row_count  |
++----------------------+------------+
+| accepted_distinct    | 1730       |
+| customers_current    | 3204       |
+| fact_total           | 15547      |
+| order_dates_touched  | 5          |
+| raw_rows             | 1741       |
+| rejected             | 5          |
++----------------------+------------+
+
++--------------+--------------+-------+
+|   gold_net   |   fact_net   | diff  |
++--------------+--------------+-------+
+| 15395190.00  | 15395190.00  | 0.00  |
++--------------+--------------+-------+</div></div>
+      <span class="behind">The 10 October load touched <b>five</b> order dates: today’s orders plus late rows and refunds for earlier days. Only those five gold partitions were rewritten (dynamic partition overwrite replaces only partitions that appear in the output). Because gold is rebuilt from the whole fact and delivery tables, an order whose delivery events arrived a day earlier gets its delivery time now. Gold and fact agree to the paisa: ₹1,53,95,190.</span></li>
+    <li><h4>Step 10 · An engine limit in the audit step</h4>
+      <div class="code" data-lang="sql" data-file="first version of step 8 · final version"><pre><code>-- first version: six UNION ALL branches over four tables
+INSERT INTO etl_audit SELECT …, step, n, CURRENT_TIMESTAMP FROM (
+  SELECT &#x27;raw_rows&#x27; AS step, COUNT(*) AS n FROM stg_orders
+  UNION ALL SELECT &#x27;rejected&#x27;, COUNT(*) FROM stg_orders WHERE reject_reason IS NOT NULL
+  UNION ALL … fact_orders … dim_customer … ) a;
+
+-- 8. audit trail for this run (one scan + STACK turns columns into rows)
+INSERT INTO etl_audit
+SELECT DATE &#x27;${hivevar:load_date}&#x27;, x.step, x.n, CURRENT_TIMESTAMP
+FROM (SELECT COUNT(*) AS raw_rows, SUM(IF(reject_reason IS NOT NULL, 1, 0)) AS rejected,
+             COUNT(DISTINCT IF(reject_reason IS NULL, order_id, NULL)) AS accepted,
+             COUNT(DISTINCT IF(reject_reason IS NULL, order_date, NULL)) AS dates
+      FROM stg_orders) s
+LATERAL VIEW STACK(4, &#x27;raw_rows&#x27;, s.raw_rows, &#x27;rejected&#x27;, s.rejected,
+                      &#x27;accepted_distinct&#x27;, s.accepted, &#x27;order_dates_touched&#x27;, s.dates) x AS step, n;
+INSERT INTO etl_audit SELECT DATE &#x27;${hivevar:load_date}&#x27;, &#x27;fact_total&#x27;, COUNT(*), CURRENT_TIMESTAMP FROM fact_orders;
+INSERT INTO etl_audit SELECT DATE &#x27;${hivevar:load_date}&#x27;, &#x27;customers_current&#x27;, COUNT(*), CURRENT_TIMESTAMP FROM dim_customer WHERE is_current;</code></pre><div class="output">Error: Error while compiling statement: FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.tez.TezTask. Too many counters: 121 max=120 (state=08S01,code=1)</div></div>
+      <span class="behind">The first audit query failed on day 1: Tez allows 120 counters per job by default, and six branches with their own scans exceeded it. Instead of raising a limit, the query was simplified: one scan of <code>stg_orders</code> computes four numbers, and <code>LATERAL VIEW STACK(4, …)</code> turns those four columns into four rows; the two other tables get one small INSERT each. Fewer stages, same audit, no error.</span></li>
+    <li><h4>Step 11 · Answers for the CEO</h4>
+      <div class="code" data-lang="sql" data-file="beeline"><pre><code>SELECT city, SUM(orders) AS orders, SUM(delivered) AS delivered, SUM(refunded) AS refunded,
+       SUM(net_revenue) AS net_revenue, ROUND(AVG(upi_share), 1) AS upi_pct,
+       ROUND(SUM(avg_delivery_min * delivered) / SUM(delivered), 1) AS avg_min, MAX(p90_delivery_min) AS worst_p90
+FROM gold_city_daily WHERE order_date BETWEEN DATE &#x27;2026-10-01&#x27; AND DATE &#x27;2026-10-31&#x27;
+GROUP BY city ORDER BY net_revenue DESC;
+
+SELECT IF(d.is_weekend, &#x27;weekend&#x27;, &#x27;weekday&#x27;) AS day_type, COUNT(DISTINCT g.order_date) AS days,
+       SUM(g.orders) AS orders, ROUND(SUM(g.orders) / COUNT(DISTINCT g.order_date), 0) AS orders_per_day
+FROM gold_city_daily g JOIN dim_date d ON d.date_key = g.order_date
+GROUP BY IF(d.is_weekend, &#x27;weekend&#x27;, &#x27;weekday&#x27;);</code></pre><div class="output">+--------------+---------+------------+-----------+--------------+----------+----------+------------+
+|     city     | orders  | delivered  | refunded  | net_revenue  | upi_pct  | avg_min  | worst_p90  |
++--------------+---------+------------+-----------+--------------+----------+----------+------------+
+| Mumbai       | 11822   | 10846      | 161       | 3836320.00   | 64.4     | 40.1     | 52.3       |
+| Bengaluru    | 11481   | 10527      | 163       | 3733320.00   | 64.8     | 39.9     | 52.1       |
+| Pune         | 9336    | 8526       | 145       | 3001340.00   | 65.6     | 34.3     | 46.7       |
+| Hyderabad    | 6318    | 5783       | 75        | 2068780.00   | 64.5     | 34.1     | 46.8       |
+| Navi Mumbai  | 4719    | 4309       | 69        | 1520700.00   | 66.8     | 33.9     | 46.8       |
+| Thane        | 3877    | 3540       | 47        | 1234730.00   | 63.9     | 34.3     | 47.3       |
++--------------+---------+------------+-----------+--------------+----------+----------+------------+
+
++-----------+-------+---------+-----------------+
+| day_type  | days  | orders  | orders_per_day  |
++-----------+-------+---------+-----------------+
+| weekday   | 22    | 32154   | 1462.0          |
+| weekend   | 9     | 15399   | 1711.0          |
++-----------+-------+---------+-----------------+</div></div>
+      <span class="behind">Mumbai’s net revenue is <b>₹38,36,320</b>, not the ₹42,77,880 of the old report: ₹4.4 lakh (11.5%) was duplicates, re-sent rows, refunds and cancellations. Bengaluru is almost level with Mumbai; Mumbai and Bengaluru deliveries take about 40 minutes from order to door, other cities about 34. Weekends bring 17% more orders per day (1,711 vs 1,462). The averaged delivery time is weighted by delivered orders; a direct query on the fact table gives the same 40.1 and 39.9.</span></li>
+    <li><h4>Step 12 · “Do Gold customers spend more?” As of the order</h4>
+      <div class="code" data-lang="sql" data-file="beeline · point-in-time join vs current plan"><pre><code>SELECT c.plan, COUNT(*) AS orders, ROUND(AVG(f.amount), 2) AS avg_order, SUM(f.amount) AS net_revenue
+FROM fact_orders f
+JOIN dim_customer c ON c.customer_id = f.customer_id
+                   AND f.order_ts &gt;= c.valid_from AND f.order_ts &lt; c.valid_to
+WHERE f.status = &#x27;DELIVERED&#x27; GROUP BY c.plan ORDER BY avg_order DESC;
+
+-- the tempting shortcut: today’s plan
+… JOIN dim_customer c ON c.customer_id = f.customer_id AND c.is_current …
+
+-- the mistake: no date condition at all
+SELECT COUNT(*) AS joined_rows FROM fact_orders f JOIN dim_customer c ON c.customer_id = f.customer_id;</code></pre><div class="output">+---------+---------+------------+--------------+
+| c.plan  | orders  | avg_order  | net_revenue  |
++---------+---------+------------+--------------+
+| Gold    | 4987    | 356.27     | 1776740.00   |
+| Silver  | 11528   | 354.51     | 4086800.00   |
+| Basic   | 27016   | 352.81     | 9531650.00   |
++---------+---------+------------+--------------+
+
+-- today’s plan
++---------+---------+------------+--------------+
+| c.plan  | orders  | avg_order  | net_revenue  |
++---------+---------+------------+--------------+
+| Gold    | 5384    | 356.46     | 1919200.00   |
+| Silver  | 11761   | 354.01     | 4163460.00   |
+| Basic   | 26386   | 352.93     | 9312530.00   |
++---------+---------+------------+--------------+
+
++--------------+
+| joined_rows  |
++--------------+
+| 54418        |
++--------------+</div></div>
+      <span class="behind">Answer for the CEO: Gold customers spend only slightly more per order (₹356 vs ₹353). The point-in-time join credits ₹17.77 lakh to Gold; using today’s plan would claim ₹19.19 lakh, because customers who upgraded later take their old orders with them. Joining without any date condition multiplies rows: 54,418 instead of 47,553. That is the most common SCD 2 bug in interviews and in production.</span></li>
+    <li><h4>Step 13 · Proof of partition pruning, and a Hive 4 surprise</h4>
+      <div class="code" data-lang="sql" data-file="beeline"><pre><code>EXPLAIN DEPENDENCY SELECT SUM(amount) FROM fact_orders
+WHERE order_date BETWEEN DATE &#x27;2026-10-05&#x27; AND DATE &#x27;2026-10-06&#x27; AND status = &#x27;DELIVERED&#x27;;
+
+DESCRIBE FORMATTED gold_city_daily;   -- selected lines</code></pre><div class="output">+----------------------------------------------------+
+|                      Explain                       |
++----------------------------------------------------+
+| {&quot;input_tables&quot;:[{&quot;tablename&quot;:&quot;tiffingo_dw@fact_orders&quot;,&quot;tabletype&quot;:&quot;MANAGED_TABLE&quot;}],&quot;input_partitions&quot;:[{&quot;partitionName&quot;:&quot;tiffingo_dw@fact_orders@order_date=2026-10-05&quot;},{&quot;partitionName&quot;:&quot;tiffingo_dw@fact_orders@order_date=2026-10-06&quot;}]} |
++----------------------------------------------------+
+
+| Table Type:                   | EXTERNAL_TABLE                                     | NULL                        |
+|                               | EXTERNAL                                           | TRUE                        |
+|                               | TRANSLATED_TO_EXTERNAL                             | TRUE                        |
+|                               | external.table.purge                               | TRUE                        |</div></div>
+      <span class="behind"><code>EXPLAIN DEPENDENCY</code> lists the inputs a query will read: two partitions out of 31. The second output is a Hive 4 behaviour worth knowing: a “managed” table that is not transactional is <b>translated to an external table</b> with <code>external.table.purge=TRUE</code>. It still behaves like a managed table (DROP deletes the data), but tools that check the table type see EXTERNAL_TABLE. ACID tables stay MANAGED_TABLE.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Raw to gold, safely</h2>
+  <p>Left: real outputs from the build. Right: what the pipeline does inside.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Raw to gold, safely <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">2026-10-01 rc=0 27.7s</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">2026-10-02 rc=0 28.9s</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">…</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">2026-10-31 rc=0 29.1s</text><text x="26" y="106" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">31 loads · 901 s</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">bad amount            31</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">missing customer      31</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">unknown restaurant    31</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">bad order_ts          11</text><text x="26" y="106" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">non-positive amount    8</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">orders 47553 · distinct 47553</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">valid_raw_orders 47553</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">5006782 2026-10-05 REFUNDED</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">        load_date 2026-10-09</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">re-run 2026-10-15</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">dim_rows 4166 → 4171</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">valid_to &lt; valid_from: 5 rows</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">fix: updated_at &gt; valid_from</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">order_dates_touched  5</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">gold_net  15395190.00</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">fact_net  15395190.00</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">diff      0.00</text></g><g data-on="6"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Mumbai  3836320.00 net</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">(raw report said 4277880)</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">Gold avg ₹356 · Basic ₹353</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">weekend 1711/day · weekday 1462</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>31 nightly loads, all successful.</li>
+          <li>Exactly the 112 rows found in Lesson 12.1.</li>
+          <li>Fact = valid raw orders; refunds updated.</li>
+          <li>The re-run test caught an SCD 2 bug.</li>
+          <li>Five dates rebuilt; gold matches fact.</li>
+          <li>The CEO’s answers, now correct.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Inside the pipeline">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One script per load_date</text><rect x="14" y="40" width="100" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="64.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">raw</text><text x="64.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">load_date</text><rect x="130" y="40" width="100" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">stg</text><text x="180.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">typed + reason</text><rect x="246" y="40" width="100" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="296.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">quarantine</text><text x="296.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">112 rows</text><rect x="14" y="112" width="100" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="64.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">fact_orders</text><text x="64.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">MERGE · ACID</text><rect x="130" y="112" width="100" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">dim_customer</text><text x="180.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">SCD 2 MERGE</text><rect x="246" y="112" width="100" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="296.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">gold</text><text x="296.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">touched dates</text><path d="M116 55L128 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M121.7 58.0L128 55L121.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M232 55L244 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M237.7 58.0L244 55L237.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M180 72L64 110" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M69.0 105.1L64 110L70.9 110.9" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M116 127L128 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M121.7 130.0L128 127L121.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M232 127L244 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M237.7 130.0L244 127L237.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><rect x="10" y="172" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="192.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">--hivevar load_date=…</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">First failed rule wins</text><rect x="14" y="40" width="100" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="64.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">raw</text><text x="64.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">load_date</text><rect x="130" y="40" width="100" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">stg</text><text x="180.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">typed + reason</text><rect x="246" y="40" width="100" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="296.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">quarantine</text><text x="296.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">112 rows</text><rect x="14" y="112" width="100" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="64.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">fact_orders</text><text x="64.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">MERGE · ACID</text><rect x="130" y="112" width="100" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">dim_customer</text><text x="180.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">SCD 2 MERGE</text><rect x="246" y="112" width="100" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="296.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">gold</text><text x="296.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">touched dates</text><path d="M116 55L128 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M121.7 58.0L128 55L121.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M232 55L244 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M237.7 58.0L244 55L237.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M180 72L64 110" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M69.0 105.1L64 110L70.9 110.9" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M116 127L128 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M121.7 130.0L128 127L121.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M232 127L244 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M237.7 130.0L244 127L237.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><rect x="10" y="172" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="192.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bad rows kept with a reason.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Newest version wins</text><rect x="14" y="40" width="100" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="64.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">raw</text><text x="64.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">load_date</text><rect x="130" y="40" width="100" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">stg</text><text x="180.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">typed + reason</text><rect x="246" y="40" width="100" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="296.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">quarantine</text><text x="296.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">112 rows</text><rect x="14" y="112" width="100" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="64.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">fact_orders</text><text x="64.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">MERGE · ACID</text><rect x="130" y="112" width="100" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">dim_customer</text><text x="180.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">SCD 2 MERGE</text><rect x="246" y="112" width="100" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="296.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">gold</text><text x="296.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">touched dates</text><path d="M116 55L128 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M121.7 58.0L128 55L121.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M232 55L244 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M237.7 58.0L244 55L237.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M180 72L64 110" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M69.0 105.1L64 110L70.9 110.9" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M116 127L128 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M121.7 130.0L128 127L121.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M232 127L244 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M237.7 130.0L244 127L237.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><rect x="10" y="172" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="192.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MERGE ignores older or equal rows.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Old file vs current row</text><rect x="14" y="40" width="100" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="64.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">raw</text><text x="64.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">load_date</text><rect x="130" y="40" width="100" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">stg</text><text x="180.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">typed + reason</text><rect x="246" y="40" width="100" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="296.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">quarantine</text><text x="296.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">112 rows</text><rect x="14" y="112" width="100" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="64.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">fact_orders</text><text x="64.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">MERGE · ACID</text><rect x="130" y="112" width="100" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="180.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">dim_customer</text><text x="180.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">SCD 2 MERGE</text><rect x="246" y="112" width="100" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="296.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">gold</text><text x="296.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">touched dates</text><path d="M116 55L128 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M121.7 58.0L128 55L121.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M232 55L244 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M237.7 58.0L244 55L237.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M180 72L64 110" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M69.0 105.1L64 110L70.9 110.9" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M116 127L128 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M121.7 130.0L128 127L121.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M232 127L244 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M237.7 130.0L244 127L237.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><rect x="10" y="172" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="192.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Guard: only newer changes.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Recompute what changed</text><rect x="14" y="40" width="100" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="64.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">raw</text><text x="64.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">load_date</text><rect x="130" y="40" width="100" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">stg</text><text x="180.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">typed + reason</text><rect x="246" y="40" width="100" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="296.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">quarantine</text><text x="296.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">112 rows</text><rect x="14" y="112" width="100" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="64.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">fact_orders</text><text x="64.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">MERGE · ACID</text><rect x="130" y="112" width="100" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">dim_customer</text><text x="180.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">SCD 2 MERGE</text><rect x="246" y="112" width="100" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="296.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">gold</text><text x="296.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">touched dates</text><path d="M116 55L128 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M121.7 58.0L128 55L121.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M232 55L244 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M237.7 58.0L244 55L237.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M180 72L64 110" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M69.0 105.1L64 110L70.9 110.9" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M116 127L128 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M121.7 130.0L128 127L121.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M232 127L244 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M237.7 130.0L244 127L237.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><rect x="10" y="172" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="192.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Gold = fact, every night.</text></g><g data-on="6"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Answers from gold</text><rect x="14" y="40" width="100" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="64.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">raw</text><text x="64.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">load_date</text><rect x="130" y="40" width="100" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">stg</text><text x="180.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">typed + reason</text><rect x="246" y="40" width="100" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="296.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">quarantine</text><text x="296.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">112 rows</text><rect x="14" y="112" width="100" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="64.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">fact_orders</text><text x="64.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">MERGE · ACID</text><rect x="130" y="112" width="100" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">dim_customer</text><text x="180.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">SCD 2 MERGE</text><rect x="246" y="112" width="100" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="296.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">gold</text><text x="296.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">touched dates</text><path d="M116 55L128 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M121.7 58.0L128 55L121.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M232 55L244 55" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M237.7 58.0L244 55L237.7 52.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M180 72L64 110" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M69.0 105.1L64 110L70.9 110.9" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M116 127L128 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M121.7 130.0L128 127L121.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M232 127L244 127" style="fill:none;stroke:#8A94A0;stroke-width:1.2;stroke-dasharray:4 3"/><path d="M237.7 130.0L244 127L237.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><rect x="10" y="172" width="340" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="192.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Point-in-time join for plans.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The load date selects one raw partition.</li>
+          <li>CASE gives each row one reject reason.</li>
+          <li>ROW_NUMBER + MERGE with a newer-only guard.</li>
+          <li>Old files must not overwrite newer history.</li>
+          <li>Dynamic overwrite replaces only touched partitions.</li>
+          <li>Orders join the version valid at order time.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a failure at night, a late correction, and scaling up.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-rerun">A night-time failure, handled by re-running</h3>
+  <p class="anim-intro">Why idempotence matters at 3 a.m. (Typical incident.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Re-run after failure <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A load fails half-way; because every step is idempotent the on-call engineer simply re-runs it and the audit shows both runs">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">02:40 · load fails at step 6</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">disk full on the cluster</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Steps 0–5 already ran.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix the disk</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">no manual clean-up of tables</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nothing to undo.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Re-run the whole load</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">run_load.sh 2026-10-16</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Steps 0–5 repeat harmlessly.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Audit shows two runs</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">same counts, two run_ts</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Evidence for the morning.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">06:00 · dashboard correct</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">because every step is idempotent</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No one woke the team lead.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Failure in the middle.</li>
+          <li>Fix the cause only.</li>
+          <li>Run again from the top.</li>
+          <li>Check the audit.</li>
+          <li>Correct by morning.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-correction">Correcting an old day without a manual fix</h3>
+  <p class="anim-intro">The same pipeline handles corrections. (Illustrative.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Late correction <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A corrected file for an old day arrives in a new load; MERGE updates the orders and gold rebuilds only the touched dates">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Source resends 3 October</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">with 40 corrected amounts</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A late correction file.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Put it in a new load folder</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">load_date=2026-11-02</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Never edit an old landing file.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MERGE updates 40 orders</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">newer updated_at wins</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Partition order_date=2026-10-03.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Gold rebuilds 3 October</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">touched dates = {10-03, 11-02}</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Only what changed.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Finance sees the fix</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">audit row explains the change</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Traceable correction.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Corrections happen.</li>
+          <li>Treat it as a new load.</li>
+          <li>Upsert by key.</li>
+          <li>Recompute touched dates.</li>
+          <li>Explainable numbers.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-scale">Taking the capstone to production scale</h3>
+  <p class="anim-intro">What changes when the data grows. (Typical next steps.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Scaling up <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="At 200 times the volume, limit MERGE to recent partitions, rely on compaction, serve gold to other engines and schedule with Airflow">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">TiffinGo grows 200×</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">300,000 orders a day</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same design, new settings.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MERGE scans the whole fact</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">add: AND t.order_date >= cutoff</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Limit the target partitions.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Compaction keeps up</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">automatic initiator + worker</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Deltas merged in the background.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Gold as Iceberg or MV</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">readable by Trino dashboards</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lessons 9.2 and 11.3.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Airflow instead of a loop</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">retries, alerts, backfill UI</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same script inside.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Bigger data.</li>
+          <li>Prune the MERGE target.</li>
+          <li>Let compaction run.</li>
+          <li>Serve gold widely.</li>
+          <li>Use a real scheduler.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>The same pipeline shape in industry</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green">orders</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">upsert</text></svg></div>
+    <div><h4>1. E-commerce and food delivery</h4>
+      <p>Order status changes (placed, delivered, returned, refunded) are merged into one fact row per order every night or every hour.</p>
+      <div class="uc-flow"><span>Status feed</span><i>→</i><span class="java">MERGE</span><i>→</i><span>Order fact</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">banking</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">reconcile</text></svg></div>
+    <div><h4>2. Banking and payments</h4>
+      <p>Transactions are reconciled between source, warehouse and ledger every day; differences go to a break report, like our quarantine.</p>
+      <div class="uc-flow"><span>Core banking</span><i>→</i><span class="java">recon checks</span><i>→</i><span>Regulatory report</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">telecom</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">late CDRs</text></svg></div>
+    <div><h4>3. Telecom usage</h4>
+      <p>Call and data records arrive hours or days late; daily usage tables are rebuilt for touched dates only.</p>
+      <div class="uc-flow"><span>CDR files</span><i>→</i><span class="java">touched dates</span><i>→</i><span>Usage marts</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="9.6" font-weight="700" class="s-acc">insurance</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">SCD 2</text></svg></div>
+    <div><h4>4. Insurance and HR</h4>
+      <p>Policy holders’ and employees’ attributes change; claims and payroll are reported with the values valid at the time.</p>
+      <div class="uc-flow"><span>Master data</span><i>→</i><span class="java">SCD 2</span><i>→</i><span>As-of reports</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">retail</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">gold marts</text></svg></div>
+    <div><h4>5. Retail dashboards</h4>
+      <p>Store × day gold tables feed BI tools; pre-aggregation keeps dashboards fast for hundreds of users.</p>
+      <div class="uc-flow"><span>Silver facts</span><i>→</i><span class="java">gold aggregates</span><i>→</i><span>BI</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>

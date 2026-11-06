@@ -1,0 +1,15 @@
+"""Generate 5,000,000 TiffinGo orders as Parquet (deterministic)."""
+from pyspark.sql import SparkSession, functions as F
+spark = SparkSession.builder.appName("make-orders-big").getOrCreate()
+cities = F.array(*[F.lit(c) for c in ["Mumbai","Mumbai","Bengaluru","Bengaluru","Pune","Hyderabad","Delhi","Thane","Navi Mumbai","Chennai"]])
+df = (spark.range(0, 5_000_000, numPartitions=8)
+      .withColumn("order_id", F.col("id") + 1_000_000)
+      .withColumn("customer_id", (F.hash("id") % 2000).cast("int") + 2001)
+      .withColumn("city", F.element_at(cities, (F.abs(F.hash(F.col("id"), F.lit(7))) % 10 + 1).cast("int")))
+      .withColumn("order_date", F.date_add(F.lit("2026-09-01").cast("date"), (F.col("id") % 61).cast("int")))
+      .withColumn("amount", ((F.abs(F.hash(F.col("id"), F.lit(3))) % 900) + 60).cast("int"))
+      .withColumn("status", F.when(F.col("id") % 20 == 0, "CANCELLED").otherwise("DELIVERED"))
+      .drop("id"))
+df.write.mode("overwrite").parquet("/data/orders_big")
+print("rows written:", spark.read.parquet("/data/orders_big").count())
+spark.stop()

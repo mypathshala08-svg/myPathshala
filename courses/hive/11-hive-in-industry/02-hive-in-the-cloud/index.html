@@ -1,0 +1,1562 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hive in the cloud: S3, EMR, Dataproc and HDInsight | MyPhatshala</title>
+<meta name="description" content="Run Hive 4.2.1 on S3-compatible object storage through the S3A connector and measure what changes: Tez tasks failing without credentials, a partitioned Parquet table on s3a://, directory markers, one partition overwrite costing 85 requests with four server-side copies, staging refused on another file system, partitions invisible until MSCK REPAIR, and request counts per query. Plus the Hive versions, storage connectors and metastore options of Amazon EMR, Google Dataproc and Azure HDInsight in 2026.">
+<meta name="mp:minutes" content="45">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/11-hive-in-industry/02-hive-in-the-cloud/">
+<meta property="og:title" content="Hive in the cloud: S3, EMR, Dataproc and HDInsight · MyPhatshala">
+<meta property="og:description" content="One output file, 85 S3 requests and four server-side copies: what really happens when Hive writes to object storage, plus EMR, Dataproc and HDInsight compared.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Hive in the cloud: S3, EMR, Dataproc and HDInsight", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="11-hive-in-industry/02-hive-in-the-cloud" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 11.2</b></nav>
+    <h1>Hive in the cloud: S3, EMR, Dataproc and HDInsight</h1>
+    <p class="lead">Most new Hive deployments keep data in cloud object storage and treat clusters as temporary. This lesson connects our Hive 4.2.1 lab to an <b>S3-compatible server</b>, logs every request Hive makes, and compares the managed services of AWS, Google Cloud and Azure. <b>All outputs are real</b>; the configuration files are in the course lab folder.</p>
+    <div class="lesson-meta"><span>Module 11 · Hive in industry today</span><span>⏱ 45 min</span><span>Intermediate → Advanced</span><span>Hive 4.2.1 · S3A</span><span>85 requests for one partition</span><span>EMR · Dataproc · HDInsight</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Shut the cluster down at night”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> external tables (<a href="../../02-hiveql/02-managed-vs-external-tables/">2.2</a>), MSCK (<a href="../../05-partitioning-and-bucketing/02-dynamic-partitions-and-msck/">5.2</a>), small files (<a href="../../05-partitioning-and-bucketing/04-partition-design-small-files-and-skew/">5.4</a>) and the metastore (<a href="../../10-administration-and-security/01-metastore-administration/">10.1</a>).</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s finance team sees the Hadoop cluster bill: twelve machines run all night for a load that takes forty minutes. The new plan is to keep the data in cloud object storage, start a cluster for the load, and shut it down afterwards. Kabir is asked to prove it works with Hive.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Compute (HiveServer2 and Tez), the catalogue (metastore) and the data (object storage) are separate in the cloud. Our lab table on S3 showed five behaviours you do not see on HDFS.">
+        <rect x="14" y="22" width="150" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="89.0" y="33" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">HiveServer2 + Tez</text><text x="89.0" y="43" text-anchor="middle" font-size="6.4" class="s-ink2 mono">compute: can be switched off</text><rect x="14" y="66" width="150" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="89.0" y="77" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Metastore</text><text x="89.0" y="87" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Postgres / Glue / Dataproc MS</text><path d="M166 37L236 66" style="fill:none;stroke:var(--track);stroke-width:1.6"/><path d="M229.0 66.4L236 66L231.3 60.8" style="fill:none;stroke:var(--track);stroke-width:1.6"/><path d="M166 81L236 81" style="fill:none;stroke:var(--track);stroke-width:1.4"/><path d="M229.7 84.0L236 81L229.7 78.0" style="fill:none;stroke:var(--track);stroke-width:1.4"/><rect x="240" y="44" width="140" height="60" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="310" y="66" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Object storage</text><text x="310" y="84" text-anchor="middle" font-size="7.2" class="s-ink2 mono">s3a://tiffingo-lake</text><rect x="410" y="12" width="222" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="521" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">What changed on S3</text><text x="422" y="52" font-size="7.2" class="s-red mono">no credentials in tasks → fail</text><text x="422" y="68" font-size="7.2" class="s-acc mono">1 file written, 4 server-side copies</text><text x="422" y="84" font-size="7.2" class="s-acc mono">85 requests for one partition</text><text x="422" y="100" font-size="7.2" class="s-ink mono">new folder: invisible until MSCK</text><text x="422" y="116" font-size="7.2" class="s-green mono">cluster gone, data stays</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">In the cloud, storage <tspan font-weight="700" class="s-acc">outlives</tspan> the cluster.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, if Hive just reads files, does it matter whether they are on HDFS or on S3?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>The SQL is the same; the table location changes from <code>hdfs://</code> to <code>s3a://</code>. But object storage is <b>not a file system</b>. A “rename” is a copy plus a delete, a “folder” is only a key prefix, every listing is an HTTP request, and permissions come from cloud credentials, not from Linux users.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So the same query can behave differently?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>It answers the same, but it fails differently, costs differently and is slower in different places. Today we connect our Hive 4.2.1 lab to an S3-compatible server, write a partitioned table there, count every request Hive makes, and compare the managed cloud services. All outputs are real.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Hive with object storage and managed services</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>In the cloud, Hive usually runs with <b>separated storage and compute</b>: table data lives in object storage (Amazon S3, Google Cloud Storage, Azure Data Lake Storage Gen2) accessed through a Hadoop file-system connector, the metastore runs as a managed database or catalogue service (AWS Glue Data Catalog, Dataproc Metastore, Azure SQL Database), and compute runs on managed clusters (Amazon EMR, Google Dataproc, Azure HDInsight) that can be resized or deleted without losing data. Object stores offer strong read-after-write consistency but no atomic rename and no real directories, so Hive’s staging-and-move commit, partition discovery and listing-heavy planning cost more requests and time than on HDFS.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>In the cloud, Hive tables usually live in object storage such as S3, the metastore is a managed service, and the cluster is temporary. The SQL stays the same; renames, folders, credentials and costs behave differently.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Object storage</b><span>Buckets of objects addressed by key: S3, GCS, ADLS Gen2.</span></div>
+    <div class="term"><b>S3A</b><span>Hadoop’s open-source S3 connector, URI scheme s3a://.</span></div>
+    <div class="term"><b>EMRFS</b><span>Amazon EMR’s own S3 connector, scheme s3://.</span></div>
+    <div class="term"><b>Key prefix</b><span>The “folder” part of an object key, e.g. order_date=2026-10-01/.</span></div>
+    <div class="term"><b>Directory marker</b><span>An empty object ending in / that tools create to look like a folder.</span></div>
+    <div class="term"><b>Staging directory</b><span>Where Hive writes results before moving them into the table (.hive-staging).</span></div>
+    <div class="term"><b>Transient cluster</b><span>A cluster created for one job and deleted afterwards.</span></div>
+    <div class="term"><b>Glue Data Catalog</b><span>AWS’s managed, Hive-metastore-compatible catalogue.</span></div>
+  </div>
+
+  <h3>HDFS versus object storage, as Hive sees it</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:760px">
+    <thead><tr><th>Operation</th><th>HDFS</th><th>Object storage (S3, GCS, ADLS)</th><th>Seen in our lab</th></tr></thead>
+    <tbody><tr><td>Rename a file or folder</td><td>Metadata change, atomic</td><td>Copy every object, then delete (ADLS Gen2 with hierarchical namespace: atomic)</td><td>1 write + 4 copies for one file</td></tr><tr><td>List a folder</td><td>NameNode call</td><td>Paged HTTP LIST requests</td><td>90 requests for a 9-file query</td></tr><tr><td>A new folder appears</td><td>Hive still needs the partition in the metastore</td><td>Same</td><td>0 rows until MSCK REPAIR</td></tr><tr><td>Who may read</td><td>Linux users, HDFS ACLs, Ranger</td><td>IAM roles, bucket policies, service accounts</td><td>Tasks failed without keys</td></tr><tr><td>Cluster deleted</td><td>Data deleted with it</td><td>Data stays</td><td>—</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Hive in the cloud at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Kitchen and warehouse</h4>
+      <ul>
+        <li>The cluster is the kitchen; object storage is the warehouse across the road.</li>
+        <li>You can close the kitchen at night; the food in the warehouse stays.</li>
+        <li>Moving a box inside the warehouse is slow: you copy it to a new shelf and throw the old one away.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The pieces you configure</h4>
+      <ul>
+        <li>A file-system connector: <b>S3A</b> (<code>s3a://</code>, open source), <b>EMRFS</b> on Amazon EMR (<code>s3://</code>), the Cloud Storage connector on Dataproc (<code>gs://</code>), <b>ABFS</b> on Azure (<code>abfs://</code>).</li>
+        <li>Credentials for every process that touches data: HiveServer2, the metastore <b>and</b> the Tez tasks (an IAM role or service account in production).</li>
+        <li>A metastore outside the cluster: a managed database, AWS Glue Data Catalog or Dataproc Metastore, so the catalogue survives when clusters are deleted.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>Tasks without credentials failed with <code>NoAuthWithAWSException</code>; the session itself had connected fine.</li>
+        <li>One partition overwrite wrote <b>1</b> object and made <b>4</b> server-side copies through staging folders: 85 requests in total.</li>
+        <li>A folder added with an S3 tool stayed invisible to Hive (0 rows) until <code>MSCK REPAIR TABLE</code>; staging on another file system was refused (<code>Wrong FS</code>).</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “How does Hive work on S3?” Through a Hadoop connector (S3A, or EMRFS on EMR) with tables at s3a:// or s3:// locations, credentials from IAM roles, and usually an external metastore such as Glue. S3 has no atomic rename, so commits copy data and listings cost requests; use fewer, larger files, partition pruning, and table formats such as Iceberg that avoid renames.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Managed Hive in the three big clouds</h2>
+  <p>Versions from the providers’ release documentation, checked October 2026. All three still ship <b>Hive 3.x</b>, not Hive 4.</p>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:820px">
+    <thead><tr><th>Service</th><th>Hive version (latest release)</th><th>Storage</th><th>Metastore options</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>Amazon EMR 7.x</td><td>Hive 3.1.3 (EMR 7.14: <code>3.1.3-amzn-24</code>)</td><td>S3 via EMRFS (<code>s3://</code>)</td><td>Glue Data Catalog, or external MySQL/Aurora</td><td>EMR Serverless runs Hive jobs without a cluster</td></tr><tr><td>Google Dataproc 2.2</td><td>Hive 3.1.3 (image 2.2.x, Spark 3.5.3)</td><td>Cloud Storage (<code>gs://</code>)</td><td>Dataproc Metastore (Hive 3.1.2 default; 2.3.6, 2.2.0, 1.2.2)</td><td>Dataproc Metastore offers no Hive 4.x</td></tr><tr><td>Azure HDInsight 5.1</td><td>Hive 3.1.2 (Spark 3.3.1, Hadoop 3.3.4)</td><td>ADLS Gen2 (<code>abfs://</code>)</td><td>Built-in or custom Azure SQL Database</td><td>HDInsight on AKS retired 31 Jan 2025; Microsoft points to Fabric</td></tr><tr><td>Self-managed (our lab)</td><td>Hive 4.2.1</td><td>Any S3-compatible store via S3A</td><td>Postgres/MySQL metastore</td><td>Newest features; you run everything</td></tr></tbody>
+  </table>
+  </div>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Related service</th><th>What it does with Hive tables</th></tr></thead>
+    <tbody><tr><td>AWS Glue Data Catalog</td><td>Hive-compatible catalogue used by EMR, Athena, Redshift Spectrum and Glue jobs; the Glue client for Hive 3 arrived in May 2026.</td></tr><tr><td>Amazon Athena</td><td>Serverless SQL (Trino-based) over tables in the Glue catalogue, written with Hive-style DDL; partition projection computes partitions instead of listing them.</td></tr><tr><td>BigQuery / BigLake</td><td>Can query external tables on Cloud Storage that Dataproc jobs wrote.</td></tr><tr><td>Microsoft Fabric</td><td>Microsoft’s suggested destination for HDInsight on AKS workloads (Spark and Delta, not Hive).</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>A managed service means somebody else patches the machines, not that the behaviour is the same as on-premises. Check the <b>Hive version</b> (cloud services are on 3.x, so Hive 4 features such as Iceberg-first defaults and newer SQL may be missing), the <b>connector</b> and the <b>catalogue</b> before you migrate SQL.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>A Hive table on S3, request by request</h2>
+  <p>Our lab uses an S3-compatible server (moto) on the lab machine, so every request can be logged and nothing costs money. Hive 4.2.1 talks to it through the standard <b>S3A</b> connector, exactly as it would to Amazon S3. Configuration files are in the course lab folder (<code>lab/cloud</code>).</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Point Hadoop at the object store</h4>
+      <div class="code" data-lang="xml" data-file="core-site.xml (metastore and HiveServer2)"><pre><code>&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;configuration&gt;
+  &lt;property&gt;&lt;name&gt;fs.s3a.endpoint&lt;/name&gt;&lt;value&gt;http://172.18.0.1:5050&lt;/value&gt;&lt;/property&gt;
+  &lt;property&gt;&lt;name&gt;fs.s3a.access.key&lt;/name&gt;&lt;value&gt;lab&lt;/value&gt;&lt;/property&gt;
+  &lt;property&gt;&lt;name&gt;fs.s3a.secret.key&lt;/name&gt;&lt;value&gt;labsecret&lt;/value&gt;&lt;/property&gt;
+  &lt;property&gt;&lt;name&gt;fs.s3a.path.style.access&lt;/name&gt;&lt;value&gt;true&lt;/value&gt;&lt;/property&gt;
+  &lt;property&gt;&lt;name&gt;fs.s3a.connection.ssl.enabled&lt;/name&gt;&lt;value&gt;false&lt;/value&gt;&lt;/property&gt;
+  &lt;property&gt;&lt;name&gt;fs.s3a.endpoint.region&lt;/name&gt;&lt;value&gt;us-east-1&lt;/value&gt;&lt;/property&gt;
+  &lt;property&gt;&lt;name&gt;fs.s3a.impl&lt;/name&gt;&lt;value&gt;org.apache.hadoop.fs.s3a.S3AFileSystem&lt;/value&gt;&lt;/property&gt;
+&lt;/configuration&gt;</code></pre></div><div class="code" data-lang="yaml" data-file="compose override s3.yml"><pre><code>services:
+  metastore:
+    environment:
+      HADOOP_OPTIONAL_TOOLS: hadoop-aws
+      AWS_ACCESS_KEY_ID: lab
+      AWS_SECRET_ACCESS_KEY: labsecret
+    volumes:
+      - ./cloud/core-site.xml:/opt/hive/conf/core-site.xml:ro
+  hiveserver2:
+    environment:
+      HADOOP_OPTIONAL_TOOLS: hadoop-aws
+      AWS_ACCESS_KEY_ID: lab
+      AWS_SECRET_ACCESS_KEY: labsecret
+    volumes:
+      - ./cloud/core-site.xml:/opt/hive/conf/core-site.xml:ro</code></pre></div>
+      <span class="behind"><code>HADOOP_OPTIONAL_TOOLS=hadoop-aws</code> puts the S3A connector and the AWS SDK on Hive’s classpath. <code>path.style.access</code> and the endpoint are only needed for S3-compatible servers; on AWS you set the region. <b>Never put keys in core-site.xml in production</b>: on EC2/EMR the instance’s IAM role provides credentials automatically.</span></li>
+    <li><h4>Step 2 · The first write fails in the tasks</h4>
+      <div class="code" data-lang="sql" data-file="beeline"><pre><code>INSERT OVERWRITE TABLE orders_s3 PARTITION (order_date)
+SELECT order_id, customer_id, city, amount, status, order_date
+FROM orders WHERE order_date BETWEEN &#x27;2026-10-01&#x27; AND &#x27;2026-10-07&#x27;;</code></pre><div class="output">Caused by: org.apache.hadoop.fs.s3a.auth.NoAuthWithAWSException: No AWS Credentials provided by TemporaryAWSCredentialsProvider SimpleAWSCredentialsProvider EnvironmentVariableCredentialsProvider IAMInstanceCredentialsProvider : software.amazon.awssdk.core.exception.SdkClientException: Unable to load credentials from system settings.</div></div>
+      <span class="behind">Creating the table worked: the metastore and HiveServer2 could reach the bucket. The INSERT failed inside a <b>Tez task</b>, which did not see the keys we had first put only in the session. Every process that reads or writes data needs credentials. We added <code>AWS_ACCESS_KEY_ID</code>/<code>AWS_SECRET_ACCESS_KEY</code> to both containers (Step 1); in the cloud an instance role covers all processes.</span></li>
+    <li><h4>Step 3 · A partitioned Parquet table on S3</h4>
+      <div class="code" data-lang="sql" data-file="beeline"><pre><code>CREATE EXTERNAL TABLE orders_s3 (
+  order_id INT, customer_id INT, city STRING, amount DECIMAL(10,2), status STRING)
+PARTITIONED BY (order_date DATE)
+STORED AS PARQUET
+LOCATION &#x27;s3a://tiffingo-lake/warehouse/orders_s3&#x27;;
+
+-- the INSERT from Step 2, then:
+SELECT order_date, COUNT(*) AS n FROM orders_s3 GROUP BY order_date ORDER BY order_date;</code></pre><div class="output">+-------------+-------+
+| order_date  |   n   |
++-------------+-------+
+| 2026-10-01  | 1641  |
+| 2026-10-02  | 1617  |
+| 2026-10-03  | 1668  |
+| 2026-10-04  | 1744  |
+| 2026-10-05  | 1621  |
+| 2026-10-06  | 1678  |
+| 2026-10-07  | 1662  |
++-------------+-------+</div></div>
+      <span class="behind">The same counts as the source <code>orders</code> table for each day. Nothing in the SQL is cloud-specific except the <code>LOCATION</code>. External tables on object storage are the most common cloud pattern: dropping the table or deleting the cluster leaves the data in the bucket.</span></li>
+    <li><h4>Step 4 · What is really in the bucket</h4>
+      <div class="code" data-lang="python" data-file="list the objects (boto3, like aws s3 ls --recursive)"><pre><code>s3.list_objects_v2(Bucket=&#x27;tiffingo-lake&#x27;, Prefix=&#x27;warehouse/orders_s3/&#x27;)</code></pre><div class="output">$ aws s3 ls --recursive s3://tiffingo-lake/warehouse/orders_s3/   (via boto3)
+       0  warehouse/orders_s3/
+   23724  warehouse/orders_s3/order_date=2026-10-01/000000_0
+   23407  warehouse/orders_s3/order_date=2026-10-02/000000_0
+   24119  warehouse/orders_s3/order_date=2026-10-03/000000_0
+   25115  warehouse/orders_s3/order_date=2026-10-04/000000_0
+   23419  warehouse/orders_s3/order_date=2026-10-05/000000_0
+   24236  warehouse/orders_s3/order_date=2026-10-06/000000_0
+   24025  warehouse/orders_s3/order_date=2026-10-07/000000_0
+objects: 8</div></div>
+      <span class="behind">Seven Parquet objects, one per partition, and a <b>0-byte object</b> <code>warehouse/orders_s3/</code>: a directory marker, because S3 has no folders. <code>order_date=2026-10-01/</code> is only part of each key. Tools that “list a folder” send LIST requests with a prefix, page by page.</span></li>
+    <li><h4>Step 5 · One partition overwrite, every request counted</h4>
+      <div class="code" data-lang="sql" data-file="beeline (S3 server log counted)"><pre><code>INSERT OVERWRITE TABLE orders_s3 PARTITION (order_date = &#x27;2026-10-08&#x27;)
+SELECT order_id, customer_id, city, amount, status FROM orders_s3 WHERE order_date = &#x27;2026-10-07&#x27;;</code></pre><div class="output">S3 requests for one INSERT OVERWRITE of a single partition (1,6xx rows, 1 file):
+  GET    38
+  HEAD   32
+  PUT    9
+  DELETE 4
+  POST   2
+  total  85
+
+Write path of ONE output file (S3 server log, staging prefix shortened to .hive-staging_…/):
+PUT …/order_date=2026-10-08/.hive-staging_…/_task_tmp.-ext-10000/-tmp.000000_0
+PUT …/order_date=2026-10-08/.hive-staging_…/-tmp.-ext-10000/000000_0
+DELETE …/order_date=2026-10-08/.hive-staging_…/_task_tmp.-ext-10000/-tmp.000000_0
+PUT …/order_date=2026-10-08/.hive-staging_…/-tmp.-ext-10000.moved/000000_0
+POST /tiffingo-lake?delete
+PUT …/order_date=2026-10-08/.hive-staging_…/-ext-10000/000000_0
+DELETE …/order_date=2026-10-08/.hive-staging_…/-tmp.-ext-10000.moved/000000_0
+PUT …/order_date=2026-10-08/000000_0
+DELETE …/order_date=2026-10-08/.hive-staging_…/-ext-10000/000000_0
+POST /tiffingo-lake?delete</div></div>
+      <span class="behind">One output file, but <b>85 requests</b>. The task wrote the data once (<code>_task_tmp…</code>), then Hive “renamed” it three times through its staging folders and once into the partition. On S3 each rename is a <b>server-side copy</b> plus a delete. With one small file it is quick; with thousands of large files the commit can take longer than the query. A second run made 93 requests.</span></li>
+    <li><h4>Step 6 · Staging must stay on the table’s file system</h4>
+      <div class="code" data-lang="sql" data-file="beeline"><pre><code>SET hive.exec.stagingdir=file:///tmp/hstage;
+INSERT OVERWRITE TABLE orders_s3 PARTITION (order_date = &#x27;2026-10-08&#x27;) SELECT …;</code></pre><div class="output">Error: Error while compiling statement: FAILED: IllegalArgumentException Wrong FS file://null//tmp/hstage_hive_2026-10-30_05-41-21_280_7636308618137132838-10 -expected s3a://tiffingo-lake</div></div>
+      <span class="behind">Moving staging off S3 to avoid the copies does not work: the final move must happen inside one file system. The real fixes are writers that commit without renames: EMR’s <b>S3-optimised committer</b> for its engines, the S3A <b>magic/staging committers</b> for Spark and MapReduce, or table formats such as <b>Iceberg</b>, which write files once and commit by swapping a metadata pointer (Lesson 11.3).</span></li>
+    <li><h4>Step 7 · Files added outside Hive stay invisible</h4>
+      <div class="code" data-lang="sql" data-file="boto3, then beeline"><pre><code>-- copy a partition object with an S3 tool
+s3.copy_object(..., Key=&#x27;warehouse/orders_s3/order_date=2026-10-09/000000_0&#x27;)
+
+SELECT COUNT(*) AS n FROM orders_s3 WHERE order_date = &#x27;2026-10-09&#x27;;
+SHOW PARTITIONS orders_s3;
+MSCK REPAIR TABLE orders_s3;
+SELECT COUNT(*) AS n FROM orders_s3 WHERE order_date = &#x27;2026-10-09&#x27;;</code></pre><div class="output">+----+
+| n  |
++----+
+| 0  |
++----+
++------------------------+
+|       partition        |
++------------------------+
+| order_date=2026-10-01  |
+| order_date=2026-10-02  |
+| order_date=2026-10-03  |
+| order_date=2026-10-04  |
+| order_date=2026-10-05  |
+| order_date=2026-10-06  |
+| order_date=2026-10-07  |
+| order_date=2026-10-08  |
++------------------------+
+
+-- after MSCK REPAIR
++-------+
+|   n   |
++-------+
+| 1662  |
++-------+</div></div>
+      <span class="behind">The object was in the bucket, but the metastore knew only eight partitions, so Hive answered <b>0</b> without an error. <code>MSCK REPAIR TABLE</code> listed the prefixes and added the partition: 1,662 rows. In the cloud, upstream jobs often drop files straight into buckets; either they register partitions (<code>ALTER TABLE … ADD PARTITION</code>), you run MSCK on a schedule, or, on Athena, partition projection computes partitions without listing.</span></li>
+    <li><h4>Step 8 · Reading from S3 versus local storage</h4>
+      <div class="code" data-lang="sql" data-file="beeline, two runs each"><pre><code>CREATE TABLE orders_loc STORED AS PARQUET AS SELECT * FROM orders_s3;   -- local copy, 14,950 rows
+SELECT city, SUM(amount) FROM orders_loc GROUP BY city;
+SELECT city, SUM(amount) FROM orders_s3  GROUP BY city;</code></pre><div class="output">SELECT city, SUM(amount) FROM &lt;t&gt; GROUP BY city      (9 partitions, ~14,900 rows, wall time incl. Beeline start)
+table        storage                         run1     run2     S3 requests per run
+orders_loc   local warehouse (Parquet)       5.29 s   5.02 s   0
+orders_s3    s3a://tiffingo-lake (Parquet)   5.93 s   6.38 s   90  (HEAD 45, GET 45)</div></div>
+      <span class="behind">Same answers. The S3 table took slightly longer and made 90 requests (45 HEAD, 45 GET) for nine small files; the local table made none. Our S3 server runs on the same machine, so each request takes about a millisecond. Real S3 requests take tens of milliseconds and are billed per thousand, which is why small files hurt more in the cloud than on HDFS. Treat the times as indicative.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Same SQL, different storage</h2>
+  <p>Left: real outputs. Right: what object storage does underneath.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Same SQL, different storage <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">INSERT … PARTITION (order_date)</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">NoAuthWithAWSException</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">add AWS keys to both containers</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">INSERT ok: 7 partitions</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">warehouse/orders_s3/             0</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">…/order_date=2026-10-01/000000_0  23724</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">…/order_date=2026-10-07/000000_0  24025</text><text x="26" y="92" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">objects: 8</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">PUT  _task_tmp…/-tmp.000000_0</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">PUT  -tmp.-ext-10000/000000_0</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">PUT  -ext-10000/000000_0</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">PUT  order_date=…/000000_0</text><text x="26" y="106" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">85 requests</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">copy object to order_date=2026-10-09</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">COUNT(*) → 0</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">MSCK REPAIR TABLE orders_s3</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">COUNT(*) → 1662</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">orders_loc  5.0–5.3 s   0 requests</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">orders_s3   5.9–6.4 s  90 requests</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">same answers</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The tasks had no credentials until we gave them keys.</li>
+          <li>Eight objects, one of them an empty “folder” marker.</li>
+          <li>One output file needed 85 requests.</li>
+          <li>A new partition stayed invisible until MSCK REPAIR.</li>
+          <li>Same answer from S3, more requests and time.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What object storage does">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Every process needs credentials</text><rect x="20" y="34" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="75.0" y="45" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Hive + Tez</text><text x="75.0" y="55" text-anchor="middle" font-size="6.4" class="s-ink2 mono">compute</text><rect x="20" y="92" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="75.0" y="103" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Metastore</text><text x="75.0" y="113" text-anchor="middle" font-size="6.4" class="s-ink2 mono">partitions</text><rect x="230" y="62" width="110" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="285.0" y="73" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">S3 bucket</text><text x="285.0" y="83" text-anchor="middle" font-size="6.4" class="s-ink2 mono">objects</text><path d="M132 49L228 74" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M221.1 75.4L228 74L222.7 69.5" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M132 107L228 82" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M222.7 86.5L228 82L221.1 80.6" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="10" y="132" width="340" height="44" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="151.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Tasks read and write objects directly.</text><text x="180.0" y="166.0" text-anchor="middle" font-size="8.8" class="s-ink2">In the cloud: an IAM role.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Folders are only key prefixes</text><rect x="20" y="34" width="110" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="75.0" y="45" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Hive + Tez</text><text x="75.0" y="55" text-anchor="middle" font-size="6.4" class="s-ink2 mono">compute</text><rect x="20" y="92" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="75.0" y="103" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Metastore</text><text x="75.0" y="113" text-anchor="middle" font-size="6.4" class="s-ink2 mono">partitions</text><rect x="230" y="62" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="285.0" y="73" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">S3 bucket</text><text x="285.0" y="83" text-anchor="middle" font-size="6.4" class="s-ink2 mono">objects</text><path d="M132 49L228 74" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M221.1 75.4L228 74L222.7 69.5" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M132 107L228 82" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M222.7 86.5L228 82L221.1 80.6" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="10" y="140" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="160.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Listing = paged HTTP requests.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rename = copy + delete</text><rect x="20" y="34" width="110" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="75.0" y="45" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Hive + Tez</text><text x="75.0" y="55" text-anchor="middle" font-size="6.4" class="s-ink2 mono">compute</text><rect x="20" y="92" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="75.0" y="103" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Metastore</text><text x="75.0" y="113" text-anchor="middle" font-size="6.4" class="s-ink2 mono">partitions</text><rect x="230" y="62" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="285.0" y="73" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">S3 bucket</text><text x="285.0" y="83" text-anchor="middle" font-size="6.4" class="s-ink2 mono">objects</text><path d="M132 49L228 74" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M221.1 75.4L228 74L222.7 69.5" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M132 107L228 82" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M222.7 86.5L228 82L221.1 80.6" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="10" y="132" width="340" height="44" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="151.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hive’s staging moves become copies.</text><text x="180.0" y="166.0" text-anchor="middle" font-size="8.8" class="s-ink2">Iceberg/committers avoid them.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The metastore decides what exists</text><rect x="20" y="34" width="110" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="75.0" y="45" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Hive + Tez</text><text x="75.0" y="55" text-anchor="middle" font-size="6.4" class="s-ink2 mono">compute</text><rect x="20" y="92" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="75.0" y="103" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Metastore</text><text x="75.0" y="113" text-anchor="middle" font-size="6.4" class="s-ink2 mono">partitions</text><rect x="230" y="62" width="110" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="285.0" y="73" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">S3 bucket</text><text x="285.0" y="83" text-anchor="middle" font-size="6.4" class="s-ink2 mono">objects</text><path d="M132 49L228 74" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M221.1 75.4L228 74L222.7 69.5" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M132 107L228 82" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M222.7 86.5L228 82L221.1 80.6" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="10" y="140" width="340" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="160.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">New prefixes need ADD PARTITION or MSCK.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Requests cost time and money</text><rect x="20" y="34" width="110" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="75.0" y="45" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Hive + Tez</text><text x="75.0" y="55" text-anchor="middle" font-size="6.4" class="s-ink2 mono">compute</text><rect x="20" y="92" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="75.0" y="103" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Metastore</text><text x="75.0" y="113" text-anchor="middle" font-size="6.4" class="s-ink2 mono">partitions</text><rect x="230" y="62" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="285.0" y="73" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">S3 bucket</text><text x="285.0" y="83" text-anchor="middle" font-size="6.4" class="s-ink2 mono">objects</text><path d="M132 49L228 74" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M221.1 75.4L228 74L222.7 69.5" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M132 107L228 82" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M222.7 86.5L228 82L221.1 80.6" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="10" y="140" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="160.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fewer, larger files; prune partitions.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Tez tasks open S3 connections of their own.</li>
+          <li>S3 stores keys; “directories” are conventions.</li>
+          <li>Each staging move is a server-side copy.</li>
+          <li>Hive plans from metastore partitions, not from the bucket.</li>
+          <li>Each file costs at least a HEAD and a GET.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a transient cluster, a slow commit, and a migration to a managed service.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-transient">A cluster that exists only for the load</h3>
+  <p class="anim-intro">The most common reason companies move Hive to the cloud. (Typical architecture.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Transient clusters <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Data in object storage and a catalogue outside the cluster let a scheduler create a cluster per job and delete it afterwards">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly load, 40 minutes</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">12 nodes running 24 hours</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Paying for idle machines.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Move data to the bucket</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">LOCATION 's3://tiffingo-lake/…'</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Data outlives clusters.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Move the catalogue out</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">Glue Data Catalog or managed RDS</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Metastore must survive too.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Create → run → delete</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">scheduler starts an EMR cluster per load</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or EMR Serverless.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Analysts keep querying</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">Athena / Trino on the same catalogue</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No cluster needed for reads.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Idle cluster costs money.</li>
+          <li>Tables point at the bucket.</li>
+          <li>The metastore lives outside.</li>
+          <li>One cluster per run.</li>
+          <li>Reads go serverless.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-commit">The commit that took longer than the query</h3>
+  <p class="anim-intro">What our 85-request partition overwrite becomes at scale. (Fixes typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">S3 commits <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Hive’s rename-based commit copies every output file on S3; fewer files, rename-free committers or Iceberg fix it">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Query done, job still running</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">20 minutes after the last task</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A classic S3 complaint.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Look at the output</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">40,000 small files per run</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each moved by copy + delete.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fewer, larger files</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">hive.merge.tezfiles, DISTRIBUTE BY</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lesson 5.4.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rename-free commits</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">EMR S3-optimised / S3A committers</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Write once, no copies.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Or Iceberg</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">commit = swap one metadata pointer</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lesson 11.3.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Tasks finish, job does not.</li>
+          <li>Too many files to copy.</li>
+          <li>Merge small files.</li>
+          <li>Use a committer.</li>
+          <li>Or use Iceberg.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-migrate">From on-premises Hive to a managed service</h3>
+  <p class="anim-intro">A migration plan with the version facts from section 3. (Typical steps.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Cloud migration <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Copy data, move or rebuild the catalogue, replace on-prem security with cloud IAM and re-test SQL against the managed Hive version">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Move on-prem Hive to EMR</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">Hive 4.2.1 → EMR Hive 3.1.3</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A version step back.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Copy the data</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">distcp hdfs://… s3://…</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Validate counts per partition.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Move the catalogue</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">metastore → Glue (or keep an RDS HMS)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rewrite every LOCATION.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Replace security</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">Ranger/Kerberos → IAM, Lake Formation</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lesson 10.2 does not carry over.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Re-test the SQL</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">Hive 4 syntax and Iceberg defaults</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Run the 11.1 interop test.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Managed Hive is 3.x.</li>
+          <li>Copy and validate data.</li>
+          <li>Rebuild the catalogue.</li>
+          <li>New permission model.</li>
+          <li>Test every query.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Hive in the cloud at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-green">transient</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">EMR</text></svg></div>
+    <div><h4>1. Clusters per job</h4>
+      <p>Schedulers create EMR or Dataproc clusters for nightly Hive loads and delete them after; data and catalogue persist.</p>
+      <div class="uc-flow"><span>Schedule</span><i>→</i><span class="java">cluster</span><i>→</i><span>S3 tables</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-blue">Glue</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">catalogue</text></svg></div>
+    <div><h4>2. One catalogue for many services</h4>
+      <p>Hive on EMR, Athena, Redshift Spectrum and Glue jobs share table definitions in the Glue Data Catalog.</p>
+      <div class="uc-flow"><span>Hive DDL</span><i>→</i><span class="java">Glue</span><i>→</i><span>Athena SQL</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">lift</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">&amp; shift</text></svg></div>
+    <div><h4>3. Lift-and-shift of on-prem Hive</h4>
+      <p>Companies copy HDFS data to buckets with DistCp and run the same HiveQL on Dataproc or HDInsight.</p>
+      <div class="uc-flow"><span>HDFS</span><i>→</i><span class="java">DistCp</span><i>→</i><span>Bucket</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">lake</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">landing</text></svg></div>
+    <div><h4>4. Landing zones with partition repair</h4>
+      <p>Upstream systems drop daily files into prefixes; a job runs ADD PARTITION or MSCK so Hive and Athena see them.</p>
+      <div class="uc-flow"><span>Files land</span><i>→</i><span class="java">MSCK</span><i>→</i><span>Queryable</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc">FinOps</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">requests</text></svg></div>
+    <div><h4>5. Cost control</h4>
+      <p>Teams track request counts and small files per table, because object stores bill per request.</p>
+      <div class="uc-flow"><span>Many files</span><i>→</i><span class="java">compact</span><i>→</i><span>Lower bill</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: requests, files and costs</h2>
+  <p>These programs use the real request counts from the lab to reason about object storage at scale. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># Request counts from the lab, and what they would cost at scale
+lab = {&quot;read 9 files&quot;: 90, &quot;overwrite 1 partition (1 file)&quot;: 85}
+for job, n in lab.items():
+    print(f&quot;{job:32} {n:4} requests&quot;)
+
+# Each extra file costs at least a HEAD and a GET when it is read
+files_per_day, days, queries_per_day = 400, 365, 200
+gets = files_per_day * days * 2 * queries_per_day
+print(f&quot;\nfull scans of a year of {files_per_day} files/day: {gets:,} requests per day&quot;)</code></pre><div class="output">read 9 files                       90 requests
+overwrite 1 partition (1 file)     85 requests
+
+full scans of a year of 400 files/day: 58,400,000 requests per day</div></div>
+  <ul class="anno"><li><code>lab = {&quot;read 9 files&quot;: 90, &quot;overwrite 1 partition (1 file)&quot;: 85}</code><span>Both numbers were counted in the S3 server log in Steps 5 and 8.</span></li><li><code>gets = files_per_day * days * 2 * queries_per_day</code><span>Two requests per file is a lower bound; listings add more.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Requests at scale",
+   "hint": "Press <b>Run<\/b>. Then halve the number of files per day and see the effect.",
+   "code": "# Request counts from the lab, and what they would cost at scale\nlab = {\"read 9 files\": 90, \"overwrite 1 partition (1 file)\": 85}\nfor job, n in lab.items():\n    print(f\"{job:32} {n:4} requests\")\n\n# Each extra file costs at least a HEAD and a GET when it is read\nfiles_per_day, days, queries_per_day = 400, 365, 200\ngets = files_per_day * days * 2 * queries_per_day\nprint(f\"\\nfull scans of a year of {files_per_day} files/day: {gets:,} requests per day\")\n"
+  },
+  {
+   "label": "2 · Predict first: renames",
+   "hint": "<b>Predict first:<\/b> each output file was copied 4 times. How many copies for 5,000 files?",
+   "code": "files, copies_per_file = 5000, 4\nprint(\"server-side copies:\", files * copies_per_file)\nprint(\"plus deletes:\", files * copies_per_file)\n"
+  },
+  {
+   "label": "3 · Pruning saves requests",
+   "hint": "A filter on the partition column reads one day instead of all nine.",
+   "code": "per_file = 10     # HEAD + GET ≈ 10 requests per file in Step 8 (90 / 9)\nfor days in (9, 1):\n    print(f\"{days} partitions read -> about {days * per_file} requests\")\n"
+  },
+  {
+   "label": "4 · Pick a URI scheme",
+   "hint": "Each cloud has its own connector and scheme.",
+   "code": "schemes = {\"Amazon EMR\": \"s3://\", \"open-source S3A\": \"s3a://\",\n           \"Google Dataproc\": \"gs://\", \"Azure HDInsight (ADLS Gen2)\": \"abfs://\"}\nfor k, v in schemes.items():\n    print(f\"{v:8} {k}\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This check says a partition is ready because the object exists. Hive disagrees.",
+   "code": "object_in_bucket = True\npartition_in_metastore = False          # nobody ran MSCK / ADD PARTITION\nhive_sees_rows = object_in_bucket       # bug\nassert hive_sees_rows == (object_in_bucket and partition_in_metastore), \"Hive reads metastore partitions\"\nprint(\"ready\")\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: the S3 side of the lab</h3>
+  <p>More from the object-storage lab. <b>Outputs are real</b> (Hive 4.2.1 with S3A against a local S3-compatible server).</p>
+  <div class="pcrun"><h4>1 · The table location</h4>
+  <div class="code" data-lang="bash" data-file="beeline"><pre><code>SHOW CREATE TABLE orders_s3;</code></pre><div class="output">CREATE EXTERNAL TABLE `orders_s3`(
+  `order_id` int, `customer_id` int, `city` string,
+  `amount` decimal(10,2), `status` string)
+PARTITIONED BY (`order_date` date)
+ROW FORMAT SERDE &#x27;org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe&#x27;
+…
+LOCATION &#x27;s3a://tiffingo-lake/warehouse/orders_s3&#x27;
+TBLPROPERTIES (&#x27;bucketing_version&#x27;=&#x27;2&#x27;, …)</div></div>
+  <p class="muted">The only cloud-specific part of the definition is the location URI.</p></div>
+  <div class="pcrun"><h4>2 · Hive’s object-store settings</h4>
+  <div class="code" data-lang="bash" data-file="beeline"><pre><code>SET hive.blobstore.supported.schemes;
+SET hive.blobstore.optimizations.enabled;
+SET hive.blobstore.use.blobstore.as.scratchdir;
+SET hive.exec.stagingdir;</code></pre><div class="output">hive.blobstore.supported.schemes=s3,s3a,s3n
+hive.blobstore.optimizations.enabled=true
+hive.blobstore.use.blobstore.as.scratchdir=false
+hive.exec.stagingdir=.hive-staging</div></div>
+  <p class="muted">Hive treats s3, s3a and s3n as blob stores and keeps intermediate scratch data off them by default; the final staging folder still sits beside the table (Step 5).</p></div>
+  <div class="pcrun"><h4>3 · Partitions after the repair</h4>
+  <div class="code" data-lang="bash" data-file="beeline"><pre><code>SELECT COUNT(*) AS n, COUNT(DISTINCT order_date) AS days FROM orders_s3;</code></pre><div class="output">+--------+-------+
+|   n    | days  |
++--------+-------+
+| 14955  | 9     |
++--------+-------+</div></div>
+  <p class="muted">Nine partitions after MSCK REPAIR added the one created outside Hive.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Why one file needed several copies</h2>
+  <p>Follow the path of the single output file from Step 5 through Hive’s staging folders.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "path = [\"_task_tmp.-ext-10000/-tmp.000000_0\",   # the task writes here (1 upload)",
+  "        \"-tmp.-ext-10000/000000_0\",             # task commit: rename 1",
+  "        \"-tmp.-ext-10000.moved/000000_0\",       # job commit:  rename 2",
+  "        \"-ext-10000/000000_0\",                  # rename 3",
+  "        \"order_date=2026-10-08/000000_0\"]       # move into the table: rename 4",
+  "copies = len(path) - 1",
+  "print(\"uploads: 1   server-side copies:\", copies, \"  deletes:\", copies)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Upload",
+   "note": "The only time the data bytes travel from the task to S3. <code>path<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "path",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;_task_tmp.-ext-10000/-tmp.000000_0&#x27;, &#x27;-tmp.-ext-10000/000000_0&#x27;, &#x27;-tmp.-ext-10000.moved…"
+   ],
+   "newVar": "path"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>copies<\/code> is created: 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "path",
+       "→ list #1"
+      ],
+      [
+       "copies",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;_task_tmp.-ext-10000/-tmp.000000_0&#x27;, &#x27;-tmp.-ext-10000/000000_0&#x27;, &#x27;-tmp.-ext-10000.moved…"
+   ],
+   "newVar": "copies"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "path",
+       "→ list #1"
+      ],
+      [
+       "copies",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;_task_tmp.-ext-10000/-tmp.000000_0&#x27;, &#x27;-tmp.-ext-10000/000000_0&#x27;, &#x27;-tmp.-ext-10000.moved…"
+   ],
+   "out": "uploads: 1   server-side copies: 4   deletes: 4\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three cloud decisions from real platforms.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Data engineering · cloud</span></div>
+    <h4>Rewrite a table for S3</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Move an HDFS external table definition to an S3 bucket.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>LOCATION &#x27;hdfs://nn1/warehouse/orders&#x27;</pre></div><div><small>Expected output</small><pre>hadoop distcp hdfs://nn1/warehouse/orders s3a://tiffingo-lake/warehouse/orders
+ALTER TABLE orders SET LOCATION &#x27;s3a://tiffingo-lake/warehouse/orders&#x27;;
+MSCK REPAIR TABLE orders;   -- partition locations are stored separately</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Copy the data (DistCp).</li><li>Change the location.</li><li>Repair partitions.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Compare COUNT(*) per partition before and after, as in Step 3.",
+   "code": "print(\"hadoop distcp hdfs://nn1/warehouse/orders s3a://tiffingo-lake/warehouse/orders\")\nprint(\"ALTER TABLE orders SET LOCATION 's3a://tiffingo-lake/warehouse/orders';\")\nprint(\"MSCK REPAIR TABLE orders;   -- partition locations are stored separately\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print(\"hadoop distcp hdfs://nn1/warehouse/orders s3a://tiffingo-lake/warehouse/orders\")",
+  "print(\"ALTER TABLE orders SET LOCATION 's3a://tiffingo-lake/warehouse/orders';\")",
+  "print(\"MSCK REPAIR TABLE orders;   -- partition locations are stored separately\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "hadoop distcp hdfs://nn1/warehouse/orders s3a://tiffingo-lake/warehouse/orders\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "ALTER TABLE orders SET LOCATION 's3a://tiffingo-lake/warehouse/orders';\n"
+  },
+  {
+   "line": 3,
+   "phase": "Partitions",
+   "note": "Each partition has its own location in the metastore; repair or re-add them after a move. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "MSCK REPAIR TABLE orders;   -- partition locations are stored separately\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Platform · cost</span></div>
+    <h4>Size a transient cluster</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Compare an always-on cluster with one created for a 40-minute nightly load.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>12 nodes, illustrative ₹40 per node-hour</pre></div><div><small>Expected output</small><pre>always on: ₹11,520/day   transient: ₹400/day</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Always-on: 24 hours a day.</li><li>Transient: load time plus start-up.</li><li>Storage is paid in both cases.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "This only works if the metastore and data live outside the cluster.",
+   "code": "nodes, rate = 12, 40\nalways_on = nodes * 24 * rate\ntransient = nodes * (40 + 10) / 60 * rate     # 10 minutes to start\nprint(f\"always on: ₹{always_on:,.0f}/day   transient: ₹{transient:,.0f}/day\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "nodes, rate = 12, 40",
+  "always_on = nodes * 24 * rate",
+  "transient = nodes * (40 + 10) / 60 * rate     # 10 minutes to start",
+  "print(f\"always on: ₹{always_on:,.0f}/day   transient: ₹{transient:,.0f}/day\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>nodes<\/code> is created: 12. <code>rate<\/code> is created: 40.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "12"
+      ],
+      [
+       "rate",
+       "40"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "rate"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>always_on<\/code> is created: 11520.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "12"
+      ],
+      [
+       "rate",
+       "40"
+      ],
+      [
+       "always_on",
+       "11520"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "always_on"
+  },
+  {
+   "line": 3,
+   "phase": "Start-up",
+   "note": "Clusters take minutes to create; include it. <code>transient<\/code> is created: 400.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "12"
+      ],
+      [
+       "rate",
+       "40"
+      ],
+      [
+       "always_on",
+       "11520"
+      ],
+      [
+       "transient",
+       "400.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "transient"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "nodes",
+       "12"
+      ],
+      [
+       "rate",
+       "40"
+      ],
+      [
+       "always_on",
+       "11520"
+      ],
+      [
+       "transient",
+       "400.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "always on: ₹11,520/day   transient: ₹400/day\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Architecture · migration</span></div>
+    <h4>Choose a managed service</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Pick a target for an on-premises Hive 4 platform using the 2026 version facts.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>needs: Hive SQL, Iceberg, managed catalogue</pre></div><div><small>Expected output</small><pre>EMR 7.14       Hive 3.1.3  Glue / RDS
+Dataproc 2.2   Hive 3.1.3  Dataproc Metastore ≤ 3.1.2
+HDInsight 5.1  Hive 3.1.2  Azure SQL
+self-managed   Hive 4.2.1  your own RDBMS</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>List the Hive versions offered.</li><li>Check the catalogue options.</li><li>Note gaps against Hive 4.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Every managed option is a step back from Hive 4: re-test SQL and plan Iceberg through the engine that supports it best.",
+   "code": "svc = {\"EMR 7.14\": (\"Hive 3.1.3\", \"Glue / RDS\"),\n       \"Dataproc 2.2\": (\"Hive 3.1.3\", \"Dataproc Metastore ≤ 3.1.2\"),\n       \"HDInsight 5.1\": (\"Hive 3.1.2\", \"Azure SQL\"),\n       \"self-managed\": (\"Hive 4.2.1\", \"your own RDBMS\")}\nfor k, (h, m) in svc.items():\n    print(f\"{k:14} {h:11} {m}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "svc = {\"EMR 7.14\": (\"Hive 3.1.3\", \"Glue / RDS\"),",
+  "       \"Dataproc 2.2\": (\"Hive 3.1.3\", \"Dataproc Metastore ≤ 3.1.2\"),",
+  "       \"HDInsight 5.1\": (\"Hive 3.1.2\", \"Azure SQL\"),",
+  "       \"self-managed\": (\"Hive 4.2.1\", \"your own RDBMS\")}",
+  "for k, (h, m) in svc.items():",
+  "    print(f\"{k:14} {h:11} {m}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Versions",
+   "note": "From provider release notes, October 2026.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>svc<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;EMR 7.14&#x27;: → tuple #2, &#x27;Dataproc 2.2&#x27;: → tuple #3, &#x27;HDInsight 5.1&#x27;: → tuple #4, &#x27;self-m… A new tuple object (#2) is created: (&#x27;Hive 3.1.3&#x27;, &#x27;Glue / RDS&#x27;) A new tuple object (#3) is created: (&#x27;Hive 3.1.3&#x27;, &#x27;Dataproc Metastore ≤ 3.1.2&#x27;) A new tuple object (#4) is created: (&#x27;Hive 3.1.2&#x27;, &#x27;Azure SQL&#x27;) A new tuple object (#5) is created: (&#x27;Hive 4.2.1&#x27;, &#x27;your own RDBMS&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "svc",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;EMR 7.14&#x27;: → tuple #2, &#x27;Dataproc 2.2&#x27;: → tuple #3, &#x27;HDInsight 5.1&#x27;: → tuple #4, &#x27;self-m…",
+    "<b>#2 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Glue / RDS&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Dataproc Metastore ≤ 3.1.2&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;Hive 3.1.2&#x27;, &#x27;Azure SQL&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;Hive 4.2.1&#x27;, &#x27;your own RDBMS&#x27;)"
+   ],
+   "newVar": "svc"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>k<\/code> is created: &#x27;EMR 7.14&#x27;. <code>h<\/code> is created: &#x27;Hive 3.1.3&#x27;. <code>m<\/code> is created: &#x27;Glue / RDS&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "svc",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'EMR 7.14'"
+      ],
+      [
+       "h",
+       "'Hive 3.1.3'"
+      ],
+      [
+       "m",
+       "'Glue / RDS'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;EMR 7.14&#x27;: → tuple #2, &#x27;Dataproc 2.2&#x27;: → tuple #3, &#x27;HDInsight 5.1&#x27;: → tuple #4, &#x27;self-m…",
+    "<b>#2 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Glue / RDS&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Dataproc Metastore ≤ 3.1.2&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;Hive 3.1.2&#x27;, &#x27;Azure SQL&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;Hive 4.2.1&#x27;, &#x27;your own RDBMS&#x27;)"
+   ],
+   "newVar": "m"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "svc",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'EMR 7.14'"
+      ],
+      [
+       "h",
+       "'Hive 3.1.3'"
+      ],
+      [
+       "m",
+       "'Glue / RDS'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;EMR 7.14&#x27;: → tuple #2, &#x27;Dataproc 2.2&#x27;: → tuple #3, &#x27;HDInsight 5.1&#x27;: → tuple #4, &#x27;self-m…",
+    "<b>#2 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Glue / RDS&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Dataproc Metastore ≤ 3.1.2&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;Hive 3.1.2&#x27;, &#x27;Azure SQL&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;Hive 4.2.1&#x27;, &#x27;your own RDBMS&#x27;)"
+   ],
+   "out": "EMR 7.14       Hive 3.1.3  Glue / RDS\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to &#x27;Dataproc 2.2&#x27;. <code>m<\/code> changes to &#x27;Dataproc Metastore ≤ 3.1.2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "svc",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'Dataproc 2.2'"
+      ],
+      [
+       "h",
+       "'Hive 3.1.3'"
+      ],
+      [
+       "m",
+       "'Dataproc Metastore ≤ 3.1.2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;EMR 7.14&#x27;: → tuple #2, &#x27;Dataproc 2.2&#x27;: → tuple #3, &#x27;HDInsight 5.1&#x27;: → tuple #4, &#x27;self-m…",
+    "<b>#2 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Glue / RDS&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Dataproc Metastore ≤ 3.1.2&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;Hive 3.1.2&#x27;, &#x27;Azure SQL&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;Hive 4.2.1&#x27;, &#x27;your own RDBMS&#x27;)"
+   ],
+   "newVar": "m"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "svc",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'Dataproc 2.2'"
+      ],
+      [
+       "h",
+       "'Hive 3.1.3'"
+      ],
+      [
+       "m",
+       "'Dataproc Metastore ≤ 3.1.2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;EMR 7.14&#x27;: → tuple #2, &#x27;Dataproc 2.2&#x27;: → tuple #3, &#x27;HDInsight 5.1&#x27;: → tuple #4, &#x27;self-m…",
+    "<b>#2 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Glue / RDS&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Dataproc Metastore ≤ 3.1.2&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;Hive 3.1.2&#x27;, &#x27;Azure SQL&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;Hive 4.2.1&#x27;, &#x27;your own RDBMS&#x27;)"
+   ],
+   "out": "Dataproc 2.2   Hive 3.1.3  Dataproc Metastore ≤ 3.1.2\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to &#x27;HDInsight 5.1&#x27;. <code>h<\/code> changes to &#x27;Hive 3.1.2&#x27;. <code>m<\/code> changes to &#x27;Azure SQL&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "svc",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'HDInsight 5.1'"
+      ],
+      [
+       "h",
+       "'Hive 3.1.2'"
+      ],
+      [
+       "m",
+       "'Azure SQL'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;EMR 7.14&#x27;: → tuple #2, &#x27;Dataproc 2.2&#x27;: → tuple #3, &#x27;HDInsight 5.1&#x27;: → tuple #4, &#x27;self-m…",
+    "<b>#2 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Glue / RDS&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Dataproc Metastore ≤ 3.1.2&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;Hive 3.1.2&#x27;, &#x27;Azure SQL&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;Hive 4.2.1&#x27;, &#x27;your own RDBMS&#x27;)"
+   ],
+   "newVar": "m"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "svc",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'HDInsight 5.1'"
+      ],
+      [
+       "h",
+       "'Hive 3.1.2'"
+      ],
+      [
+       "m",
+       "'Azure SQL'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;EMR 7.14&#x27;: → tuple #2, &#x27;Dataproc 2.2&#x27;: → tuple #3, &#x27;HDInsight 5.1&#x27;: → tuple #4, &#x27;self-m…",
+    "<b>#2 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Glue / RDS&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Dataproc Metastore ≤ 3.1.2&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;Hive 3.1.2&#x27;, &#x27;Azure SQL&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;Hive 4.2.1&#x27;, &#x27;your own RDBMS&#x27;)"
+   ],
+   "out": "HDInsight 5.1  Hive 3.1.2  Azure SQL\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>k<\/code> changes to &#x27;self-managed&#x27;. <code>h<\/code> changes to &#x27;Hive 4.2.1&#x27;. <code>m<\/code> changes to &#x27;your own RDBMS&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "svc",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'self-managed'"
+      ],
+      [
+       "h",
+       "'Hive 4.2.1'"
+      ],
+      [
+       "m",
+       "'your own RDBMS'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;EMR 7.14&#x27;: → tuple #2, &#x27;Dataproc 2.2&#x27;: → tuple #3, &#x27;HDInsight 5.1&#x27;: → tuple #4, &#x27;self-m…",
+    "<b>#2 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Glue / RDS&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Dataproc Metastore ≤ 3.1.2&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;Hive 3.1.2&#x27;, &#x27;Azure SQL&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;Hive 4.2.1&#x27;, &#x27;your own RDBMS&#x27;)"
+   ],
+   "newVar": "m"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "svc",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'self-managed'"
+      ],
+      [
+       "h",
+       "'Hive 4.2.1'"
+      ],
+      [
+       "m",
+       "'your own RDBMS'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;EMR 7.14&#x27;: → tuple #2, &#x27;Dataproc 2.2&#x27;: → tuple #3, &#x27;HDInsight 5.1&#x27;: → tuple #4, &#x27;self-m…",
+    "<b>#2 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Glue / RDS&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Dataproc Metastore ≤ 3.1.2&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;Hive 3.1.2&#x27;, &#x27;Azure SQL&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;Hive 4.2.1&#x27;, &#x27;your own RDBMS&#x27;)"
+   ],
+   "out": "self-managed   Hive 4.2.1  your own RDBMS\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "svc",
+       "→ dict #1"
+      ],
+      [
+       "k",
+       "'self-managed'"
+      ],
+      [
+       "h",
+       "'Hive 4.2.1'"
+      ],
+      [
+       "m",
+       "'your own RDBMS'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;EMR 7.14&#x27;: → tuple #2, &#x27;Dataproc 2.2&#x27;: → tuple #3, &#x27;HDInsight 5.1&#x27;: → tuple #4, &#x27;self-m…",
+    "<b>#2 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Glue / RDS&#x27;)",
+    "<b>#3 tuple (2)<\/b> (&#x27;Hive 3.1.3&#x27;, &#x27;Dataproc Metastore ≤ 3.1.2&#x27;)",
+    "<b>#4 tuple (2)<\/b> (&#x27;Hive 3.1.2&#x27;, &#x27;Azure SQL&#x27;)",
+    "<b>#5 tuple (2)<\/b> (&#x27;Hive 4.2.1&#x27;, &#x27;your own RDBMS&#x27;)"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: Which URI scheme does Hadoop’s open-source S3 connector use?",
+  "options": [
+   "hdfs://",
+   "gs://",
+   "s3a://",
+   "file://"
+  ],
+  "answer": 2,
+  "why": "EMR’s own connector uses s3://."
+ },
+ {
+  "q": "Beginner: What happens to an external table’s data on S3 when the cluster is deleted?",
+  "options": [
+   "It is deleted",
+   "It stays in the bucket",
+   "It moves to HDFS",
+   "It is archived"
+  ],
+  "answer": 1,
+  "why": "Storage and compute are separate."
+ },
+ {
+  "q": "Beginner: Which Hive version do EMR, Dataproc and HDInsight ship in 2026?",
+  "options": [
+   "Hive 3.1.x",
+   "Hive 4.x",
+   "Hive 2.1",
+   "Hive 1.2"
+  ],
+  "answer": 0,
+  "why": "EMR 3.1.3, Dataproc 3.1.3, HDInsight 3.1.2."
+ },
+ {
+  "q": "Intermediate: Why did the first INSERT fail in our lab?",
+  "options": [
+   "Wrong bucket",
+   "Parquet unsupported",
+   "Metastore down",
+   "The Tez tasks had no AWS credentials"
+  ],
+  "answer": 3,
+  "why": "NoAuthWithAWSException in a task."
+ },
+ {
+  "q": "Intermediate: What is a rename on S3?",
+  "options": [
+   "A metadata change",
+   "Impossible",
+   "A copy of the object plus a delete",
+   "A symbolic link"
+  ],
+  "answer": 2,
+  "why": "One output file was copied four times."
+ },
+ {
+  "q": "Intermediate: An object was copied into a new partition prefix. What did Hive return?",
+  "options": [
+   "The new rows",
+   "0 rows until MSCK REPAIR TABLE",
+   "An error",
+   "Duplicates"
+  ],
+  "answer": 1,
+  "why": "Hive plans from metastore partitions."
+ },
+ {
+  "q": "Advanced: Why did setting hive.exec.stagingdir to file:///tmp fail?",
+  "options": [
+   "The final move must stay on the table’s file system (Wrong FS)",
+   "Permissions",
+   "Disk full",
+   "Syntax"
+  ],
+  "answer": 0,
+  "why": "Use rename-free committers or Iceberg instead."
+ },
+ {
+  "q": "Advanced: Why do small files hurt more on object storage?",
+  "options": [
+   "They are larger",
+   "S3 cannot store them",
+   "Hive skips them",
+   "Each file costs billed requests with network latency"
+  ],
+  "answer": 3,
+  "why": "About 10 requests per file in Step 8."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 11.2 in one screen</h3>
+    <ul><li>Cloud pattern: data in <b>object storage</b>, metastore outside the cluster, clusters that can be <b>deleted</b>.</li><li>Connectors: <code>s3a://</code> (S3A), <code>s3://</code> (EMRFS), <code>gs://</code> (Dataproc), <code>abfs://</code> (ADLS Gen2).</li><li>Every process needs credentials, including the Tez tasks; use IAM roles, not keys in files.</li><li>S3 rename = copy + delete: one file, 1 upload, 4 copies, 85 requests.</li><li>Staging must stay on the table’s file system (<code>Wrong FS</code>); use committers or Iceberg to avoid copies.</li><li>Folders are key prefixes; new prefixes need <code>ADD PARTITION</code> or <code>MSCK REPAIR</code> (0 rows before, 1,662 after).</li><li>About 10 requests per file read: fewer, larger files and partition pruning save time and money.</li><li>Managed Hive in 2026: EMR 3.1.3 · Dataproc 3.1.3 · HDInsight 5.1 3.1.2. HDInsight on AKS retired 31 Jan 2025.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Is S3 still “eventually consistent”?</summary><p>No. Amazon S3 has offered strong read-after-write consistency for all requests since December 2020, and Google Cloud Storage and ADLS Gen2 are strongly consistent too. Old advice about S3Guard and consistency layers is obsolete; the rename and listing costs remain.</p></details>
+    <details><summary>Should I use s3:// or s3a://?</summary><p>On Amazon EMR use <code>s3://</code>, which is EMRFS with EMR’s optimisations. Everywhere else (self-managed Hadoop, S3-compatible stores such as MinIO or Ceph) use <code>s3a://</code>. <code>s3n://</code> is obsolete.</p></details>
+    <details><summary>Can Hive ACID tables live on S3?</summary><p>Yes, Hive ACID works on object storage, but every compaction and commit rewrites and moves files, so costs are higher. For updated tables in the cloud, most teams choose Iceberg (Lesson 11.3).</p></details>
+    <details><summary>Do I still need HDFS on a cloud cluster?</summary><p>Usually a small one for scratch and temporary data, which Hive keeps off blob storage by default (<code>hive.blobstore.use.blobstore.as.scratchdir=false</code>). Table data lives in the bucket.</p></details>
+    <details><summary>Why does the lab use a fake S3 server?</summary><p>So that every request can be logged and nothing costs money. It speaks the S3 API, and Hive uses the same S3A connector as with Amazon S3; latencies are much lower than in the real service.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs for object-storage checks, with the SQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Build a location</h4></div>
+      <p>Build an S3A table location from bucket and path.</p>
+      <div class="prob__io"><div><small>Input</small><pre>tiffingo-lake, warehouse/orders_s3</pre></div><div><small>Expected output</small><pre>s3a://tiffingo-lake/warehouse/orders_s3</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;s3a://&quot; + &quot;tiffingo-lake&quot; + &quot;/&quot; + &quot;warehouse/orders_s3&quot;)</code></pre><div class="output">s3a://tiffingo-lake/warehouse/orders_s3</div></div>
+        <p><b>How it works:</b> Use it in LOCATION '…' of CREATE EXTERNAL TABLE.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Partition prefix</h4></div>
+      <p>Build the key prefix of one partition.</p>
+      <div class="prob__io"><div><small>Input</small><pre>order_date = 2026-10-09</pre></div><div><small>Expected output</small><pre>warehouse/orders_s3/order_date=2026-10-09/</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;warehouse/orders_s3/order_date=2026-10-09/&quot;)</code></pre><div class="output">warehouse/orders_s3/order_date=2026-10-09/</div></div>
+        <p><b>How it works:</b> Objects under this prefix belong to the partition once the metastore knows it.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Requests per file</h4></div>
+      <p>Average requests per file in the read test.</p>
+      <div class="prob__io"><div><small>Input</small><pre>90 requests, 9 files</pre></div><div><small>Expected output</small><pre>10.0</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(90 / 9)</code></pre><div class="output">10.0</div></div>
+        <p><b>How it works:</b> HEAD and GET calls; larger files spread this cost over more rows.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Missing partitions</h4></div>
+      <p>Find prefixes in the bucket that the metastore does not know.</p>
+      <div class="prob__io"><div><small>Input</small><pre>bucket and metastore lists</pre></div><div><small>Expected output</small><pre>ALTER TABLE orders_s3 ADD PARTITION (order_date=&#x27;2026-10-09&#x27;)</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>bucket = {&quot;2026-10-07&quot;, &quot;2026-10-08&quot;, &quot;2026-10-09&quot;}
+metastore = {&quot;2026-10-07&quot;, &quot;2026-10-08&quot;}
+print(&quot;ALTER TABLE orders_s3 ADD&quot;, *[f&quot;PARTITION (order_date=&#x27;{d}&#x27;)&quot; for d in sorted(bucket - metastore)])</code></pre><div class="output">ALTER TABLE orders_s3 ADD PARTITION (order_date=&#x27;2026-10-09&#x27;)</div></div>
+        <p><b>How it works:</b> Adding exact partitions is cheaper than MSCK, which lists the whole table.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Copy cost of a commit</h4></div>
+      <p>Estimate copied bytes for a commit.</p>
+      <div class="prob__io"><div><small>Input</small><pre>2,000 files of 128 MB, 4 copies each</pre></div><div><small>Expected output</small><pre>1,000 GB copied inside S3</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>files, mb, copies = 2000, 128, 4
+print(f&quot;{files * mb * copies / 1024:,.0f} GB copied inside S3&quot;)</code></pre><div class="output">1,000 GB copied inside S3</div></div>
+        <p><b>How it works:</b> Server-side copies are faster than uploads but still take time per object.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Credentials check</h4></div>
+      <p>List which processes need cloud credentials.</p>
+      <div class="prob__io"><div><small>Input</small><pre>Hive components</pre></div><div><small>Expected output</small><pre>needs access: HiveServer2
+needs access: metastore
+needs access: Tez tasks
+needs access: compaction workers</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for p in [&quot;HiveServer2&quot;, &quot;metastore&quot;, &quot;Tez tasks&quot;, &quot;compaction workers&quot;]:
+    print(&quot;needs access:&quot;, p)</code></pre><div class="output">needs access: HiveServer2
+needs access: metastore
+needs access: Tez tasks
+needs access: compaction workers</div></div>
+        <p><b>How it works:</b> Our lab failed at the tasks; in the cloud one instance role covers all.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Always-on vs transient</h4></div>
+      <p>Savings per year of a transient cluster.</p>
+      <div class="prob__io"><div><small>Input</small><pre>₹11,520/day vs ₹400/day (illustrative)</pre></div><div><small>Expected output</small><pre>₹4,058,800 per year</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;₹{(11520 - 400) * 365:,} per year&quot;)</code></pre><div class="output">₹4,058,800 per year</div></div>
+        <p><b>How it works:</b> Only possible because data and catalogue outlive the cluster.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Small-file bill</h4></div>
+      <p>Request cost of reading 400 small files instead of 4 large ones, 200 times a day.</p>
+      <div class="prob__io"><div><small>Input</small><pre>illustrative ₹0.035 per 1,000 GETs</pre></div><div><small>Expected output</small><pre> 400 files: ₹2,044 per year
+   4 files: ₹20 per year</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>price = 0.035 / 1000
+for files in (400, 4):
+    print(f&quot;{files:4} files: ₹{files * 2 * 200 * 365 * price:,.0f} per year&quot;)</code></pre><div class="output"> 400 files: ₹2,044 per year
+   4 files: ₹20 per year</div></div>
+        <p><b>How it works:</b> Small per query, but it adds up across tables and is paid with latency too.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Cloud questions appear in almost every data engineering interview today.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · cloud</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“How is Hive different on S3?”</h4>
+      <p class="scn__situation">Explain what changes when Hive tables live in S3 instead of HDFS.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know storage/compute separation?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>The SQL stays the same; the location becomes s3a:// or s3://. Data survives the cluster, so clusters can be temporary. Renames become copies, listings become requests, and permissions come from IAM roles. Partitions added directly to the bucket must be registered with ADD PARTITION or MSCK REPAIR.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Saying S3 is just a remote HDFS.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Job finishes late on S3</h4>
+      <p class="scn__situation">All tasks finish in 5 minutes, but the INSERT takes 25 minutes.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know commit behaviour?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Count output files: thousands of small files are moved by copy + delete during commit.</li>
+          <li>Reduce files (merge settings, DISTRIBUTE BY) and use rename-free committers where the engine supports them.</li>
+          <li>For new tables, use Iceberg, which commits through metadata.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> “Add more nodes.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Rows missing after an upstream load</h4>
+      <p class="scn__situation">An upstream job wrote today’s files to S3, but Hive shows no rows for today.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know the metastore’s role?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>The partition is not registered: Hive plans from metastore partitions.</li>
+          <li>Run ALTER TABLE … ADD PARTITION in the upstream job, or MSCK REPAIR on a schedule.</li>
+          <li>On Athena, partition projection removes the need to register.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Restarting HiveServer2.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Architecture</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Move an on-prem Hive 4 platform to the cloud</h4>
+      <p class="scn__situation">200 TB on HDFS, Hive 4, Ranger, Spark and Trino users.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you plan versions, catalogue and security?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Managed services ship Hive 3.x: decide between EMR/Dataproc/HDInsight with SQL re-testing, or self-managed Hive 4 on VMs or Kubernetes.</li>
+          <li>Data via DistCp with per-partition validation; catalogue to Glue/Dataproc Metastore or an RDS-backed HMS.</li>
+          <li>Security from Ranger/Kerberos to IAM and Lake Formation; consider moving shared tables to Iceberg during the move.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Copying data first and discovering the version gap later.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,969 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-cluster and MirrorMaker 2 | MyPhatshala</title>
+<meta name="description" content="Running more than one Kafka cluster: disaster recovery, aggregation, migration and geo-replication with MirrorMaker 2 (remote topics, heartbeats, checkpoints, offset syncs, group offset sync), active-passive vs active-active, RPO and RTO, and alternatives such as Cluster Linking. Real Kafka 4.4 lab: 1,000 orders mirrored to a DR cluster and a failover drill where the consumer resumed at a translated offset of 405 instead of 600.">
+<meta name="mp:minutes" content="22">
+<link rel="canonical" href="https://myphatshala.in/courses/kafka/10-kafka-in-production/04-multi-cluster-and-mirrormaker-2/">
+<meta property="og:title" content="Multi-cluster and MirrorMaker 2 · MyPhatshala">
+<meta property="og:description" content="A real failover drill with MirrorMaker 2: offset 600 on primary became 405 on DR.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Multi-cluster and MirrorMaker 2", "learningResourceType": "Lesson", "educationalLevel": "Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Kafka", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="10-kafka-in-production/04-multi-cluster-and-mirrormaker-2" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Kafka syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Kafka</a><span>›</span><b>Lesson 10.4</b></nav>
+    <h1>Multi-cluster and MirrorMaker 2</h1>
+    <p class="lead">What happens when a whole region fails? We mirror topics with <b>MirrorMaker 2</b>, read the <b>translated offsets</b>, and fail a consumer over to the DR cluster. <b>All outputs are real.</b></p>
+    <div class="lesson-meta"><span>Module 10 · Kafka in production</span><span>⏱ 22 min</span><span>Advanced</span><span>primary.orders-104</span><span>600 → 405</span><span>At-least-once failover</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>When a whole region fails</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> <a href="../../07-kafka-connect/01-kafka-connect/">7.1 Connect</a>.</p></div>
+  <div class="story">
+<div class="callout callout--exam" style="display:block"><p style="font-size:1.12rem;margin:0 0 6px"><b>🤔 Your whole data centre goes dark. A second Kafka cluster in another region has a copy of the orders, but where should the kitchen consumer continue: offset 600, offset 0, or somewhere else?</b></p><p style="margin:0 0 6px"><b>MirrorMaker 2</b> copies topics to another cluster as <code>primary.orders-104</code> and also <b>translates consumer offsets</b>. In our lab the group had committed 600 on the primary; on DR it resumed at <b>405</b>, not 0 and not exactly 600. That gap is by design: failover is <b>at-least-once</b>, so consumers must handle a few hundred duplicates.</p><ul style="margin:0 0 0 18px"><li>Why and when to run more than one cluster.</li><li>How MirrorMaker 2 works: remote topics, heartbeats, checkpoints, offset syncs.</li><li>Failover and failback, and their limits.</li></ul></div>
+
+    <p class="narration">TiffinGo’s board asks what happens if the Mumbai cloud region goes down during dinner rush. Kabir sets up a DR cluster and runs a failover drill.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="MirrorMaker 2 copies topic orders-104 from the primary cluster to the DR cluster as primary.orders-104, and translates the consumer group offset from 600 on primary to 405 on DR.">
+        <rect x="8" y="34" width="130" height="80" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/><text x="73" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">primary (k1-k3)</text><text x="73" y="72" text-anchor="middle" font-size="7.4" class="s-ink mono">orders-104</text><text x="73" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @600</text><rect x="214" y="34" width="140" height="80" rx="8" class="s-soft-green" style="stroke:var(--green)"/><text x="284" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">DR (dr1)</text><text x="284" y="72" text-anchor="middle" font-size="7.0" class="s-ink mono">primary.orders-104</text><text x="284" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @405</text><rect x="144" y="58" width="64" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="176" y="77" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">MM2</text><path d="M138 73L144 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M137.7 76.0L144 73L137.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M208 73L214 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M207.7 76.0L214 73L207.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Copy the data <tspan font-weight="700" class="s-acc">and</tspan> the place where each consumer was.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, management asks: if the Mumbai region fails, how fast can kitchens continue from the Hyderabad cluster?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>We mirror topics there with MirrorMaker 2. It also translates consumer offsets, so consumers don’t restart from zero.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Exactly where they stopped?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Close, but a bit earlier, so some orders are processed twice. Let’s measure how much.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Multi-cluster and MirrorMaker 2</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Multi-cluster</b> architectures replicate data between independent Kafka clusters for disaster recovery, geo-locality, aggregation or migration. <b>MirrorMaker 2</b> (KIP-382) is Apache Kafka’s Connect-based replicator: it copies topics (data, partitions and configs) to <b>remote topics</b> named by a replication policy, emits heartbeats, and records checkpoints that <b>translate consumer-group offsets</b> between clusters, optionally syncing them into target groups. Replication is asynchronous.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>MirrorMaker 2 keeps a copy of your topics in another cluster, a few seconds behind, and remembers roughly where each consumer group was, so after a disaster consumers can continue there (with some repeats).</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>DR</b><span>Disaster recovery.</span></div>
+    <div class="term"><b>MirrorMaker 2</b><span>Cluster-to-cluster copier.</span></div>
+    <div class="term"><b>Remote topic</b><span>Prefixed copy.</span></div>
+    <div class="term"><b>Checkpoint</b><span>Translated group offset.</span></div>
+    <div class="term"><b>Offset sync</b><span>Source↔target offset pair.</span></div>
+    <div class="term"><b>RPO</b><span>Data you may lose.</span></div>
+    <div class="term"><b>RTO</b><span>Time to recover.</span></div>
+    <div class="term"><b>Failback</b><span>Return to primary.</span></div>
+  </div>
+
+  <h3>Why, how, where</h3>
+  <div class="cards">
+    <div class="card"><h4>Why</h4><p>Replication inside a cluster survives broker or zone failures, not a region outage, a cloud account loss, or a bad operator command. Some data must also live near users or in separate clusters for compliance and isolation.</p><span class="tag">the problem it solves</span></div>
+    <div class="card"><h4>How</h4><p>MM2 runs as Kafka Connect source connectors: MirrorSourceConnector copies records and configs into prefixed remote topics; MirrorCheckpointConnector maps group offsets using offset-sync records and can sync them into the target; MirrorHeartbeatConnector proves the link is alive.</p><span class="tag">the mechanism</span></div>
+    <div class="card"><h4>Where</h4><p>Disaster recovery (active-passive), aggregation from edge/regional clusters to a central one, migrations between clusters or to the cloud, and geo-local reads.</p><span class="tag">in real systems</span></div>
+    <div class="card"><h4>When not</h4><p>Asynchronous: the DR copy is slightly behind (RPO > 0). Offsets differ between clusters; translation is conservative, so expect re-processing. Active-active needs care to avoid loops (MM2’s prefixes prevent them).</p><span class="tag">know the limits</span></div>
+  </div>
+
+  <h3>Concept map: what depends on what</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 230" role="img" aria-label="Concept map. Beginner: backup copy, region, disaster. Intermediate: MirrorMaker 2, remote topics, offset translation, active-passive. Advanced: active-active, replication policy, RPO/RTO, Cluster Linking and other replicators.">
+        <rect x="14" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="112" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-green">Beginner</text><a href="../../05-replication-and-the-cluster/01-brokers-and-replication/"><rect x="28" y="36" width="168" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="112.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Replication in a cluster</text><text x="112.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 5.1</text></a><a href="../../07-kafka-connect/01-kafka-connect/"><rect x="28" y="74" width="168" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="112.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Kafka Connect</text><text x="112.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 7.1</text></a><rect x="224" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="322" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-blue">Intermediate</text><rect x="238" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">MirrorMaker 2</text><text x="322.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Connect-based</text><rect x="238" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Remote topics</text><text x="322.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">primary.orders</text><rect x="238" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Offset translation</text><text x="322.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">checkpoints</text><rect x="238" y="150" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="161" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Active-passive DR</text><text x="322.0" y="171" text-anchor="middle" font-size="6.4" class="s-ink2 mono">failover</text><rect x="434" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="532" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-violet">Advanced</text><rect x="448" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Active-active</text><text x="532.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">two writers</text><rect x="448" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">RPO / RTO</text><text x="532.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">how much, how fast</text><rect x="448" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="532.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Other replicators</text><text x="532.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Cluster Linking …</text><a href="../../03-consumers/04-delivery-guarantees/"><rect x="448" y="150" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="161" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Idempotent consumers</text><text x="532.0" y="171" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 3.4</text></a><path d="M196 51L238 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M231.7 54.0L238 51L231.7 48.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 89L238 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M235.4 57.5L238 51L231.3 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 66L322 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 67.7L322 74L325.0 67.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 66L322 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 105.7L322 112L325.0 105.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 142L322 150" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 143.7L322 150L325.0 143.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 89L448 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M445.4 57.5L448 51L441.3 53.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 165L448 89" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M447.6 96.0L448 89L442.3 93.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 51L448 127" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M442.3 123.0L448 127L447.6 120.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 127L448 165" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M441.3 163.0L448 165L445.4 158.5" style="fill:none;stroke:#8A94A0;stroke-width:1"/><text x="320" y="212" text-anchor="middle" font-size="8" class="s-ink2">Orange = this lesson · arrows = “you need this first” · click a box to jump</text>
+        
+        <text x="632" y="228" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>  <p class="muted"><b>Builds on:</b> <a href="../../05-replication-and-the-cluster/01-brokers-and-replication/">5.1</a>, <a href="../../07-kafka-connect/01-kafka-connect/">7.1</a>. <b>Next:</b> Module 11 Kafka in industry.</p>
+
+
+  <h3>The topics MirrorMaker 2 creates</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 158" role="img" aria-label="DR cluster topics after MirrorMaker 2 started: the remote topic primary.orders-104, the internal topics heartbeats, primary.heartbeats, primary.checkpoints.internal and mm2 configs, offsets and status topics.">
+        <text x="16" y="22" font-size="8.6" font-weight="700" class="s-ink">What MM2 created on DR (real list)</text><rect x="16" y="34" width="96.81599999999999" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="64.40799999999999" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">primary.orders-104</text><circle cx="18" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="18" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><rect x="116.81599999999999" y="34" width="143.93599999999998" height="22" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="188.784" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">primary.checkpoints.internal</text><circle cx="118.81599999999999" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="118.81599999999999" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><rect x="264.75199999999995" y="34" width="158.072" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="343.78799999999995" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">heartbeats · primary.heartbeats</text><circle cx="266.75199999999995" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="266.75199999999995" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><rect x="426.82399999999996" y="34" width="134.512" height="22" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="494.0799999999999" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">mm2-configs/offsets/status</text><circle cx="428.82399999999996" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="428.82399999999996" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><circle cx="24" cy="81" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="84" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><text x="38" y="84" font-size="8" font-weight="700" class="s-ink">Remote topic</text><text x="106" y="84" font-size="7.6" class="s-ink2">the data, prefixed with the source cluster alias</text><circle cx="24" cy="96" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="99" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><text x="38" y="99" font-size="8" font-weight="700" class="s-ink">Checkpoints</text><text x="106" y="99" font-size="7.6" class="s-ink2">translated group offsets</text><circle cx="24" cy="111" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="114" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><text x="38" y="114" font-size="8" font-weight="700" class="s-ink">Heartbeats</text><text x="106" y="114" font-size="7.6" class="s-ink2">link liveness and topology</text><circle cx="24" cy="126" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="129" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><text x="38" y="129" font-size="8" font-weight="700" class="s-ink">Connect state</text><text x="106" y="129" font-size="7.6" class="s-ink2">MM2 runs on Kafka Connect</text>
+        <text x="320" y="148" text-anchor="middle" font-size="10.5" class="s-ink2">Offset-sync records live on the source side by default.</text>
+        <text x="632" y="156" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+  <h3 id="levels">Multi-cluster at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A photocopy in another city</h4>
+      <ul>
+        <li>Every page of the register is photocopied to a branch in another city, a few seconds later. If the main office burns, the branch continues, re-checking the last few pages because it is not sure which were already handled.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> MirrorMaker 2 pieces</h4>
+      <ul>
+        <li>Config: <code>clusters = primary, dr</code>, bootstrap servers per cluster, <code>primary->dr.enabled</code>, <code>primary->dr.topics</code> / <code>.groups</code> (regex). Run with <code>connect-mirror-maker.sh mm2.properties</code> or as connectors on a Connect cluster.</li>
+        <li><b>Remote topics</b> get the source alias as prefix (DefaultReplicationPolicy): <code>primary.orders-104</code>. Internal: <code>heartbeats</code>, <code>primary.checkpoints.internal</code>, <code>mm2-offset-syncs…</code>, plus mm2 configs/offsets/status.</li>
+        <li><code>sync.group.offsets.enabled=true</code> writes translated offsets into the DR cluster’s group, so a consumer can just start there.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Design for failure</h4>
+      <ul>
+        <li>RPO = data you can lose (replication lag); RTO = time to switch (DNS, configs, consumer restarts). Measure both in drills.</li>
+        <li>Offset translation uses periodic offset-sync points (<code>offset.lag.max</code>, 100 by default), so the translated offset is at or before the true one: plan for duplicates (idempotent consumers, Lesson 3.4).</li>
+        <li>Failback: mirror DR → primary for the period of the outage, or use an identity replication policy for migrations. Alternatives: Confluent Cluster Linking (offset-preserving byte copy), Redpanda/WarpStream replication features, or dual writes (rarely good).</li>
+      </ul>
+
+    </div>
+  </div>
+<div class="callout callout--warn" style="display:block"><p style="margin:0 0 6px"><b>Myth vs reality: things many websites still say</b></p><ul style="margin:0 0 0 18px"><li><b>Myth:</b> Offsets are identical across clusters.<br><b>Reality (Kafka 4.4):</b> They differ; MM2 translates.<br><span class="muted">Proof: Step 4.</span></li><li><b>Myth:</b> Failover is exactly-once.<br><b>Reality (Kafka 4.4):</b> Translated offsets are earlier: duplicates.<br><span class="muted">Proof: Step 5: from 406.</span></li><li><b>Myth:</b> RF 3 covers region loss.<br><b>Reality (Kafka 4.4):</b> Only within the cluster’s zones.<br><span class="muted">Proof: Why box.</span></li></ul></div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “How do you do Kafka DR?” Second cluster + MirrorMaker 2 (remote prefixed topics, heartbeats, checkpoints, offset translation, sync.group.offsets); active-passive vs active-active; RPO/RTO; at-least-once failover; runbooks and drills; Cluster Linking alternative.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Patterns and replicators</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th>Pattern</th><th>Writers</th><th>Use</th><th>Watch out</th></tr></thead>
+    <tbody><tr><td>Active-passive (DR)</td><td>primary only</td><td>region failure</td><td>RPO > 0, duplicates on failover</td></tr><tr><td>Active-active</td><td>both</td><td>local writes in two regions</td><td>conflicts; consumers read local + remote topics</td></tr><tr><td>Aggregation (hub)</td><td>edges</td><td>central analytics</td><td>bandwidth, prefixes</td></tr><tr><td>Migration</td><td>old → new</td><td>move cluster/cloud</td><td>cut-over plan, identity policy</td></tr></tbody>
+  </table>
+  </div>  <div class="table-wrap">
+  <table class="compare" style="min-width:520px">
+    <thead><tr><th>Replicator</th><th>Offsets</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>MirrorMaker 2 (Apache)</td><td>translated (≤ true offset)</td><td>Connect-based, open source</td></tr><tr><td>Confluent Cluster Linking</td><td>preserved</td><td>commercial, byte-for-byte</td></tr><tr><td>Vendor replication (MSK Replicator, etc.)</td><td>varies</td><td>managed services</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Practise failover before you need it. Write the runbook (stop producers, wait for lag ~0, switch bootstrap servers, start consumers on DR), run it every quarter, and make consumers idempotent: our drill re-delivered 195 orders.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>A failover drill</h2>
+  <p>All outputs are real: primary = our 3-broker Kafka 4.4 cluster, DR = single broker dr1, MirrorMaker 2 from Kafka 4.4.0.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Primary state</h4>
+      <div class="code" data-lang="bash" data-file="terminal"><pre><code>seq 1 1000 | … kafka-console-producer.sh --topic orders-104
+kafka-console-consumer.sh --topic orders-104 --group kitchen-104 --max-messages 600</code></pre><div class="output">== 1) primary: topic orders-104 (1,000 orders) and group kitchen-104 (read 600)
+  p0 committed 0 end 0 lag 0
+  p1 committed 0 end 0 lag 0
+  p2 committed 600 end 1000 lag 400</div></div>
+      <span class="behind">1,000 orders (keyless, so all landed in p2), group kitchen-104 committed 600.</span></li>
+    <li><h4>Step 2 · Start MirrorMaker 2</h4>
+      <div class="code" data-lang="properties" data-file="mm2.properties"><pre><code>clusters = primary, dr
+primary.bootstrap.servers = k1:9092,k2:9092,k3:9092
+dr.bootstrap.servers = dr1:9092
+primary-&gt;dr.enabled = true
+primary-&gt;dr.topics = orders-104
+primary-&gt;dr.groups = kitchen-104
+primary-&gt;dr.sync.group.offsets.enabled = true</code></pre><div class="output">== 2) DR cluster after MirrorMaker 2 started: topics
+  heartbeats
+  mm2-configs.primary.internal
+  mm2-offsets.primary.internal
+  mm2-status.primary.internal
+  primary.checkpoints.internal
+  primary.heartbeats
+  primary.orders-104</div></div>
+      <span class="behind">One command: <code>connect-mirror-maker.sh mm2.properties</code>. MM2 created the remote topic and its internal topics on DR.</span></li>
+    <li><h4>Step 3 · The copy</h4>
+      <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-get-offsets.sh --bootstrap-server dr1:9092 --topic primary.orders-104</code></pre><div class="output">== 3) the remote topic has the same records
+  primary.orders-104:0:0
+  primary.orders-104:1:0
+  primary.orders-104:2:1000
+  NO_HEADERS	order-1
+  NO_HEADERS	order-2</div></div>
+      <span class="behind">All 1,000 records, same partition layout.</span></li>
+    <li><h4>Step 4 · Translated offset</h4>
+      <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-consumer-groups.sh --bootstrap-server dr1:9092 --describe --group kitchen-104</code></pre><div class="output">== 4) the group offset, translated and synced on DR
+  primary.orders-104 p2 committed 405 end 1000 lag 595</div></div>
+      <span class="behind">The group exists on DR at 405, not 600: translation steps back to the last offset-sync point it can prove.</span></li>
+    <li><h4>Step 5 · Failover</h4>
+      <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-console-consumer.sh --bootstrap-server dr1:9092 --topic primary.orders-104 --group kitchen-104</code></pre><div class="output">== 5) failover: a consumer on DR with the same group continues, no re-read from 0
+  first records read on DR: order-406
+  first records read on DR: order-407
+  first records read on DR: order-408</div></div>
+      <span class="behind">The consumer continued at order-406: no restart from 0, but orders 406–600 are processed a second time.</span></li>
+    <li><h4>Step 6 · Still mirroring</h4>
+      <div class="code" data-lang="bash" data-file="terminal"><pre><code>seq 1001 1010 | … producer on primary; sleep 12; kafka-get-offsets on dr1</code></pre><div class="output">== 6) new orders on primary keep flowing to DR
+  primary.orders-104:0:0
+  primary.orders-104:1:10
+  primary.orders-104:2:1000</div></div>
+      <span class="behind">Ten new orders arrived on DR within seconds (this time in p1).</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Two views of the same run</h2>
+  <p>Left: real lab output. Right: what happens inside.</p>
+  <div class="anim" data-frames="6">
+    <div class="anim__title">Copy, translate, fail over <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real outputs from the lab">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">p2 committed 600</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">end 1000</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="6.8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">primary.orders-104</text><text x="26" y="64" font-size="6.8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">primary.checkpoints.internal</text><text x="26" y="78" font-size="6.8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">heartbeats</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">primary.orders-104:2:1000</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">DR group @405</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">(primary @600)</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">first on DR: order-406</text></g><g data-on="6"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">p1: 10 new</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Primary.</li>
+          <li>Start.</li>
+          <li>Copy.</li>
+          <li>Translate.</li>
+          <li>Failover.</li>
+          <li>Live.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Two clusters">
+          <g data-on="1"><rect x="8" y="34" width="130" height="80" rx="8" class="s-soft-acc" style="stroke:var(--track)"/><text x="73" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">primary (k1-k3)</text><text x="73" y="72" text-anchor="middle" font-size="7.4" class="s-ink mono">orders-104</text><text x="73" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @600</text><rect x="214" y="34" width="140" height="80" rx="8" class="s-soft-green" style="stroke:var(--green)"/><text x="284" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">DR (dr1)</text><text x="284" y="72" text-anchor="middle" font-size="7.0" class="s-ink mono">primary.orders-104</text><text x="284" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @405</text><rect x="144" y="58" width="64" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="176" y="77" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">MM2</text><path d="M138 73L144 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M137.7 76.0L144 73L137.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M208 73L214 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M207.7 76.0L214 73L207.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="10" y="128" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="146.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Primary at 600</text></g><g data-on="2"><rect x="8" y="34" width="130" height="80" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/><text x="73" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">primary (k1-k3)</text><text x="73" y="72" text-anchor="middle" font-size="7.4" class="s-ink mono">orders-104</text><text x="73" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @600</text><rect x="214" y="34" width="140" height="80" rx="8" class="s-soft-green" style="stroke:var(--green)"/><text x="284" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">DR (dr1)</text><text x="284" y="72" text-anchor="middle" font-size="7.0" class="s-ink mono">primary.orders-104</text><text x="284" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @405</text><rect x="144" y="58" width="64" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="176" y="77" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">MM2</text><path d="M138 73L144 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M137.7 76.0L144 73L137.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M208 73L214 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M207.7 76.0L214 73L207.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="10" y="128" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="146.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MM2 starts</text></g><g data-on="3"><rect x="8" y="34" width="130" height="80" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/><text x="73" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">primary (k1-k3)</text><text x="73" y="72" text-anchor="middle" font-size="7.4" class="s-ink mono">orders-104</text><text x="73" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @600</text><rect x="214" y="34" width="140" height="80" rx="8" class="s-soft-acc" style="stroke:var(--track)"/><text x="284" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">DR (dr1)</text><text x="284" y="72" text-anchor="middle" font-size="7.0" class="s-ink mono">primary.orders-104</text><text x="284" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @405</text><rect x="144" y="58" width="64" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="176" y="77" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">MM2</text><path d="M138 73L144 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M137.7 76.0L144 73L137.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M208 73L214 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M207.7 76.0L214 73L207.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="10" y="128" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="146.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Copy complete</text></g><g data-on="4"><rect x="8" y="34" width="130" height="80" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/><text x="73" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">primary (k1-k3)</text><text x="73" y="72" text-anchor="middle" font-size="7.4" class="s-ink mono">orders-104</text><text x="73" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @600</text><rect x="214" y="34" width="140" height="80" rx="8" class="s-soft-acc" style="stroke:var(--track)"/><text x="284" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">DR (dr1)</text><text x="284" y="72" text-anchor="middle" font-size="7.0" class="s-ink mono">primary.orders-104</text><text x="284" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @405</text><rect x="144" y="58" width="64" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="176" y="77" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">MM2</text><path d="M138 73L144 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M137.7 76.0L144 73L137.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M208 73L214 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M207.7 76.0L214 73L207.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="10" y="128" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="146.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Offset → 405</text></g><g data-on="5"><rect x="8" y="34" width="130" height="80" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/><text x="73" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">primary (k1-k3)</text><text x="73" y="72" text-anchor="middle" font-size="7.4" class="s-ink mono">orders-104</text><text x="73" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @600</text><rect x="214" y="34" width="140" height="80" rx="8" class="s-soft-acc" style="stroke:var(--track)"/><text x="284" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">DR (dr1)</text><text x="284" y="72" text-anchor="middle" font-size="7.0" class="s-ink mono">primary.orders-104</text><text x="284" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @405</text><rect x="144" y="58" width="64" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="176" y="77" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">MM2</text><path d="M138 73L144 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M137.7 76.0L144 73L137.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M208 73L214 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M207.7 76.0L214 73L207.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="10" y="128" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="146.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Failover continues</text></g><g data-on="6"><rect x="8" y="34" width="130" height="80" rx="8" class="s-soft-blue" style="stroke:var(--blue)"/><text x="73" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">primary (k1-k3)</text><text x="73" y="72" text-anchor="middle" font-size="7.4" class="s-ink mono">orders-104</text><text x="73" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @600</text><rect x="214" y="34" width="140" height="80" rx="8" class="s-soft-green" style="stroke:var(--green)"/><text x="284" y="52" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">DR (dr1)</text><text x="284" y="72" text-anchor="middle" font-size="7.0" class="s-ink mono">primary.orders-104</text><text x="284" y="90" text-anchor="middle" font-size="7.4" class="s-ink mono">group @405</text><rect x="144" y="58" width="64" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="176" y="77" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">MM2</text><path d="M138 73L144 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M137.7 76.0L144 73L137.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M208 73L214 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M207.7 76.0L214 73L207.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="10" y="128" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="146.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Live mirroring</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>600.</li>
+          <li>MM2.</li>
+          <li>1000.</li>
+          <li>405.</li>
+          <li>406.</li>
+          <li>Flow.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Now peel offset translation.</p>
+
+  <span class="live">Layer by layer</span>
+  <h3 id="scenario-peel">Offset translation, layer by layer</h3>
+  <p class="anim-intro">Group at 600 on primary. (Simplified.)</p>
+  <div class="anim anim--one" data-frames="6" data-delay="5000">
+    <div class="anim__title">Layers <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Each layer of the system, from your code down to the disk">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Copy</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Offset sync</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Checkpoint</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Translate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Sync group</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Resume</text><rect x="134" y="26" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="35.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Copy</text><text x="184" y="53" font-size="7.4" class="s-ink2">source offset → target offset</text><text x="184" y="66" font-size="7.4" class="s-ink2">may differ</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Copy</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Offset sync</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Checkpoint</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Translate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Sync group</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Resume</text><rect x="134" y="48" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="57.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 40L149 48" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 41.7L149 48L152.0 41.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Offset sync</text><text x="184" y="53" font-size="7.4" class="s-ink2">every ~100 offsets</text><text x="184" y="66" font-size="7.4" class="s-ink2">(source, target) pairs</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Copy</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Offset sync</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Checkpoint</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Translate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Sync group</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Resume</text><rect x="134" y="70" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="79.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 62L149 70" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 63.7L149 70L152.0 63.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Checkpoint</text><text x="184" y="53" font-size="7.4" class="s-ink2">group committed 600</text><text x="184" y="66" font-size="7.4" class="s-ink2">read periodically</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Copy</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Offset sync</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Checkpoint</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Translate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Sync group</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Resume</text><rect x="134" y="92" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="101.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 84L149 92" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 85.7L149 92L152.0 85.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Translate</text><text x="184" y="53" font-size="7.4" class="s-ink2">last sync ≤ 600</text><text x="184" y="66" font-size="7.4" class="s-ink2">→ target 405</text><text x="184" y="79" font-size="7.4" class="s-ink2">safe, never ahead</text></g><g data-on="5"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Copy</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Offset sync</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Checkpoint</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Translate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Sync group</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Resume</text><rect x="134" y="114" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="123.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 106L149 114" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 107.7L149 114L152.0 107.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Sync group</text><text x="184" y="53" font-size="7.4" class="s-ink2">write 405 into</text><text x="184" y="66" font-size="7.4" class="s-ink2">DR group kitchen-104</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="6"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Copy</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Offset sync</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Checkpoint</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Translate</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Sync group</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Resume</text><rect x="134" y="136" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="145.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 128L149 136" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 129.7L149 136L152.0 129.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Resume</text><text x="184" y="53" font-size="7.4" class="s-ink2">consumer on DR</text><text x="184" y="66" font-size="7.4" class="s-ink2">starts at 405</text><text x="184" y="79" font-size="7.4" class="s-ink2">duplicates 406–600</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Copy.</li>
+          <li>Pair.</li>
+          <li>Read.</li>
+          <li>Map.</li>
+          <li>Write.</li>
+          <li>Resume.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios: a drill, a migration, and active-active.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-drill">Region outage drill</h3>
+  <p class="anim-intro">Planned failover test. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Active-passive <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Runbook + MM2">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Stop primary producers</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">lag → ~0</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Drain.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Switch apps to DR</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">bootstrap servers</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cut over.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Consumers resume</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">translated offsets</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Continue.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Duplicates handled</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">idempotent writes</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Correct.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Measure RTO</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">8 minutes</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Improve.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Drain.</li>
+          <li>Switch.</li>
+          <li>Resume.</li>
+          <li>Dedupe.</li>
+          <li>Measure.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-migrate">Move to the cloud</h3>
+  <p class="anim-intro">On-prem → managed Kafka. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Migration <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Mirror, then cut over">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Mirror all topics</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">identity policy (same names)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Copy.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Consumers move first</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">translated offsets</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Read new.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Producers move</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">stop old writes</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Write new.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Verify counts</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">end offsets, checksums</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Retire old cluster</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">after retention</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Done.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Mirror.</li>
+          <li>Consumers.</li>
+          <li>Producers.</li>
+          <li>Verify.</li>
+          <li>Retire.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-aa">Two regions both write</h3>
+  <p class="anim-intro">Active-active. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Prefixes stop loops <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Read local + remote">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Mumbai and Delhi accept orders</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">each local cluster</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Two writers.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MM2 both ways</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">mumbai.orders, delhi.orders</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Prefixed.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No infinite loop</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">MM2 skips remote topics</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Safe.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Consumers subscribe</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">orders + *.orders</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Full view.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Conflicts by design</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">key ownership per region</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rules.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Write.</li>
+          <li>Mirror.</li>
+          <li>No loop.</li>
+          <li>Read.</li>
+          <li>Own.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Multi-cluster at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-red" style="stroke:var(--red)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-red">dr</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">DR</text></svg></div>
+    <div><h4>1. Disaster recovery</h4>
+      <p>Region outage plan.</p>
+      <div class="uc-flow"><span>Primary</span><i>→</i><span class="java">MM2</span><i>→</i><span>DR</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">edge</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">edge</text></svg></div>
+    <div><h4>2. Edge to core</h4>
+      <p>Stores/factories to central.</p>
+      <div class="uc-flow"><span>Edges</span><i>→</i><span class="java">mirror</span><i>→</i><span>Core</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-amber" style="stroke:var(--amber)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">mig</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">migrate</text></svg></div>
+    <div><h4>3. Migrations</h4>
+      <p>On-prem → cloud.</p>
+      <div class="uc-flow"><span>Old</span><i>→</i><span class="java">mirror</span><i>→</i><span>New</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green">geo</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">geo</text></svg></div>
+    <div><h4>4. Geo-local reads</h4>
+      <p>Data near users.</p>
+      <div class="uc-flow"><span>Region A</span><i>→</i><span class="java">copy</span><i>→</i><span>Region B</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified descriptions of common practice.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: translation</h2>
+  <p>Why DR resumes earlier. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># Offset translation from offset-sync points (MM2-style, simplified)
+syncs = [(0, 0), (101, 101), (203, 203), (304, 304), (405, 405), (707, 707)]   # (source, target)
+committed_on_primary = 600
+
+def translate(src_offset):
+    best = max((s, t) for s, t in syncs if s &lt;= src_offset)   # last proven point
+    return best[1]
+
+t = translate(committed_on_primary)
+print(&quot;primary committed:&quot;, committed_on_primary, &quot;-&gt; DR offset:&quot;, t)
+print(&quot;records processed twice after failover:&quot;, committed_on_primary - t)</code></pre><div class="output">primary committed: 600 -&gt; DR offset: 405
+records processed twice after failover: 195</div></div>
+  <ul class="anno"><li><code>    best = max((s, t) for s, t in syncs if s &lt;= src_offset)   # last proven point</code><span>Never ahead of the truth.</span></li><li><code>print(&quot;records processed twice after failover:&quot;, committed_on_primary - t)</code><span>Our lab: 195.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Add a sync at 590.",
+   "code": "# Offset translation from offset-sync points (MM2-style, simplified)\nsyncs = [(0, 0), (101, 101), (203, 203), (304, 304), (405, 405), (707, 707)]   # (source, target)\ncommitted_on_primary = 600\n\ndef translate(src_offset):\n    best = max((s, t) for s, t in syncs if s <= src_offset)   # last proven point\n    return best[1]\n\nt = translate(committed_on_primary)\nprint(\"primary committed:\", committed_on_primary, \"-> DR offset:\", t)\nprint(\"records processed twice after failover:\", committed_on_primary - t)\n"
+  },
+  {
+   "label": "2 · Predict first: name",
+   "hint": "<b>Predict first:<\/b> remote topic name.",
+   "code": "print(\"primary\" + \".\" + \"orders-104\")\n"
+  },
+  {
+   "label": "3 · RPO",
+   "hint": "Replication lag 3 s at 2,000 msg/s.",
+   "code": "print(3 * 2000, \"messages at risk\")\n"
+  },
+  {
+   "label": "4 · Loop guard",
+   "hint": "Skip remote topics.",
+   "code": "topics = [\"orders\", \"dr.orders\"]\nprint([t for t in topics if \".\" not in t])\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "Unreachable DR.",
+   "code": "raise TimeoutError(\"Timed out waiting for a node assignment. Call: listTopics (dr.bootstrap.servers unreachable)\")\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: MirrorMaker 2</h3>
+  <p>Needs two clusters. <b>Outputs are real.</b></p>
+  <div class="pcrun"><h4>1 · Start</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>connect-mirror-maker.sh mm2.properties</code></pre></div>
+  <p class="muted">Dedicated MM2 mode.</p></div>
+  <div class="pcrun"><h4>2 · Remote topic</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-get-offsets.sh --bootstrap-server dr1:9092 --topic primary.orders-104</code></pre><div class="output">primary.orders-104:2:1000</div></div>
+  <p class="muted">Copied.</p></div>
+  <div class="pcrun"><h4>3 · Translated group</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-consumer-groups.sh --bootstrap-server dr1:9092 --describe --group kitchen-104</code></pre><div class="output">primary.orders-104 2 405 1000 595</div></div>
+  <p class="muted">Synced.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Failover step by step</h2>
+  <p>Translate, resume, dedupe.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "primary, dr = 600, 405",
+  "reprocessed = list(range(dr + 1, primary + 1))",
+  "print(len(reprocessed), reprocessed[:3])"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>primary<\/code> is created: 600. <code>dr<\/code> is created: 405.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "primary",
+       "600"
+      ],
+      [
+       "dr",
+       "405"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "dr"
+  },
+  {
+   "line": 2,
+   "phase": "Duplicates",
+   "note": "406..600. <code>reprocessed<\/code> is created: → list #1. A new list object (#1) is created: [406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 419, 420, 421, 422, 423…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "primary",
+       "600"
+      ],
+      [
+       "dr",
+       "405"
+      ],
+      [
+       "reprocessed",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (195)<\/b> [406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 419, 420, 421, 422, 423…"
+   ],
+   "newVar": "reprocessed"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "primary",
+       "600"
+      ],
+      [
+       "dr",
+       "405"
+      ],
+      [
+       "reprocessed",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (195)<\/b> [406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 419, 420, 421, 422, 423…"
+   ],
+   "out": "195 [406, 407, 408]\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three multi-cluster decisions.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">DR · pattern</span></div>
+    <h4>Choose a pattern</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Survive region loss, one writer.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>need</pre></div><div><small>Expected output</small><pre>active-passive + MM2</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Active-passive.</li><li>MM2 primary → DR.</li><li>Runbook.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Types table.",
+   "code": "print(\"active-passive + MM2\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print(\"active-passive + MM2\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Simple",
+   "note": "Most common. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "active-passive + MM2\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">DR · consumers</span></div>
+    <h4>Handle duplicates</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>195 orders re-delivered.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>design</pre></div><div><small>Expected output</small><pre>INSERT … ON CONFLICT (order_id) DO NOTHING</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Idempotent writes (upsert by order id).</li><li>Or dedupe store.</li><li>Test in drills.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 5.",
+   "code": "print(\"INSERT … ON CONFLICT (order_id) DO NOTHING\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print(\"INSERT … ON CONFLICT (order_id) DO NOTHING\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Safe",
+   "note": "Lesson 3.4. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "INSERT … ON CONFLICT (order_id) DO NOTHING\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">DR · migration</span></div>
+    <h4>Keep topic names</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Migrate, no prefixes.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>policy</pre></div><div><small>Expected output</small><pre>{&#x27;replication.policy.class&#x27;: &#x27;org.apache.kafka.connect.mirror.IdentityReplicationPolicy&#x27;}</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>IdentityReplicationPolicy.</li><li>One direction only.</li><li>Cut over, retire old.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Scenario 2.",
+   "code": "print({\"replication.policy.class\": \"org.apache.kafka.connect.mirror.IdentityReplicationPolicy\"})\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print({\"replication.policy.class\": \"org.apache.kafka.connect.mirror.IdentityReplicationPolicy\"})"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Careful",
+   "note": "Loops if bidirectional. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "{'replication.policy.class': 'org.apache.kafka.connect.mirror.IdentityReplicationPolicy'}\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: MirrorMaker 2 copies…",
+  "options": [
+   "Brokers",
+   "Schemas only",
+   "Topics between clusters",
+   "Users"
+  ],
+  "answer": 2,
+  "why": "Replicator."
+ },
+ {
+  "q": "Beginner: Remote topic for orders from primary is…",
+  "options": [
+   "orders",
+   "primary.orders",
+   "orders.primary",
+   "dr.orders"
+  ],
+  "answer": 1,
+  "why": "Prefix."
+ },
+ {
+  "q": "Beginner: MM2 runs on…",
+  "options": [
+   "Kafka Connect",
+   "ZooKeeper",
+   "Spark",
+   "Flink"
+  ],
+  "answer": 0,
+  "why": "Connectors."
+ },
+ {
+  "q": "Intermediate: Group at 600 on primary resumed on DR at…",
+  "options": [
+   "0",
+   "600",
+   "1000",
+   "405"
+  ],
+  "answer": 3,
+  "why": "Translated."
+ },
+ {
+  "q": "Intermediate: Failover with MM2 is…",
+  "options": [
+   "Exactly-once",
+   "At-most-once",
+   "At-least-once",
+   "Lossless always"
+  ],
+  "answer": 2,
+  "why": "Duplicates."
+ },
+ {
+  "q": "Intermediate: RPO means…",
+  "options": [
+   "Recovery time",
+   "Data you may lose",
+   "Replication factor",
+   "Partitions"
+  ],
+  "answer": 1,
+  "why": "Point objective."
+ },
+ {
+  "q": "Advanced: Prefixes in active-active prevent…",
+  "options": [
+   "Replication loops",
+   "Compression",
+   "ACLs",
+   "Lag"
+  ],
+  "answer": 0,
+  "why": "Skip remote topics."
+ },
+ {
+  "q": "Advanced: An offset-preserving alternative is…",
+  "options": [
+   "Compaction",
+   "Tiered storage",
+   "Share groups",
+   "Cluster Linking"
+  ],
+  "answer": 3,
+  "why": "Commercial."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 10.4 in one screen</h3>
+    <ul><li>Multi-cluster for DR, aggregation, migration, geo.</li><li>MM2: source, checkpoint, heartbeat connectors; prefixed remote topics.</li><li>Lab: 1,000 copied; group 600 → 405 on DR; consumer resumed at order-406; new orders keep flowing.</li><li>Failover at-least-once; idempotent consumers; RPO/RTO drills.</li><li>Active-active with prefixes; identity policy for migrations; Cluster Linking alternative.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Does MM2 copy ACLs and configs?</summary><p>Topic configs and ACLs can be synced (sync.topic.configs, sync.topic.acls) with some limits.</p></details>
+    <details><summary>Why 405 not 600?</summary><p>Offsets are translated only at offset-sync points; the result is the last safe point at or before 600.</p></details>
+    <details><summary>Can consumers read both clusters?</summary><p>Yes: subscribe to orders and *.orders for active-active.</p></details>
+    <details><summary>Is MM1 still used?</summary><p>Legacy MirrorMaker 1 was removed in Kafka 4.0; use MM2.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Multi-cluster programs.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Name</h4></div>
+      <p>Remote name for payments from mumbai.</p>
+      <div class="prob__io"><div><small>Input</small><pre>str</pre></div><div><small>Expected output</small><pre>mumbai.payments</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;mumbai.payments&quot;)</code></pre><div class="output">mumbai.payments</div></div>
+        <p><b>How it works:</b> Prefix.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Duplicates</h4></div>
+      <p>600 vs 405.</p>
+      <div class="prob__io"><div><small>Input</small><pre>ints</pre></div><div><small>Expected output</small><pre>195</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(600 - 405)</code></pre><div class="output">195</div></div>
+        <p><b>How it works:</b> 195.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Copy check</h4></div>
+      <p>Same end offsets?</p>
+      <div class="prob__io"><div><small>Input</small><pre>ints</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(1000 == 1000)</code></pre><div class="output">True</div></div>
+        <p><b>How it works:</b> Yes.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Translate</h4></div>
+      <p>Last sync ≤ 250.</p>
+      <div class="prob__io"><div><small>Input</small><pre>list</pre></div><div><small>Expected output</small><pre>203</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>s = [0, 101, 203, 304]
+print(max(x for x in s if x &lt;= 250))</code></pre><div class="output">203</div></div>
+        <p><b>How it works:</b> 203.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Filter remote</h4></div>
+      <p>Local topics only.</p>
+      <div class="prob__io"><div><small>Input</small><pre>list</pre></div><div><small>Expected output</small><pre>[&#x27;orders&#x27;, &#x27;menu&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>ts = [&quot;orders&quot;, &quot;delhi.orders&quot;, &quot;menu&quot;]
+print([t for t in ts if &quot;.&quot; not in t])</code></pre><div class="output">[&#x27;orders&#x27;, &#x27;menu&#x27;]</div></div>
+        <p><b>How it works:</b> Local.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Dedupe</h4></div>
+      <p>Skip seen ids.</p>
+      <div class="prob__io"><div><small>Input</small><pre>list</pre></div><div><small>Expected output</small><pre>[405, 406, 407]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>seen, out = set(), []
+for i in [405, 406, 406, 407]:
+    if i not in seen: seen.add(i); out.append(i)
+print(out)</code></pre><div class="output">[405, 406, 407]</div></div>
+        <p><b>How it works:</b> Unique.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>RTO</h4></div>
+      <p>Steps 2+3+3 min.</p>
+      <div class="prob__io"><div><small>Input</small><pre>ints</pre></div><div><small>Expected output</small><pre>8 minutes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(2 + 3 + 3, &quot;minutes&quot;)</code></pre><div class="output">8 minutes</div></div>
+        <p><b>How it works:</b> 8.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Bandwidth</h4></div>
+      <p>40 MB/s across regions per day.</p>
+      <div class="prob__io"><div><small>Input</small><pre>ints</pre></div><div><small>Expected output</small><pre>3.3 TB/day</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(40 * 86400 / 1024 / 1024, 1), &quot;TB/day&quot;)</code></pre><div class="output">3.3 TB/day</div></div>
+        <p><b>How it works:</b> ~3.3.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Multi-cluster interview questions.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · data</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“How do you replicate Kafka across regions?”</h4>
+      <p class="scn__situation">Explain.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> answer?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>Run a second cluster and replicate with MirrorMaker 2 (or a vendor tool). It copies topics, syncs configs and translates consumer offsets so consumers can fail over.</p>
+        <p class="scn__avoid"><b>Avoid:</b> “Set RF to 6.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Duplicates after failover</h4>
+      <p class="scn__situation">Business complains.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> fix?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>Expected with translation.</li><li>Idempotent consumers.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> Disable MM2.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>DR lag</h4>
+      <p class="scn__situation">DR 10 min behind.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>More MM2 tasks, bandwidth, compression.</li><li>Monitor replication latency.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> Ignore it.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Architecture</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Two regions write</h4>
+      <p class="scn__situation">Design.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> answer?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>Active-active with prefixes.</li><li>Key ownership, consumers read local+remote.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> Same topic names both ways without policy.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Kafka syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/kafka.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

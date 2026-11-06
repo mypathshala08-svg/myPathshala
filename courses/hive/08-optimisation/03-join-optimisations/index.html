@@ -1,0 +1,2803 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join optimisations: map join, bucket map join, SMB and skew join | MyPhatshala</title>
+<meta name="description" content="Hive join algorithms with real Hive 4.2.1 plans and Tez counters: shuffle (merge) join vs map join (342,929 vs 31,867 shuffled bytes), the map-join size threshold, ignored MAPJOIN hints, why bucketed external tables never got a bucket join, a real bucket map join (CUSTOM_EDGE, BucketMapJoin:true) on managed tables, an SMB join with insert-only sorted tables, the ACID “cannot be sorted” error, and skewed keys: what skew-join settings did on Tez and the hot-key split that worked.">
+<meta name="mp:minutes" content="45">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/08-optimisation/03-join-optimisations/">
+<meta property="og:title" content="Join optimisations: map join, bucket map join, SMB and skew join · MyPhatshala">
+<meta property="og:description" content="Shuffle join moved 10.8× more data than a map join. Bucket map join and SMB join finally appeared once we used the right table type. Real Hive 4.2.1 plans.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Join optimisations: map join, bucket map join, SMB and skew join", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="08-optimisation/03-join-optimisations" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 8.3</b></nav>
+    <h1>Join optimisations: map join, bucket map join, SMB and skew join</h1>
+    <p class="lead">Joins are where most Hive time goes. This lesson runs one join four ways (shuffle, map, bucket map and SMB) and measures what moves, then builds a skewed table with one customer holding 40% of the orders. Along the way it finds the conditions most tutorials leave out: table type, sorting and ACID. <b>All plans and counters are real</b>, from Hive 4.2.1.</p>
+    <div class="lesson-meta"><span>Module 8 · Query optimisation</span><span>⏱ 45 min</span><span>Intermediate → Advanced</span><span>Real plans and counters</span><span>Bucket map join and SMB that work</span><span>Skew: what worked on Tez</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Can we make the join stop shuffling?”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> joins (<a href="../../03-querying/03-joins/">3.3</a>), bucketing (<a href="../../05-partitioning-and-bucketing/03-bucketing/">5.3</a>), plans (<a href="../01-explain-in-depth/">8.1</a>) and statistics (<a href="../02-cbo-and-statistics/">8.2</a>).</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s biggest nightly job joins orders with customers. Kabir read the plan (Lesson 8.1) and fixed the statistics (Lesson 8.2). Now the team wants to know which join methods Hive has and how to get the fast ones.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="One join between orders and customers can run as a shuffle join, a map join, a bucket map join or a sort-merge-bucket join. The optimiser chooses from estimated sizes, bucketing and sorting metadata, table type and settings.">
+        <rect x="10" y="12" width="196" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="108" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">Same join, four plans</text><rect x="22" y="40" width="172" height="20" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="108.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Shuffle (merge) join</text><text x="108.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">342,929 bytes shuffled</text><rect x="22" y="64" width="172" height="20" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="108.0" y="75" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Map join</text><text x="108.0" y="85" text-anchor="middle" font-size="6.4" class="s-ink2 mono">small side broadcast</text><rect x="22" y="88" width="172" height="20" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="108.0" y="99" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Bucket map join</text><text x="108.0" y="109" text-anchor="middle" font-size="6.4" class="s-ink2 mono">8 tasks, bucket i ↔ i</text><rect x="22" y="112" width="172" height="20" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="108.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">SMB join</text><text x="108.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">merge sorted buckets</text><path d="M212 76L252 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M245.7 79.0L252 76L245.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="258" y="46" width="110" height="60" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="313" y="72" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">Optimiser</text><text x="313" y="88" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">chooses</text><path d="M374 76L410 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M403.7 79.0L410 76L403.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="416" y="12" width="214" height="128" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="523" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">It decides from</text><text x="430" y="54" font-size="7.4" class="s-ink2 mono">estimated size of each side</text><text x="430" y="72" font-size="7.4" class="s-ink2 mono">bucketing + sorting metadata</text><text x="430" y="90" font-size="7.4" class="s-ink2 mono">table type (managed/external)</text><text x="430" y="108" font-size="7.4" class="s-ink2 mono">settings and thresholds</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">The fastest join is the one that <tspan font-weight="700" class="s-acc">moves the least data</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, Lesson 5.3 said bucketing gives faster joins. But my plan still broadcasts.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Hive has four join methods. A <b>shuffle join</b> sends both tables across the network by key. A <b>map join</b> copies the small table to every task and skips the shuffle. A <b>bucket map join</b> loads only the matching bucket. An <b>SMB join</b> merges sorted buckets without any hash table. Each has conditions, and Hive is strict about them.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>And skew? One corporate customer has 40% of the orders.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>We will build that table, see what Hive’s skew settings do on Tez (in our lab: nothing), and fix it by hand. Every plan and counter today is real, from Hive 4.2.1, including the conditions that made bucket joins finally appear.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Join optimisations in Hive</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>Hive executes an equi-join with one of several physical algorithms. The <b>shuffle (common) join</b> repartitions both inputs by the join key and joins them in reducers. A <b>map join</b> (broadcast join) loads the smaller input into an in-memory hash table on every task processing the larger input, avoiding the shuffle; Hive converts joins automatically when the estimated size of the small inputs is below <code>hive.auto.convert.join.noconditionaltask.size</code>. When both tables are bucketed on the join key, a <b>bucket map join</b> sends each task only the matching bucket of the small table, and when they are also sorted on the key with the same number of buckets, a <b>sort-merge-bucket (SMB) join</b> merges the buckets directly. <b>Skew join</b> handling separates heavily repeated keys so they do not overload one task.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Hive can join tables in different ways. The slow, general way sends both tables over the network. Faster ways copy a small table to every worker, or use matching buckets so each worker only needs a slice. The plan shows which one Hive picked.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Shuffle join</b><span>Both sides repartitioned by key to reducers (Merge Join Operator).</span></div>
+    <div class="term"><b>Map join</b><span>Small side broadcast; join in the map task (Map Join Operator).</span></div>
+    <div class="term"><b>Bucket map join</b><span>Each task loads only the matching bucket of the small side.</span></div>
+    <div class="term"><b>SMB join</b><span>Sort-merge-bucket: merge sorted buckets, no hash table.</span></div>
+    <div class="term"><b>Big / small table</b><span>The side streamed vs the side held in memory.</span></div>
+    <div class="term"><b>Skew</b><span>A few key values with far more rows than the rest.</span></div>
+    <div class="term"><b>Hot key</b><span>One very frequent key, e.g. a corporate customer.</span></div>
+    <div class="term"><b>Semi-join reduction</b><span>Bloom/min-max filter from one side applied to the other’s scan.</span></div>
+  </div>
+
+  <h3>Choosing a join</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:760px">
+    <thead><tr><th>Join</th><th>Needs</th><th>Plan clue</th><th>Lab result</th></tr></thead>
+    <tbody><tr><td>Shuffle (merge) join</td><td>Nothing</td><td><code>Reducer n &lt;- Map a, Map b (SIMPLE_EDGE)</code></td><td>342,929 bytes shuffled</td></tr><tr><td>Map join</td><td>Small side under the size threshold</td><td><code>BROADCAST_EDGE</code>, Map Join Operator</td><td>31,867 bytes; 3 tasks</td></tr><tr><td>Bucket map join</td><td>Both bucketed on key; managed tables</td><td><code>CUSTOM_EDGE</code>, <code>BucketMapJoin:true</code></td><td>8 map tasks, one per bucket</td></tr><tr><td>SMB join</td><td>Bucketed + sorted, same buckets; not full ACID</td><td>Merge Join in Map, <code>Dummy Store</code></td><td>No shuffle for the join</td></tr><tr><td>Skew handling</td><td>Hot keys known</td><td>Manual split / UNION ALL in our lab</td><td>Same result, hot key isolated</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Join optimisation at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Matching two lists</h4>
+      <ul>
+        <li>To join orders with customers, Hive must bring each order and its customer to the same place.</li>
+        <li><b>Shuffle join:</b> both lists are sorted into piles by customer_id and sent over the network. Works for any size, but moves a lot of data.</li>
+        <li><b>Map join:</b> if one list is small, give a full copy to every worker. No piles needed.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The four methods and their conditions</h4>
+      <ul>
+        <li><b>Shuffle (common / merge) join:</b> default fallback. Both sides go through SIMPLE_EDGE to a reducer running <code>Merge Join Operator</code>.</li>
+        <li><b>Map (broadcast) join:</b> small side under <code>hive.auto.convert.join.noconditionaltask.size</code> (10,000,000 bytes in our lab); <code>BROADCAST_EDGE</code>, <code>Map Join Operator</code>.</li>
+        <li><b>Bucket map join:</b> both tables bucketed on the join key with compatible counts; each big-table task gets only its bucket of the small table (<code>CUSTOM_EDGE</code>, <code>BucketMapJoin:true</code>).</li>
+        <li><b>SMB join:</b> both bucketed <i>and sorted</i> on the key, same bucket count: merge bucket i with bucket i inside the map task (<code>Merge Join Operator</code> + <code>Dummy Store</code>).</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>Bucketed, sorted <b>external</b> tables never got a bucket map or SMB join; <b>managed</b> transactional tables did.</li>
+        <li>Full ACID tables cannot be <code>SORTED BY</code> (“cannot support full ACID functionality since it is sorted”); SMB worked with insert-only tables.</li>
+        <li>Shuffle join moved 342,929 bytes vs 31,867 for the map join. <code>/*+ MAPJOIN */</code> hints are ignored by default. Skew settings did not change the Tez plan; splitting the hot key did the job.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “Explain map join, bucket map join and SMB join.” Map join: small table copied to every task, no shuffle; automatic below a size threshold. Bucket map join: both tables bucketed on the join key (compatible counts); each task loads only its bucket of the small table. SMB: both bucketed and sorted on the key with the same bucket count; buckets are merged, so neither side must fit in memory. Verify in EXPLAIN.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Settings that control joins</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:720px">
+    <thead><tr><th>Setting</th><th>Lab value</th><th>Meaning</th></tr></thead>
+    <tbody><tr><td><code>hive.auto.convert.join</code></td><td>true</td><td>Convert to map join when the small side is small enough</td></tr><tr><td><code>hive.auto.convert.join.noconditionaltask.size</code></td><td>10000000</td><td>Bytes allowed for the small side(s)</td></tr><tr><td><code>hive.convert.join.bucket.mapjoin.tez</code></td><td>true</td><td>Allow bucket map join on Tez</td></tr><tr><td><code>hive.auto.convert.sortmerge.join</code></td><td>true</td><td>Allow SMB join conversion</td></tr><tr><td><code>hive.ignore.mapjoin.hint</code></td><td>true</td><td><code>/*+ MAPJOIN(x) */</code> hints are ignored</td></tr><tr><td><code>hive.optimize.skewjoin</code> / <code>.compiletime</code></td><td>false / false</td><td>Skew join handling (no plan change on Tez in our lab)</td></tr><tr><td><code>hive.skewjoin.key</code></td><td>100000</td><td>Rows per key treated as skewed (runtime skew join)</td></tr><tr><td><code>hive.tez.dynamic.semijoin.reduction</code></td><td>true</td><td>Bloom-filter semi-join reduction when worthwhile</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Turning <code>hive.auto.convert.join</code> off to “be safe” forces shuffle joins everywhere: 10× more shuffled bytes in our lab. Fix the statistics or lower the threshold for one query instead.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Four join methods, real plans and counters</h2>
+  <p>All outputs are real, from the Hive 4.2.1 lab. Plans keep the lines that identify the join; counters come from <code>SET hive.tez.exec.print.summary=true</code>.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Shuffle (merge) join</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.auto.convert.join=false;
+EXPLAIN SELECT c.city, COUNT(*), SUM(o.amount)
+FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.city;</code></pre><div class="output">Reducer 2 &lt;- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)
+Reducer 3 &lt;- Reducer 2 (SIMPLE_EDGE)
+        &lt;-Reducer 2 [SIMPLE_EDGE]
+              Merge Join Operator [MERGEJOIN_19] (rows=50000 width=203)
+              &lt;-Map 1 [SIMPLE_EDGE] vectorized
+                      TableScan [TS_0] (rows=50000 width=116)
+              &lt;-Map 4 [SIMPLE_EDGE] vectorized
+                      TableScan [TS_3] (rows=2000 width=95)</div></div>
+      <span class="behind">Both tables are read by their own map vertex (Map 1, Map 4) and <b>shuffled</b> by customer_id (SIMPLE_EDGE) into Reducer 2, where the <code>Merge Join Operator</code> joins rows with the same key. A third vertex groups by city. This works for any size, but every row of both tables crosses the network.</span></li>
+    <li><h4>Step 2 · Map join (the default here)</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>EXPLAIN SELECT c.city, COUNT(*), SUM(o.amount)
+FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.city;</code></pre><div class="output">Map 1 &lt;- Map 3 (BROADCAST_EDGE)
+Reducer 2 &lt;- Map 1 (SIMPLE_EDGE)
+        &lt;-Map 1 [SIMPLE_EDGE] vectorized
+              Map Join Operator [MAPJOIN_26] (rows=50000 width=203)
+              &lt;-Map 3 [BROADCAST_EDGE] vectorized
+                      TableScan [TS_3] (rows=2000 width=95)
+              &lt;-Select Operator [SEL_25] (rows=50000 width=116)
+                    TableScan [TS_0] (rows=50000 width=116)</div></div>
+      <span class="behind">With the default settings customers (2,000 rows) is under the 10,000,000-byte limit, so Map 3 <b>broadcasts</b> it to every task of Map 1, which joins in memory. The join needs no reducer; one shuffle remains for GROUP BY.</span></li>
+    <li><h4>Step 3 · Measure it: counters of both runs</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.tez.exec.print.summary=true;
+-- run the query once with the map join, once with hive.auto.convert.join=false</code></pre><div class="output">-- map join
+  VERTICES      DURATION(ms)   CPU_TIME(ms)    GC_TIME(ms)   INPUT_RECORDS   OUTPUT_RECORDS
+     Map 1            382.00              0              0          52,000                8
+     Map 3              0.00              0              0           2,000            2,000
+ Reducer 2              0.00              0              0               8                0
+   TOTAL_LAUNCHED_TASKS: 3
+   SHUFFLE_BYTES: 31867
+
+-- shuffle join
+  VERTICES      DURATION(ms)   CPU_TIME(ms)    GC_TIME(ms)   INPUT_RECORDS   OUTPUT_RECORDS
+     Map 1              0.00              0              0          50,000           50,000
+     Map 4              0.00              0              0           2,000            2,000
+ Reducer 2              0.00              0              0          52,000                8
+ Reducer 3              0.00              0              0               8                0
+   TOTAL_LAUNCHED_TASKS: 4
+   SHUFFLE_BYTES: 342929</div></div>
+      <span class="behind">Same 8 result rows. The shuffle join sends all <b>52,000</b> rows to Reducer 2 and moves <b>342,929</b> bytes; the map join sends 8 partial results and 31,867 bytes (mostly the broadcast copy of customers): <b>10.8× less</b>. Map 1’s 52,000 input records in the map join include the 2,000 broadcast rows. Durations on 50,000 rows are mostly start-up overhead, so compare bytes and records, not milliseconds.</span></li>
+    <li><h4>Step 4 · Hints are ignored</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.ignore.mapjoin.hint;   -- true
+EXPLAIN SELECT /*+ MAPJOIN(o) */ c.city, SUM(o.amount)
+FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.city;</code></pre><div class="output">Map 1 &lt;- Map 3 (BROADCAST_EDGE)
+Reducer 2 &lt;- Map 1 (SIMPLE_EDGE)
+        &lt;-Map 1 [SIMPLE_EDGE] vectorized
+              Map Join Operator [MAPJOIN_26] (rows=50000 width=203)
+              &lt;-Map 3 [BROADCAST_EDGE] vectorized
+              &lt;-Select Operator [SEL_25] (rows=50000 width=116)
+                  Filter Operator [FIL_24] (rows=50000 width=116)
+                    TableScan [TS_0] (rows=50000 width=116)</div></div>
+      <span class="behind">The hint asked Hive to hold <b>orders</b> (50,000 rows) in memory. Hive ignored it and still streamed orders (SEL_25, rows=50000) and broadcast customers. Old tutorials rely on <code>MAPJOIN</code> and <code>STREAMTABLE</code> hints; in Hive 4 the cost-based decision wins unless you set <code>hive.ignore.mapjoin.hint=false</code>.</span></li>
+    <li><h4>Step 5 · Bucketed external tables: still a broadcast</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>-- orders_bkt, customers_bkt: EXTERNAL, CLUSTERED BY (customer_id) SORTED BY (customer_id) INTO 8 BUCKETS
+SET hive.auto.convert.join.noconditionaltask.size=20000;
+SET hive.optimize.bucketmapjoin=true; SET hive.optimize.bucketmapjoin.sortedmerge=true;
+EXPLAIN SELECT … FROM orders_bkt o JOIN customers_bkt c ON …;</code></pre><div class="output">-- default settings
+Map 1 &lt;- Map 3 (BROADCAST_EDGE)
+Reducer 2 &lt;- Map 1 (SIMPLE_EDGE)
+        &lt;-Map 1 [SIMPLE_EDGE] vectorized
+              Map Join Operator [MAPJOIN_26] (rows=50000 width=203)
+              &lt;-Map 3 [BROADCAST_EDGE] vectorized
+              &lt;-Select Operator [SEL_25] (rows=50000 width=116)
+
+-- small threshold + bucket settings
+Reducer 2 &lt;- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)
+Reducer 3 &lt;- Reducer 2 (SIMPLE_EDGE)
+        &lt;-Reducer 2 [SIMPLE_EDGE]
+              Merge Join Operator [MERGEJOIN_19] (rows=50000 width=203)
+              &lt;-Map 1 [SIMPLE_EDGE] vectorized
+              &lt;-Map 4 [SIMPLE_EDGE] vectorized</div></div>
+      <span class="behind">This is why Lesson 5.3 never saw a bucket join. With default settings the bucketed tables got an ordinary <b>broadcast</b>; with a small threshold and every bucket setting on, a <b>shuffle</b> merge join. In Hive 4.2.1 our <b>external</b> bucketed tables were never joined bucket by bucket, most likely because Hive cannot guarantee that files written outside it follow the bucketing.</span></li>
+    <li><h4>Step 6 · Bucket map join on managed tables</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE ob_acid (order_id BIGINT, customer_id INT, amount DECIMAL(10,2), order_date DATE)
+  CLUSTERED BY (customer_id) INTO 8 BUCKETS STORED AS ORC TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;);
+CREATE TABLE cb_acid (customer_id INT, city STRING, plan STRING)
+  CLUSTERED BY (customer_id) INTO 8 BUCKETS STORED AS ORC TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;);
+-- INSERT … SELECT from orders / customers, then:
+EXPLAIN SELECT … FROM ob_acid o JOIN cb_acid c ON o.customer_id = c.customer_id GROUP BY c.city;</code></pre><div class="output">Map 1 &lt;- Map 3 (CUSTOM_EDGE)
+Reducer 2 &lt;- Map 1 (SIMPLE_EDGE)
+        &lt;-Map 1 [SIMPLE_EDGE] vectorized
+              Map Join Operator [MAPJOIN_36] (rows=50000 width=203)
+                BucketMapJoin:true,Conds:SEL_35._col0=RS_33._col0(Inner),Output:[&quot;_col1&quot;,&quot;_col3&quot;]
+              &lt;-Map 3 [CUSTOM_EDGE] vectorized
+                MULTICAST [RS_33]
+              &lt;-Select Operator [SEL_35] (rows=50000 width=116)
+
+-- run summary
+  VERTICES      DURATION(ms)   CPU_TIME(ms)    GC_TIME(ms)   INPUT_RECORDS   OUTPUT_RECORDS
+     Map 1           1810.00              0              0          52,000               64
+     Map 3              0.00              0              0           2,000            2,000
+ Reducer 2              0.00              0              0              64                0
+   TOTAL_LAUNCHED_TASKS: 10
+   SHUFFLE_BYTES: 33179</div></div>
+      <span class="behind">Now the plan says <code>CUSTOM_EDGE</code>, <code>MULTICAST</code> and <b><code>BucketMapJoin:true</code></b>. Map 1 ran <b>8 tasks</b>, one per bucket of orders (10 tasks in total), and each received only the customers of its own bucket: 64 partial rows = 8 tasks × 8 cities. Because each task holds one bucket, the plan stayed a bucket map join even with the 20,000-byte threshold; at 1,000 bytes Hive fell back to a shuffle join.</span></li>
+    <li><h4>Step 7 · SMB join: sorted buckets, merged in the map</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE ob_acid (…) CLUSTERED BY (customer_id) SORTED BY (customer_id) INTO 8 BUCKETS
+  STORED AS ORC TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;);      -- full ACID: refused
+
+CREATE TABLE ob_mm (…) CLUSTERED BY (customer_id) SORTED BY (customer_id) INTO 8 BUCKETS STORED AS ORC
+  TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;,&#x27;transactional_properties&#x27;=&#x27;insert_only&#x27;);   -- same for cb_mm
+SET hive.auto.convert.join.noconditionaltask.size=1000;
+EXPLAIN SELECT … FROM ob_mm o JOIN cb_mm c ON o.customer_id = c.customer_id GROUP BY c.city;</code></pre><div class="output">Error: Error while compiling statement: FAILED: Execution Error, return code 40000 from org.apache.hadoop.hive.ql.ddl.DDLTask. MetaException(message:Table tiffingo.ob_acid cannot support full ACID functionality since it is sorted.)
+
+Reducer 2 &lt;- Map 1 (SIMPLE_EDGE)
+        &lt;-Map 1 [SIMPLE_EDGE]
+              Merge Join Operator [MERGEJOIN_29] (rows=50000 width=203)
+              &lt;-Dummy Store [DUMMY_STORE_30]
+                      TableScan [TS_3] (rows=2000 width=95)
+              &lt;-Select Operator [SEL_2] (rows=50000 width=116)
+                    TableScan [TS_0] (rows=50000 width=116)
+
+  VERTICES      DURATION(ms)   CPU_TIME(ms)    GC_TIME(ms)   INPUT_RECORDS   OUTPUT_RECORDS
+     Map 1           2029.00              0              0          50,000               72
+ Reducer 2              0.00              0              0              72                8
+ Reducer 3              0.00              0              0               8                0
+   TOTAL_LAUNCHED_TASKS: 10</div></div>
+      <span class="behind">Full ACID tables cannot be sorted, so we used <b>insert-only</b> transactional tables. With a threshold too small for any map join, Hive chose <b>SMB</b>: the vertex list has <b>no join shuffle</b> (only Reducer 2 for GROUP BY), and the <code>Merge Join Operator</code> runs <b>inside Map 1</b>, with customers read through a <code>Dummy Store</code>. 8 tasks merged bucket i of orders with bucket i of customers. Note that Map 1 is not marked <i>vectorized</i> here.</span></li>
+    <li><h4>Step 8 · A skewed key</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE orders_skew STORED AS ORC AS SELECT order_id,
+  CASE WHEN order_id % 10 &lt; 4 THEN 7 ELSE customer_id END AS customer_id, amount FROM orders;
+SELECT customer_id, COUNT(*) AS n FROM orders_skew GROUP BY customer_id ORDER BY n DESC LIMIT 3;
+
+SET hive.auto.convert.join=false; SET hive.optimize.skewjoin=true; SET hive.skewjoin.key=5000;
+ALTER TABLE orders_skew SKEWED BY (customer_id) ON (7); SET hive.optimize.skewjoin.compiletime=true;
+EXPLAIN SELECT c.city, COUNT(*), SUM(o.amount) FROM orders_skew o JOIN customers c ON … GROUP BY c.city;</code></pre><div class="output">+--------------+--------+
+| customer_id  |   n    |
++--------------+--------+
+| 7            | 20016  |
+| 1044         | 31     |
+| 1492         | 28     |
++--------------+--------+
+
+Reducer 2 &lt;- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)
+Reducer 3 &lt;- Reducer 2 (SIMPLE_EDGE)
+        &lt;-Reducer 2 [SIMPLE_EDGE]
+              Merge Join Operator [MERGEJOIN_19] (rows=50000 width=203)
+              &lt;-Map 1 [SIMPLE_EDGE] vectorized
+              &lt;-Map 4 [SIMPLE_EDGE] vectorized</div></div>
+      <span class="behind">Customer 7 now has <b>20,016</b> of 50,000 orders; the next customer has 31. In a shuffle join, all 20,016 rows go to <b>one</b> reducer task while others idle. We switched on both skew-join settings and declared the skewed value: the Tez plan in Hive 4.2.1 <b>did not change</b> (the runtime skew join is a MapReduce-era feature). Two fixes worked: a map join (the default for this small dimension: no shuffle on the key at all), or splitting the hot key by hand, shown in the code section below.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Where the rows go in each join</h2>
+  <p>Left: real plans and counters. Right: how the data moves.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">How rows meet <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real plans and counters">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">Reducer 2 &lt;- Map 1 (SIMPLE_EDGE),</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">             Map 4 (SIMPLE_EDGE)</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Merge Join Operator [MERGEJOIN_19]</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">Reducer 2  INPUT_RECORDS 52,000</text><text x="26" y="106" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">SHUFFLE_BYTES: 342929</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Map 1 &lt;- Map 3 (BROADCAST_EDGE)</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Map Join Operator [MAPJOIN_26]</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Reducer 2  INPUT_RECORDS 8</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">SHUFFLE_BYTES: 31867</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Map 1 &lt;- Map 3 (CUSTOM_EDGE)</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">MULTICAST [RS_33]</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">BucketMapJoin:true</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">TOTAL_LAUNCHED_TASKS: 10</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Reducer 2 &lt;- Map 1 (SIMPLE_EDGE)</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Merge Join Operator [MERGEJOIN_29]</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">&lt;-Dummy Store [DUMMY_STORE_30]</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  tiffingo@cb_mm … transactional table</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">customer_id = 7    20,016 rows</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">customer_id = 1044     31 rows</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">skewjoin settings on:</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  plan unchanged</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The shuffle join moved 342,929 bytes.</li>
+          <li>The map join moved 31,867 bytes: 10.8× less.</li>
+          <li>Managed bucketed tables got a bucket map join with 8 tasks.</li>
+          <li>Sorted insert-only tables got an SMB join inside Map 1.</li>
+          <li>One customer holds 40% of the skewed table.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Where the data moves">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Shuffle join: everything moves</text><rect x="20" y="44" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="55" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 0</text><path d="M92 52L200 52" style="fill:none;stroke:#D64545;stroke-width:1.2"/><path d="M193.7 55.0L200 52L193.7 49.0" style="fill:none;stroke:#D64545;stroke-width:1.2"/><rect x="20" y="66" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="77" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 1</text><path d="M92 74L200 118" style="fill:none;stroke:#D64545;stroke-width:1.2"/><path d="M193.0 118.4L200 118L195.3 112.8" style="fill:none;stroke:#D64545;stroke-width:1.2"/><rect x="20" y="88" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="99" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 2</text><path d="M92 96L200 96" style="fill:none;stroke:#D64545;stroke-width:1.2"/><path d="M193.7 99.0L200 96L193.7 93.0" style="fill:none;stroke:#D64545;stroke-width:1.2"/><rect x="20" y="110" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="121" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 3</text><path d="M92 118L200 74" style="fill:none;stroke:#D64545;stroke-width:1.2"/><path d="M195.3 79.2L200 74L193.0 73.6" style="fill:none;stroke:#D64545;stroke-width:1.2"/><rect x="202" y="44" width="70" height="16" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="237" y="55" text-anchor="middle" font-size="6.8" class="s-ink mono">reducer 0</text><rect x="202" y="66" width="70" height="16" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="237" y="77" text-anchor="middle" font-size="6.8" class="s-ink mono">reducer 1</text><rect x="202" y="88" width="70" height="16" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="237" y="99" text-anchor="middle" font-size="6.8" class="s-ink mono">reducer 2</text><rect x="202" y="110" width="70" height="16" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="237" y="121" text-anchor="middle" font-size="6.8" class="s-ink mono">reducer 3</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rows of both tables cross the network.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Map join: small side copied to all</text><rect x="20" y="44" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="55" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 0</text><path d="M92 52L128 52" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 55.0L128 52L121.7 49.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="44" width="70" height="16" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="165" y="55" text-anchor="middle" font-size="6.8" class="s-ink mono">all cust</text><rect x="20" y="66" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="77" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 1</text><path d="M92 74L128 74" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 77.0L128 74L121.7 71.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="66" width="70" height="16" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="165" y="77" text-anchor="middle" font-size="6.8" class="s-ink mono">all cust</text><rect x="20" y="88" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="99" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 2</text><path d="M92 96L128 96" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 99.0L128 96L121.7 93.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="88" width="70" height="16" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="165" y="99" text-anchor="middle" font-size="6.8" class="s-ink mono">all cust</text><rect x="20" y="110" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="121" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 3</text><path d="M92 118L128 118" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 121.0L128 118L121.7 115.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="110" width="70" height="16" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="165" y="121" text-anchor="middle" font-size="6.8" class="s-ink mono">all cust</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Big side stays; no shuffle for the join.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bucket map join: bucket i gets bucket i</text><rect x="20" y="44" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="55" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 0</text><path d="M92 52L128 52" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 55.0L128 52L121.7 49.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="44" width="70" height="16" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="165" y="55" text-anchor="middle" font-size="6.8" class="s-ink mono">cust 0</text><rect x="20" y="66" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="77" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 1</text><path d="M92 74L128 74" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 77.0L128 74L121.7 71.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="66" width="70" height="16" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="165" y="77" text-anchor="middle" font-size="6.8" class="s-ink mono">cust 1</text><rect x="20" y="88" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="99" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 2</text><path d="M92 96L128 96" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 99.0L128 96L121.7 93.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="88" width="70" height="16" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="165" y="99" text-anchor="middle" font-size="6.8" class="s-ink mono">cust 2</text><rect x="20" y="110" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="121" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 3</text><path d="M92 118L128 118" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 121.0L128 118L121.7 115.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="110" width="70" height="16" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="165" y="121" text-anchor="middle" font-size="6.8" class="s-ink mono">cust 3</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each task holds 1/8 of the small table.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">SMB: sorted buckets merged</text><rect x="20" y="44" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="55" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 0</text><path d="M92 52L128 52" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 55.0L128 52L121.7 49.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="44" width="70" height="16" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="165" y="55" text-anchor="middle" font-size="6.8" class="s-ink mono">cust 0</text><rect x="20" y="66" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="77" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 1</text><path d="M92 74L128 74" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 77.0L128 74L121.7 71.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="66" width="70" height="16" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="165" y="77" text-anchor="middle" font-size="6.8" class="s-ink mono">cust 1</text><rect x="20" y="88" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="99" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 2</text><path d="M92 96L128 96" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 99.0L128 96L121.7 93.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="88" width="70" height="16" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="165" y="99" text-anchor="middle" font-size="6.8" class="s-ink mono">cust 2</text><rect x="20" y="110" width="70" height="16" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="55" y="121" text-anchor="middle" font-size="6.8" class="s-ink mono">orders 3</text><path d="M92 118L128 118" style="fill:none;stroke:var(--green);stroke-width:1.4"/><path d="M121.7 121.0L128 118L121.7 115.0" style="fill:none;stroke:var(--green);stroke-width:1.4"/><rect x="130" y="110" width="70" height="16" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="165" y="121" text-anchor="middle" font-size="6.8" class="s-ink mono">cust 3</text><text x="290" y="80" text-anchor="middle" font-size="8" font-weight="700" class="s-violet">merge</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No hash table: neither side must fit in memory.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Skew: one key, one overloaded task</text><rect x="40" y="50" width="260" height="12" rx="2" style="fill:var(--track)"/><text x="40" y="76" font-size="7.6" class="s-red mono">key 7: 20,016 rows → one reducer</text><rect x="40" y="86" width="4" height="12" rx="1" style="fill:var(--blue)"/><text x="50" y="96" font-size="7.6" class="s-ink2 mono">key 1044: 31 rows</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Map join or a hot-key split avoids it.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Both inputs are repartitioned by key so equal keys meet in one reducer.</li>
+          <li>Every map task builds a hash table of the small side and streams the big side through it.</li>
+          <li>Bucket i of the big table only needs bucket i of the small one.</li>
+          <li>Sorted buckets are merged like two sorted lists.</li>
+          <li>Hash partitioning sends every row of a key to the same task.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a map join out of memory, a skewed join, and a design for SMB.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-oom">A map join runs out of memory</h3>
+  <p class="anim-intro">A frequent production failure and its fixes. (Sizes illustrative; the mechanisms are those we measured.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Map join OOM <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A dimension grew beyond what fits in memory; fresh statistics or bucketing restore a safe plan">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly job fails: “GC overhead / OOM” in Map 1</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2 mono">plan: BROADCAST_EDGE to a dimension</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A map join that no longer fits.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check the estimate</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-red mono">statistics: 5 MB · real table: 900 MB</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Stale statistics (Lesson 8.2). Illustrative sizes.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix the cause</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink mono">ANALYZE TABLE dim COMPUTE STATISTICS FOR COLUMNS</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Planner now picks a shuffle join.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or for this query only</text><text x="180" y="56" text-anchor="middle" font-size="7.6" class="s-ink mono">SET hive.auto.convert.join.noconditionaltask.size=…</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Never switch auto.convert.join off globally.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Long term</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">bucket both tables → bucket map join</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each task holds 1/N of the dimension.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Map tasks fail while building the hash table.</li>
+          <li>The estimate says small, the table is big.</li>
+          <li>Refresh statistics so the planner sees the real size.</li>
+          <li>Override the threshold for one query if needed.</li>
+          <li>Bucketing splits the small side across tasks.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-skew">One task that never finishes</h3>
+  <p class="anim-intro">Skew is diagnosed from data, not settings. Lab numbers are real; the 200-task job is typical.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Skewed join <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Find the hot key, prefer a map join, otherwise split or salt the hot key">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One reducer runs for an hour</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">199 tasks done in 2 minutes, 1 still running</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Classic sign of a skewed key.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Find the hot key</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink mono">GROUP BY key ORDER BY COUNT(*) DESC LIMIT 10</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lab: customer 7 = 20,016 of 50,000.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Small other side? Use a map join</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">no shuffle on the key → no skew in the join</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Our default plan did exactly this.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Both sides big? Split the hot key</text><text x="180" y="52" text-anchor="middle" font-size="8" class="s-ink mono">join WHERE key != 7  (shuffle)</text><text x="180" y="70" text-anchor="middle" font-size="8" class="s-ink mono">UNION ALL join WHERE key = 7 (map join)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same result, verified in the lab.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Or salt it</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">spread key 7 over N random sub-keys</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Replicate the other side N times.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>One straggler task is the symptom.</li>
+          <li>Count rows per key to find it.</li>
+          <li>A map join avoids the shuffle on the key.</li>
+          <li>Split the hot key into a separate join.</li>
+          <li>Salting spreads one key over many tasks.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-smb">Designing two big tables for SMB</h3>
+  <p class="anim-intro">When both sides are large, the layout decides the join. (Typical design; table-type rules from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">SMB design <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Bucket and sort both tables identically on the join key, use managed tables, and verify the SMB plan">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Two big tables joined every hour</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">orders × payments on order_id, both huge</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No side fits in memory.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bucket and sort both the same way</text><text x="180" y="56" text-anchor="middle" font-size="7" class="s-ink mono">CLUSTERED BY (order_id) SORTED BY (order_id) INTO 256 BUCKETS</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same key, same count (or multiples).</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Table type matters</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">managed insert-only (sorted) · not external</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">What our Hive 4.2.1 lab required.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Verify</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">EXPLAIN: Merge Join in Map, Dummy Store</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No SIMPLE_EDGE into the join.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Or Iceberg + Spark</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">storage-partitioned joins in other engines</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same idea in the lakehouse world.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Two large tables, joined often.</li>
+          <li>Use the same bucketing and sorting on the key.</li>
+          <li>Choose a table type Hive trusts for bucketing.</li>
+          <li>Confirm the SMB plan with EXPLAIN.</li>
+          <li>Other engines offer similar bucket-aligned joins.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Join optimisation at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green">map join</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">star schema</text></svg></div>
+    <div><h4>1. Fact-to-dimension joins</h4>
+      <p>Reports join a huge fact table with small dimensions (stores, plans, dates); map joins keep them shuffle-free.</p>
+      <div class="uc-flow"><span>Fact + dims</span><i>→</i><span class="java">broadcast</span><i>→</i><span>Fast report</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">buckets</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">big × big</text></svg></div>
+    <div><h4>2. Large-to-large joins</h4>
+      <p>Orders with payments or clicks with sessions: tables bucketed (and sorted) on the key avoid repeated full shuffles.</p>
+      <div class="uc-flow"><span>Same buckets</span><i>→</i><span class="java">bucket / SMB</span><i>→</i><span>Less shuffle</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-violet">hot keys</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">skew</text></svg></div>
+    <div><h4>3. Marketplaces and telecom</h4>
+      <p>A few sellers or cell towers dominate the data; hot keys are split out or salted so one task does not hold up the job.</p>
+      <div class="uc-flow"><span>Hot key</span><i>→</i><span class="java">split / salt</span><i>→</i><span>Even tasks</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">OOM</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">incident</text></svg></div>
+    <div><h4>4. Incident response</h4>
+      <p>Map-join memory failures are traced to stale statistics or a grown dimension, fixed with ANALYZE or a threshold change.</p>
+      <div class="uc-flow"><span>Failure</span><i>→</i><span class="java">EXPLAIN + stats</span><i>→</i><span>Stable job</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">review</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">join type</text></svg></div>
+    <div><h4>5. Code review</h4>
+      <p>Reviewers check the join type in the plan and ask why a large shuffle join is needed before a job goes live.</p>
+      <div class="uc-flow"><span>New job</span><i>→</i><span class="java">join check</span><i>→</i><span>Approved</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: model the join methods</h2>
+  <p>These programs model what each join moves and how buckets and skew behave, using the lab numbers. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># Shuffle join vs map join: which rows move? (sizes from the lab)
+orders, customers = 50000, 2000
+row_bytes = {&quot;orders&quot;: 116, &quot;customers&quot;: 95}      # width from EXPLAIN
+
+shuffle_join = orders * row_bytes[&quot;orders&quot;] + customers * row_bytes[&quot;customers&quot;]
+tasks = 1                                         # map tasks reading orders
+map_join = customers * row_bytes[&quot;customers&quot;] * tasks
+
+print(&quot;shuffle join moves about&quot;, shuffle_join, &quot;bytes (both tables)&quot;)
+print(&quot;map join moves about    &quot;, map_join, &quot;bytes (small side, per task)&quot;)
+print(&quot;real SHUFFLE_BYTES: 342,929 vs 31,867&quot;)</code></pre><div class="output">shuffle join moves about 5990000 bytes (both tables)
+map join moves about     190000 bytes (small side, per task)
+real SHUFFLE_BYTES: 342,929 vs 31,867</div></div>
+  <ul class="anno"><li><code>shuffle_join = orders * row_bytes[&quot;orders&quot;] + customers * row_bytes[&quot;customers&quot;]</code><span>Every row of both sides crosses the network (estimated widths; real bytes are compressed and serialized differently).</span></li><li><code>map_join = customers * row_bytes[&quot;customers&quot;] * tasks</code><span>The small side is copied once per task. With 500 tasks the copies add up: map joins are for genuinely small sides.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Bytes moved",
+   "hint": "Press <b>Run<\/b>. The model counts raw row bytes; real shuffle data is serialized and compressed, so the counters are smaller and the ratio differs (10.8× in reality), but the direction is the same.",
+   "code": "# Shuffle join vs map join: which rows move? (sizes from the lab)\norders, customers = 50000, 2000\nrow_bytes = {\"orders\": 116, \"customers\": 95}      # width from EXPLAIN\n\nshuffle_join = orders * row_bytes[\"orders\"] + customers * row_bytes[\"customers\"]\ntasks = 1                                         # map tasks reading orders\nmap_join = customers * row_bytes[\"customers\"] * tasks\n\nprint(\"shuffle join moves about\", shuffle_join, \"bytes (both tables)\")\nprint(\"map join moves about    \", map_join, \"bytes (small side, per task)\")\nprint(\"real SHUFFLE_BYTES: 342,929 vs 31,867\")\n"
+  },
+  {
+   "label": "2 · Predict first: many tasks",
+   "hint": "<b>Predict first:<\/b> with 400 map tasks, does broadcasting 2,000 customers still beat shuffling 50,000 orders? Change <code>tasks<\/code>.",
+   "code": "orders_bytes = 50000 * 116\nfor tasks in [1, 10, 100, 400]:\n    broadcast = 2000 * 95 * tasks\n    print(tasks, \"tasks: broadcast\", broadcast, \"vs shuffle\", orders_bytes, \"->\", \"map join\" if broadcast < orders_bytes else \"shuffle\")\n"
+  },
+  {
+   "label": "3 · Which bucket?",
+   "hint": "Rows go to bucket hash(key) mod 8. A bucket map join only pairs bucket i with bucket i. (Python’s hash of small ints is the int itself; Hive uses its own hash.)",
+   "code": "buckets = 8\nfor cid in [7, 15, 1044, 1492]:\n    print(\"customer\", cid, \"-> bucket\", cid % buckets)\n"
+  },
+  {
+   "label": "4 · Skewed reducers",
+   "hint": "Hash-partition the real skewed counts over 4 reducers and see the imbalance.",
+   "code": "rows = {7: 20016}\nrows.update({cid: 15 for cid in range(1, 2001) if cid != 7})   # ~30,000 other rows spread evenly\nreducers = [0] * 4\nfor cid, n in rows.items():\n    reducers[cid % 4] += n\nprint(reducers)\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This query plan check says “bucket map join” for any bucketed table. Fix it with what the lab showed.",
+   "code": "table = {\"bucketed\": True, \"external\": True}\nbucket_join_possible = table[\"bucketed\"]          # bug\nassert not (bucket_join_possible and table[\"external\"]), \"external bucketed tables got no bucket join in Hive 4.2.1\"\nprint(\"ok\")\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: the hot-key split, the default plan and skew metadata</h3>
+  <p>The skew fixes from Step 8. <b>Outputs are real</b>, from Hive 4.2.1.</p>
+  <div class="pcrun"><h4>1 · Split the hot key into its own join</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SET hive.auto.convert.join=false;
+SELECT city, SUM(n) AS n, SUM(rev) AS rev FROM (
+  SELECT c.city, COUNT(*) AS n, SUM(o.amount) AS rev FROM orders_skew o JOIN customers c
+    ON o.customer_id = c.customer_id WHERE o.customer_id &lt;&gt; 7 GROUP BY c.city
+  UNION ALL
+  SELECT c.city, COUNT(*) AS n, SUM(o.amount) AS rev FROM orders_skew o JOIN customers c
+    ON o.customer_id = c.customer_id WHERE o.customer_id = 7 AND c.customer_id = 7 GROUP BY c.city
+) u GROUP BY city ORDER BY city;</code></pre><div class="output">+--------------+--------+-------------+
+|     city     |   n    |     rev     |
++--------------+--------+-------------+
+| Bengaluru    | 5698   | 1676190.00  |
+| Chennai      | 1523   | 455780.00   |
+| Delhi        | 3220   | 949890.00   |
+| Hyderabad    | 3552   | 1035930.00  |
+| Mumbai       | 25990  | 7647980.00  |
+| Navi Mumbai  | 2381   | 698400.00   |
+| Pune         | 4764   | 1416490.00  |
+| Thane        | 2872   | 840520.00   |
++--------------+--------+-------------+</div></div>
+  <p class="muted">Identical to the plain join, row for row (we compared both outputs). Customer 7 lives in Mumbai: 25,990 orders. The second branch joins 20,016 orders with one customer row, which is trivially a map join; the first branch has no hot key left.</p></div>
+  <div class="pcrun"><h4>2 · The default plan already avoids skew here</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>EXPLAIN SELECT c.city, COUNT(*), SUM(o.amount)
+FROM orders_skew o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.city;</code></pre><div class="output">Map 1 &lt;- Map 3 (BROADCAST_EDGE)
+Reducer 2 &lt;- Map 1 (SIMPLE_EDGE)
+        &lt;-Map 1 [SIMPLE_EDGE] vectorized
+              &lt;-Map 3 [BROADCAST_EDGE] vectorized
+              &lt;-Select Operator [SEL_25] (rows=50000 width=116)</div></div>
+  <p class="muted">Customers is small, so Hive broadcasts it: rows are never shuffled by customer_id, so the hot key does not land on one reducer. Skew hurts shuffle joins between two large tables.</p></div>
+  <div class="pcrun"><h4>3 · Declaring skew in the table metadata</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>ALTER TABLE orders_skew SKEWED BY (customer_id) ON (7);
+DESCRIBE FORMATTED orders_skew;   -- skew lines</code></pre><div class="output">| Skewed Columns:               | [customer_id]                                      | NULL                                               |
+| Skewed Values:                | [[7]]                                              | NULL                                               |</div></div>
+  <p class="muted">The metadata is stored, but with <code>hive.optimize.skewjoin.compiletime=true</code> (CBO on or off) the Tez plan did not change in our lab. Treat these settings as version-dependent and always check EXPLAIN.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>A sort-merge join of two sorted buckets</h2>
+  <p>SMB merges bucket i of orders with bucket i of customers, both sorted by customer_id: two pointers, no hash table.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "orders = [(3, 120), (3, 80), (11, 300), (19, 50)]      # (customer_id, amount), sorted",
+  "cust = [(3, \"Pune\"), (11, \"Thane\"), (19, \"Delhi\")]      # sorted",
+  "i = j = 0",
+  "out = []",
+  "while i < len(orders) and j < len(cust):",
+  "    if orders[i][0] == cust[j][0]:",
+  "        out.append((cust[j][1], orders[i][1])); i += 1",
+  "    elif orders[i][0] < cust[j][0]:",
+  "        i += 1",
+  "    else:",
+  "        j += 1",
+  "print(out)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Bucket 3",
+   "note": "customer_ids 3, 11, 19 are all 3 mod 8, so they share bucket 3. <code>orders<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)"
+   ],
+   "newVar": "orders"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>cust<\/code> is created: → list #6. A new list object (#6) is created: [→ tuple #7, → tuple #8, → tuple #9] A new tuple object (#7) is created: (3, &#x27;Pune&#x27;) A new tuple object (#8) is created: (11, &#x27;Thane&#x27;) A new tuple object (#9) is created: (19, &#x27;Delhi&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)"
+   ],
+   "newVar": "cust"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>i<\/code> is created: 0. <code>j<\/code> is created: 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "0"
+      ],
+      [
+       "j",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)"
+   ],
+   "newVar": "j"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>out<\/code> is created: → list #10. A new list object (#10) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "0"
+      ],
+      [
+       "j",
+       "0"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (0)<\/b> []"
+   ],
+   "newVar": "out"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "0"
+      ],
+      [
+       "j",
+       "0"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Match",
+   "note": "Equal keys: emit and move the order pointer. The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "0"
+      ],
+      [
+       "j",
+       "0"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>i<\/code> changes to 1. Object #10 list now holds [→ tuple #11] A new tuple object (#11) is created: (&#x27;Pune&#x27;, 120)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "1"
+      ],
+      [
+       "j",
+       "0"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (1)<\/b> [→ tuple #11]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)"
+   ],
+   "newVar": "i"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "1"
+      ],
+      [
+       "j",
+       "0"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (1)<\/b> [→ tuple #11]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "1"
+      ],
+      [
+       "j",
+       "0"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (1)<\/b> [→ tuple #11]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>i<\/code> changes to 2. Object #10 list now holds [→ tuple #11, → tuple #12] A new tuple object (#12) is created: (&#x27;Pune&#x27;, 80)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "2"
+      ],
+      [
+       "j",
+       "0"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (2)<\/b> [→ tuple #11, → tuple #12]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)"
+   ],
+   "newVar": "i"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "2"
+      ],
+      [
+       "j",
+       "0"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (2)<\/b> [→ tuple #11, → tuple #12]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "2"
+      ],
+      [
+       "j",
+       "0"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (2)<\/b> [→ tuple #11, → tuple #12]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "2"
+      ],
+      [
+       "j",
+       "0"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (2)<\/b> [→ tuple #11, → tuple #12]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Result",
+   "note": "Only one row of each side is needed at a time: nothing must fit in memory. <code>j<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "2"
+      ],
+      [
+       "j",
+       "1"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (2)<\/b> [→ tuple #11, → tuple #12]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)"
+   ],
+   "newVar": "j"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "2"
+      ],
+      [
+       "j",
+       "1"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (2)<\/b> [→ tuple #11, → tuple #12]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "2"
+      ],
+      [
+       "j",
+       "1"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (2)<\/b> [→ tuple #11, → tuple #12]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>i<\/code> changes to 3. Object #10 list now holds [→ tuple #11, → tuple #12, → tuple #13] A new tuple object (#13) is created: (&#x27;Thane&#x27;, 300)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "3"
+      ],
+      [
+       "j",
+       "1"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (3)<\/b> [→ tuple #11, → tuple #12, → tuple #13]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)",
+    "<b>#13 tuple (2)<\/b> (&#x27;Thane&#x27;, 300)"
+   ],
+   "newVar": "i"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "3"
+      ],
+      [
+       "j",
+       "1"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (3)<\/b> [→ tuple #11, → tuple #12, → tuple #13]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)",
+    "<b>#13 tuple (2)<\/b> (&#x27;Thane&#x27;, 300)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "3"
+      ],
+      [
+       "j",
+       "1"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (3)<\/b> [→ tuple #11, → tuple #12, → tuple #13]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)",
+    "<b>#13 tuple (2)<\/b> (&#x27;Thane&#x27;, 300)"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "3"
+      ],
+      [
+       "j",
+       "1"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (3)<\/b> [→ tuple #11, → tuple #12, → tuple #13]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)",
+    "<b>#13 tuple (2)<\/b> (&#x27;Thane&#x27;, 300)"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "<code>j<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "3"
+      ],
+      [
+       "j",
+       "2"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (3)<\/b> [→ tuple #11, → tuple #12, → tuple #13]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)",
+    "<b>#13 tuple (2)<\/b> (&#x27;Thane&#x27;, 300)"
+   ],
+   "newVar": "j"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "3"
+      ],
+      [
+       "j",
+       "2"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (3)<\/b> [→ tuple #11, → tuple #12, → tuple #13]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)",
+    "<b>#13 tuple (2)<\/b> (&#x27;Thane&#x27;, 300)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "3"
+      ],
+      [
+       "j",
+       "2"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (3)<\/b> [→ tuple #11, → tuple #12, → tuple #13]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)",
+    "<b>#13 tuple (2)<\/b> (&#x27;Thane&#x27;, 300)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>i<\/code> changes to 4. Object #10 list now holds [→ tuple #11, → tuple #12, → tuple #13, → tuple #14] A new tuple object (#14) is created: (&#x27;Delhi&#x27;, 50)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "4"
+      ],
+      [
+       "j",
+       "2"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (4)<\/b> [→ tuple #11, → tuple #12, → tuple #13, → tuple #14]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)",
+    "<b>#13 tuple (2)<\/b> (&#x27;Thane&#x27;, 300)",
+    "<b>#14 tuple (2)<\/b> (&#x27;Delhi&#x27;, 50)"
+   ],
+   "newVar": "i"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "4"
+      ],
+      [
+       "j",
+       "2"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (4)<\/b> [→ tuple #11, → tuple #12, → tuple #13, → tuple #14]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)",
+    "<b>#13 tuple (2)<\/b> (&#x27;Thane&#x27;, 300)",
+    "<b>#14 tuple (2)<\/b> (&#x27;Delhi&#x27;, 50)"
+   ]
+  },
+  {
+   "line": 12,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ list #1"
+      ],
+      [
+       "cust",
+       "→ list #6"
+      ],
+      [
+       "i",
+       "4"
+      ],
+      [
+       "j",
+       "2"
+      ],
+      [
+       "out",
+       "→ list #10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (3, 120)",
+    "<b>#3 tuple (2)<\/b> (3, 80)",
+    "<b>#4 tuple (2)<\/b> (11, 300)",
+    "<b>#5 tuple (2)<\/b> (19, 50)",
+    "<b>#6 list (3)<\/b> [→ tuple #7, → tuple #8, → tuple #9]",
+    "<b>#7 tuple (2)<\/b> (3, &#x27;Pune&#x27;)",
+    "<b>#8 tuple (2)<\/b> (11, &#x27;Thane&#x27;)",
+    "<b>#9 tuple (2)<\/b> (19, &#x27;Delhi&#x27;)",
+    "<b>#10 list (4)<\/b> [→ tuple #11, → tuple #12, → tuple #13, → tuple #14]",
+    "<b>#11 tuple (2)<\/b> (&#x27;Pune&#x27;, 120)",
+    "<b>#12 tuple (2)<\/b> (&#x27;Pune&#x27;, 80)",
+    "<b>#13 tuple (2)<\/b> (&#x27;Thane&#x27;, 300)",
+    "<b>#14 tuple (2)<\/b> (&#x27;Delhi&#x27;, 50)"
+   ],
+   "out": "[('Pune', 120), ('Pune', 80), ('Thane', 300), ('Delhi', 50)]\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three join decisions from real platforms.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Analytics · reading plans</span></div>
+    <h4>Name the join from the plan</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Classify four plan fragments by join method.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>four vertex lines and operator names from this lesson</pre></div><div><small>Expected output</small><pre>map join         &lt;- Map 1 &lt;- Map 3 (BROADCAST_EDGE)
+bucket map join  &lt;- Map 1 &lt;- Map 3 (CUSTOM_EDGE) BucketMapJoin:true
+SMB join         &lt;- Map 1: Merge Join Operator &lt;-Dummy Store
+shuffle join     &lt;- Reducer 2 &lt;- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>BROADCAST_EDGE → map join.</li><li>CUSTOM_EDGE + BucketMapJoin:true → bucket map join.</li><li>Merge Join + Dummy Store in a Map → SMB; Merge Join in a Reducer with two SIMPLE_EDGEs → shuffle join.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "All four fragments are from this lesson’s real plans.",
+   "code": "plans = {\n  \"Map 1 <- Map 3 (BROADCAST_EDGE)\": \"map join\",\n  \"Map 1 <- Map 3 (CUSTOM_EDGE) BucketMapJoin:true\": \"bucket map join\",\n  \"Map 1: Merge Join Operator <-Dummy Store\": \"SMB join\",\n  \"Reducer 2 <- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)\": \"shuffle join\",\n}\nfor p, kind in plans.items():\n    print(f\"{kind:16} <- {p}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "plans = {",
+  "  \"Map 1 <- Map 3 (BROADCAST_EDGE)\": \"map join\",",
+  "  \"Map 1 <- Map 3 (CUSTOM_EDGE) BucketMapJoin:true\": \"bucket map join\",",
+  "  \"Map 1: Merge Join Operator <-Dummy Store\": \"SMB join\",",
+  "  \"Reducer 2 <- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)\": \"shuffle join\",",
+  "}",
+  "for p, kind in plans.items():",
+  "    print(f\"{kind:16} <- {p}\")"
+ ],
+ "steps": [
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 3,
+   "phase": "SMB",
+   "note": "The join operator sits in the map vertex, not in a reducer.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>plans<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;Map 1 &lt;- Map 3 (BR…: &#x27;map join&#x27;, &#x27;Map 1 &lt;- Map 3 (CU…: &#x27;bucket map join&#x27;, &#x27;Map 1: Merge…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plans",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Map 1 &lt;- Map 3 (BR…: &#x27;map join&#x27;, &#x27;Map 1 &lt;- Map 3 (CU…: &#x27;bucket map join&#x27;, &#x27;Map 1: Merge…"
+   ],
+   "newVar": "plans"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>p<\/code> is created: &#x27;Map 1 &lt;- Map 3 (BROADCAST_EDGE)&#x27;. <code>kind<\/code> is created: &#x27;map join&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plans",
+       "→ dict #1"
+      ],
+      [
+       "p",
+       "'Map 1 <- Map 3 (BROADCAST_EDGE)'"
+      ],
+      [
+       "kind",
+       "'map join'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Map 1 &lt;- Map 3 (BR…: &#x27;map join&#x27;, &#x27;Map 1 &lt;- Map 3 (CU…: &#x27;bucket map join&#x27;, &#x27;Map 1: Merge…"
+   ],
+   "newVar": "kind"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plans",
+       "→ dict #1"
+      ],
+      [
+       "p",
+       "'Map 1 <- Map 3 (BROADCAST_EDGE)'"
+      ],
+      [
+       "kind",
+       "'map join'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Map 1 &lt;- Map 3 (BR…: &#x27;map join&#x27;, &#x27;Map 1 &lt;- Map 3 (CU…: &#x27;bucket map join&#x27;, &#x27;Map 1: Merge…"
+   ],
+   "out": "map join         <- Map 1 <- Map 3 (BROADCAST_EDGE)\n"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;Map 1 &lt;- Map 3 (CUSTOM_EDGE) BucketMapJoin:true&#x27;. <code>kind<\/code> changes to &#x27;bucket map join&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plans",
+       "→ dict #1"
+      ],
+      [
+       "p",
+       "'Map 1 <- Map 3 (CUSTOM_EDGE) BucketMapJoin:true'"
+      ],
+      [
+       "kind",
+       "'bucket map join'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Map 1 &lt;- Map 3 (BR…: &#x27;map join&#x27;, &#x27;Map 1 &lt;- Map 3 (CU…: &#x27;bucket map join&#x27;, &#x27;Map 1: Merge…"
+   ],
+   "newVar": "kind"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plans",
+       "→ dict #1"
+      ],
+      [
+       "p",
+       "'Map 1 <- Map 3 (CUSTOM_EDGE) BucketMapJoin:true'"
+      ],
+      [
+       "kind",
+       "'bucket map join'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Map 1 &lt;- Map 3 (BR…: &#x27;map join&#x27;, &#x27;Map 1 &lt;- Map 3 (CU…: &#x27;bucket map join&#x27;, &#x27;Map 1: Merge…"
+   ],
+   "out": "bucket map join  <- Map 1 <- Map 3 (CUSTOM_EDGE) BucketMapJoin:true\n"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;Map 1: Merge Join Operator &lt;-Dummy Store&#x27;. <code>kind<\/code> changes to &#x27;SMB join&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plans",
+       "→ dict #1"
+      ],
+      [
+       "p",
+       "'Map 1: Merge Join Operator <-Dummy Store'"
+      ],
+      [
+       "kind",
+       "'SMB join'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Map 1 &lt;- Map 3 (BR…: &#x27;map join&#x27;, &#x27;Map 1 &lt;- Map 3 (CU…: &#x27;bucket map join&#x27;, &#x27;Map 1: Merge…"
+   ],
+   "newVar": "kind"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plans",
+       "→ dict #1"
+      ],
+      [
+       "p",
+       "'Map 1: Merge Join Operator <-Dummy Store'"
+      ],
+      [
+       "kind",
+       "'SMB join'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Map 1 &lt;- Map 3 (BR…: &#x27;map join&#x27;, &#x27;Map 1 &lt;- Map 3 (CU…: &#x27;bucket map join&#x27;, &#x27;Map 1: Merge…"
+   ],
+   "out": "SMB join         <- Map 1: Merge Join Operator <-Dummy Store\n"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>p<\/code> changes to &#x27;Reducer 2 &lt;- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)&#x27;. <code>kind<\/code> changes to &#x27;shuffle join&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plans",
+       "→ dict #1"
+      ],
+      [
+       "p",
+       "'Reducer 2 <- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)'"
+      ],
+      [
+       "kind",
+       "'shuffle join'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Map 1 &lt;- Map 3 (BR…: &#x27;map join&#x27;, &#x27;Map 1 &lt;- Map 3 (CU…: &#x27;bucket map join&#x27;, &#x27;Map 1: Merge…"
+   ],
+   "newVar": "kind"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plans",
+       "→ dict #1"
+      ],
+      [
+       "p",
+       "'Reducer 2 <- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)'"
+      ],
+      [
+       "kind",
+       "'shuffle join'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Map 1 &lt;- Map 3 (BR…: &#x27;map join&#x27;, &#x27;Map 1 &lt;- Map 3 (CU…: &#x27;bucket map join&#x27;, &#x27;Map 1: Merge…"
+   ],
+   "out": "shuffle join     <- Reducer 2 <- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)\n"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "plans",
+       "→ dict #1"
+      ],
+      [
+       "p",
+       "'Reducer 2 <- Map 1 (SIMPLE_EDGE), Map 4 (SIMPLE_EDGE)'"
+      ],
+      [
+       "kind",
+       "'shuffle join'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;Map 1 &lt;- Map 3 (BR…: &#x27;map join&#x27;, &#x27;Map 1 &lt;- Map 3 (CU…: &#x27;bucket map join&#x27;, &#x27;Map 1: Merge…"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Data engineering · skew</span></div>
+    <h4>Find and isolate hot keys</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>List keys holding more than 5% of rows, so they can be joined separately.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>top keys from GROUP BY customer_id: 7 → 20,016; 1044 → 31; 1492 → 28 (of 50,000)</pre></div><div><small>Expected output</small><pre>hot keys: [7]
+WHERE o.customer_id NOT IN (7)</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Count rows per key.</li><li>Compare with a share threshold.</li><li>Generate the WHERE clauses for the split.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The real split query in “Run on your PC” returned exactly the same result as the plain join.",
+   "code": "counts = {7: 20016, 1044: 31, 1492: 28}\ntotal = 50000\nhot = [k for k, n in counts.items() if n / total > 0.05]\nprint(\"hot keys:\", hot)\nprint(\"WHERE o.customer_id NOT IN\", tuple(hot) if len(hot) > 1 else f\"({hot[0]})\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "counts = {7: 20016, 1044: 31, 1492: 28}",
+  "total = 50000",
+  "hot = [k for k, n in counts.items() if n / total > 0.05]",
+  "print(\"hot keys:\", hot)",
+  "print(\"WHERE o.customer_id NOT IN\", tuple(hot) if len(hot) > 1 else f\"({hot[0]})\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>counts<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "counts",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {7: 20016, 1044: 31, 1492: 28}"
+   ],
+   "newVar": "counts"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>total<\/code> is created: 50000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "counts",
+       "→ dict #1"
+      ],
+      [
+       "total",
+       "50000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {7: 20016, 1044: 31, 1492: 28}"
+   ],
+   "newVar": "total"
+  },
+  {
+   "line": 3,
+   "phase": "Threshold",
+   "note": "5% is a team choice; one key with 40% is unmistakable.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "counts",
+       "→ dict #1"
+      ],
+      [
+       "total",
+       "50000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {7: 20016, 1044: 31, 1492: 28}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "counts",
+       "→ dict #1"
+      ],
+      [
+       "total",
+       "50000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {7: 20016, 1044: 31, 1492: 28}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "counts",
+       "→ dict #1"
+      ],
+      [
+       "total",
+       "50000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {7: 20016, 1044: 31, 1492: 28}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>hot<\/code> is created: → list #2. A new list object (#2) is created: [7]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "counts",
+       "→ dict #1"
+      ],
+      [
+       "total",
+       "50000"
+      ],
+      [
+       "hot",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {7: 20016, 1044: 31, 1492: 28}",
+    "<b>#2 list (1)<\/b> [7]"
+   ],
+   "newVar": "hot"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "counts",
+       "→ dict #1"
+      ],
+      [
+       "total",
+       "50000"
+      ],
+      [
+       "hot",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {7: 20016, 1044: 31, 1492: 28}",
+    "<b>#2 list (1)<\/b> [7]"
+   ],
+   "out": "hot keys: [7]\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "counts",
+       "→ dict #1"
+      ],
+      [
+       "total",
+       "50000"
+      ],
+      [
+       "hot",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {7: 20016, 1044: 31, 1492: 28}",
+    "<b>#2 list (1)<\/b> [7]"
+   ],
+   "out": "WHERE o.customer_id NOT IN (7)\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Architecture · layout</span></div>
+    <h4>Pick bucket counts for SMB</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>orders (2 TB) and payments (600 GB) are joined hourly on order_id. Choose bucket counts so each bucket is about 1 GB and SMB is possible.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>illustrative sizes; SMB needs the same number of buckets (Hive also accepts multiples for bucket map join)</pre></div><div><small>Expected output</small><pre>buckets for both: 2048
+payments bucket size: 0.29 GB</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Size the larger table.</li><li>Round to a power of two.</li><li>Use the same count for both.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "2048 buckets each. In our lab SMB also required managed (insert-only) tables, sorted on the key; check EXPLAIN on your version before migrating data.",
+   "code": "import math\norders_gb, payments_gb, target_gb = 2000, 600, 1\nn = 2 ** math.ceil(math.log2(orders_gb / target_gb))\nprint(\"buckets for both:\", n)\nprint(\"payments bucket size:\", round(payments_gb / n, 2), \"GB\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import math",
+  "orders_gb, payments_gb, target_gb = 2000, 600, 1",
+  "n = 2 ** math.ceil(math.log2(orders_gb / target_gb))",
+  "print(\"buckets for both:\", n)",
+  "print(\"payments bucket size:\", round(payments_gb / n, 2), \"GB\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>orders_gb<\/code> is created: 2000. <code>payments_gb<\/code> is created: 600. <code>target_gb<\/code> is created: 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders_gb",
+       "2000"
+      ],
+      [
+       "payments_gb",
+       "600"
+      ],
+      [
+       "target_gb",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "target_gb"
+  },
+  {
+   "line": 3,
+   "phase": "Power of two",
+   "note": "Keeps hash distribution and future re-bucketing simple. <code>n<\/code> is created: 2048.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders_gb",
+       "2000"
+      ],
+      [
+       "payments_gb",
+       "600"
+      ],
+      [
+       "target_gb",
+       "1"
+      ],
+      [
+       "n",
+       "2048"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders_gb",
+       "2000"
+      ],
+      [
+       "payments_gb",
+       "600"
+      ],
+      [
+       "target_gb",
+       "1"
+      ],
+      [
+       "n",
+       "2048"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "buckets for both: 2048\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders_gb",
+       "2000"
+      ],
+      [
+       "payments_gb",
+       "600"
+      ],
+      [
+       "target_gb",
+       "1"
+      ],
+      [
+       "n",
+       "2048"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "payments bucket size: 0.29 GB\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: What does a map join avoid?",
+  "options": [
+   "Reading the big table",
+   "Using memory",
+   "Shuffling rows by the join key",
+   "Statistics"
+  ],
+  "answer": 2,
+  "why": "The small side is broadcast; the big side is joined where it is read."
+ },
+ {
+  "q": "Beginner: Which plan edge shows a map join?",
+  "options": [
+   "SIMPLE_EDGE",
+   "BROADCAST_EDGE",
+   "CUSTOM_SIMPLE_EDGE",
+   "ONE_TO_ONE_EDGE"
+  ],
+  "answer": 1,
+  "why": "Map 1 &lt;- Map 3 (BROADCAST_EDGE)."
+ },
+ {
+  "q": "Beginner: Which setting is the size limit for automatic map joins?",
+  "options": [
+   "hive.auto.convert.join.noconditionaltask.size",
+   "hive.mapjoin.size",
+   "hive.exec.reducers.bytes.per.reducer",
+   "hive.tez.container.size"
+  ],
+  "answer": 0,
+  "why": "10,000,000 bytes in our lab."
+ },
+ {
+  "q": "Intermediate: How many bytes did the shuffle join move compared with the map join?",
+  "options": [
+   "About the same",
+   "2× more",
+   "Less",
+   "342,929 vs 31,867 (10.8×)"
+  ],
+  "answer": 3,
+  "why": "Real SHUFFLE_BYTES counters."
+ },
+ {
+  "q": "Intermediate: What does BucketMapJoin:true with a CUSTOM_EDGE mean?",
+  "options": [
+   "A shuffle join",
+   "An SMB join",
+   "Each task receives only the matching bucket of the small table",
+   "A hint was used"
+  ],
+  "answer": 2,
+  "why": "8 map tasks, one per bucket."
+ },
+ {
+  "q": "Intermediate: What happened to /*+ MAPJOIN(o) */?",
+  "options": [
+   "orders was broadcast",
+   "It was ignored (hive.ignore.mapjoin.hint=true)",
+   "Error",
+   "Shuffle join"
+  ],
+  "answer": 1,
+  "why": "Customers was still broadcast."
+ },
+ {
+  "q": "Advanced: Why did our SMB join use insert-only tables?",
+  "options": [
+   "Full ACID tables cannot be SORTED BY",
+   "Faster inserts",
+   "External tables are required",
+   "SMB needs Parquet"
+  ],
+  "answer": 0,
+  "why": "“cannot support full ACID functionality since it is sorted”."
+ },
+ {
+  "q": "Advanced: With skew-join settings on, what changed in the Tez plan?",
+  "options": [
+   "A skew join stage was added",
+   "The join became SMB",
+   "Error",
+   "Nothing in our lab; the hot-key split fixed it"
+  ],
+  "answer": 3,
+  "why": "Check EXPLAIN; a map join or a manual split handled the skew."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 8.3 in one screen</h3>
+    <ul><li><b>Shuffle join:</b> SIMPLE_EDGE from both sides into a reducer, <code>Merge Join Operator</code>. Always works; moves most data.</li><li><b>Map join:</b> small side under <code>hive.auto.convert.join.noconditionaltask.size</code> (10 MB in lab) → BROADCAST_EDGE. Lab: 31,867 vs 342,929 bytes.</li><li><b>Bucket map join:</b> both bucketed on the key → CUSTOM_EDGE, MULTICAST, <code>BucketMapJoin:true</code>, one task per bucket.</li><li><b>SMB:</b> bucketed + sorted, same count → Merge Join in the Map vertex with Dummy Store; no join shuffle.</li><li>Lab conditions: external bucketed tables got no bucket join; full ACID cannot be sorted; insert-only sorted tables gave SMB.</li><li>Hints (<code>MAPJOIN</code>, <code>STREAMTABLE</code>) are ignored by default (<code>hive.ignore.mapjoin.hint=true</code>).</li><li><b>Skew:</b> find hot keys with GROUP BY … ORDER BY COUNT(*) DESC; map join or split/salt the hot key. Skew settings did not change the Tez plan in 4.2.1.</li><li>Never disable auto map joins globally; fix statistics (8.2) or adjust the threshold per query.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Is a map join always faster?</summary><p>Only when the small side is genuinely small. Every task builds the hash table, so a large “small side” costs memory and broadcast time, and if it does not fit, tasks fail or spill. That is why the threshold exists and why stale statistics (Lesson 8.2) are dangerous.</p></details>
+    <details><summary>What is the difference between a bucket map join and an SMB join?</summary><p>A bucket map join still builds a hash table, but of one bucket of the small table per task. An SMB join needs both tables sorted as well, and merges the buckets without any hash table, so neither side has to fit in memory. SMB is the choice for two large tables.</p></details>
+    <details><summary>Why did Hive not use bucket joins for our external tables?</summary><p>Hive can only rely on bucketing if every file follows the bucketing scheme. Files of external tables may be written by other tools. In Hive 4.2.1 our external bucketed tables never got a bucket map or SMB join, while managed transactional tables did. Behaviour can differ between versions, so verify with EXPLAIN.</p></details>
+    <details><summary>How do I join on more than one key or a non-equal condition?</summary><p>Map, bucket and SMB joins work for equi-joins on the bucketing keys. Non-equi conditions (BETWEEN, &lt;) can be added after the join or, in Hive 4, used in the ON clause, but they generally lead to shuffle or cross-product style plans; check EXPLAIN and keep such joins on small inputs.</p></details>
+    <details><summary>What is salting?</summary><p>Adding a random number (0…N-1) to the hot key on the big side and replicating the matching rows of the other side N times, so the hot key is spread over N tasks. It needs no special Hive feature and works in every engine.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs about join methods, buckets and skew, with the HiveQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Shuffle reduction</h4></div>
+      <p>How many times fewer bytes did the map join shuffle?</p>
+      <div class="prob__io"><div><small>Input</small><pre>342,929 and 31,867</pre></div><div><small>Expected output</small><pre>10.8</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(342929 / 31867, 1))</code></pre><div class="output">10.8</div></div>
+        <p><b>How it works:</b> 10.8×. Measured with SET hive.tez.exec.print.summary=true.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Fits the threshold?</h4></div>
+      <p>Would 2,000 rows of width 95 be broadcast with the default threshold?</p>
+      <div class="prob__io"><div><small>Input</small><pre>threshold 10,000,000 bytes</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(2000 * 95 &lt;= 10_000_000)</code></pre><div class="output">True</div></div>
+        <p><b>How it works:</b> True: about 190 KB. That is why the default plan broadcast customers.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Hot-key share</h4></div>
+      <p>What share of orders_skew belongs to customer 7?</p>
+      <div class="prob__io"><div><small>Input</small><pre>20,016 of 50,000</pre></div><div><small>Expected output</small><pre>40%</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{20016 / 50000:.0%}&quot;)</code></pre><div class="output">40%</div></div>
+        <p><b>How it works:</b> 40%: in a shuffle join, one task gets at least 40% of the rows.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Bucket pairing</h4></div>
+      <p>For each bucket of orders (8 buckets), which bucket of customers does a bucket map join load?</p>
+      <div class="prob__io"><div><small>Input</small><pre>8 and 8 buckets</pre></div><div><small>Expected output</small><pre>orders bucket 0 -&gt; customers bucket 0
+orders bucket 1 -&gt; customers bucket 1
+orders bucket 2 -&gt; customers bucket 2
+orders bucket 3 -&gt; customers bucket 3
+orders bucket 4 -&gt; customers bucket 4
+orders bucket 5 -&gt; customers bucket 5
+orders bucket 6 -&gt; customers bucket 6
+orders bucket 7 -&gt; customers bucket 7</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for b in range(8):
+    print(f&quot;orders bucket {b} -&gt; customers bucket {b}&quot;)</code></pre><div class="output">orders bucket 0 -&gt; customers bucket 0
+orders bucket 1 -&gt; customers bucket 1
+orders bucket 2 -&gt; customers bucket 2
+orders bucket 3 -&gt; customers bucket 3
+orders bucket 4 -&gt; customers bucket 4
+orders bucket 5 -&gt; customers bucket 5
+orders bucket 6 -&gt; customers bucket 6
+orders bucket 7 -&gt; customers bucket 7</div></div>
+        <p><b>How it works:</b> With 8 and 4 buckets, bucket b of the big table would use bucket b mod 4 of the small one; SMB needs equal counts.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Salting plan</h4></div>
+      <p>Spread hot key 7 over 4 salts: list the big-side keys and the replicated small-side rows.</p>
+      <div class="prob__io"><div><small>Input</small><pre>key 7, 4 salts</pre></div><div><small>Expected output</small><pre>orders keys   : [&#x27;7_0&#x27;, &#x27;7_1&#x27;, &#x27;7_2&#x27;, &#x27;7_3&#x27;]
+customer rows : [&#x27;7_0&#x27;, &#x27;7_1&#x27;, &#x27;7_2&#x27;, &#x27;7_3&#x27;] (one row copied 4 times)</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>salts = 4
+print(&quot;orders keys   :&quot;, [f&quot;7_{s}&quot; for s in range(salts)])
+print(&quot;customer rows :&quot;, [f&quot;7_{s}&quot; for s in range(salts)], &quot;(one row copied 4 times)&quot;)</code></pre><div class="output">orders keys   : [&#x27;7_0&#x27;, &#x27;7_1&#x27;, &#x27;7_2&#x27;, &#x27;7_3&#x27;]
+customer rows : [&#x27;7_0&#x27;, &#x27;7_1&#x27;, &#x27;7_2&#x27;, &#x27;7_3&#x27;] (one row copied 4 times)</div></div>
+        <p><b>How it works:</b> In SQL: CONCAT(customer_id, '_', CAST(FLOOR(RAND()*4) AS INT)) on orders, and a LATERAL VIEW explode over 0..3 on customers.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Join method from facts</h4></div>
+      <p>Choose a join method from table facts.</p>
+      <div class="prob__io"><div><small>Input</small><pre>size of small side, bucketing, sorting</pre></div><div><small>Expected output</small><pre>map join | SMB join | shuffle join</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>def choose(small_bytes, both_bucketed, both_sorted, threshold=10_000_000):
+    if small_bytes &lt;= threshold: return &quot;map join&quot;
+    if both_bucketed and both_sorted: return &quot;SMB join&quot;
+    if both_bucketed: return &quot;bucket map join (if one bucket fits)&quot;
+    return &quot;shuffle join&quot;
+print(choose(190_000, False, False), &quot;|&quot;, choose(5e9, True, True), &quot;|&quot;, choose(5e9, False, False))</code></pre><div class="output">map join | SMB join | shuffle join</div></div>
+        <p><b>How it works:</b> A simplification of Hive’s choice; the real decision also depends on table type and settings, so always confirm in EXPLAIN.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Straggler cost</h4></div>
+      <p>199 reducers finish in 2 minutes; the one with the hot key takes 60. What does fixing skew save per run?</p>
+      <div class="prob__io"><div><small>Input</small><pre>illustrative</pre></div><div><small>Expected output</small><pre>saved per run: 58 minutes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>before, after = 60, 2
+print(&quot;saved per run:&quot;, before - after, &quot;minutes&quot;)</code></pre><div class="output">saved per run: 58 minutes</div></div>
+        <p><b>How it works:</b> 58 minutes per run: job time is the time of the slowest task.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Broadcast traffic</h4></div>
+      <p>A 50 MB dimension broadcast to 400 tasks: how much data moves, compared with shuffling a 10 GB fact table?</p>
+      <div class="prob__io"><div><small>Input</small><pre>illustrative</pre></div><div><small>Expected output</small><pre>broadcast: 20.0 GB vs shuffle: 10 GB</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>broadcast_gb = 50 * 400 / 1000
+print(&quot;broadcast:&quot;, broadcast_gb, &quot;GB vs shuffle: 10 GB&quot;)</code></pre><div class="output">broadcast: 20.0 GB vs shuffle: 10 GB</div></div>
+        <p><b>How it works:</b> 20 GB of broadcast copies: more than the shuffle. Sizes and task counts matter, which is why Hive caps map joins by size.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Join optimisation is the most asked Hive performance topic in interviews.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Hive</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is a map join?”</h4>
+      <p class="scn__situation">Explain the map join and when Hive uses it.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know why it is fast and its limit?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>In a map join the small table is loaded into a hash table on every task that reads the big table, so the join happens in the map phase without shuffling the big table. Hive converts joins automatically when the small side is under <code>hive.auto.convert.join.noconditionaltask.size</code>. In EXPLAIN it appears as BROADCAST_EDGE and Map Join Operator.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Saying it is for any join.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Bucketed but no bucket join</h4>
+      <p class="scn__situation">You bucketed two tables on customer_id, but EXPLAIN still shows a broadcast or shuffle join.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know the real conditions?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Check both tables are bucketed on the join key with compatible counts (and sorted, for SMB).</li>
+          <li>Check the table type: in our Hive 4.2.1 lab external bucketed tables never got bucket joins; managed transactional ones did.</li>
+          <li>Check the size: if the small side fits, a plain map join may be chosen instead (often fine).</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> “Add more buckets.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Analytics</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>One reducer never ends</h4>
+      <p class="scn__situation">A join job is stuck at 99% for an hour with one running task.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you diagnose and fix skew?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Find hot keys: GROUP BY key ORDER BY COUNT(*) DESC LIMIT 10 on the big side.</li>
+          <li>If the other side is small, make sure a map join is used.</li>
+          <li>Otherwise join the hot keys separately (UNION ALL) or salt them; verify results match.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Raising the reducer count, which does not split one key.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Two 2 TB tables joined hourly</h4>
+      <p class="scn__situation">Design storage so the hourly join avoids a full shuffle.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you design for SMB?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Bucket and sort both tables on the join key with the same number of buckets (sized ~1 GB per bucket).</li>
+          <li>Use a table type Hive trusts for bucketing (managed; insert-only if sorted), write only through Hive.</li>
+          <li>Verify the SMB plan in CI, and keep statistics fresh.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Relying on map joins for two large tables.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

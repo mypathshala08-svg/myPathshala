@@ -1,0 +1,1480 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lakehouse and migration: moving Hive tables to Iceberg | MyPhatshala</title>
+<meta name="description" content="Migrate real Hive tables to Apache Iceberg in Hive 4.2.1: an in-place migration that rewrote no data files, a transactional table refused and copied with CTAS so that Hive and Trino finally agree on 5,000,001 rows, partition evolution from daily to monthly without rewriting, DELETE and UPDATE as snapshots, time travel and rollback seen immediately in Trino, stray files ignored even after MSCK, and the cost of in-place versus copy migration on 5 million rows. Plus Iceberg, Delta Lake and Hudi in 2026.">
+<meta name="mp:minutes" content="50">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/11-hive-in-industry/03-lakehouse-and-migration/">
+<meta property="og:title" content="Lakehouse and migration: moving Hive tables to Iceberg · MyPhatshala">
+<meta property="og:description" content="Same files, new metadata: an in-place Hive-to-Iceberg migration that rewrote zero data files, and an ACID table that finally gives one answer in Hive and Trino.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Lakehouse and migration: moving Hive tables to Iceberg", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="11-hive-in-industry/03-lakehouse-and-migration" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 11.3</b></nav>
+    <h1>Lakehouse and migration: moving Hive tables to Iceberg</h1>
+    <p class="lead">The problems from Lessons 11.1 and 11.2 (different answers per engine, MSCK, rename-based commits) are why companies move Hive tables to an open table format. This lesson migrates real tables from our Hive 4.2.1 lab to <b>Apache Iceberg</b>, in place and by copy, then evolves, changes, time-travels and rolls them back, checking every result in Trino. <b>All outputs are real.</b></p>
+    <div class="lesson-meta"><span>Module 11 · Hive in industry today</span><span>⏱ 50 min</span><span>Intermediate → Advanced</span><span>Hive 4.2.1 · Iceberg 1.9.1 · Trino 476</span><span>0 data files rewritten</span><span>One answer in every engine</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Can we fix this without copying 200 TB?”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> Iceberg basics (<a href="../../07-acid-and-iceberg/03-compaction-and-iceberg/">7.3</a>), the multi-engine test (<a href="../01-hive-spark-and-trino/">11.1</a>) and object storage (<a href="../02-hive-in-the-cloud/">11.2</a>).</p></div>
+  <div class="story">
+    <p class="narration">After Lessons 11.1 and 11.2, TiffinGo’s platform team has a list: Spark sees an empty orders table, Trino overcounts, files dropped into S3 need MSCK, and commits on object storage copy every file. The architects propose a lakehouse on Apache Iceberg. The first question from management is about cost.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="TiffinGo moves its Hive tables to Apache Iceberg. External tables convert in place by adding metadata; transactional tables have to be copied. Afterwards Hive and Trino agree.">
+        <rect x="14" y="22" width="150" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="89.0" y="33" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Hive tables today</text><text x="89.0" y="43" text-anchor="middle" font-size="6.4" class="s-ink2 mono">external · ACID · 11 years</text><rect x="14" y="70" width="150" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="89.0" y="81" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Problems</text><text x="89.0" y="91" text-anchor="middle" font-size="6.4" class="s-ink2 mono">MSCK · 3 engines, 3 counts</text><path d="M166 50L236 66" style="fill:none;stroke:var(--track);stroke-width:1.8"/><path d="M229.2 67.6L236 66L230.5 61.6" style="fill:none;stroke:var(--track);stroke-width:1.8"/><rect x="240" y="40" width="140" height="60" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="310" y="62" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Iceberg tables</text><text x="310" y="80" text-anchor="middle" font-size="7.2" class="s-ink2 mono">same files, new metadata</text><rect x="410" y="12" width="222" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="521" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">What the migration showed</text><text x="422" y="52" font-size="7.2" class="s-green mono">in place: 0 data files rewritten</text><text x="422" y="68" font-size="7.2" class="s-acc mono">ACID: refused → CTAS</text><text x="422" y="84" font-size="7.2" class="s-green mono">Trino now 5,000,001 (was 5,000,004)</text><text x="422" y="100" font-size="7.2" class="s-green mono">new partition spec, no rewrite</text><text x="422" y="116" font-size="7.2" class="s-green mono">rollback in one statement</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Migration changes the <tspan font-weight="700" class="s-acc">metadata</tspan>, not necessarily the data.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, do we have to rewrite all our tables to use Iceberg?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Not all. Iceberg keeps the data in ordinary Parquet, ORC or Avro files and adds its own <b>metadata</b>: snapshots, manifests and a schema with column IDs. For an external table, Hive 4 can write that metadata around the existing files: an <b>in-place migration</b>.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>And transactional tables?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Those carry Hive’s delta and delete-delta folders, which Iceberg does not understand, so they must be <b>copied</b>. Today we migrate both kinds in our Hive 4.2.1 lab, evolve the partitioning, change rows, travel back in time, roll back, and check every result in Trino. All outputs are real.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Lakehouse tables and migrating Hive to Iceberg</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A <b>lakehouse</b> stores data in open file formats in a data lake or object store and adds an <b>open table format</b>, such as Apache Iceberg, Delta Lake or Apache Hudi, that provides warehouse features: atomic commits, row-level changes, schema and partition evolution, snapshots and time travel, readable by many engines through a shared catalogue. <b>Migrating Hive tables to Iceberg</b> means creating Iceberg metadata for a table, either around its existing data files (in-place migration, possible for external Parquet, ORC and Avro tables) or by rewriting the data into a new Iceberg table (copy migration, required for Hive ACID tables), followed by validation and switching every reader and writer to the Iceberg table.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>A lakehouse keeps data in open files and adds a table format such as Iceberg for transactions and history. Hive external tables can become Iceberg tables in place; ACID tables must be copied.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Table format</b><span>Rules and metadata that turn files into a table: Hive layout, Iceberg, Delta, Hudi.</span></div>
+    <div class="term"><b>Snapshot</b><span>One committed version of an Iceberg table.</span></div>
+    <div class="term"><b>Manifest</b><span>An Avro file listing data files and their statistics.</span></div>
+    <div class="term"><b>Name mapping</b><span>Maps column names in old files to Iceberg column IDs after migration.</span></div>
+    <div class="term"><b>Partition spec</b><span>How Iceberg partitions data; can change without rewriting old data.</span></div>
+    <div class="term"><b>Position delete</b><span>A small file marking deleted rows by file and position (merge-on-read).</span></div>
+    <div class="term"><b>Time travel</b><span>Querying an older snapshot: FOR SYSTEM_VERSION AS OF.</span></div>
+    <div class="term"><b>REST catalog</b><span>A standard HTTP API for Iceberg catalogues (Polaris, Glue, Unity …).</span></div>
+  </div>
+
+  <h3>Hive table layout versus Iceberg, as seen in the lab</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:780px">
+    <thead><tr><th>Question</th><th>Hive layout (external / ACID)</th><th>Iceberg</th><th>Seen in our lab</th></tr></thead>
+    <tbody><tr><td>Which files belong to the table?</td><td>Every file in the partition folders</td><td>Only files listed in the current snapshot’s manifests</td><td>Copied file ignored even after MSCK</td></tr><tr><td>Where are partitions?</td><td>Metastore partition list</td><td>Iceberg metadata; spec can change</td><td>Daily spec + monthly spec in one table</td></tr><tr><td>Deletes and updates</td><td>ACID delta / delete-delta folders, Hive-specific</td><td>Position or equality delete files, open spec</td><td>Hive and Trino both 5,000,001</td></tr><tr><td>History</td><td>None (ACID: until compaction)</td><td>Snapshots, time travel, rollback</td><td>4 snapshots, rollback in one statement</td></tr><tr><td>Commit on object storage</td><td>Rename-based (11.2)</td><td>Swap one metadata pointer</td><td>—</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Lakehouse migration at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A new index for the same library</h4>
+      <ul>
+        <li>The books (data files) stay on the shelves. Iceberg writes a new, exact index of which books belong to the table.</li>
+        <li>Every change creates a new version of the index, so you can open yesterday’s version.</li>
+        <li>A book placed on the shelf without updating the index is not part of the table.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The two migration paths in Hive 4</h4>
+      <ul>
+        <li><b>In place</b>: <code>ALTER TABLE t SET TBLPROPERTIES ('storage_handler'=…)</code> with Hive’s Iceberg storage handler class, for <b>external</b> Parquet, ORC or Avro tables. Metadata only.</li>
+        <li><b>Copy</b>: <code>CREATE TABLE … STORED BY ICEBERG AS SELECT …</code> (or INSERT into a new table) for managed ACID tables, other formats, or when you also want a new layout.</li>
+        <li>After either path: validate counts and sums in every engine, then switch readers and writers.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>In-place migration added 4 metadata files and rewrote <b>0</b> data files; the counts were identical.</li>
+        <li>The ACID table was refused (“Converting … transactional hive table to iceberg table is not allowed”); CTAS gave 5,000,001 rows, and Trino now agreed.</li>
+        <li>After migration, files copied into the folder stayed invisible even after <code>MSCK REPAIR</code>: only Iceberg’s manifests define the table.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “How do you migrate a Hive table to Iceberg?” External Parquet/ORC/Avro tables in place by setting the storage_handler table property to Hive’s Iceberg storage handler, which only writes metadata. Managed ACID tables with CTAS … STORED BY ICEBERG. Then validate counts and checksums in every engine and move readers and writers.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Table formats and migration options</h2>
+  <p>Status as of October 2026 from the projects’ release pages.</p>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:820px">
+    <thead><tr><th>Format</th><th>Origin</th><th>Strengths</th><th>Hive support</th><th>Notes (2026)</th></tr></thead>
+    <tbody><tr><td>Apache Iceberg</td><td>Netflix → Apache</td><td>Engine-neutral spec, hidden partitioning, partition evolution, REST catalog</td><td>Native in Hive 4 (<code>STORED BY ICEBERG</code>; our lab bundles Iceberg 1.9.1)</td><td>Iceberg 1.11 (May 2026); spec v3 adds deletion vectors, row lineage, variant type</td></tr><tr><td>Delta Lake</td><td>Databricks → Linux Foundation</td><td>Deep Spark/Databricks integration, Unity Catalog</td><td>Read via connectors, not native</td><td>Delta 4.1 (March 2026); UniForm can expose Iceberg metadata</td></tr><tr><td>Apache Hudi</td><td>Uber → Apache</td><td>Upserts, incremental pulls, record indexes</td><td>Hive can read via Hudi’s input formats</td><td>Strong in CDC-heavy pipelines</td></tr><tr><td>Hive ACID</td><td>Hive</td><td>MERGE, compaction, materialized views</td><td>Native</td><td>Hive-only reliably (11.1)</td></tr></tbody>
+  </table>
+  </div>  <div class="table-wrap">
+  <table class="compare" style="min-width:760px">
+    <thead><tr><th>Migration method</th><th>Rewrites data?</th><th>Use when</th><th>Lab result</th></tr></thead>
+    <tbody><tr><td>In place (<code>SET TBLPROPERTIES storage_handler</code>)</td><td>No</td><td>External Parquet / ORC / Avro tables</td><td>5M rows in 4.4 s, 0 files rewritten</td></tr><tr><td>CTAS / INSERT into a new Iceberg table</td><td>Yes</td><td>ACID tables, text/other formats, new layout or sort</td><td>5M rows in 16.7 s</td></tr><tr><td>Snapshot / add_files procedures (Spark)</td><td>No</td><td>Test a copy of the metadata first; register existing files</td><td>Not run in this lab</td></tr><tr><td>Dual-write, then cut over</td><td>Yes</td><td>Critical tables with zero downtime</td><td>Typical practice</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>In-place migration changes the table for <b>every</b> engine at once. Engines without Iceberg support (Spark without the Iceberg runtime, older tools reading folders directly) stop seeing correct data, and writers that still drop files into folders write into the void. Migrate readers and writers in the same change window.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Migrating real tables, checking every number</h2>
+  <p>All outputs are real: Hive 4.2.1 with its bundled Iceberg 1.9.1, and Trino 476 from Lesson 11.1 reading through its <code>iceberg</code> catalog on the same metastore.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · A typical external Hive table</h4>
+      <div class="code" data-lang="sql" data-file="beeline"><pre><code>CREATE EXTERNAL TABLE orders_mig (
+  order_id INT, customer_id INT, city STRING, amount DECIMAL(10,2), status STRING)
+PARTITIONED BY (order_date DATE) STORED AS PARQUET
+LOCATION &#x27;/opt/hive/data/warehouse/tiffingo.db/orders_mig&#x27;;
+INSERT OVERWRITE TABLE orders_mig PARTITION (order_date)
+SELECT order_id, customer_id, city, amount, status, order_date FROM orders
+WHERE order_date BETWEEN &#x27;2026-10-01&#x27; AND &#x27;2026-10-07&#x27;;
+SELECT COUNT(*) AS n, SUM(amount) AS amt FROM orders_mig;</code></pre><div class="output">+--------+-------------+
+|   n    |     amt     |
++--------+-------------+
+| 11631  | 3415600.00  |
++--------+-------------+</div></div>
+      <span class="behind">Seven daily partitions, one Parquet file each. We record the count and the sum <b>before</b> migrating: these two numbers are the validation baseline.</span></li>
+    <li><h4>Step 2 · Migrate in place</h4>
+      <div class="code" data-lang="sql" data-file="beeline, then list the folder"><pre><code>ALTER TABLE orders_mig SET TBLPROPERTIES (
+  &#x27;storage_handler&#x27;=&#x27;org.apache.iceberg.mr.hive.HiveIcebergStorageHandler&#x27;);
+SELECT COUNT(*) AS n, SUM(amount) AS amt FROM orders_mig;</code></pre><div class="output">+--------+-------------+
+|   n    |     amt     |
++--------+-------------+
+| 11631  | 3415600.00  |
++--------+-------------+
+
+$ find orders_mig -type f
+./metadata/00000-05cee382-c2cb-4b75-b2f0-df764041a5ec.metadata.json
+./metadata/00001-dec3245f-668d-43c4-8cd3-2bc8a003cee5.metadata.json
+./metadata/53fbb13d-3205-4ad5-ab5b-589184641ae5-m0.avro
+./metadata/snap-6356967414929367428-1-53fbb13d-3205-4ad5-ab5b-589184641ae5.avro
+./order_date=2026-10-01/000000_0
+./order_date=2026-10-02/000000_0
+./order_date=2026-10-03/000000_0
+./order_date=2026-10-04/000000_0
+./order_date=2026-10-05/000000_0
+./order_date=2026-10-06/000000_0
+./order_date=2026-10-07/000000_0</div></div>
+      <span class="behind">Identical numbers. The seven data files were not touched; Hive added a <code>metadata/</code> folder with two metadata JSON files, one manifest and one manifest list. That is the whole migration. The partition folders keep their old names; Iceberg no longer needs them, because the manifests list every file.</span></li>
+    <li><h4>Step 3 · What the table definition became</h4>
+      <div class="code" data-lang="sql" data-file="beeline (shortened)"><pre><code>SHOW CREATE TABLE orders_mig;</code></pre><div class="output">CREATE EXTERNAL TABLE `orders_mig`( … `order_date` date)
+PARTITIONED BY SPEC (`order_date`)
+ROW FORMAT SERDE &#x27;org.apache.iceberg.mr.hive.HiveIcebergSerDe&#x27;
+STORED BY &#x27;org.apache.iceberg.mr.hive.HiveIcebergStorageHandler&#x27;
+LOCATION &#x27;file:/opt/hive/data/warehouse/tiffingo.db/orders_mig&#x27;
+TBLPROPERTIES (
+  &#x27;MIGRATED_TO_ICEBERG&#x27;=&#x27;true&#x27;,
+  &#x27;current-snapshot-summary&#x27;=&#x27;{&quot;added-data-files&quot;:&quot;7&quot;,&quot;added-records&quot;:&quot;11631&quot;, … &quot;iceberg-version&quot;:&quot;Apache Iceberg 1.9.1 …&quot;}&#x27;,
+  &#x27;format-version&#x27;=&#x27;2&#x27;,
+  &#x27;metadata_location&#x27;=&#x27;file:/…/orders_mig/metadata/00001-dec3245f-….metadata.json&#x27;,
+  &#x27;schema.name-mapping.default&#x27;=&#x27;[ {&quot;field-id&quot; : 1, &quot;names&quot; : [ &quot;order_id&quot; ]}, … ]&#x27;,
+  &#x27;table_type&#x27;=&#x27;ICEBERG&#x27;,
+  &#x27;write.delete.mode&#x27;=&#x27;merge-on-read&#x27;,
+  &#x27;write.format.default&#x27;=&#x27;parquet&#x27;,
+  &#x27;write.update.mode&#x27;=&#x27;merge-on-read&#x27;, …)</div></div>
+      <span class="behind">The storage handler and SerDe are Iceberg’s, the partition is now a <code>PARTITIONED BY SPEC</code>, and the first snapshot records 7 files and 11,631 rows. <code>format-version 2</code> allows row-level deletes; <code>merge-on-read</code> writes small delete files instead of rewriting data. <code>schema.name-mapping.default</code> lets Iceberg read the old Parquet files, which have column names but no Iceberg field IDs.</span></li>
+    <li><h4>Step 4 · ACID tables cannot migrate in place</h4>
+      <div class="code" data-lang="sql" data-file="beeline · trino"><pre><code>ALTER TABLE orders_tx SET TBLPROPERTIES (
+  &#x27;storage_handler&#x27;=&#x27;org.apache.iceberg.mr.hive.HiveIcebergStorageHandler&#x27;);
+
+CREATE TABLE orders_tx_ice STORED BY ICEBERG STORED AS PARQUET AS SELECT * FROM orders_tx;
+SELECT COUNT(*) AS n FROM orders_tx_ice;
+SELECT order_id, status FROM orders_tx_ice WHERE order_id &gt; 999000000 ORDER BY order_id;
+
+-- Trino
+SELECT COUNT(*) AS n FROM iceberg.tiffingo.orders_tx_ice;</code></pre><div class="output">Error: Error while compiling statement: FAILED: Execution Error, return code 40013 from org.apache.hadoop.hive.ql.ddl.DDLTask. Unable to alter table. MetaException(message:Converting non-external, temporary or transactional hive table to iceberg table is not allowed.)
+
++----------+
+|    n     |
++----------+
+| 5000001  |
++----------+
++------------+------------+
+|  order_id  |   status   |
++------------+------------+
+| 999000010  | CANCELLED  |
++------------+------------+
+
+-- Trino
+    n    
+---------
+ 5000001 
+(1 row)</div></div>
+      <span class="behind">Hive refused to convert the transactional table. The copy did what Lesson 11.1 could not: Hive applied all deletes and updates while reading, so the new table has 5,000,001 rows with order 999000010 once, CANCELLED. <b>Trino now returns 5,000,001 too</b>, where it returned 5,000,004 from the ACID table. One table format, one answer.</span></li>
+    <li><h4>Step 5 · Change the partitioning without rewriting</h4>
+      <div class="code" data-lang="sql" data-file="beeline"><pre><code>ALTER TABLE orders_mig SET PARTITION SPEC (month(order_date));
+INSERT INTO orders_mig SELECT order_id, customer_id, city, amount, status, order_date
+FROM orders WHERE order_date BETWEEN &#x27;2026-10-08&#x27; AND &#x27;2026-10-14&#x27;;
+
+SELECT spec_id, `partition`, record_count FROM tiffingo.orders_mig.files ORDER BY spec_id, record_count;</code></pre><div class="output">+----------+----------------------------------------------------+---------------+
+| spec_id  |                     partition                      | record_count  |
++----------+----------------------------------------------------+---------------+
+| 0        | {&quot;order_date&quot;:&quot;2026-10-02&quot;,&quot;order_date_month&quot;:null} | 1617          |
+| 0        | {&quot;order_date&quot;:&quot;2026-10-05&quot;,&quot;order_date_month&quot;:null} | 1621          |
+| 0        | {&quot;order_date&quot;:&quot;2026-10-01&quot;,&quot;order_date_month&quot;:null} | 1641          |
+| 0        | {&quot;order_date&quot;:&quot;2026-10-07&quot;,&quot;order_date_month&quot;:null} | 1662          |
+| 0        | {&quot;order_date&quot;:&quot;2026-10-03&quot;,&quot;order_date_month&quot;:null} | 1668          |
+| 0        | {&quot;order_date&quot;:&quot;2026-10-06&quot;,&quot;order_date_month&quot;:null} | 1678          |
+| 0        | {&quot;order_date&quot;:&quot;2026-10-04&quot;,&quot;order_date_month&quot;:null} | 1744          |
+| 1        | {&quot;order_date&quot;:null,&quot;order_date_month&quot;:681}         | 11751         |
++----------+----------------------------------------------------+---------------+</div></div>
+      <span class="behind">Seven small daily files stay in spec 0; the new week went into one monthly file under spec 1 (<code>681</code> is months since 1970, i.e. October 2026). Queries filtering on <code>order_date</code> prune both layouts, because Iceberg partitions are <b>hidden</b>: users never write the partition column. In plain Hive, changing the partition scheme means rewriting the whole table. (<code>partition</code> is a reserved word, hence the backticks.)</span></li>
+    <li><h4>Step 6 · Row-level changes become snapshots</h4>
+      <div class="code" data-lang="sql" data-file="beeline"><pre><code>DELETE FROM orders_mig WHERE status = &#x27;CANCELLED&#x27; AND order_date = &#x27;2026-10-03&#x27;;
+UPDATE orders_mig SET amount = amount + 10
+WHERE order_id = (SELECT MIN(order_id) FROM orders_mig WHERE order_date = &#x27;2026-10-10&#x27;);
+
+SELECT snapshot_id, operation, summary[&#x27;added-records&#x27;] AS added,
+       summary[&#x27;deleted-records&#x27;] AS deleted, summary[&#x27;added-position-deletes&#x27;] AS pos_del
+FROM tiffingo.orders_mig.snapshots ORDER BY committed_at;</code></pre><div class="output">+--------+-------------+
+|   n    |     amt     |
++--------+-------------+
+| 23276  | 6869400.00  |
++--------+-------------+
+
++----------------------+------------+--------+----------+----------+
+|     snapshot_id      | operation  | added  | deleted  | pos_del  |
++----------------------+------------+--------+----------+----------+
+| 6356967414929367428  | append     | 11631  | NULL     | NULL     |
+| 8935160337224414664  | append     | 11751  | NULL     | NULL     |
+| 7700454950423225386  | delete     | NULL   | NULL     | 106      |
+| 7073719229572187090  | overwrite  | 1      | NULL     | 1        |
++----------------------+------------+--------+----------+----------+</div></div>
+      <span class="behind">DML works on the migrated table, with no <code>transactional</code> property. The DELETE wrote one position-delete file for 106 rows; the UPDATE wrote one new row and one position delete. Four snapshots: migration, the new week, the delete and the update. 23,382 − 106 = 23,276 rows.</span></li>
+    <li><h4>Step 7 · Time travel, rollback, and Trino agrees</h4>
+      <div class="code" data-lang="sql" data-file="beeline · trino"><pre><code>SELECT COUNT(*) AS n, SUM(amount) AS amt FROM orders_mig FOR SYSTEM_VERSION AS OF 8935160337224414664;
+-- Trino, before the rollback
+SELECT COUNT(*) AS n, SUM(amount) AS amt FROM iceberg.tiffingo.orders_mig;
+
+ALTER TABLE orders_mig EXECUTE ROLLBACK(8935160337224414664);
+SELECT COUNT(*) AS n, SUM(amount) AS amt FROM orders_mig;
+SELECT snapshot_id, is_current_ancestor FROM tiffingo.orders_mig.history;
+-- Trino, after
+SELECT COUNT(*) AS n FROM iceberg.tiffingo.orders_mig;</code></pre><div class="output">+--------+-------------+
+|   n    |     amt     |
++--------+-------------+
+| 23382  | 6899030.00  |
++--------+-------------+
+
+-- Trino, before the rollback
+   n   |    amt     
+-------+------------
+ 23276 | 6869400.00 
+(1 row)
+
++--------+-------------+
+|   n    |     amt     |
++--------+-------------+
+| 23382  | 6899030.00  |
++--------+-------------+
++----------------------+----------------------+
+|     snapshot_id      | is_current_ancestor  |
++----------------------+----------------------+
+| 6356967414929367428  | true                 |
+| 8935160337224414664  | true                 |
+| 7700454950423225386  | false                |
+| 7073719229572187090  | false                |
+| 8935160337224414664  | true                 |
++----------------------+----------------------+
+
+-- Trino, after
+   n   
+-------
+ 23382 
+(1 row)</div></div>
+      <span class="behind">Time travel read the state before the DELETE: 23,382 rows. Trino saw the current state with exactly Hive’s count and sum. The rollback moved the table pointer back; the history shows the DELETE and UPDATE snapshots as no longer ancestors, and Trino immediately read 23,382. Undoing a bad load is one statement, not a restore from backup.</span></li>
+    <li><h4>Step 8 · The folder is no longer the table</h4>
+      <div class="code" data-lang="bash" data-file="copy a file into a new folder, then beeline"><pre><code>cp orders_mig/order_date=2026-10-01/000000_0 orders_mig/order_date=2026-10-15/000000_0
+
+MSCK REPAIR TABLE orders_mig;
+SELECT COUNT(*) AS n FROM orders_mig;</code></pre><div class="output">+--------+
+|   n    |
++--------+
+| 23382  |
++--------+</div></div>
+      <span class="behind">In Lesson 11.2, a file copied into a new folder became visible after MSCK. Here it stays invisible: Iceberg reads only the files listed in its manifests. That protects the table from half-written or stray files, but it means every writer must commit through an Iceberg-aware engine. Upstream jobs that “just drop files” must change during the migration.</span></li>
+    <li><h4>Step 9 · What each migration path costs</h4>
+      <div class="code" data-lang="sql" data-file="beeline (orders_big, 5,000,000 rows)"><pre><code>-- in place, on an external ORC copy
+ALTER TABLE ob_copy SET TBLPROPERTIES (&#x27;storage_handler&#x27;=&#x27;org.apache.iceberg.mr.hive.HiveIcebergStorageHandler&#x27;);
+-- copy
+CREATE TABLE ob_ctas STORED BY ICEBERG STORED AS ORC AS SELECT * FROM orders_big;</code></pre><div class="output">orders_big: 5,000,000 rows, 9.9 MB ORC (wall time incl. ~3.5 s Beeline start)
+method                         time     data files rewritten   rows after
+in-place (SET TBLPROPERTIES)   4.4 s    0 (metadata added)     5,000,000
+CTAS ... STORED BY ICEBERG    16.7 s    all (new 9.9 MB)       5,000,000</div></div>
+      <span class="behind">Both tables returned 5,000,000 rows. The in-place migration took about one second beyond Beeline’s start-up, because it only writes metadata; the copy reads and writes every row, so its cost grows with the data. At 200 TB the difference is hours of cluster time and double storage until the old table is dropped. Use in place where you can, copy where you must.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Same files, new metadata</h2>
+  <p>Left: real outputs. Right: what happens inside the Iceberg table.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Same files, new metadata <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="6.8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">ALTER TABLE orders_mig SET TBLPROPERTIES</text><text x="26" y="64" font-size="6.8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  (&#x27;storage_handler&#x27;=&#x27;…HiveIcebergStorageHandler&#x27;)</text><text x="26" y="78" font-size="6.8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">11631 · 3415600.00 (before and after)</text><text x="26" y="92" font-size="6.8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">+4 metadata files, 0 data files rewritten</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">ALTER TABLE orders_tx … storage_handler</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Converting … transactional … not allowed</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">CTAS STORED BY ICEBERG → 5000001</text><text x="26" y="92" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Trino: 5000001 (was 5000004)</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">SET PARTITION SPEC (month(order_date))</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">spec 0: 7 daily files</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">spec 1: 1 monthly file, 11751 rows</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">old files not rewritten</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">delete     pos_del 106</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">overwrite  added 1, pos_del 1</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">EXECUTE ROLLBACK(8935…)</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">Hive 23382 · Trino 23382</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">cp … order_date=2026-10-15/</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">MSCK REPAIR TABLE orders_mig</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">COUNT(*) → 23382 (unchanged)</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">only manifests define the table</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>In-place migration: same numbers, only metadata added.</li>
+          <li>ACID refused; the copy gives one answer in Hive and Trino.</li>
+          <li>New partition layout for new data only.</li>
+          <li>Changes are snapshots; rollback is instant.</li>
+          <li>A copied file stays invisible.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Inside the Iceberg table">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Metadata around existing files</text><rect x="20" y="30" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="75.0" y="41" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">metadata.json</text><text x="75.0" y="51" text-anchor="middle" font-size="6.4" class="s-ink2 mono">current pointer</text><rect x="20" y="92" width="110" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="75.0" y="103" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">manifests</text><text x="75.0" y="113" text-anchor="middle" font-size="6.4" class="s-ink2 mono">list of files</text><rect x="230" y="62" width="110" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="285.0" y="73" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">data files</text><text x="285.0" y="83" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Parquet / ORC</text><path d="M132 45L132 90" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M129.0 83.7L132 90L135.0 83.7" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M132 107L228 80" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M222.8 84.6L228 80L221.1 78.8" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="10" y="140" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="160.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">In place: new index, same files.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">ACID deltas need Hive to read</text><rect x="20" y="30" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="75.0" y="41" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">metadata.json</text><text x="75.0" y="51" text-anchor="middle" font-size="6.4" class="s-ink2 mono">current pointer</text><rect x="20" y="92" width="110" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="75.0" y="103" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">manifests</text><text x="75.0" y="113" text-anchor="middle" font-size="6.4" class="s-ink2 mono">list of files</text><rect x="230" y="62" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="285.0" y="73" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">data files</text><text x="285.0" y="83" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Parquet / ORC</text><path d="M132 45L132 90" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M129.0 83.7L132 90L135.0 83.7" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M132 107L228 80" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M222.8 84.6L228 80L221.1 78.8" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="10" y="140" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="160.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">So ACID tables are copied, not converted.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each file remembers its spec</text><rect x="20" y="30" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="75.0" y="41" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">metadata.json</text><text x="75.0" y="51" text-anchor="middle" font-size="6.4" class="s-ink2 mono">current pointer</text><rect x="20" y="92" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="75.0" y="103" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">manifests</text><text x="75.0" y="113" text-anchor="middle" font-size="6.4" class="s-ink2 mono">list of files</text><rect x="230" y="62" width="110" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="285.0" y="73" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">data files</text><text x="285.0" y="83" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Parquet / ORC</text><path d="M132 45L132 90" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M129.0 83.7L132 90L135.0 83.7" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M132 107L228 80" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M222.8 84.6L228 80L221.1 78.8" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="10" y="140" width="340" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180.0" y="160.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Old and new layouts coexist.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A commit swaps the pointer</text><rect x="20" y="30" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="75.0" y="41" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">metadata.json</text><text x="75.0" y="51" text-anchor="middle" font-size="6.4" class="s-ink2 mono">current pointer</text><rect x="20" y="92" width="110" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="75.0" y="103" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">manifests</text><text x="75.0" y="113" text-anchor="middle" font-size="6.4" class="s-ink2 mono">list of files</text><rect x="230" y="62" width="110" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="285.0" y="73" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">data files</text><text x="285.0" y="83" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Parquet / ORC</text><path d="M132 45L132 90" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M129.0 83.7L132 90L135.0 83.7" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M132 107L228 80" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M222.8 84.6L228 80L221.1 78.8" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="10" y="140" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="160.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rollback = point to an older snapshot.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Unlisted files do not exist</text><rect x="20" y="30" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="75.0" y="41" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">metadata.json</text><text x="75.0" y="51" text-anchor="middle" font-size="6.4" class="s-ink2 mono">current pointer</text><rect x="20" y="92" width="110" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="75.0" y="103" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">manifests</text><text x="75.0" y="113" text-anchor="middle" font-size="6.4" class="s-ink2 mono">list of files</text><rect x="230" y="62" width="110" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="285.0" y="73" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">data files</text><text x="285.0" y="83" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Parquet / ORC</text><path d="M132 45L132 90" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M129.0 83.7L132 90L135.0 83.7" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M132 107L228 80" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M222.8 84.6L228 80L221.1 78.8" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="10" y="140" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="160.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Writers must commit through Iceberg.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The manifest lists the seven existing files.</li>
+          <li>Delete deltas are Hive-specific; CTAS applies them.</li>
+          <li>Manifests store each file’s partition spec ID.</li>
+          <li>The catalogue points at a new metadata.json.</li>
+          <li>Iceberg plans from manifests, not folders.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a migration in waves, a rollback during an incident, and choosing the catalogue.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-waves">A migration in waves</h3>
+  <p class="anim-intro">How platform teams migrate hundreds of tables. (Typical plan; numbers illustrative.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Phased migration <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Inventory tables, migrate external ones in place, copy ACID ones, validate in every engine and switch writers">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">800 Hive tables</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">650 external · 150 ACID</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Inventory first.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Wave 1: external, read-mostly</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">in place, metadata only</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Minutes per table.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Wave 2: ACID tables</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">CTAS into new tables, swap names</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Plan storage and time.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Validate every table</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">COUNT + SUM per partition, all engines</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Like Steps 1, 2 and 7.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Move writers last</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">no more “drop files into folders”</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Step 8 is the reason.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Know what you have.</li>
+          <li>Cheap wins first.</li>
+          <li>Copy what must be copied.</li>
+          <li>Prove the numbers.</li>
+          <li>Change the writers.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-rollback">Undoing a bad load in fifteen minutes</h3>
+  <p class="anim-intro">What Step 7 looks like during an incident. (Typical timeline.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Snapshot rollback <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Find the last good snapshot, verify it with time travel and roll back; every engine sees the fix immediately">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">06:10 · dashboard doubled</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">nightly job loaded the same day twice</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A classic incident.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Find the last good snapshot</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">SELECT … FROM t.snapshots</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Before the bad append.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check it with time travel</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">FOR SYSTEM_VERSION AS OF …</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Counts look right.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Roll back</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">ALTER TABLE t EXECUTE ROLLBACK(…)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">All engines see it at once.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">06:25 · fixed</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">then fix the job and reload</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No backup restore.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Wrong numbers on a dashboard.</li>
+          <li>List snapshots.</li>
+          <li>Check the old state.</li>
+          <li>Roll back.</li>
+          <li>Fix the job.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-catalog">Choosing the lakehouse catalogue</h3>
+  <p class="anim-intro">The decision that comes right after the table format. (Options as of 2026.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Catalogue choice <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Keep the Hive metastore or adopt an Iceberg REST catalog; either way every engine must use the same catalogue and be tested">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Which catalogue?</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">Hive metastore, Glue, Polaris, Unity …</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Every engine must use the same one.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Keep the Hive metastore</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">Hive, Spark, Trino, Flink support it</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Simplest after a Hive migration.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or an Iceberg REST catalog</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">Apache Polaris (top-level, Feb 2026)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Vendor-neutral, credential vending.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Watch client versions</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">Spark’s Iceberg catalog failed in 11.1</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Test every engine.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Hive stays useful</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">SQL ETL on Iceberg, metastore for all</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hive as one lakehouse engine.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>One catalogue for all.</li>
+          <li>HMS: already there.</li>
+          <li>REST: the new standard.</li>
+          <li>Versions matter.</li>
+          <li>Hive keeps a role.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Lakehouses at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-green">in place</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">migration</text></svg></div>
+    <div><h4>1. Converting a Hive warehouse</h4>
+      <p>Companies with large Hive estates convert external tables in place and copy ACID tables, table by table.</p>
+      <div class="uc-flow"><span>Hive tables</span><i>→</i><span class="java">Iceberg</span><i>→</i><span>Same files</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-blue">engines</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">one answer</text></svg></div>
+    <div><h4>2. One table, many engines</h4>
+      <p>Spark writes, Trino serves dashboards, Hive runs SQL ETL and Flink streams into the same Iceberg tables.</p>
+      <div class="uc-flow"><span>Writers</span><i>→</i><span class="java">Iceberg</span><i>→</i><span>Readers</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-violet">undo</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">snapshots</text></svg></div>
+    <div><h4>3. Recovering from bad loads</h4>
+      <p>Snapshots, time travel and rollback replace many restore-from-backup procedures.</p>
+      <div class="uc-flow"><span>Bad load</span><i>→</i><span class="java">rollback</span><i>→</i><span>Good data</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">GDPR</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">deletes</text></svg></div>
+    <div><h4>4. Row-level deletes for compliance</h4>
+      <p>Erasure requests become DELETE statements with delete files, compacted later, in every engine consistently.</p>
+      <div class="uc-flow"><span>Request</span><i>→</i><span class="java">DELETE</span><i>→</i><span>Compacted</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="9" font-weight="700" class="s-acc">warehouse</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">sharing</text></svg></div>
+    <div><h4>5. Sharing with cloud warehouses</h4>
+      <p>Snowflake, BigQuery, Redshift and Databricks read Iceberg tables through catalogues, without copying data.</p>
+      <div class="uc-flow"><span>Lake tables</span><i>→</i><span class="java">catalogue</span><i>→</i><span>Warehouses</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: planning and validating a migration</h2>
+  <p>These programs model the decisions and checks of a Hive-to-Iceberg migration with the real numbers from the lab. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># Plan a migration: which tables can convert in place?
+tables = [
+    (&quot;orders_mig&quot;,  &quot;external&quot;, &quot;parquet&quot;),
+    (&quot;orders_big&quot;,  &quot;external&quot;, &quot;orc&quot;),
+    (&quot;orders_tx&quot;,   &quot;managed&quot;,  &quot;orc, transactional&quot;),
+    (&quot;raw_events&quot;,  &quot;external&quot;, &quot;textfile&quot;),
+]
+for name, kind, fmt in tables:
+    in_place = kind == &quot;external&quot; and fmt.split(&quot;,&quot;)[0] in (&quot;parquet&quot;, &quot;orc&quot;, &quot;avro&quot;)
+    print(f&quot;{name:11} {&#x27;in place&#x27; if in_place else &#x27;copy (CTAS)&#x27;:12}  {kind}, {fmt}&quot;)</code></pre><div class="output">orders_mig  in place      external, parquet
+orders_big  in place      external, orc
+orders_tx   copy (CTAS)   managed, orc, transactional
+raw_events  copy (CTAS)   external, textfile</div></div>
+  <ul class="anno"><li><code>    in_place = kind == &quot;external&quot; and fmt.split(&quot;,&quot;)[0] in (&quot;parquet&quot;, &quot;orc&quot;, &quot;avro&quot;)</code><span>Hive refused the transactional table in Step 4; text files are not an Iceberg data format.</span></li><li><code>    (&quot;orders_tx&quot;,   &quot;managed&quot;,  &quot;orc, transactional&quot;),</code><span>The ACID table from Modules 7–11: copied with CTAS.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Plan the tables",
+   "hint": "Press <b>Run<\/b>. Add a managed non-ACID Parquet table and see which path it gets.",
+   "code": "# Plan a migration: which tables can convert in place?\ntables = [\n    (\"orders_mig\",  \"external\", \"parquet\"),\n    (\"orders_big\",  \"external\", \"orc\"),\n    (\"orders_tx\",   \"managed\",  \"orc, transactional\"),\n    (\"raw_events\",  \"external\", \"textfile\"),\n]\nfor name, kind, fmt in tables:\n    in_place = kind == \"external\" and fmt.split(\",\")[0] in (\"parquet\", \"orc\", \"avro\")\n    print(f\"{name:11} {'in place' if in_place else 'copy (CTAS)':12}  {kind}, {fmt}\")\n"
+  },
+  {
+   "label": "2 · Validate before and after",
+   "hint": "Compare the baseline from Step 1 with the result after Step 2.",
+   "code": "before = {\"n\": 11631, \"amt\": 3415600.00}\nafter  = {\"n\": 11631, \"amt\": 3415600.00}\nprint(\"valid\" if before == after else f\"MISMATCH {before} vs {after}\")\n"
+  },
+  {
+   "label": "3 · Predict first: rows after DELETE",
+   "hint": "<b>Predict first:<\/b> 23,382 rows, then 106 deleted. How many after the rollback?",
+   "code": "rows, deleted = 23382, 106\nprint(\"after delete:\", rows - deleted)\nprint(\"after rollback to the snapshot before the delete:\", rows)\n"
+  },
+  {
+   "label": "4 · Months since 1970",
+   "hint": "Iceberg stored the monthly partition as 681. Check it.",
+   "code": "y, m = 2026, 10\nprint((y - 1970) * 12 + (m - 1))\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This validation compares only counts. A changed amount slips through.",
+   "code": "hive  = {\"n\": 23276, \"amt\": 6869400.00}\ntrino = {\"n\": 23276, \"amt\": 6869390.00}\nok = hive[\"n\"] == trino[\"n\"]            # bug: only counts\nassert ok == (hive == trino), \"compare sums (checksums) too, not just counts\"\nprint(\"ok\")\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: inspect the Iceberg table</h3>
+  <p>More from the migrated table. <b>Outputs are real</b> (Hive 4.2.1, Iceberg 1.9.1).</p>
+  <div class="pcrun"><h4>1 · Partitions from Iceberg metadata</h4>
+  <div class="code" data-lang="bash" data-file="beeline"><pre><code>SHOW PARTITIONS orders_mig;</code></pre><div class="output">+---------------------------+
+|         partition         |
++---------------------------+
+| order_date=2026-10-01     |
+| order_date=2026-10-02     |
+| order_date=2026-10-03     |
+| order_date=2026-10-04     |
+| order_date=2026-10-05     |
+| order_date=2026-10-06     |
+| order_date=2026-10-07     |
+| order_date_month=2026-10  |
++---------------------------+</div></div>
+  <p class="muted">Hive lists both specs: seven daily partitions and the monthly one. They come from Iceberg’s manifests, not from metastore partition rows.</p></div>
+  <div class="pcrun"><h4>2 · Snapshot lineage</h4>
+  <div class="code" data-lang="bash" data-file="beeline"><pre><code>SELECT snapshot_id, parent_id, operation
+FROM tiffingo.orders_mig.snapshots ORDER BY committed_at;</code></pre><div class="output">+----------------------+----------------------+------------+
+|     snapshot_id      |      parent_id       | operation  |
++----------------------+----------------------+------------+
+| 6356967414929367428  | NULL                 | append     |
+| 8935160337224414664  | 6356967414929367428  | append     |
+| 7700454950423225386  | 8935160337224414664  | delete     |
+| 7073719229572187090  | 7700454950423225386  | overwrite  |
++----------------------+----------------------+------------+</div></div>
+  <p class="muted">Each snapshot points to its parent. After the rollback the last two are kept, but they are no longer ancestors of the current state, until snapshot expiry removes them.</p></div>
+  <div class="pcrun"><h4>3 · The copied ACID table in Trino</h4>
+  <div class="code" data-lang="bash" data-file="trino"><pre><code>SELECT COUNT(*) AS n FROM iceberg.tiffingo.orders_tx_ice;</code></pre><div class="output">    n    
+---------
+ 5000001 
+(1 row)</div></div>
+  <p class="muted">Compare 5,000,004 from the ACID original in Lesson 11.1.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Why the copied table gives one answer</h2>
+  <p>Follow what CTAS does with the ACID table’s base, deltas and delete deltas.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "base = 5_000_000",
+  "inserted = 4      # 999000001, 999000002, 999000010 NEW, 999000010 CANCELLED",
+  "deleted = 3       # two DELETEs + old version from the UPDATE",
+  "ctas_rows = base + inserted - deleted          # Hive applies deletes while reading",
+  "print(\"rows written to Iceberg:\", ctas_rows)",
+  "print(\"delete files in the new table: 0, so every engine reads\", ctas_rows)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Base",
+   "note": "The original 5 million rows in Hive ACID base files. <code>base<\/code> is created: 5000000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "base",
+       "5000000"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "base"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>inserted<\/code> is created: 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "base",
+       "5000000"
+      ],
+      [
+       "inserted",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "inserted"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>deleted<\/code> is created: 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "base",
+       "5000000"
+      ],
+      [
+       "inserted",
+       "4"
+      ],
+      [
+       "deleted",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "deleted"
+  },
+  {
+   "line": 4,
+   "phase": "CTAS",
+   "note": "Hive reads the ACID table correctly and writes plain Parquet. <code>ctas_rows<\/code> is created: 5000001.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "base",
+       "5000000"
+      ],
+      [
+       "inserted",
+       "4"
+      ],
+      [
+       "deleted",
+       "3"
+      ],
+      [
+       "ctas_rows",
+       "5000001"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "ctas_rows"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "base",
+       "5000000"
+      ],
+      [
+       "inserted",
+       "4"
+      ],
+      [
+       "deleted",
+       "3"
+      ],
+      [
+       "ctas_rows",
+       "5000001"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "rows written to Iceberg: 5000001\n"
+  },
+  {
+   "line": 6,
+   "phase": "One answer",
+   "note": "No Hive-specific deltas remain for other engines to misread. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "base",
+       "5000000"
+      ],
+      [
+       "inserted",
+       "4"
+      ],
+      [
+       "deleted",
+       "3"
+      ],
+      [
+       "ctas_rows",
+       "5000001"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "delete files in the new table: 0, so every engine reads 5000001\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three migration decisions from real platforms.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Data engineering · migration</span></div>
+    <h4>Migrate one external table</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Convert an external Parquet table to Iceberg with validation.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>tiffingo.orders_mig</pre></div><div><small>Expected output</small><pre>SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- baseline
+ALTER TABLE orders_mig SET TBLPROPERTIES (&#x27;storage_handler&#x27;=&#x27;org.apache.iceberg.mr.hive.HiveIcebergStorageHandler&#x27;);
+SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- must match</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Record count and sum.</li><li>Migrate in place.</li><li>Compare.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Run the same validation query in Trino through the iceberg catalog.",
+   "code": "for sql in [\"SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- baseline\",\n            \"ALTER TABLE orders_mig SET TBLPROPERTIES ('storage_handler'='org.apache.iceberg.mr.hive.HiveIcebergStorageHandler');\",\n            \"SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- must match\"]:\n    print(sql)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "for sql in [\"SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- baseline\",",
+  "            \"ALTER TABLE orders_mig SET TBLPROPERTIES ('storage_handler'='org.apache.iceberg.mr.hive.HiveIcebergStorageHandler');\",",
+  "            \"SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- must match\"]:",
+  "    print(sql)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>sql<\/code> is created: &#x27;SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- baseline&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sql",
+       "'SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- baseline'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "sql"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sql",
+       "'SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- baseline'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- baseline\n"
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>sql<\/code> changes to &quot;ALTER TABLE orders_mig SET TBLPROPERTIES (&#x27;storage_handler&#x27;=&#x27;org.apa….",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sql",
+       "\"ALTER TABLE orders_mig SET TBLPROPERTIES ('storage_handler'='org.apa…"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "sql"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sql",
+       "\"ALTER TABLE orders_mig SET TBLPROPERTIES ('storage_handler'='org.apa…"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "ALTER TABLE orders_mig SET TBLPROPERTIES ('storage_handler'='org.apache.iceberg.mr.hive.HiveIcebergStorageHandler');\n"
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>sql<\/code> changes to &#x27;SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- must match&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sql",
+       "'SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- must match'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "sql"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sql",
+       "'SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- must match'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- must match\n"
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sql",
+       "'SELECT COUNT(*), SUM(amount) FROM orders_mig;   -- must match'"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Data engineering · ACID</span></div>
+    <h4>Copy an ACID table with a name swap</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Replace a Hive ACID table with an Iceberg copy that keeps its name.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>orders_tx (full ACID)</pre></div><div><small>Expected output</small><pre>CREATE TABLE orders_tx_ice STORED BY ICEBERG STORED AS PARQUET AS SELECT * FROM orders_tx;
+-- validate: COUNT(*) and SUM(amount) in Hive and Trino
+ALTER TABLE orders_tx RENAME TO orders_tx_old;
+ALTER TABLE orders_tx_ice RENAME TO orders_tx;</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>CTAS into a new table.</li><li>Validate.</li><li>Rename old and new in one window.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Keep orders_tx_old until every consumer has run on the new table for a full cycle.",
+   "code": "steps = [\"CREATE TABLE orders_tx_ice STORED BY ICEBERG STORED AS PARQUET AS SELECT * FROM orders_tx;\",\n         \"-- validate: COUNT(*) and SUM(amount) in Hive and Trino\",\n         \"ALTER TABLE orders_tx RENAME TO orders_tx_old;\",\n         \"ALTER TABLE orders_tx_ice RENAME TO orders_tx;\"]\nprint(\"\\n\".join(steps))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "steps = [\"CREATE TABLE orders_tx_ice STORED BY ICEBERG STORED AS PARQUET AS SELECT * FROM orders_tx;\",",
+  "         \"-- validate: COUNT(*) and SUM(amount) in Hive and Trino\",",
+  "         \"ALTER TABLE orders_tx RENAME TO orders_tx_old;\",",
+  "         \"ALTER TABLE orders_tx_ice RENAME TO orders_tx;\"]",
+  "print(\"\\n\".join(steps))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>steps<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;CREATE TABLE orders_tx_ice STORED BY ICEBERG STORED AS PARQUET AS SE…, &#x27;-- validate: CO…"
+   ],
+   "newVar": "steps"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;CREATE TABLE orders_tx_ice STORED BY ICEBERG STORED AS PARQUET AS SE…, &#x27;-- validate: CO…"
+   ],
+   "out": "CREATE TABLE orders_tx_ice STORED BY ICEBERG STORED AS PARQUET AS SELECT * FROM orders_tx;\n-- validate: COUNT(*) and SUM(amount) in Hive and Trino\nALTER TABLE orders_tx RENAME TO orders_tx_old;\nALTER TABLE orders_tx_ice RENAME TO orders_tx;\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Architecture · cost</span></div>
+    <h4>Estimate a migration programme</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Estimate cluster hours for migrating a warehouse, using the lab’s rates as a rough guide.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>600 TB external, 120 TB ACID (illustrative)</pre></div><div><small>Expected output</small><pre>in place: 11 h   copy: 60 h</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>In place: per table, not per TB.</li><li>Copy: proportional to data.</li><li>Add validation reads.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Validation (count + sum per partition) often costs more than the in-place migration itself.",
+   "code": "external_tables, acid_tb = 650, 120\ncopy_tb_per_hour = 2            # assumed cluster throughput\nin_place_hours = external_tables * 1 / 60    # ~1 minute per table incl. validation\ncopy_hours = acid_tb / copy_tb_per_hour\nprint(f\"in place: {in_place_hours:.0f} h   copy: {copy_hours:.0f} h\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "external_tables, acid_tb = 650, 120",
+  "copy_tb_per_hour = 2            # assumed cluster throughput",
+  "in_place_hours = external_tables * 1 / 60    # ~1 minute per table incl. validation",
+  "copy_hours = acid_tb / copy_tb_per_hour",
+  "print(f\"in place: {in_place_hours:.0f} h   copy: {copy_hours:.0f} h\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>external_tables<\/code> is created: 650. <code>acid_tb<\/code> is created: 120.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "external_tables",
+       "650"
+      ],
+      [
+       "acid_tb",
+       "120"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "acid_tb"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>copy_tb_per_hour<\/code> is created: 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "external_tables",
+       "650"
+      ],
+      [
+       "acid_tb",
+       "120"
+      ],
+      [
+       "copy_tb_per_hour",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "copy_tb_per_hour"
+  },
+  {
+   "line": 3,
+   "phase": "Throughput",
+   "note": "Measure on your own cluster; the lab is far too small to extrapolate. <code>in_place_hours<\/code> is created: 10.8333.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "external_tables",
+       "650"
+      ],
+      [
+       "acid_tb",
+       "120"
+      ],
+      [
+       "copy_tb_per_hour",
+       "2"
+      ],
+      [
+       "in_place_hours",
+       "10.8333"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "in_place_hours"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>copy_hours<\/code> is created: 60.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "external_tables",
+       "650"
+      ],
+      [
+       "acid_tb",
+       "120"
+      ],
+      [
+       "copy_tb_per_hour",
+       "2"
+      ],
+      [
+       "in_place_hours",
+       "10.8333"
+      ],
+      [
+       "copy_hours",
+       "60.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "copy_hours"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "external_tables",
+       "650"
+      ],
+      [
+       "acid_tb",
+       "120"
+      ],
+      [
+       "copy_tb_per_hour",
+       "2"
+      ],
+      [
+       "in_place_hours",
+       "10.8333"
+      ],
+      [
+       "copy_hours",
+       "60.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "in place: 11 h   copy: 60 h\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: What does an in-place migration to Iceberg change?",
+  "options": [
+   "It rewrites all data files",
+   "It moves data to HDFS",
+   "It adds Iceberg metadata around the existing files",
+   "Nothing"
+  ],
+  "answer": 2,
+  "why": "0 data files rewritten in Step 2."
+ },
+ {
+  "q": "Beginner: Which statement migrates an external table in place in Hive 4?",
+  "options": [
+   "CONVERT TABLE t TO ICEBERG",
+   "ALTER TABLE … SET TBLPROPERTIES with the Iceberg storage_handler",
+   "MSCK REPAIR TABLE t",
+   "DROP TABLE t"
+  ],
+  "answer": 1,
+  "why": "The storage handler property triggers the migration."
+ },
+ {
+  "q": "Beginner: Which is NOT an open table format?",
+  "options": [
+   "Parquet",
+   "Apache Iceberg",
+   "Delta Lake",
+   "Apache Hudi"
+  ],
+  "answer": 0,
+  "why": "Parquet is a file format; table formats organise files."
+ },
+ {
+  "q": "Intermediate: Why was the ACID table copied instead of migrated?",
+  "options": [
+   "Too large",
+   "Wrong format",
+   "No permission",
+   "Hive refuses to convert transactional tables; their delta files are Hive-specific"
+  ],
+  "answer": 3,
+  "why": "“Converting … transactional hive table to iceberg table is not allowed.”"
+ },
+ {
+  "q": "Intermediate: What did Trino return for the copied table?",
+  "options": [
+   "5,000,004",
+   "0",
+   "5,000,001, the same as Hive",
+   "An error"
+  ],
+  "answer": 2,
+  "why": "No Hive deltas remain to misread."
+ },
+ {
+  "q": "Intermediate: What happened to old files after SET PARTITION SPEC (month(order_date))?",
+  "options": [
+   "Rewritten monthly",
+   "They kept the old daily spec; new data used the monthly spec",
+   "Deleted",
+   "Moved"
+  ],
+  "answer": 1,
+  "why": "Partition evolution affects new writes only."
+ },
+ {
+  "q": "Advanced: A file was copied into the migrated table’s folder and MSCK was run. Result?",
+  "options": [
+   "Count unchanged: only manifest-listed files belong to the table",
+   "New rows appear",
+   "Error",
+   "Duplicate partitions"
+  ],
+  "answer": 0,
+  "why": "Opposite of the plain table in Lesson 11.2."
+ },
+ {
+  "q": "Advanced: What does EXECUTE ROLLBACK change?",
+  "options": [
+   "Deletes data files",
+   "Restores a backup",
+   "Drops the table",
+   "Points the table at an older snapshot"
+  ],
+  "answer": 3,
+  "why": "Trino saw 23,382 immediately."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 11.3 in one screen</h3>
+    <ul><li><b>Lakehouse</b> = open files + open table format (Iceberg, Delta, Hudi) + shared catalogue.</li><li><b>In place</b>: <code>SET TBLPROPERTIES</code> with the Iceberg <code>storage_handler</code> on external Parquet/ORC/Avro tables: metadata only, 0 files rewritten.</li><li><b>ACID</b> tables are refused; copy with <code>CTAS … STORED BY ICEBERG</code>. Then Hive and Trino agree (5,000,001).</li><li>Validate with count <b>and</b> sum, before and after, in every engine.</li><li>Partition evolution: <code>SET PARTITION SPEC</code>; old files keep the old spec, nothing is rewritten.</li><li>DML creates snapshots with delete files; time travel with <code>FOR SYSTEM_VERSION AS OF</code>; undo with <code>EXECUTE ROLLBACK</code>.</li><li>Only manifest-listed files belong to the table: writers must commit through Iceberg.</li><li>Cost: in place 4.4 s vs CTAS 16.7 s for 5M rows in the lab; copy cost grows with data.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Can I go back after an in-place migration?</summary><p>Not with a single built-in statement in our version. Because the data files are unchanged, you can recreate a plain external table on the same location as an emergency path, but files written after the migration may live in new folders and contain delete files. Test on a copy and keep the old DDL.</p></details>
+    <details><summary>Iceberg, Delta or Hudi?</summary><p>For Hive users Iceberg is the natural choice: Hive 4 supports it natively and Trino, Spark, Flink and the big cloud warehouses read it. Delta Lake fits Databricks-centred platforms; Hudi is strong for CDC upserts. Interoperability layers such as Delta UniForm and Apache XTable reduce lock-in.</p></details>
+    <details><summary>Do I still need the Hive metastore?</summary><p>Iceberg needs a catalogue to store the current metadata pointer. The Hive metastore is one option and is already there after a Hive migration; REST catalogues such as Apache Polaris, AWS Glue or Unity Catalog are others.</p></details>
+    <details><summary>What about snapshot growth?</summary><p>Every commit adds a snapshot and files. Schedule snapshot expiry and compaction (Lesson 7.3) so storage and planning time stay under control, while keeping enough history for rollback.</p></details>
+    <details><summary>Why did Spark not appear in this lesson?</summary><p>In Lesson 11.1, Spark 3.5’s Iceberg catalog could not talk to the Hive 4 metastore because of the metastore client version. With a compatible client or a REST catalogue, Spark reads the same Iceberg tables.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs for migration checks, with the SQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Migration statement</h4></div>
+      <p>Generate the in-place migration statement for a table.</p>
+      <div class="prob__io"><div><small>Input</small><pre>orders_big</pre></div><div><small>Expected output</small><pre>ALTER TABLE orders_big SET TBLPROPERTIES (&#x27;storage_handler&#x27;=&#x27;org.apache.iceberg.mr.hive.HiveIcebergStorageHandler&#x27;);</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>t = &quot;orders_big&quot;
+print(f&quot;ALTER TABLE {t} SET TBLPROPERTIES (&#x27;storage_handler&#x27;=&#x27;org.apache.iceberg.mr.hive.HiveIcebergStorageHandler&#x27;);&quot;)</code></pre><div class="output">ALTER TABLE orders_big SET TBLPROPERTIES (&#x27;storage_handler&#x27;=&#x27;org.apache.iceberg.mr.hive.HiveIcebergStorageHandler&#x27;);</div></div>
+        <p><b>How it works:</b> Only for external Parquet, ORC or Avro tables.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Rows after DML</h4></div>
+      <p>Compute rows after the DELETE and UPDATE in Step 6.</p>
+      <div class="prob__io"><div><small>Input</small><pre>23,382 rows, 106 deleted, 1 updated</pre></div><div><small>Expected output</small><pre>23276</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(23382 - 106 + 1 - 1)</code></pre><div class="output">23276</div></div>
+        <p><b>How it works:</b> An update deletes one row version and adds one: count unchanged.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Time-travel query</h4></div>
+      <p>Write a time-travel query for a snapshot ID.</p>
+      <div class="prob__io"><div><small>Input</small><pre>8935160337224414664</pre></div><div><small>Expected output</small><pre>SELECT COUNT(*) FROM orders_mig FOR SYSTEM_VERSION AS OF 8935160337224414664;</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;SELECT COUNT(*) FROM orders_mig FOR SYSTEM_VERSION AS OF 8935160337224414664;&quot;)</code></pre><div class="output">SELECT COUNT(*) FROM orders_mig FOR SYSTEM_VERSION AS OF 8935160337224414664;</div></div>
+        <p><b>How it works:</b> FOR SYSTEM_TIME AS OF '…' works with a timestamp instead.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Path chooser</h4></div>
+      <p>Choose in place or copy for each table.</p>
+      <div class="prob__io"><div><small>Input</small><pre>table properties</pre></div><div><small>Expected output</small><pre>a in place
+b copy
+c copy</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for name, external, transactional, fmt in [(&quot;a&quot;, True, False, &quot;orc&quot;), (&quot;b&quot;, False, True, &quot;orc&quot;), (&quot;c&quot;, True, False, &quot;textfile&quot;)]:
+    ok = external and not transactional and fmt in (&quot;orc&quot;, &quot;parquet&quot;, &quot;avro&quot;)
+    print(name, &quot;in place&quot; if ok else &quot;copy&quot;)</code></pre><div class="output">a in place
+b copy
+c copy</div></div>
+        <p><b>How it works:</b> Text tables need a copy because Iceberg data files are Parquet, ORC or Avro.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Partition validation</h4></div>
+      <p>Compare per-partition counts before and after.</p>
+      <div class="prob__io"><div><small>Input</small><pre>two dictionaries</pre></div><div><small>Expected output</small><pre>all partitions match</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>before = {&quot;2026-10-01&quot;: 1641, &quot;2026-10-02&quot;: 1617}
+after  = {&quot;2026-10-01&quot;: 1641, &quot;2026-10-02&quot;: 1617}
+print([d for d in before if before[d] != after.get(d)] or &quot;all partitions match&quot;)</code></pre><div class="output">all partitions match</div></div>
+        <p><b>How it works:</b> SELECT order_date, COUNT(*), SUM(amount) … GROUP BY order_date, in each engine.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Find the rollback target</h4></div>
+      <p>Pick the last snapshot before the first delete.</p>
+      <div class="prob__io"><div><small>Input</small><pre>snapshot list</pre></div><div><small>Expected output</small><pre>ALTER TABLE orders_mig EXECUTE ROLLBACK(8935160337224414664);</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>snaps = [(&quot;6356967414929367428&quot;, &quot;append&quot;), (&quot;8935160337224414664&quot;, &quot;append&quot;),
+         (&quot;7700454950423225386&quot;, &quot;delete&quot;), (&quot;7073719229572187090&quot;, &quot;overwrite&quot;)]
+target = None
+for sid, op in snaps:
+    if op == &quot;delete&quot;:
+        break
+    target = sid
+print(&quot;ALTER TABLE orders_mig EXECUTE ROLLBACK(&quot; + target + &quot;);&quot;)</code></pre><div class="output">ALTER TABLE orders_mig EXECUTE ROLLBACK(8935160337224414664);</div></div>
+        <p><b>How it works:</b> Verify the target with time travel before rolling back.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Storage during a copy</h4></div>
+      <p>Extra storage while old and new tables coexist.</p>
+      <div class="prob__io"><div><small>Input</small><pre>120 TB ACID data, 30 days overlap</pre></div><div><small>Expected output</small><pre>₹240,000 for the overlap period</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>tb, days, per_tb_month = 120, 30, 2000   # illustrative ₹ per TB-month
+print(f&quot;₹{tb * per_tb_month * days / 30:,.0f} for the overlap period&quot;)</code></pre><div class="output">₹240,000 for the overlap period</div></div>
+        <p><b>How it works:</b> In-place migration avoids this cost entirely.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Incident time saved</h4></div>
+      <p>Hours saved per bad load with rollback instead of restore.</p>
+      <div class="prob__io"><div><small>Input</small><pre>restore 6 h, rollback 0.25 h, 8 incidents a year</pre></div><div><small>Expected output</small><pre>46.0 hours per year</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print((6 - 0.25) * 8, &quot;hours per year&quot;)</code></pre><div class="output">46.0 hours per year</div></div>
+        <p><b>How it works:</b> Plus fewer wrong dashboards while the restore runs.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Lakehouse and migration questions are common for senior data roles in 2026.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · lakehouse</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is a lakehouse?”</h4>
+      <p class="scn__situation">Explain a lakehouse and where Hive fits.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know table formats?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>Data stays in open files (Parquet/ORC) in a lake or object store; a table format such as Iceberg adds transactions, snapshots, schema and partition evolution; a shared catalogue lets Hive, Spark, Trino and others use the same tables. Hive 4 creates and queries Iceberg tables natively and its metastore can be the catalogue.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Saying a lakehouse is a product you buy.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Migrate a Hive table to Iceberg</h4>
+      <p class="scn__situation">An external ORC table of 50 TB must become Iceberg with minimal downtime.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know in-place migration?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Record per-partition counts and sums.</li>
+          <li>Migrate in place with the Iceberg storage handler: metadata only, no data copy.</li>
+          <li>Validate in every engine, then switch writers to Iceberg-aware commits.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Copying 50 TB with CTAS when in place is possible.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Rows written but not visible</h4>
+      <p class="scn__situation">After migration, an upstream job’s new files do not appear in queries.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you understand manifests?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>The job still writes files into folders; Iceberg ignores files not in its manifests (MSCK does not help).</li>
+          <li>Change the job to write through Spark, Flink, Hive or Trino with the Iceberg catalogue.</li>
+          <li>Short-term: register files with an add_files procedure after validating their schema.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Running MSCK REPAIR again.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Architecture</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Plan a warehouse-to-lakehouse migration</h4>
+      <p class="scn__situation">800 Hive tables, 150 ACID, Spark and Trino users, cloud move planned.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you sequence the work?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Inventory; waves: external in place, ACID by copy with name swap; catalogue choice (HMS vs REST) up front.</li>
+          <li>Automated validation per partition in every engine; maintenance jobs for snapshot expiry and compaction.</li>
+          <li>Combine with the cloud move: Iceberg removes rename-based commits on object storage.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Migrating everything in one weekend without validation.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

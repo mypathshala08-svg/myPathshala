@@ -49,7 +49,8 @@ const meta = (html, name) => {
 };
 const titleOf = html => {
   const m = html.match(/<title>([^<]*)<\/title>/i);
-  return m ? m[1].replace(/\s*[|·–-]\s*MyPhatshala\s*$/i, "").trim() : null;
+  return m ? m[1].replace(/\s*[|·–-]\s*MyPhatshala\s*$/i, "").trim()
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&amp;/g, "&") : null;
 };
 
 // ------------------------------------------------------------------ load
@@ -151,6 +152,11 @@ if (fs.existsSync(oldManifestJs)) fs.unlinkSync(oldManifestJs); // replaced by c
 const template = fs.readFileSync(TEMPLATE, "utf8");
 const base = siteUrl();
 
+// A prerequisite that points to a lesson of this course which is not live yet links to its module in the syllabus instead (no 404).
+function prereqHref(c, href) {
+  for (const m of c.modules) for (const l of m.lessons) if (l.rel === href || l.rel === href + "/") return l.status === "live" ? href : "#m" + m.number;
+  return href;
+}
 for (const c of courses) {
   const t = trackById[c.category];
   const out = path.join(COURSES, c.id, "index.html");
@@ -204,7 +210,7 @@ for (const c of courses) {
     .replaceAll("{{SYLLABUS}}", syllabus)
     .replaceAll("{{RELATED}}", related || "<p class=\"muted\">More courses coming to this track.</p>")
     .replaceAll("{{PATHS}}", inPaths ? `<h4>Part of these career paths</h4>${inPaths}` : "")
-    .replaceAll("{{EXTRAS}}", (c.extras || []).length ? `<div class="aside-card"><h4>Course tools</h4>${c.extras.map(x => `<a href="${esc(x.href)}">${esc(x.title)}<span>${esc(x.note || "")}</span></a>`).join("")}</div>` : "")
+    .replaceAll("{{EXTRAS}}", ((c.prerequisites || []).length ? `<div class="aside-card aside-card--notes"><h4>Before you start</h4><p class="muted">Helpful to know first:</p>${c.prerequisites.map(x => `<a href="${esc(prereqHref(c, x.href))}">${esc(x.title)}<span>${esc(x.note || "")}</span></a>`).join("")}</div>` : "") + ((c.extras || []).length ? `<div class="aside-card aside-card--notes"><h4>Course tools</h4>${c.extras.map(x => `<a href="${esc(x.href)}">${esc(x.title)}<span>${esc(x.note || "")}</span></a>`).join("")}</div>` : ""))
     .replaceAll("{{JSONLD}}", jsonld);
   fs.writeFileSync(out, html);
 }

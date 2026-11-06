@@ -1,0 +1,4355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bucketing: CLUSTERED BY, sampling and bucket joins | MyPhatshala</title>
+<meta name="description" content="Hive bucketing explained with real Hive 4.2.1 results: CLUSTERED BY … SORTED BY … INTO n BUCKETS, one file per bucket, the Murmur3 hash of bucketing_version 2 (not id mod n), INPUT__FILE__NAME, TABLESAMPLE by bucket, ROWS and rand(), bucket pruning (5,649 rows read instead of 50,000), partitioning vs bucketing, bucket map and SMB joins and what EXPLAIN really chose, plus two surprises: bucketed CTAS refused and LOAD DATA losing rows with a header.">
+<meta name="mp:minutes" content="35">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/05-partitioning-and-bucketing/03-bucketing/">
+<meta property="og:title" content="Bucketing: CLUSTERED BY, sampling and bucket joins · MyPhatshala">
+<meta property="og:description" content="Is the bucket really id mod n? Not in Hive 4. Bucketing with real files, samples, pruning counters and a LOAD that silently lost three customers.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Bucketing: CLUSTERED BY, sampling and bucket joins", "learningResourceType": "Lesson", "educationalLevel": "Beginner → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="05-partitioning-and-bucketing/03-bucketing" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 5.3</b></nav>
+    <h1>Bucketing: CLUSTERED BY, sampling and bucket joins</h1>
+    <p class="lead">Partitioning works for columns with a modest number of values. For ids, which have thousands or millions of values, Hive offers <b>bucketing</b>: a fixed number of files chosen by a hash. In this lesson Kabir buckets orders by customer, looks inside the 8 files, shows that Hive 4 uses Murmur3 and not “id mod n”, samples a stable 1-in-8 group while reading one file, and finds two surprises. <b>All outputs are real</b>, from Hive 4.2.1.</p>
+    <div class="lesson-meta"><span>Module 5 · Partitioning and bucketing</span><span>⏱ 35 min</span><span>Beginner → Advanced</span><span>Real Hive 4.2.1 outputs</span><span>Murmur3, not mod n</span><span>Sampling and pruning</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Can we partition by customer?”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> finish partitioning (<a href="../01-partitioning/">5.1</a>) and joins (<a href="../../03-querying/03-joins/">3.3</a>); DISTRIBUTE BY and CLUSTER BY (<a href="../../03-querying/04-order-sort-distribute-cluster-by/">3.4</a>) explain the shuffle behind bucketing.</p></div>
+  <div class="story">
+    <p class="narration">The CRM team asks Kabir for two things: a quick 1-in-8 sample of customers to test a new loyalty rule, and faster joins between <code>orders</code> and <code>customers</code> on <code>customer_id</code>. Kabir’s first idea, after Lesson 5.1, is to partition by customer.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Two thousand customers pass through a hash function and modulo 8; each lands in one of eight files of about 250 customers, and the same customer always lands in the same file.">
+        <rect x="10" y="12" width="200" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="110" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">2,000 customers</text><text x="22" y="52" font-size="7.4" class="s-ink2 mono">customer 1  → ?</text><text x="22" y="67" font-size="7.4" class="s-ink2 mono">customer 2  → ?</text><text x="22" y="82" font-size="7.4" class="s-ink2 mono">customer 3  → ?</text><text x="22" y="97" font-size="7.4" class="s-ink2 mono">…</text><text x="22" y="112" font-size="7.4" class="s-ink2 mono">customer 2000 → ?</text><path d="M216 76L256 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M249.7 79.0L256 76L249.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="262" y="46" width="108" height="60" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="316" y="66" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink mono">murmur3(id)</text><text x="316" y="82" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink mono">mod 8</text><text x="316" y="98" text-anchor="middle" font-size="7" class="s-ink2">bucket number</text><path d="M376 76L410 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M403.7 79.0L410 76L403.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="416" y="12" width="214" height="128" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="523" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-green">8 files, ~250 customers each</text><rect x="428" y="42" width="44" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="450" y="58" text-anchor="middle" font-size="6.4" class="s-ink mono">00000_0</text><text x="450" y="70" text-anchor="middle" font-size="6.4" class="s-ink2">247 cust</text><rect x="478" y="42" width="44" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="500" y="58" text-anchor="middle" font-size="6.4" class="s-ink mono">00001_0</text><text x="500" y="70" text-anchor="middle" font-size="6.4" class="s-ink2">244 cust</text><rect x="528" y="42" width="44" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="550" y="58" text-anchor="middle" font-size="6.4" class="s-ink mono">00002_0</text><text x="550" y="70" text-anchor="middle" font-size="6.4" class="s-ink2">269 cust</text><rect x="578" y="42" width="44" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="600" y="58" text-anchor="middle" font-size="6.4" class="s-ink mono">00003_0</text><text x="600" y="70" text-anchor="middle" font-size="6.4" class="s-ink2">237 cust</text><rect x="428" y="86" width="44" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="450" y="102" text-anchor="middle" font-size="6.4" class="s-ink mono">00004_0</text><text x="450" y="114" text-anchor="middle" font-size="6.4" class="s-ink2">262 cust</text><rect x="478" y="86" width="44" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="500" y="102" text-anchor="middle" font-size="6.4" class="s-ink mono">00005_0</text><text x="500" y="114" text-anchor="middle" font-size="6.4" class="s-ink2">230 cust</text><rect x="528" y="86" width="44" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="550" y="102" text-anchor="middle" font-size="6.4" class="s-ink mono">00006_0</text><text x="550" y="114" text-anchor="middle" font-size="6.4" class="s-ink2">250 cust</text><rect x="578" y="86" width="44" height="36" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="600" y="102" text-anchor="middle" font-size="6.4" class="s-ink mono">00007_0</text><text x="600" y="114" text-anchor="middle" font-size="6.4" class="s-ink2">261 cust</text><text x="523" y="134" text-anchor="middle" font-size="7.4" class="s-ink2">same customer → always the same file</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Bucketing spreads rows over a <tspan font-weight="700" class="s-acc">fixed number of files</tspan> by a hash of a column.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, if date partitions work so well, why not <code>PARTITIONED BY (customer_id)</code>?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Two thousand customers today, two lakh next year: that is two lakh folders with a few rows each. Partitioning is for columns with a modest number of values. For high-cardinality columns like ids we use <b>bucketing</b>: <code>CLUSTERED BY (customer_id) INTO 8 BUCKETS</code>. Hive hashes each id and writes it into one of exactly 8 files.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>And the same customer always lands in the same file?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Always. That is what makes bucket sampling and bucket-aware joins possible. Today we look inside the 8 files, prove that the hash is <b>not</b> simply id mod 8 in Hive 4, sample one bucket while reading one file, and hit two surprises: bucketed CTAS is refused, and a LOAD into a bucketed table lost three customers. All outputs are real, from Hive 4.2.1.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Bucketing (clustering) in Hive</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Bucketing</b> divides the data of a table, or of each partition, into a fixed number of files called <b>buckets</b>, declared with <code>CLUSTERED BY (col, …) [SORTED BY (col [ASC|DESC], …)] INTO n BUCKETS</code>. Each row is written to bucket <code>hash(bucketing columns) mod n</code>, so equal values always go to the same bucket. Bucketing columns remain ordinary columns of the data. Bucketing enables efficient <b>sampling</b> (<code>TABLESAMPLE</code>), <b>bucket pruning</b> on equality filters and, when tables are bucketed compatibly on the join key, <b>bucket map joins</b> and <b>sort-merge-bucket (SMB) joins</b>.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Bucketing splits a table into a fixed number of files using a hash of a column such as customer_id. The same id always goes to the same file, so Hive can read just one file for a sample or for one id, and can join matching files of two tables.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Bucket</b><span>One of the n files of a bucketed table or partition, e.g. <code>000005_0</code>.</span></div>
+    <div class="term"><b>CLUSTERED BY</b><span>The bucketing column(s). Not the same as the CLUSTER BY query clause (3.4).</span></div>
+    <div class="term"><b>Murmur3</b><span>The hash used by bucketing_version 2 tables (Hive 3+).</span></div>
+    <div class="term"><b>TABLESAMPLE</b><span><code>TABLESAMPLE(BUCKET x OUT OF y ON col)</code>: a sample by bucket.</span></div>
+    <div class="term"><b>Bucket pruning</b><span>Reading only the bucket that can hold the value in <code>WHERE col = v</code>.</span></div>
+    <div class="term"><b>Bucket map join</b><span>Each task loads only the matching bucket of the small table.</span></div>
+    <div class="term"><b>SMB join</b><span>Sort-merge-bucket join: both tables bucketed and sorted on the key; merge bucket by bucket.</span></div>
+    <div class="term"><b>INPUT__FILE__NAME</b><span>Virtual column: the file each row was read from.</span></div>
+  </div>
+
+  <h3>Partitioning vs bucketing</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th></th><th>Partitioning</th><th>Bucketing</th></tr></thead>
+    <tbody><tr><td>Clause</td><td><code>PARTITIONED BY (col)</code></td><td><code>CLUSTERED BY (col) INTO n BUCKETS</code></td></tr><tr><td>Unit on disk</td><td>A folder per value</td><td>A fixed number of files</td></tr><tr><td>Column stored in files?</td><td>No (folder name)</td><td>Yes</td></tr><tr><td>Best for</td><td>Few to moderate values used in filters (date)</td><td>Many values (ids), joins and sampling</td></tr><tr><td>Grows with new values?</td><td>Yes, new folders</td><td>No, always n files</td></tr><tr><td>Skips data by</td><td>Partition pruning</td><td>Bucket pruning and sampling</td></tr><tr><td>Can combine?</td><td>Yes: partition by date, then bucket each day by customer_id</td><td></td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Bucketing at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Roll numbers into sections</h4>
+      <ul>
+        <li>A school splits 2,000 students into 8 sections by a fixed rule on the roll number. Every student is always in the same section, and each section has roughly the same size.</li>
+        <li>In Hive the sections are files. <code>CLUSTERED BY (customer_id) INTO 8 BUCKETS</code> creates 8 files per table (or per partition).</li>
+        <li>Unlike a partition, the bucket column <b>stays in the data</b>, and the number of buckets never grows with the data.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> How rows are placed and what it enables</h4>
+      <ul>
+        <li>Bucket number = hash(bucket column) mod number of buckets. Hive 3+ tables have <code>bucketing_version=2</code> and use the <b>Murmur3</b> hash. Our lab confirmed it: customer 1 is in bucket 5, which is <code>pmod(murmur_hash(1), 8)</code>, not <code>1 % 8</code>. Older articles that say “for INT the hash is the value” describe version 1.</li>
+        <li><code>SORTED BY</code> sorts rows inside each bucket file.</li>
+        <li><b>Sampling:</b> <code>TABLESAMPLE(BUCKET x OUT OF y ON col)</code> reads only the matching bucket files when y divides the bucket count.</li>
+        <li><b>Bucket pruning:</b> <code>WHERE customer_id = 1</code> read 5,649 rows instead of 50,000 (<code>hive.tez.bucket.pruning=true</code>).</li>
+        <li><code>hive.enforce.bucketing</code> is no longer needed: since Hive 2.x inserts always write the declared buckets.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Joins, loads and limits in Hive 4.2.1</h4>
+      <ul>
+        <li><b>Bucket map join / SMB join:</b> when both tables are bucketed (and sorted) on the join key with compatible bucket counts, the optimiser <i>can</i> join bucket i with bucket i without a full shuffle. It is a cost-based choice: on our small lab tables Hive picked a broadcast map join or a shuffle merge join instead. Always check <code>EXPLAIN</code>.</li>
+        <li><b>CTAS</b> into a bucketed table was refused (Error 10068); create the table, then INSERT.</li>
+        <li><b>LOAD DATA</b> into a bucketed table is rewritten into an insert job. With <code>skip.header.line.count=1</code> it lost customers 1, 3 and 5: the header became a data row, and then the first line of <b>every</b> bucket file was skipped. Load into a staging table, then INSERT … SELECT.</li>
+        <li><code>TABLESAMPLE(10 PERCENT)</code> was refused on Tez in our lab; <code>TABLESAMPLE(100 ROWS)</code> and bucket sampling worked.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “Partitioning vs bucketing” is one of the most asked Hive questions. Say: partitioning makes folders by value and suits low-cardinality filter columns; bucketing hashes a column into a fixed number of files and suits high-cardinality columns, sampling and joins; they can be combined. Mention <code>CLUSTERED BY … INTO n BUCKETS</code> and <code>TABLESAMPLE</code>.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Ways to use buckets</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:720px">
+    <thead><tr><th>Use</th><th>Statement</th><th>What happens</th></tr></thead>
+    <tbody><tr><td>Create</td><td><code>CLUSTERED BY (customer_id) SORTED BY (customer_id) INTO 8 BUCKETS</code></td><td>8 files per table or partition, sorted inside</td></tr><tr><td>Partition + bucket</td><td><code>PARTITIONED BY (order_date) CLUSTERED BY (customer_id) INTO 8 BUCKETS</code></td><td>8 files inside every day folder</td></tr><tr><td>Fill</td><td><code>INSERT OVERWRITE TABLE t SELECT …</code></td><td>Hive shuffles by the hash and writes n files</td></tr><tr><td>Bucket sample</td><td><code>TABLESAMPLE(BUCKET 6 OUT OF 8 ON customer_id)</code></td><td>Reads one file (real: 5,649 rows)</td></tr><tr><td>Row sample</td><td><code>TABLESAMPLE(100 ROWS)</code></td><td>First rows of each split</td></tr><tr><td>Random sample</td><td><code>TABLESAMPLE(BUCKET 1 OUT OF 10 ON rand())</code></td><td>Reads everything; different rows each run</td></tr><tr><td>Point lookup</td><td><code>WHERE customer_id = 1</code></td><td>Bucket pruning: one bucket’s rows read</td></tr><tr><td>Join</td><td>Both tables <code>CLUSTERED BY</code> the join key</td><td>Bucket map / SMB join possible (check EXPLAIN)</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Choosing the bucket count: aim for bucket files of a healthy size (tens to hundreds of MB in production), and for joins use the same count, or multiples, on both tables. Too many buckets on a small table just creates small files: our 8 buckets hold only 44–53 KB each, fine for learning but far too many for 50,000 rows in real life.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Kabir buckets orders by customer</h2>
+  <p>All outputs are real, from the Hive 4.2.1 lab (database <code>tiffingo</code>).</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Create a bucketed, sorted table and fill it</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE orders_bkt (
+  order_id INT, customer_id INT, city STRING, order_ts TIMESTAMP,
+  amount DECIMAL(10,2), payment STRING, status STRING)
+CLUSTERED BY (customer_id) SORTED BY (customer_id) INTO 8 BUCKETS
+STORED AS ORC;
+
+INSERT OVERWRITE TABLE orders_bkt
+SELECT order_id, customer_id, city, order_ts, amount, payment, status FROM orders;
+
+DESCRIBE FORMATTED orders_bkt;   -- selected lines
+$ ls …/tiffingo.db/orders_bkt</code></pre><div class="output">| bucketing_version | 2                                 |
+| Num Buckets:      | 8                                 |
+| Bucket Columns:   | [customer_id]                     |
+| Sort Columns:     | [Order(col:customer_id, order:1)] |
+
+000000_0  000001_0  000002_0  000003_0
+000004_0  000005_0  000006_0  000007_0</div></div>
+      <span class="behind">Exactly 8 files, one per bucket, named by bucket number. No <code>SET hive.enforce.bucketing</code> was needed; that setting only mattered before Hive 2. <code>bucketing_version=2</code> tells every engine which hash to use.</span></li>
+    <li><h4>Step 2 · Which file holds which customer?</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT customer_id,
+       regexp_extract(INPUT__FILE__NAME, &#x27;[^/]+$&#x27;, 0) AS file,
+       customer_id % 8                  AS mod8,
+       pmod(hash(customer_id), 8)       AS legacy_hash,
+       pmod(murmur_hash(customer_id), 8) AS murmur
+FROM orders_bkt WHERE customer_id IN (1, 2, 3, 4, 5, 6, 7, 8)
+GROUP BY customer_id, INPUT__FILE__NAME ORDER BY customer_id;</code></pre><div class="output">+--------------+-----------+-------+--------------+---------+
+| customer_id  |   file    | mod8  | legacy_hash  | murmur  |
++--------------+-----------+-------+--------------+---------+
+| 1            | 000005_0  | 1     | 1            | 5       |
+| 2            | 000004_0  | 2     | 2            | 4       |
+| 3            | 000006_0  | 3     | 3            | 6       |
+| 4            | 000005_0  | 4     | 4            | 5       |
+| 5            | 000007_0  | 5     | 5            | 7       |
+| 6            | 000004_0  | 6     | 6            | 4       |
+| 7            | 000000_0  | 7     | 7            | 0       |
+| 8            | 000001_0  | 0     | 0            | 1       |
++--------------+-----------+-------+--------------+---------+</div></div>
+      <span class="behind">The real file number matches the <b>murmur</b> column every time, not <code>id % 8</code>. Many tutorials still teach “bucket = id mod n”; that was version 1. The <code>INPUT__FILE__NAME</code> virtual column is the quickest way to check where rows really are.</span></li>
+    <li><h4>Step 3 · How even are the buckets?</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT regexp_extract(INPUT__FILE__NAME, &#x27;[^/]+$&#x27;, 0) AS file,
+       COUNT(*) AS rows_in_file, COUNT(DISTINCT customer_id) AS customers
+FROM orders_bkt GROUP BY INPUT__FILE__NAME ORDER BY file;</code></pre><div class="output">+-----------+---------------+------------+
+|   file    | rows_in_file  | customers  |
++-----------+---------------+------------+
+| 000000_0  | 6210          | 247        |
+| 000001_0  | 5961          | 244        |
+| 000002_0  | 6754          | 269        |
+| 000003_0  | 5922          | 237        |
+| 000004_0  | 6689          | 262        |
+| 000005_0  | 5649          | 230        |
+| 000006_0  | 6276          | 250        |
+| 000007_0  | 6539          | 261        |
++-----------+---------------+------------+</div></div>
+      <span class="behind">Between 230 and 269 customers per bucket, close to 2,000 ÷ 8 = 250. Rows vary more (5,649 to 6,754), because some customers order more. A customer who orders 100 times more than others would make one bucket much bigger: bucketing spreads <b>keys</b>, not rows (skew, Lesson 5.4).</span></li>
+    <li><h4>Step 4 · Sample one bucket, read one file</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.tez.exec.print.summary=true;
+SELECT COUNT(*) AS n, COUNT(DISTINCT customer_id) AS c
+FROM orders_bkt TABLESAMPLE(BUCKET 6 OUT OF 8 ON customer_id) s;
+
+SELECT … FROM orders_bkt TABLESAMPLE(BUCKET 2 OUT OF 4 ON customer_id) s;
+SELECT … FROM orders     TABLESAMPLE(BUCKET 6 OUT OF 8 ON customer_id) s;  -- not bucketed</code></pre><div class="output">SELECT COUNT(*) AS n, COUNT(DISTINCT customer_id) AS c FROM orders_bkt TABLESAMPLE(BUCKET 6 OUT OF 8 ON customer_id) s;
+  result | 5649  | 230  | · RECORDS_IN 5649 · INPUT_FILES 1
+SELECT COUNT(*) AS n, COUNT(DISTINCT customer_id) AS c FROM orders_bkt TABLESAMPLE(BUCKET 2 OUT OF 4 ON customer_id) s;
+  result | 11610  | 474  | · RECORDS_IN 11610 · INPUT_FILES 2
+SELECT COUNT(*) AS n, COUNT(DISTINCT customer_id) AS c FROM orders TABLESAMPLE(BUCKET 6 OUT OF 8 ON customer_id) s;
+  result | 5649  | 230  | · RECORDS_IN 50000 · INPUT_FILES 1</div></div>
+      <span class="behind">Bucket numbers in TABLESAMPLE start at 1, so BUCKET 6 is file <code>000005_0</code>: 5,649 rows, 230 customers, one file read. <code>2 OUT OF 4</code> takes buckets 2 and 6 (files 1 and 5). On the unbucketed table the same sample gives the same answer but reads all 50,000 rows, because Hive must hash every row.</span></li>
+    <li><h4>Step 5 · Bucket pruning on an equality filter</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.tez.bucket.pruning;
+SELECT COUNT(*) AS n, COUNT(DISTINCT customer_id) AS c
+FROM orders_bkt WHERE customer_id = 1;</code></pre><div class="output">+-------------------------------+
+| hive.tez.bucket.pruning=true  |
++-------------------------------+
+SELECT COUNT(*) AS n, COUNT(DISTINCT customer_id) AS c FROM orders_bkt WHERE customer_id = 1;
+  result | 26  | 1  | · RECORDS_IN 5649 · INPUT_FILES 8</div></div>
+      <span class="behind">Customer 1 has 26 orders. Hive computed customer 1’s bucket and read only that bucket’s 5,649 rows, not 50,000. It also worked for <code>IN (1, 2)</code>: 12,338 rows, exactly buckets 5 and 4. A wide range such as <code>BETWEEN 1 AND 1000</code> touches every bucket, so it saves nothing.</span></li>
+    <li><h4>Step 6 · Other samples: ROWS, rand() and PERCENT</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT COUNT(*) AS n  FROM orders TABLESAMPLE(100 ROWS) s;
+SELECT COUNT(*) AS n1 FROM orders TABLESAMPLE(BUCKET 1 OUT OF 10 ON rand()) s;
+SELECT COUNT(*) AS n2 FROM orders TABLESAMPLE(BUCKET 1 OUT OF 10 ON rand()) s;
+SELECT COUNT(*) AS n  FROM orders TABLESAMPLE(10 PERCENT) s;</code></pre><div class="output">+------+
+|  n   |
++------+
+| 100  |
++------+
++-------+
+|  n1   |
+Error: Error while compiling statement: FAILED: SemanticException 1:45 Percentage sampling is not supported in org.apache.hadoop.hive.ql.io.HiveInputFormat. Error encountered near token &#x27;10&#x27;</div></div>
+      <span class="behind"><code>ON rand()</code> gives about 10% but a different sample each run (5,057, then 4,981), so results cannot be reproduced. Sample on a column (or <code>hash(col)</code>) for repeatable tests. Block sampling by PERCENT was refused on our Tez setup.</span></li>
+    <li><h4>Step 7 · Two surprises: CTAS and LOAD DATA</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE customers_bkt CLUSTERED BY (customer_id) INTO 8 BUCKETS
+STORED AS ORC AS SELECT * FROM customers;
+
+CREATE TABLE cust_bkt_load (customer_id INT, name STRING, city STRING, state STRING,
+  joined_on DATE, plan STRING)
+CLUSTERED BY (customer_id) INTO 4 BUCKETS
+ROW FORMAT DELIMITED FIELDS TERMINATED BY &#x27;,&#x27;
+TBLPROPERTIES (&#x27;skip.header.line.count&#x27;=&#x27;1&#x27;);
+LOAD DATA LOCAL INPATH &#x27;/data/tiffingo/customers/customers.csv&#x27; INTO TABLE cust_bkt_load;
+SELECT COUNT(*) AS loaded, MIN(customer_id) AS min_id, MAX(customer_id) AS max_id FROM cust_bkt_load;</code></pre><div class="output">Error: Error while compiling statement: FAILED: SemanticException [Error 10068]: CREATE-TABLE-AS-SELECT does not support partitioning in the target table 
+
++---------+---------+---------+
+| loaded  | min_id  | max_id  |</div></div>
+      <span class="behind">Bucketed CTAS is refused (the message says “partitioning”, but bucketing triggers it too). LOAD into a bucketed table ran an insert job and wrote 4 bucket files, but only <b>1,997</b> of 2,000 customers came back: the header line was stored as a row, and <code>skip.header.line.count</code> then skipped the first line of <b>each</b> of the 4 files, hiding customers 1, 3 and 5. Load into a plain staging table and INSERT … SELECT instead.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Hashing rows into buckets</h2>
+  <p>Left: real Beeline output. Right: where each row goes and which files are read.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Hash, files, sampling and the LOAD surprise <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real Beeline output">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; CREATE TABLE orders_bkt (…)</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  CLUSTERED BY (customer_id) SORTED BY (customer_id)</text><text x="26" y="78" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  INTO 8 BUCKETS STORED AS ORC;</text><text x="26" y="92" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; INSERT OVERWRITE TABLE orders_bkt SELECT …;</text><text x="26" y="106" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">$ ls  → 000000_0 … 000007_0</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">| customer_id | file     | mod8 | murmur |</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 1           | 000005_0 | 1    | 5      |</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 2           | 000004_0 | 2    | 4      |</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 7           | 000000_0 | 7    | 0      |</text><text x="26" y="106" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  file = murmur, not mod8</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … TABLESAMPLE(BUCKET 6 OUT OF 8</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">                 ON customer_id) s;</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 5649 | 230 |</text><text x="26" y="92" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  RECORDS_IN_Map_1: 5649   INPUT_FILES: 1</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … FROM orders_bkt WHERE customer_id = 1;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 26 | 1 |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  RECORDS_IN_Map_1: 5649 (not 50000)</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; LOAD DATA … INTO TABLE cust_bkt_load;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT COUNT(*), MIN(customer_id) …</text><text x="26" y="78" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">| 1997 | 2 | 2000 |</text><text x="26" y="92" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  customers 1, 3, 5 missing</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Kabir creates and fills an 8-bucket table: 8 files appear.</li>
+          <li>The real bucket of each customer matches murmur_hash, not id mod 8.</li>
+          <li>Sampling one bucket reads one file: 5,649 rows.</li>
+          <li>A filter on one customer reads only that customer’s bucket.</li>
+          <li>LOAD into a bucketed table with a header lost three customers.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Where each row goes and which files are read">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rows are shuffled by hash into 8 writers</text><rect x="14" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="32" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B0</text><rect x="55" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="73" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B1</text><rect x="96" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="114" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B2</text><rect x="137" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="155" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B3</text><rect x="178" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="196" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B4</text><rect x="219" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="237" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B5</text><rect x="260" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="278" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B6</text><rect x="301" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="319" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B7</text><text x="180" y="112" text-anchor="middle" font-size="8" class="s-ink2">one reducer per bucket → one file per bucket</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">n buckets = n files, sorted inside.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink mono">bucket = murmur3(customer_id) mod 8</text><rect x="14" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="32" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B0</text><rect x="55" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="73" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B1</text><rect x="96" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="114" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B2</text><rect x="137" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="155" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B3</text><rect x="178" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="196" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B4</text><rect x="219" y="52" width="37" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="237" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B5</text><rect x="260" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="278" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B6</text><rect x="301" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="319" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B7</text><text x="180" y="112" text-anchor="middle" font-size="8" font-weight="700" class="s-green mono">customer 1 → murmur → 5 → 000005_0</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">bucketing_version 2 (Hive 3+).</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Version 1 used the plain value for INT.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">TABLESAMPLE picks bucket 6 (1-based)</text><rect x="14" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="32" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B0</text><text x="32" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,210</text><rect x="55" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="73" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B1</text><text x="73" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">5,961</text><rect x="96" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="114" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B2</text><text x="114" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,754</text><rect x="137" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="155" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B3</text><text x="155" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">5,922</text><rect x="178" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="196" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B4</text><text x="196" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,689</text><rect x="219" y="52" width="37" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="237" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B5</text><text x="237" y="82" text-anchor="middle" font-size="6.6" class="s-ink2 mono">5,649</text><rect x="260" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="278" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B6</text><text x="278" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,276</text><rect x="301" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="319" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B7</text><text x="319" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,539</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Only file 000005_0 is opened.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Same answer on a flat table costs a full scan.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">WHERE customer_id = 1 → its bucket only</text><rect x="14" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="32" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B0</text><text x="32" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,210</text><rect x="55" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="73" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B1</text><text x="73" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">5,961</text><rect x="96" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="114" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B2</text><text x="114" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,754</text><rect x="137" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="155" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B3</text><text x="155" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">5,922</text><rect x="178" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="196" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B4</text><text x="196" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,689</text><rect x="219" y="52" width="37" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="237" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B5</text><text x="237" y="82" text-anchor="middle" font-size="6.6" class="s-ink2 mono">5,649</text><rect x="260" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="278" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B6</text><text x="278" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,276</text><rect x="301" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="319" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B7</text><text x="319" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,539</text><text x="180" y="112" text-anchor="middle" font-size="8" class="s-ink2">hash the literal, keep that bucket</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bucket pruning: works for = and IN.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Header row + per-file skip</text><rect x="20" y="46" width="76" height="60" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="58" y="62" text-anchor="middle" font-size="7" class="s-ink mono">000000_0</text><text x="58" y="80" text-anchor="middle" font-size="7.6" font-weight="700" class="s-red">header row</text><text x="58" y="96" text-anchor="middle" font-size="6.8" class="s-ink2">skipped</text><rect x="102" y="46" width="76" height="60" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="140" y="62" text-anchor="middle" font-size="7" class="s-ink mono">000001_0</text><text x="140" y="80" text-anchor="middle" font-size="7.6" font-weight="700" class="s-red">cust 1</text><text x="140" y="96" text-anchor="middle" font-size="6.8" class="s-ink2">skipped</text><rect x="184" y="46" width="76" height="60" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="222" y="62" text-anchor="middle" font-size="7" class="s-ink mono">000002_0</text><text x="222" y="80" text-anchor="middle" font-size="7.6" font-weight="700" class="s-red">cust 3</text><text x="222" y="96" text-anchor="middle" font-size="6.8" class="s-ink2">skipped</text><rect x="266" y="46" width="76" height="60" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="304" y="62" text-anchor="middle" font-size="7" class="s-ink mono">000003_0</text><text x="304" y="80" text-anchor="middle" font-size="7.6" font-weight="700" class="s-red">cust 5</text><text x="304" y="96" text-anchor="middle" font-size="6.8" class="s-ink2">skipped</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">skip.header.line.count applies to every file.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">1 header + 3 customers hidden = 1,997.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The insert shuffles rows by the hash so each writer produces one bucket file.</li>
+          <li>Hive 3+ tables use Murmur3 for the bucket number.</li>
+          <li>TABLESAMPLE maps bucket 6 of 8 to file 000005_0 and skips the rest.</li>
+          <li>Hive hashes the literal 1, finds bucket 5 and reads only it.</li>
+          <li>The rewritten load stored the header as a row; then the first line of each bucket file was skipped.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a repeatable sample, a LOAD that lost rows, and what the optimiser did with bucketed joins.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-sample">A repeatable 1-in-8 customer test group</h3>
+  <p class="anim-intro">Product teams need a stable sample of customers. Bucket sampling on the customer column gives one. Counts are real.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Bucket sampling <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A deterministic 1-in-8 sample of customers comes from one bucket of tables bucketed on customer_id">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Test a loyalty rule on 1 in 8 customers</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">needs the SAME customers every day</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">rand() samples change every run.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">(real: 5,057 then 4,981 rows)</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Sample by bucket on the customer column</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink mono">TABLESAMPLE(BUCKET 6 OUT OF 8 ON customer_id)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Deterministic: 230 customers, every time.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cheap on a bucketed table</text><rect x="14" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="32" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B0</text><text x="32" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,210</text><rect x="55" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="73" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B1</text><text x="73" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">5,961</text><rect x="96" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="114" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B2</text><text x="114" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,754</text><rect x="137" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="155" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B3</text><text x="155" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">5,922</text><rect x="178" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="196" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B4</text><text x="196" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,689</text><rect x="219" y="52" width="37" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="237" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B5</text><text x="237" y="82" text-anchor="middle" font-size="6.6" class="s-ink2 mono">5,649</text><rect x="260" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="278" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B6</text><text x="278" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,276</text><rect x="301" y="52" width="37" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="319" y="68" text-anchor="middle" font-size="8" font-weight="700" class="s-ink3">B7</text><text x="319" y="82" text-anchor="middle" font-size="6.6" class="s-ink3 mono">6,539</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One file read instead of eight.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same group in other tables</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">customers_bkt is bucketed the same way</text><text x="180" y="74" text-anchor="middle" font-size="8.4" font-weight="700" class="s-green">bucket 6 = the same 230 customers</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same column, same count, same hash → same group.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Compare</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">test group (bucket 6) vs the rest</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A simple, repeatable experiment split.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A random sample changes every run, so the test group would change too.</li>
+          <li>Sampling on customer_id always selects the same customers.</li>
+          <li>On a bucketed table this reads a single file.</li>
+          <li>Tables bucketed the same way share the same groups.</li>
+          <li>The test group and the rest can be compared fairly.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-loadbug">Three customers vanished: LOAD into a bucketed table</h3>
+  <p class="anim-intro">We found this while building the lesson. LOAD with a header into a bucketed table lost rows silently. Outputs are real.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Load reconciliation <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Loading a CSV with a header into a bucketed table lost three customers because the header became a row and each bucket file skipped its first line">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Monthly customer refresh via LOAD DATA</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">CSV with a header · bucketed text table</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">It used to be an unbucketed table.</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; LOAD DATA … INTO TABLE cust_bkt_load;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT COUNT(*) FROM cust_bkt_load;</text><text x="26" y="78" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">| 1997 |</text><text x="26" y="92" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  expected 2000</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; ALTER TABLE … SET TBLPROPERTIES (&#x27;skip.header.line.count&#x27;=&#x27;0&#x27;);</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">| lines_in_files 2001 | with_id 2000 |</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">| 000000_0 | NULL | name |</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  the header was stored as a row</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-green">Safe pattern</text><text x="180" y="52" text-anchor="middle" font-size="8.4" class="s-ink">1. LOAD into a plain staging table</text><text x="180" y="70" text-anchor="middle" font-size="8" class="s-ink mono">2. INSERT OVERWRITE TABLE bucketed SELECT * FROM stage</text><text x="180" y="88" text-anchor="middle" font-size="8.4" class="s-ink">3. compare counts</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Every row arrives, buckets are correct.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Lesson</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">always reconcile row counts after a load</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Silent data loss is the worst kind.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The refresh job loads a CSV with a header into a bucketed table.</li>
+          <li>The count is 1,997 instead of 2,000.</li>
+          <li>Reading the files without skipping shows the header stored as a row.</li>
+          <li>Load into staging, then INSERT … SELECT into the bucketed table.</li>
+          <li>Reconcile counts after every load.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-joins">Bucket joins: possible, not guaranteed</h3>
+  <p class="anim-intro">Both tables were bucketed and sorted on customer_id. Here is what Hive 4.2.1 actually chose on our small tables.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Join planning <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Two tables bucketed on the join key allow bucket map or SMB joins, but on small tables Hive chose a broadcast map join or a shuffle merge join">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">orders ⋈ customers on customer_id</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink mono">both CLUSTERED BY (customer_id) INTO 8 BUCKETS</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The setup for bucket-aware joins.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bucket map join (idea)</text><rect x="20" y="46" width="76" height="24" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="58" y="62" text-anchor="middle" font-size="7.4" class="s-ink mono">orders B0</text><path d="M58 72L58 86" style="fill:none;stroke:var(--green);stroke-width:1.8"/><path d="M55.0 79.7L58 86L61.0 79.7" style="fill:none;stroke:var(--green);stroke-width:1.8"/><rect x="20" y="88" width="76" height="24" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="58" y="104" text-anchor="middle" font-size="7.4" class="s-ink mono">cust B0</text><rect x="102" y="46" width="76" height="24" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="140" y="62" text-anchor="middle" font-size="7.4" class="s-ink mono">orders B1</text><path d="M140 72L140 86" style="fill:none;stroke:var(--green);stroke-width:1.8"/><path d="M137.0 79.7L140 86L143.0 79.7" style="fill:none;stroke:var(--green);stroke-width:1.8"/><rect x="102" y="88" width="76" height="24" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="140" y="104" text-anchor="middle" font-size="7.4" class="s-ink mono">cust B1</text><rect x="184" y="46" width="76" height="24" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="222" y="62" text-anchor="middle" font-size="7.4" class="s-ink mono">orders B2</text><path d="M222 72L222 86" style="fill:none;stroke:var(--green);stroke-width:1.8"/><path d="M219.0 79.7L222 86L225.0 79.7" style="fill:none;stroke:var(--green);stroke-width:1.8"/><rect x="184" y="88" width="76" height="24" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="222" y="104" text-anchor="middle" font-size="7.4" class="s-ink mono">cust B2</text><rect x="266" y="46" width="76" height="24" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="304" y="62" text-anchor="middle" font-size="7.4" class="s-ink mono">orders B3</text><path d="M304 72L304 86" style="fill:none;stroke:var(--green);stroke-width:1.8"/><path d="M301.0 79.7L304 86L307.0 79.7" style="fill:none;stroke:var(--green);stroke-width:1.8"/><rect x="266" y="88" width="76" height="24" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="304" y="104" text-anchor="middle" font-size="7.4" class="s-ink mono">cust B3</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each task loads only its matching bucket.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">SMB: both sorted → merge without hashing.</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; EXPLAIN SELECT c.plan, COUNT(*) …</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  FROM orders_bkt o JOIN customers_bkt c …</text><text x="26" y="78" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  Map 1 &lt;- Map 3 (BROADCAST_EDGE)</text><text x="26" y="92" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  Map Join Operator [MAPJOIN_26]</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SET hive.auto.convert.join=false;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; EXPLAIN …</text><text x="26" y="78" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  Reducer 2 &lt;- Map 1, Map 4 (SIMPLE_EDGE)</text><text x="26" y="92" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  Merge Join Operator [MERGEJOIN_19]</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">What this means</text><text x="180" y="52" text-anchor="middle" font-size="8.2" class="s-ink2">small dimension → broadcast is cheaper anyway</text><text x="180" y="70" text-anchor="middle" font-size="8.2" class="s-ink2">bucket joins pay off when BOTH tables are big</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bucketing makes it possible; the optimiser decides.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Check EXPLAIN on your data.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Both tables are bucketed the same way on the join key.</li>
+          <li>In a bucket map join each task joins bucket i with bucket i only.</li>
+          <li>With 2,000 customers, Hive simply broadcast the whole small table.</li>
+          <li>With map joins turned off, it used a normal shuffle merge join.</li>
+          <li>Bucket joins help when both sides are too large to broadcast; always confirm with EXPLAIN.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Bucketing at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="9" font-weight="700" class="s-green mono">BUCKET 1/32</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">stable sample</text></svg></div>
+    <div><h4>1. Repeatable samples and experiments</h4>
+      <p>Data scientists test queries and models on one bucket of a huge table, and product teams pick experiment groups by user bucket, so the same users are in the group every day.</p>
+      <div class="uc-flow"><span>Huge table</span><i>→</i><span class="java">TABLESAMPLE bucket</span><i>→</i><span>Fast, stable sample</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-blue mono">B i ⋈ B i</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">big joins</text></svg></div>
+    <div><h4>2. Joining two large tables</h4>
+      <p>When two fact-sized tables are joined every day on the same key (orders and payments on order_id), bucketing both on that key lets the engine join matching buckets instead of shuffling everything.</p>
+      <div class="uc-flow"><span>Two big tables</span><i>→</i><span class="java">bucketed on key</span><i>→</i><span>Bucket / SMB join</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet mono">id = ?</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">lookups</text></svg></div>
+    <div><h4>3. Customer look-ups</h4>
+      <p>Support tools that pull one customer’s history benefit from bucket pruning: only that customer’s bucket inside each date partition is read.</p>
+      <div class="uc-flow"><span>Customer id</span><i>→</i><span class="java">bucket pruning</span><i>→</i><span>One file per day</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc mono">ACID</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">transactional</text></svg></div>
+    <div><h4>4. Transactional tables</h4>
+      <p>Older Hive versions required ACID tables to be bucketed; Hive 3+ does not, but bucketing still organises delta files by key in many existing warehouses (Module 7).</p>
+      <div class="uc-flow"><span>Updates</span><i>→</i><span class="java">bucketed ACID</span><i>→</i><span>Organised deltas</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc mono">v2 hash</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">engines agree</text></svg></div>
+    <div><h4>5. Shared tables across engines</h4>
+      <p>Spark and Trino can read Hive-bucketed tables. The bucketing_version property tells them which hash Hive used, so bucket pruning and joins stay correct across engines.</p>
+      <div class="uc-flow"><span>Hive writes</span><i>→</i><span class="java">bucketing_version</span><i>→</i><span>Spark / Trino read</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: hashing ids into bucket files</h2>
+  <p>These programs place ids into bucket files and sample them, the way Hive does. Remember: real Hive 4 tables use Murmur3, so the exact file numbers differ (Step 2). Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># Bucketing: a hash of the column decides the file. Python&#x27;s hash() for small
+# ints is the value itself, like Hive&#x27;s old version 1; version 2 uses Murmur3.
+customers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+N = 4
+
+buckets = {b: [] for b in range(N)}
+for cid in customers:
+    b = hash(cid) % N                 # version 1 idea: value mod N
+    buckets[b].append(cid)
+
+for b, ids in buckets.items():
+    print(f&quot;{b:06d}_0&quot;, ids)</code></pre><div class="output">000000_0 [4, 8, 12, 16]
+000001_0 [1, 5, 9, 13]
+000002_0 [2, 6, 10, 14]
+000003_0 [3, 7, 11, 15]</div></div>
+  <ul class="anno"><li><code>    b = hash(cid) % N                 # version 1 idea: value mod N</code><span>The rule is always hash mod N. Only the hash function changed between bucketing versions.</span></li><li><code>    print(f&quot;{b:06d}_0&quot;, ids)</code><span>Hive names bucket files by number: 000000_0, 000001_0, …</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Ids into buckets",
+   "hint": "Press <b>Run<\/b>. Each bucket gets 4 of the 16 ids, and an id always lands in the same bucket.",
+   "code": "# Bucketing: a hash of the column decides the file. Python's hash() for small\n# ints is the value itself, like Hive's old version 1; version 2 uses Murmur3.\ncustomers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]\nN = 4\n\nbuckets = {b: [] for b in range(N)}\nfor cid in customers:\n    b = hash(cid) % N                 # version 1 idea: value mod N\n    buckets[b].append(cid)\n\nfor b, ids in buckets.items():\n    print(f\"{b:06d}_0\", ids)\n"
+  },
+  {
+   "label": "2 · Predict first: TABLESAMPLE",
+   "hint": "<b>Predict first:<\/b> which file does BUCKET 6 OUT OF 8 read? (Real lab: 000005_0, 5,649 rows.)",
+   "code": "x, y = 6, 8          # TABLESAMPLE(BUCKET x OUT OF y ON customer_id)\nn_buckets = 8\nfiles = [b for b in range(n_buckets) if b % y == x - 1]\nprint([f\"{b:06d}_0\" for b in files])\n"
+  },
+  {
+   "label": "3 · Half the buckets",
+   "hint": "BUCKET 2 OUT OF 4 on an 8-bucket table reads two files. Real lab: 5,961 + 5,649 = 11,610 rows.",
+   "code": "rows = [6210, 5961, 6754, 5922, 6689, 5649, 6276, 6539]   # real rows per file\nx, y = 2, 4\npicked = [b for b in range(8) if b % y == x - 1]\nprint(picked, sum(rows[b] for b in picked))\n"
+  },
+  {
+   "label": "4 · Keys are even, rows are not",
+   "hint": "Add a “whale” customer with 5,000 orders to bucket 0 and see how uneven the files become.",
+   "code": "rows = [6210, 5961, 6754, 5922, 6689, 5649, 6276, 6539]\nwhale = 0\nrows[0] += whale\navg = sum(rows) / len(rows)\nprint(\"largest / average =\", round(max(rows) / avg, 2))\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This loader skips one header line in every bucket file, like the real LOAD bug. Make it skip the header only once, before bucketing.",
+   "code": "lines = [\"customer_id,name\", \"1,Aarav\", \"2,Ananya\", \"3,Arjun\", \"4,Diya\", \"5,Ishaan\"]\nN = 2\nfiles = {b: [] for b in range(N)}\nfor i, line in enumerate(lines):                 # header goes in as a row\n    files[i % N].append(line)\nloaded = [l for b in files.values() for l in b[1:]]   # skip 1 line per file\nassert len(loaded) == 5, f\"loaded {len(loaded)} customers, expected 5\"\nprint(loaded)\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: partitions with buckets, shared groups and the hidden header</h3>
+  <p>Three more queries to try in Beeline on the TiffinGo data. <b>Outputs are real</b>, from Hive 4.2.1.</p>
+  <div class="pcrun"><h4>1 · Partition by day, bucket by customer</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>CREATE TABLE orders_day_bkt (order_id INT, customer_id INT, city STRING, amount DECIMAL(10,2))
+PARTITIONED BY (order_date DATE)
+CLUSTERED BY (customer_id) INTO 4 BUCKETS STORED AS ORC;
+INSERT OVERWRITE TABLE orders_day_bkt PARTITION (order_date)
+SELECT order_id, customer_id, city, amount, order_date FROM orders WHERE order_date &lt;= &#x27;2026-10-02&#x27;;
+SELECT order_date, regexp_extract(INPUT__FILE__NAME, &#x27;[^/]+/[^/]+$&#x27;, 0) AS file, COUNT(*) AS n
+FROM orders_day_bkt GROUP BY order_date, INPUT__FILE__NAME ORDER BY file;</code></pre><div class="output">+-------------+---------------------------------+------+
+| order_date  |              file               |  n   |
++-------------+---------------------------------+------+
+| 2026-10-01  | order_date=2026-10-01/000000_0  | 403  |
+| 2026-10-01  | order_date=2026-10-01/000001_0  | 359  |
+| 2026-10-01  | order_date=2026-10-01/000002_0  | 431  |
+| 2026-10-01  | order_date=2026-10-01/000003_0  | 448  |
+| 2026-10-02  | order_date=2026-10-02/000000_0  | 452  |
+| 2026-10-02  | order_date=2026-10-02/000001_0  | 358  |
+| 2026-10-02  | order_date=2026-10-02/000002_0  | 418  |
+| 2026-10-02  | order_date=2026-10-02/000003_0  | 389  |
++-------------+---------------------------------+------+</div></div>
+  <p class="muted">Every partition folder gets its own 4 bucket files. The four files of 10-01 add up to 1,641, the day’s real count. Date filters prune folders; customer filters prune buckets inside them.</p></div>
+  <div class="pcrun"><h4>2 · Same bucket, same customers, in two tables</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SELECT COUNT(*) AS same FROM
+  (SELECT DISTINCT customer_id FROM orders_bkt TABLESAMPLE(BUCKET 6 OUT OF 8 ON customer_id) a) x
+JOIN
+  (SELECT customer_id FROM customers_bkt TABLESAMPLE(BUCKET 6 OUT OF 8 ON customer_id) b) y
+ON x.customer_id = y.customer_id;</code></pre><div class="output">+-------+
+| same  |</div></div>
+  <p class="muted">All 230 customers in bucket 6 of orders are exactly the customers in bucket 6 of customers: same column, same bucket count, same hash. This is the property bucket joins rely on.</p></div>
+  <div class="pcrun"><h4>3 · Find the hidden header</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>ALTER TABLE cust_bkt_load SET TBLPROPERTIES (&#x27;skip.header.line.count&#x27;=&#x27;0&#x27;);
+SELECT COUNT(*) AS lines_in_files, COUNT(customer_id) AS with_id FROM cust_bkt_load;
+SELECT regexp_extract(INPUT__FILE__NAME, &#x27;[^/]+$&#x27;, 0) AS file, customer_id, name
+FROM cust_bkt_load WHERE customer_id IS NULL OR customer_id IN (1, 3, 5);</code></pre><div class="output">+-----------------+----------+
+| lines_in_files  | with_id  |
++-----------------+----------+
+| 2001            | 2000     |
++-----------------+----------+
++-----------+--------------+--------------+
+|   file    | customer_id  |     name     |
++-----------+--------------+--------------+
+| 000000_0  | NULL         | name         |
+| 000002_0  | 3            | Arjun Nair   |
+| 000001_0  | 1            | Aarav Desai  |
+| 000003_0  | 5            | Aarav Singh  |
++-----------+--------------+--------------+</div></div>
+  <p class="muted">With skipping off, all 2,001 lines are back: the header sits in file 0 as a row with a NULL id, and customers 1, 3 and 5 are the first lines of files 1, 2 and 3. That explains the 1,997.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Writing rows into bucket files</h2>
+  <p>Each row is hashed and appended to its bucket’s file. Watch <code>files</code> fill up; equal ids always meet in the same file.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "rows = [(100001, 7), (100002, 12), (100003, 7), (100004, 3)]",
+  "N = 4",
+  "files = {}",
+  "for order_id, cid in rows:",
+  "    b = cid % N",
+  "    files.setdefault(b, []).append(order_id)",
+  "print(files)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>rows<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)"
+   ],
+   "newVar": "rows"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>N<\/code> is created: 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)"
+   ],
+   "newVar": "N"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>files<\/code> is created: → dict #6. A new dict object (#6) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (0)<\/b> {}"
+   ],
+   "newVar": "files"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>order_id<\/code> is created: 100001. <code>cid<\/code> is created: 7.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100001"
+      ],
+      [
+       "cid",
+       "7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (0)<\/b> {}"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 5,
+   "phase": "Hash",
+   "note": "Version-1 style (value mod N) to keep the numbers easy; Hive 4 tables use Murmur3. <code>b<\/code> is created: 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100001"
+      ],
+      [
+       "cid",
+       "7"
+      ],
+      [
+       "b",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (0)<\/b> {}"
+   ],
+   "newVar": "b"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #6 dict now holds {3: → list #7} A new list object (#7) is created: [100001]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100001"
+      ],
+      [
+       "cid",
+       "7"
+      ],
+      [
+       "b",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (1)<\/b> {3: → list #7}",
+    "<b>#7 list (1)<\/b> [100001]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>order_id<\/code> changes to 100002. <code>cid<\/code> changes to 12.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100002"
+      ],
+      [
+       "cid",
+       "12"
+      ],
+      [
+       "b",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (1)<\/b> {3: → list #7}",
+    "<b>#7 list (1)<\/b> [100001]"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>b<\/code> changes to 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100002"
+      ],
+      [
+       "cid",
+       "12"
+      ],
+      [
+       "b",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (1)<\/b> {3: → list #7}",
+    "<b>#7 list (1)<\/b> [100001]"
+   ],
+   "newVar": "b"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #6 dict now holds {3: → list #7, 0: → list #8} A new list object (#8) is created: [100002]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100002"
+      ],
+      [
+       "cid",
+       "12"
+      ],
+      [
+       "b",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (2)<\/b> {3: → list #7, 0: → list #8}",
+    "<b>#7 list (1)<\/b> [100001]",
+    "<b>#8 list (1)<\/b> [100002]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>order_id<\/code> changes to 100003. <code>cid<\/code> changes to 7.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100003"
+      ],
+      [
+       "cid",
+       "7"
+      ],
+      [
+       "b",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (2)<\/b> {3: → list #7, 0: → list #8}",
+    "<b>#7 list (1)<\/b> [100001]",
+    "<b>#8 list (1)<\/b> [100002]"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>b<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100003"
+      ],
+      [
+       "cid",
+       "7"
+      ],
+      [
+       "b",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (2)<\/b> {3: → list #7, 0: → list #8}",
+    "<b>#7 list (1)<\/b> [100001]",
+    "<b>#8 list (1)<\/b> [100002]"
+   ],
+   "newVar": "b"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #7 list now holds [100001, 100003]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100003"
+      ],
+      [
+       "cid",
+       "7"
+      ],
+      [
+       "b",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (2)<\/b> {3: → list #7, 0: → list #8}",
+    "<b>#7 list (2)<\/b> [100001, 100003]",
+    "<b>#8 list (1)<\/b> [100002]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>order_id<\/code> changes to 100004. <code>cid<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100004"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "b",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (2)<\/b> {3: → list #7, 0: → list #8}",
+    "<b>#7 list (2)<\/b> [100001, 100003]",
+    "<b>#8 list (1)<\/b> [100002]"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100004"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "b",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (2)<\/b> {3: → list #7, 0: → list #8}",
+    "<b>#7 list (2)<\/b> [100001, 100003]",
+    "<b>#8 list (1)<\/b> [100002]"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #7 list now holds [100001, 100003, 100004]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100004"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "b",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (2)<\/b> {3: → list #7, 0: → list #8}",
+    "<b>#7 list (3)<\/b> [100001, 100003, 100004]",
+    "<b>#8 list (1)<\/b> [100002]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100004"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "b",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (2)<\/b> {3: → list #7, 0: → list #8}",
+    "<b>#7 list (3)<\/b> [100001, 100003, 100004]",
+    "<b>#8 list (1)<\/b> [100002]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Result",
+   "note": "Both orders of customer 7 are in the same file, which is what makes bucket sampling and joins work. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "files",
+       "→ dict #6"
+      ],
+      [
+       "order_id",
+       "100004"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "b",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [→ tuple #2, → tuple #3, → tuple #4, → tuple #5]",
+    "<b>#2 tuple (2)<\/b> (100001, 7)",
+    "<b>#3 tuple (2)<\/b> (100002, 12)",
+    "<b>#4 tuple (2)<\/b> (100003, 7)",
+    "<b>#5 tuple (2)<\/b> (100004, 3)",
+    "<b>#6 dict (2)<\/b> {3: → list #7, 0: → list #8}",
+    "<b>#7 list (3)<\/b> [100001, 100003, 100004]",
+    "<b>#8 list (1)<\/b> [100002]"
+   ],
+   "out": "{3: [100001, 100003, 100004], 0: [100002]}\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three bucketing decisions from TiffinGo’s data team.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Design · partition or bucket?</span></div>
+    <h4>Pick partitioning or bucketing for each column</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>For each column, decide: partition (few values, used in filters), bucket (many values, used in joins or lookups), or neither.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>order_date (30/month), city (8), customer_id (2,000+), order_id (50,000), status (3)</pre></div><div><small>Expected output</small><pre>order_date       30 filter  -&gt; partition
+city              8 filter  -&gt; partition
+customer_id    2000 join    -&gt; bucket
+order_id      50000 lookup  -&gt; bucket
+status            3 rare    -&gt; neither</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Count distinct values.</li><li>Few values and filtered often → partition.</li><li>Many values and joined or looked up → bucket.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "city could be a second partition level only if each date-city folder stays large; otherwise keep it as a normal column.",
+   "code": "cols = {\"order_date\": (30, \"filter\"), \"city\": (8, \"filter\"), \"customer_id\": (2000, \"join\"),\n        \"order_id\": (50000, \"lookup\"), \"status\": (3, \"rare\")}\nfor c, (n, use) in cols.items():\n    if use == \"filter\" and n <= 1000:\n        d = \"partition\"\n    elif use in (\"join\", \"lookup\"):\n        d = \"bucket\"\n    else:\n        d = \"neither\"\n    print(f\"{c:12} {n:6} {use:7} -> {d}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "cols = {\"order_date\": (30, \"filter\"), \"city\": (8, \"filter\"), \"customer_id\": (2000, \"join\"),",
+  "        \"order_id\": (50000, \"lookup\"), \"status\": (3, \"rare\")}",
+  "for c, (n, use) in cols.items():",
+  "    if use == \"filter\" and n <= 1000:",
+  "        d = \"partition\"",
+  "    elif use in (\"join\", \"lookup\"):",
+  "        d = \"bucket\"",
+  "    else:",
+  "        d = \"neither\"",
+  "    print(f\"{c:12} {n:6} {use:7} -> {d}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>cols<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t… A new tuple object (#2) is created: (30, &#x27;filter&#x27;) A new tuple object (#3) is created: (8, &#x27;filter&#x27;) A new tuple object (#4) is created: (2000, &#x27;join&#x27;) A new tuple object (#5) is created: (50000, &#x27;lookup&#x27;) A new tuple object (#6) is created: (3, &#x27;rare&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "newVar": "cols"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>c<\/code> is created: &#x27;order_date&#x27;. <code>n<\/code> is created: 30. <code>use<\/code> is created: &#x27;filter&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date'"
+      ],
+      [
+       "n",
+       "30"
+      ],
+      [
+       "use",
+       "'filter'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "newVar": "use"
+  },
+  {
+   "line": 4,
+   "phase": "Rule",
+   "note": "A simplification. Real decisions also consider data size per partition (Lesson 5.4). The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date'"
+      ],
+      [
+       "n",
+       "30"
+      ],
+      [
+       "use",
+       "'filter'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>d<\/code> is created: &#x27;partition&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date'"
+      ],
+      [
+       "n",
+       "30"
+      ],
+      [
+       "use",
+       "'filter'"
+      ],
+      [
+       "d",
+       "'partition'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "newVar": "d"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date'"
+      ],
+      [
+       "n",
+       "30"
+      ],
+      [
+       "use",
+       "'filter'"
+      ],
+      [
+       "d",
+       "'partition'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "out": "order_date       30 filter  -> partition\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>c<\/code> changes to &#x27;city&#x27;. <code>n<\/code> changes to 8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'city'"
+      ],
+      [
+       "n",
+       "8"
+      ],
+      [
+       "use",
+       "'filter'"
+      ],
+      [
+       "d",
+       "'partition'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "newVar": "n"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'city'"
+      ],
+      [
+       "n",
+       "8"
+      ],
+      [
+       "use",
+       "'filter'"
+      ],
+      [
+       "d",
+       "'partition'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'city'"
+      ],
+      [
+       "n",
+       "8"
+      ],
+      [
+       "use",
+       "'filter'"
+      ],
+      [
+       "d",
+       "'partition'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'city'"
+      ],
+      [
+       "n",
+       "8"
+      ],
+      [
+       "use",
+       "'filter'"
+      ],
+      [
+       "d",
+       "'partition'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "out": "city              8 filter  -> partition\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>c<\/code> changes to &#x27;customer_id&#x27;. <code>n<\/code> changes to 2000. <code>use<\/code> changes to &#x27;join&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'customer_id'"
+      ],
+      [
+       "n",
+       "2000"
+      ],
+      [
+       "use",
+       "'join'"
+      ],
+      [
+       "d",
+       "'partition'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "newVar": "use"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'customer_id'"
+      ],
+      [
+       "n",
+       "2000"
+      ],
+      [
+       "use",
+       "'join'"
+      ],
+      [
+       "d",
+       "'partition'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'customer_id'"
+      ],
+      [
+       "n",
+       "2000"
+      ],
+      [
+       "use",
+       "'join'"
+      ],
+      [
+       "d",
+       "'partition'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>d<\/code> changes to &#x27;bucket&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'customer_id'"
+      ],
+      [
+       "n",
+       "2000"
+      ],
+      [
+       "use",
+       "'join'"
+      ],
+      [
+       "d",
+       "'bucket'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "newVar": "d"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'customer_id'"
+      ],
+      [
+       "n",
+       "2000"
+      ],
+      [
+       "use",
+       "'join'"
+      ],
+      [
+       "d",
+       "'bucket'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "out": "customer_id    2000 join    -> bucket\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>c<\/code> changes to &#x27;order_id&#x27;. <code>n<\/code> changes to 50000. <code>use<\/code> changes to &#x27;lookup&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_id'"
+      ],
+      [
+       "n",
+       "50000"
+      ],
+      [
+       "use",
+       "'lookup'"
+      ],
+      [
+       "d",
+       "'bucket'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "newVar": "use"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_id'"
+      ],
+      [
+       "n",
+       "50000"
+      ],
+      [
+       "use",
+       "'lookup'"
+      ],
+      [
+       "d",
+       "'bucket'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_id'"
+      ],
+      [
+       "n",
+       "50000"
+      ],
+      [
+       "use",
+       "'lookup'"
+      ],
+      [
+       "d",
+       "'bucket'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_id'"
+      ],
+      [
+       "n",
+       "50000"
+      ],
+      [
+       "use",
+       "'lookup'"
+      ],
+      [
+       "d",
+       "'bucket'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_id'"
+      ],
+      [
+       "n",
+       "50000"
+      ],
+      [
+       "use",
+       "'lookup'"
+      ],
+      [
+       "d",
+       "'bucket'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "out": "order_id      50000 lookup  -> bucket\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>c<\/code> changes to &#x27;status&#x27;. <code>n<\/code> changes to 3. <code>use<\/code> changes to &#x27;rare&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'status'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "use",
+       "'rare'"
+      ],
+      [
+       "d",
+       "'bucket'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "newVar": "use"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'status'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "use",
+       "'rare'"
+      ],
+      [
+       "d",
+       "'bucket'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'status'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "use",
+       "'rare'"
+      ],
+      [
+       "d",
+       "'bucket'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "<code>d<\/code> changes to &#x27;neither&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'status'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "use",
+       "'rare'"
+      ],
+      [
+       "d",
+       "'neither'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "newVar": "d"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'status'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "use",
+       "'rare'"
+      ],
+      [
+       "d",
+       "'neither'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ],
+   "out": "status            3 rare    -> neither\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'status'"
+      ],
+      [
+       "n",
+       "3"
+      ],
+      [
+       "use",
+       "'rare'"
+      ],
+      [
+       "d",
+       "'neither'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (5)<\/b> {&#x27;order_date&#x27;: → tuple #2, &#x27;city&#x27;: → tuple #3, &#x27;customer_id&#x27;: → tuple #4, &#x27;order_id&#x27;: → t…",
+    "<b>#2 tuple (2)<\/b> (30, &#x27;filter&#x27;)",
+    "<b>#3 tuple (2)<\/b> (8, &#x27;filter&#x27;)",
+    "<b>#4 tuple (2)<\/b> (2000, &#x27;join&#x27;)",
+    "<b>#5 tuple (2)<\/b> (50000, &#x27;lookup&#x27;)",
+    "<b>#6 tuple (2)<\/b> (3, &#x27;rare&#x27;)"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Analytics · sampling</span></div>
+    <h4>Estimate total revenue from one bucket</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Before running a heavy query, estimate total October revenue from bucket 6 of 8 and compare with the real total of all buckets.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>rows per bucket (real), average order value 300</pre></div><div><small>Expected output</small><pre>estimate 45192 actual 50000 error -9.6%</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Take the rows of one bucket.</li><li>Scale by the number of buckets.</li><li>Compare with the full count.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The estimate is 9.6% low because bucket 6 is the smallest file. Sample two or three buckets for a better estimate.",
+   "code": "rows = [6210, 5961, 6754, 5922, 6689, 5649, 6276, 6539]\nsample = rows[5]                      # BUCKET 6 OUT OF 8\nestimate = sample * 8\nprint(\"estimate\", estimate, \"actual\", sum(rows), f\"error {100 * (estimate - sum(rows)) / sum(rows):.1f}%\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "rows = [6210, 5961, 6754, 5922, 6689, 5649, 6276, 6539]",
+  "sample = rows[5]                      # BUCKET 6 OUT OF 8",
+  "estimate = sample * 8",
+  "print(\"estimate\", estimate, \"actual\", sum(rows), f\"error {100 * (estimate - sum(rows)) / sum(rows):.1f}%\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>rows<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6210, 5961, 6754, 5922, 6689, 5649, 6276, 6539]"
+   ],
+   "newVar": "rows"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>sample<\/code> is created: 5649.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "sample",
+       "5649"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6210, 5961, 6754, 5922, 6689, 5649, 6276, 6539]"
+   ],
+   "newVar": "sample"
+  },
+  {
+   "line": 3,
+   "phase": "Scale",
+   "note": "One bucket holds about one-eighth of the keys, not exactly one-eighth of the rows. <code>estimate<\/code> is created: 45192.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "sample",
+       "5649"
+      ],
+      [
+       "estimate",
+       "45192"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6210, 5961, 6754, 5922, 6689, 5649, 6276, 6539]"
+   ],
+   "newVar": "estimate"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "sample",
+       "5649"
+      ],
+      [
+       "estimate",
+       "45192"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6210, 5961, 6754, 5922, 6689, 5649, 6276, 6539]"
+   ],
+   "out": "estimate 45192 actual 50000 error -9.6%\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Engineering · load pipeline</span></div>
+    <h4>A safe load into a bucketed table</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Write the steps so that a CSV with a header lands fully in a bucketed table, and prove the count, avoiding the LOAD bug from Step 7.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>CSV: 1 header + 8 rows (a small version of the 2,000-customer file)</pre></div><div><small>Expected output</small><pre>stage 8 bucketed 8 OK</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>LOAD into a plain staging table with skip.header.line.count=1.</li><li>INSERT OVERWRITE the bucketed table from staging.</li><li>Compare COUNT(*) of both.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Add the count check to the job and fail it on a mismatch: in our lab the direct LOAD gave 1,997 without any error.",
+   "code": "csv = [\"customer_id,name\"] + [f\"{i},Customer {i}\" for i in range(1, 9)]\nstage = csv[1:]                                  # header skipped once, on the plain table\nN = 4\nbuckets = {b: [] for b in range(N)}\nfor line in stage:                               # INSERT ... SELECT * FROM stage\n    cid = int(line.split(\",\")[0])\n    buckets[cid % N].append(line)\nloaded = sum(len(v) for v in buckets.values())\nprint(\"stage\", len(stage), \"bucketed\", loaded, \"OK\" if loaded == len(stage) else \"MISMATCH\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "csv = [\"customer_id,name\"] + [f\"{i},Customer {i}\" for i in range(1, 9)]",
+  "stage = csv[1:]                                  # header skipped once, on the plain table",
+  "N = 4",
+  "buckets = {b: [] for b in range(N)}",
+  "for line in stage:                               # INSERT ... SELECT * FROM stage",
+  "    cid = int(line.split(\",\")[0])",
+  "    buckets[cid % N].append(line)",
+  "loaded = sum(len(v) for v in buckets.values())",
+  "print(\"stage\", len(stage), \"bucketed\", loaded, \"OK\" if loaded == len(stage) else \"MISMATCH\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>csv<\/code> is created: → list #1. A new list object (#1) is created: [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…"
+   ],
+   "newVar": "csv"
+  },
+  {
+   "line": 2,
+   "phase": "Staging",
+   "note": "The header is removed by the plain text table before any bucketing happens. <code>stage<\/code> is created: → list #2. A new list object (#2) is created: [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…"
+   ],
+   "newVar": "stage"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>N<\/code> is created: 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…"
+   ],
+   "newVar": "N"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>buckets<\/code> is created: → dict #3. A new dict object (#3) is created: {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7} A new list object (#4) is created: [] A new list object (#5) is created: [] A new list object (#6) is created: [] A new list object (#7) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "buckets"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>line<\/code> is created: &#x27;1,Customer 1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'1,Customer 1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "line"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>cid<\/code> is created: 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'1,Customer 1'"
+      ],
+      [
+       "cid",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (0)<\/b> []",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #5 list now holds [&#x27;1,Customer 1&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'1,Customer 1'"
+      ],
+      [
+       "cid",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>line<\/code> changes to &#x27;2,Customer 2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'2,Customer 2'"
+      ],
+      [
+       "cid",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "line"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>cid<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'2,Customer 2'"
+      ],
+      [
+       "cid",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (0)<\/b> []",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #6 list now holds [&#x27;2,Customer 2&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'2,Customer 2'"
+      ],
+      [
+       "cid",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>line<\/code> changes to &#x27;3,Customer 3&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'3,Customer 3'"
+      ],
+      [
+       "cid",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "line"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>cid<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'3,Customer 3'"
+      ],
+      [
+       "cid",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (0)<\/b> []"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #7 list now holds [&#x27;3,Customer 3&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'3,Customer 3'"
+      ],
+      [
+       "cid",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>line<\/code> changes to &#x27;4,Customer 4&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'4,Customer 4'"
+      ],
+      [
+       "cid",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ],
+   "newVar": "line"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>cid<\/code> changes to 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'4,Customer 4'"
+      ],
+      [
+       "cid",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (0)<\/b> []",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #4 list now holds [&#x27;4,Customer 4&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'4,Customer 4'"
+      ],
+      [
+       "cid",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>line<\/code> changes to &#x27;5,Customer 5&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'5,Customer 5'"
+      ],
+      [
+       "cid",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ],
+   "newVar": "line"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>cid<\/code> changes to 5.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'5,Customer 5'"
+      ],
+      [
+       "cid",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (1)<\/b> [&#x27;1,Customer 1&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #5 list now holds [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'5,Customer 5'"
+      ],
+      [
+       "cid",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>line<\/code> changes to &#x27;6,Customer 6&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'6,Customer 6'"
+      ],
+      [
+       "cid",
+       "5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ],
+   "newVar": "line"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>cid<\/code> changes to 6.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'6,Customer 6'"
+      ],
+      [
+       "cid",
+       "6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (1)<\/b> [&#x27;2,Customer 2&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #6 list now holds [&#x27;2,Customer 2&#x27;, &#x27;6,Customer 6&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'6,Customer 6'"
+      ],
+      [
+       "cid",
+       "6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;2,Customer 2&#x27;, &#x27;6,Customer 6&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>line<\/code> changes to &#x27;7,Customer 7&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'7,Customer 7'"
+      ],
+      [
+       "cid",
+       "6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;2,Customer 2&#x27;, &#x27;6,Customer 6&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ],
+   "newVar": "line"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>cid<\/code> changes to 7.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'7,Customer 7'"
+      ],
+      [
+       "cid",
+       "7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;2,Customer 2&#x27;, &#x27;6,Customer 6&#x27;]",
+    "<b>#7 list (1)<\/b> [&#x27;3,Customer 3&#x27;]"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #7 list now holds [&#x27;3,Customer 3&#x27;, &#x27;7,Customer 7&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'7,Customer 7'"
+      ],
+      [
+       "cid",
+       "7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;2,Customer 2&#x27;, &#x27;6,Customer 6&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;3,Customer 3&#x27;, &#x27;7,Customer 7&#x27;]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>line<\/code> changes to &#x27;8,Customer 8&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'8,Customer 8'"
+      ],
+      [
+       "cid",
+       "7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;2,Customer 2&#x27;, &#x27;6,Customer 6&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;3,Customer 3&#x27;, &#x27;7,Customer 7&#x27;]"
+   ],
+   "newVar": "line"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>cid<\/code> changes to 8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'8,Customer 8'"
+      ],
+      [
+       "cid",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (1)<\/b> [&#x27;4,Customer 4&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;2,Customer 2&#x27;, &#x27;6,Customer 6&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;3,Customer 3&#x27;, &#x27;7,Customer 7&#x27;]"
+   ],
+   "newVar": "cid"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #4 list now holds [&#x27;4,Customer 4&#x27;, &#x27;8,Customer 8&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'8,Customer 8'"
+      ],
+      [
+       "cid",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (2)<\/b> [&#x27;4,Customer 4&#x27;, &#x27;8,Customer 8&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;2,Customer 2&#x27;, &#x27;6,Customer 6&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;3,Customer 3&#x27;, &#x27;7,Customer 7&#x27;]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'8,Customer 8'"
+      ],
+      [
+       "cid",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (2)<\/b> [&#x27;4,Customer 4&#x27;, &#x27;8,Customer 8&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;2,Customer 2&#x27;, &#x27;6,Customer 6&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;3,Customer 3&#x27;, &#x27;7,Customer 7&#x27;]"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>loaded<\/code> is created: 8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'8,Customer 8'"
+      ],
+      [
+       "cid",
+       "8"
+      ],
+      [
+       "loaded",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (2)<\/b> [&#x27;4,Customer 4&#x27;, &#x27;8,Customer 8&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;2,Customer 2&#x27;, &#x27;6,Customer 6&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;3,Customer 3&#x27;, &#x27;7,Customer 7&#x27;]"
+   ],
+   "newVar": "loaded"
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "csv",
+       "→ list #1"
+      ],
+      [
+       "stage",
+       "→ list #2"
+      ],
+      [
+       "N",
+       "4"
+      ],
+      [
+       "buckets",
+       "→ dict #3"
+      ],
+      [
+       "line",
+       "'8,Customer 8'"
+      ],
+      [
+       "cid",
+       "8"
+      ],
+      [
+       "loaded",
+       "8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (9)<\/b> [&#x27;customer_id,name&#x27;, &#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,C…",
+    "<b>#2 list (8)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;2,Customer 2&#x27;, &#x27;3,Customer 3&#x27;, &#x27;4,Customer 4&#x27;, &#x27;5,Customer 5&#x27;, &#x27;6,Custo…",
+    "<b>#3 dict (4)<\/b> {0: → list #4, 1: → list #5, 2: → list #6, 3: → list #7}",
+    "<b>#4 list (2)<\/b> [&#x27;4,Customer 4&#x27;, &#x27;8,Customer 8&#x27;]",
+    "<b>#5 list (2)<\/b> [&#x27;1,Customer 1&#x27;, &#x27;5,Customer 5&#x27;]",
+    "<b>#6 list (2)<\/b> [&#x27;2,Customer 2&#x27;, &#x27;6,Customer 6&#x27;]",
+    "<b>#7 list (2)<\/b> [&#x27;3,Customer 3&#x27;, &#x27;7,Customer 7&#x27;]"
+   ],
+   "out": "stage 8 bucketed 8 OK\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: What does CLUSTERED BY (customer_id) INTO 8 BUCKETS create?",
+  "options": [
+   "8 folders",
+   "8 tables",
+   "8 files per table or partition, chosen by a hash of customer_id",
+   "An index on customer_id"
+  ],
+  "answer": 2,
+  "why": "One file per bucket: 000000_0 … 000007_0 in our lab."
+ },
+ {
+  "q": "Beginner: Which column type suits bucketing better than partitioning?",
+  "options": [
+   "order_date",
+   "customer_id with thousands of values",
+   "status with 3 values",
+   "country with 5 values"
+  ],
+  "answer": 1,
+  "why": "High-cardinality columns would create too many partitions; buckets stay at a fixed number."
+ },
+ {
+  "q": "Beginner: Is the bucketing column stored inside the data files?",
+  "options": [
+   "Yes, it is a normal column",
+   "No, only in folder names",
+   "Only in the metastore",
+   "Only when SORTED BY is used"
+  ],
+  "answer": 0,
+  "why": "Unlike a partition column, a bucket column stays in the data."
+ },
+ {
+  "q": "Intermediate: In our Hive 4.2.1 lab, customer 1 was in file 000005_0 of an 8-bucket table. Why not 000001_0?",
+  "options": [
+   "Random placement",
+   "Files are numbered from the end",
+   "Sorting moved it",
+   "bucketing_version 2 uses Murmur3, not the plain value"
+  ],
+  "answer": 3,
+  "why": "pmod(murmur_hash(1), 8) = 5; id mod 8 is the old version-1 rule."
+ },
+ {
+  "q": "Intermediate: TABLESAMPLE(BUCKET 6 OUT OF 8 ON customer_id) on an 8-bucket table reads…",
+  "options": [
+   "all 8 files",
+   "file 000006_0",
+   "file 000005_0",
+   "a random 1/8 of rows"
+  ],
+  "answer": 2,
+  "why": "Sample bucket numbers start at 1. Real: 5,649 rows, one file."
+ },
+ {
+  "q": "Intermediate: Is SET hive.enforce.bucketing=true needed in Hive 4?",
+  "options": [
+   "Yes, always",
+   "No, bucketing is always enforced since Hive 2.x",
+   "Only for ORC",
+   "Only with SORTED BY"
+  ],
+  "answer": 1,
+  "why": "The setting was removed; inserts always write the declared buckets."
+ },
+ {
+  "q": "Advanced: What happened when we used CREATE TABLE … CLUSTERED BY … AS SELECT?",
+  "options": [
+   "Error 10068: CTAS not supported for the target layout",
+   "It worked",
+   "It created an unbucketed table",
+   "It created 8 tables"
+  ],
+  "answer": 0,
+  "why": "Create the bucketed table first, then INSERT … SELECT."
+ },
+ {
+  "q": "Advanced: Both tables are bucketed on customer_id, yet EXPLAIN shows a broadcast map join. Why?",
+  "options": [
+   "Bucketing is broken",
+   "Buckets must be 1",
+   "Joins ignore buckets in Hive",
+   "The optimiser found broadcasting the small table cheaper"
+  ],
+  "answer": 3,
+  "why": "Bucket joins are a cost-based option; they pay off when both sides are large."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 5.3 in one screen</h3>
+    <ul><li><code>CLUSTERED BY (col) [SORTED BY (col)] INTO n BUCKETS</code> → n files per table or partition. Bucket column stays in the data.</li><li>Bucket = hash(col) mod n. <b>bucketing_version 2 → Murmur3</b> (customer 1 → bucket 5 of 8), not id mod n.</li><li>No <code>hive.enforce.bucketing</code> since Hive 2.x. Check placement with <code>INPUT__FILE__NAME</code>.</li><li><b>Partition vs bucket:</b> folders by value for low-cardinality filters · fixed files by hash for ids, joins, sampling. Combine them.</li><li><b>TABLESAMPLE(BUCKET x OUT OF y ON col)</b>: 1-based; reads only matching files on a bucketed table. <code>ON rand()</code> changes every run. <code>(n ROWS)</code> works; <code>PERCENT</code> was refused on Tez.</li><li><b>Bucket pruning:</b> <code>WHERE id = v</code> / <code>IN</code> → one bucket’s rows (5,649 not 50,000).</li><li><b>Bucket map / SMB join</b>: both sides bucketed (and sorted) on the key; optimiser decides; check EXPLAIN.</li><li><b>Gotchas:</b> bucketed CTAS → Error 10068; LOAD + header into bucketed table lost rows → stage, then INSERT.</li><li>Buckets spread <b>keys</b> evenly, not rows: a heavy key makes a heavy bucket.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>How many buckets should I choose?</summary><p>Pick a count that gives bucket files of a useful size, usually tens to hundreds of MB, and that you will not need to change, because changing it means rewriting the table. For tables you join, use the same count (or one a multiple of the other). Powers of two are common. With partitions, remember the count applies to every partition.</p></details>
+    <details><summary>What is the difference between CLUSTERED BY in CREATE TABLE and CLUSTER BY in a query?</summary><p>CLUSTERED BY … INTO n BUCKETS is table DDL: it fixes how the table’s files are organised. CLUSTER BY col in a SELECT (Lesson 3.4) only distributes and sorts that query’s output across reducers; it does not change any table.</p></details>
+    <details><summary>Can I bucket an existing table?</summary><p>ALTER TABLE … CLUSTERED BY only changes the metadata; existing files are not rewritten, so they no longer match the declaration. Create a new bucketed table, INSERT OVERWRITE … SELECT from the old one, check counts, and swap.</p></details>
+    <details><summary>Do Spark and Hive buckets match?</summary><p>Not automatically. Spark’s own bucketing scheme (its hash function and file layout) is not the same as Hive’s. Spark can read Hive-bucketed tables, but for bucket joins across engines check that both use the Hive bucketing scheme (bucketing_version) for that table.</p></details>
+    <details><summary>Is bucketing still useful with Iceberg?</summary><p>Iceberg replaces Hive bucketing with its own <b>bucket transform</b> in the partition spec, <code>PARTITIONED BY SPEC (bucket(16, customer_id))</code>, which also hashes ids into a fixed number of groups. The idea from this lesson carries over directly (Module 7).</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs that simulate buckets, samples and checks, with the HiveQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>File name of a bucket</h4></div>
+      <p>Print Hive’s file name for buckets 0 to 3.</p>
+      <div class="prob__io"><div><small>Input</small><pre>4 buckets</pre></div><div><small>Expected output</small><pre>000000_0
+000001_0
+000002_0
+000003_0</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for b in range(4):
+    print(f&quot;{b:06d}_0&quot;)</code></pre><div class="output">000000_0
+000001_0
+000002_0
+000003_0</div></div>
+        <p><b>How it works:</b> Bucket files are numbered from 000000_0; TABLESAMPLE numbers buckets from 1.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Version-1 bucket</h4></div>
+      <p>Using the old rule (value mod n), which bucket does customer 13 go to with 8 buckets?</p>
+      <div class="prob__io"><div><small>Input</small><pre>13, n = 8</pre></div><div><small>Expected output</small><pre>5</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(13 % 8)</code></pre><div class="output">5</div></div>
+        <p><b>How it works:</b> 5 under version 1. In Hive 4 the real bucket is <code>pmod(murmur_hash(13), 8)</code>; check it with INPUT__FILE__NAME.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Average customers per bucket</h4></div>
+      <p>How many customers should each of 8 buckets hold?</p>
+      <div class="prob__io"><div><small>Input</small><pre>2,000 customers</pre></div><div><small>Expected output</small><pre>250.0</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(2000 / 8)</code></pre><div class="output">250.0</div></div>
+        <p><b>How it works:</b> 250. The real lab had 230–269 per bucket.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Files read by a sample</h4></div>
+      <p>Which bucket files does BUCKET 3 OUT OF 4 read on a 16-bucket table?</p>
+      <div class="prob__io"><div><small>Input</small><pre>x = 3, y = 4, n = 16</pre></div><div><small>Expected output</small><pre>[&#x27;000002_0&#x27;, &#x27;000006_0&#x27;, &#x27;000010_0&#x27;, &#x27;000014_0&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>x, y, n = 3, 4, 16
+print([f&quot;{b:06d}_0&quot; for b in range(n) if b % y == x - 1])</code></pre><div class="output">[&#x27;000002_0&#x27;, &#x27;000006_0&#x27;, &#x27;000010_0&#x27;, &#x27;000014_0&#x27;]</div></div>
+        <p><b>How it works:</b> 4 files: 2, 6, 10 and 14. The sample size is n / y buckets.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Skew check</h4></div>
+      <p>Flag buckets more than 15% above the average size.</p>
+      <div class="prob__io"><div><small>Input</small><pre>real rows per bucket</pre></div><div><small>Expected output</small><pre>6250 []</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>rows = [6210, 5961, 6754, 5922, 6689, 5649, 6276, 6539]
+avg = sum(rows) / len(rows)
+print(round(avg), [i for i, r in enumerate(rows) if r &gt; 1.15 * avg])</code></pre><div class="output">6250 []</div></div>
+        <p><b>How it works:</b> None: the largest is 8% above average. A whale customer would change that (Lesson 5.4).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Count check after a load</h4></div>
+      <p>Compare the source line count with the loaded count and report missing rows.</p>
+      <div class="prob__io"><div><small>Input</small><pre>2,001 lines with a header, 1,997 loaded</pre></div><div><small>Expected output</small><pre>missing 3 FAIL</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>source_lines, header, loaded = 2001, 1, 1997
+missing = source_lines - header - loaded
+print(&quot;missing&quot;, missing, &quot;FAIL&quot; if missing else &quot;OK&quot;)</code></pre><div class="output">missing 3 FAIL</div></div>
+        <p><b>How it works:</b> The real LOAD lost 3 customers. A count check would have stopped the job.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Stable experiment group</h4></div>
+      <p>Put customers into a test group if their bucket (8 buckets) is 0, and print the group size for ids 1–40 using value mod 8.</p>
+      <div class="prob__io"><div><small>Input</small><pre>ids 1–40</pre></div><div><small>Expected output</small><pre>5 [8, 16, 24, 32, 40]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>group = [c for c in range(1, 41) if c % 8 == 0]
+print(len(group), group)</code></pre><div class="output">5 [8, 16, 24, 32, 40]</div></div>
+        <p><b>How it works:</b> Real Hive: <code>TABLESAMPLE(BUCKET 1 OUT OF 8 ON customer_id)</code> or <code>pmod(murmur_hash(customer_id), 8) = 0</code>. The group is the same every day.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Cost of a bucketed lookup per day</h4></div>
+      <p>A support tool looks up one customer across 30 day partitions, each with 8 buckets of about 200 rows. Compare rows read with and without bucket pruning.</p>
+      <div class="prob__io"><div><small>Input</small><pre>30 days, 8 buckets, 200 rows each</pre></div><div><small>Expected output</small><pre>without pruning 48000
+with pruning    6000</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>days, buckets, rows = 30, 8, 200
+print(&quot;without pruning&quot;, days * buckets * rows)
+print(&quot;with pruning   &quot;, days * rows)</code></pre><div class="output">without pruning 48000
+with pruning    6000</div></div>
+        <p><b>How it works:</b> 8 times fewer rows: one bucket per day instead of all eight.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Bucketing questions test whether you know when to use it and how it differs from partitioning.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Hive</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“Partitioning vs bucketing”</h4>
+      <p class="scn__situation">Explain both and say when to use each.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know folders vs files, and cardinality?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>Partitioning creates a folder per value of a column (date) and helps queries that filter on it; good for low-to-moderate cardinality. Bucketing hashes a column (customer_id) into a fixed number of files; good for high cardinality, sampling and joins. Partition columns are not in the files; bucket columns are. They can be combined: partition by date, bucket by customer.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Saying bucketing is “partitioning with more partitions”.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data science</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>A reproducible sample</h4>
+      <p class="scn__situation">Your notebook samples 10% of users with rand() and your numbers change every run.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know deterministic sampling?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Sample on the user column: <code>TABLESAMPLE(BUCKET 1 OUT OF 10 ON user_id)</code>, or filter <code>pmod(hash(user_id), 10) = 0</code>.</li>
+          <li>On a table bucketed by user_id this also reads less data.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> “Set a random seed in Hive”.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Rows missing after moving to a bucketed table</h4>
+      <p class="scn__situation">A CSV load into a newly bucketed table has slightly fewer rows than the file.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you reconcile and know load paths?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Compare counts and find missing keys with a LEFT JOIN against a staging copy.</li>
+          <li>Check table properties such as skip.header.line.count; in Hive 4.2.1 the header was stored as a row and each bucket file skipped its first line.</li>
+          <li>Fix: LOAD into staging, INSERT … SELECT into the bucketed table, and keep the count check.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Assuming LOAD DATA is just a file move for every table type.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Speeding up a daily big-table join</h4>
+      <p class="scn__situation">orders (2 billion rows) and payments (2 billion rows) are joined on order_id every night, and the shuffle dominates.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you understand bucket and SMB joins and their conditions?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Bucket (and sort) both tables on order_id with the same bucket count, partitioned by the same date.</li>
+          <li>Enable the bucket map / SMB join settings and confirm in EXPLAIN that the join uses buckets.</li>
+          <li>Rewrite both tables once; keep all writers producing the same bucketing. Compare runtime and shuffle bytes before and after.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Bucketing only one side, or with different bucket counts.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

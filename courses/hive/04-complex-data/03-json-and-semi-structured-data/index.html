@@ -1,0 +1,2675 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JSON and semi-structured data | MyPhatshala</title>
+<meta name="description" content="Reading JSON in Hive with real Hive 4.2.1 results: raw STRING tables, get_json_object paths and their limits, json_tuple with LATERAL VIEW, the JsonSerDe with STRUCT and ARRAY columns, how one malformed line fails a scan, quarantining bad records, CTAS into ORC, plus parse_url_tuple and xpath for URLs and XML.">
+<meta name="mp:minutes" content="35">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/04-complex-data/03-json-and-semi-structured-data/">
+<meta property="og:title" content="JSON and semi-structured data · MyPhatshala">
+<meta property="og:description" content="One broken JSON line stopped the whole query. get_json_object, json_tuple and JsonSerDe in Hive with real outputs and a production pattern.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "JSON and semi-structured data", "learningResourceType": "Lesson", "educationalLevel": "Beginner → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="04-complex-data/03-json-and-semi-structured-data" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 4.3</b></nav>
+    <h1>JSON and semi-structured data</h1>
+    <p class="lead">Apps, APIs and devices send JSON: nested objects, lists and optional fields. Hive can read it with functions at query time or with a SerDe as a typed table. This lesson loads 2,000 real-shaped app events, finds the one truncated line that breaks the SerDe, quarantines it, converts the rest into ORC and answers revenue per city. <b>All outputs are real</b>, from Hive 4.2.1.</p>
+    <div class="lesson-meta"><span>Module 4 · Functions and complex data</span><span>⏱ 35 min</span><span>Beginner → Advanced</span><span>Real Hive 4.2.1 outputs</span><span>get_json_object vs json_tuple vs SerDe</span><span>Bad-record quarantine</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“The app team sends us JSON. Can Hive read it?”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> you need SerDes (<a href="../../02-hiveql/04-row-formats-and-serdes/">2.4</a>) and LATERAL VIEW (<a href="../02-explode-and-lateral-view/">4.2</a>).</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s mobile app writes every action as a JSON line: app opens, searches, coupons and orders. Each order event has a nested <code>user</code> object and an <code>items</code> list with dish, quantity and price. The product team wants revenue per city and the order rate on Android vs iOS. One upload was cut off half-way, so one line is broken JSON.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="A JSON app event with nested user and items on the left; on the right the same data as typed columns that can be grouped and summed.">
+        <rect x="10" y="12" width="300" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="160" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">App events: one JSON document per line</text><text x="24" y="54" font-size="7.8" class="s-ink mono">{"event":"order_placed",</text><text x="24" y="70" font-size="7.8" class="s-ink mono"> "user":{"id":1376,"city":"Chennai"},</text><text x="24" y="86" font-size="7.8" class="s-ink mono"> "items":[{"dish":"Rajma Chawal",</text><text x="24" y="102" font-size="7.8" class="s-ink mono">           "qty":3,"price":120}, …]}</text><text x="160" y="128" text-anchor="middle" font-size="7.8" class="s-red">1 of 2,000 lines is cut off</text><path d="M316 76L330 76" style="fill:none;stroke:#8A94A0;stroke-width:2"/><path d="M323.7 79.0L330 76L323.7 73.0" style="fill:none;stroke:#8A94A0;stroke-width:2"/><rect x="334" y="12" width="300" height="128" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="484" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-green">Columns you can GROUP BY</text><text x="348" y="54" font-size="7.8" class="s-ink mono">event  user_id  city</text><text x="348" y="72" font-size="7.8" class="s-ink mono">order_placed  1376  Chennai</text><text x="348" y="90" font-size="7.8" class="s-ink mono">dish  qty  price</text><text x="348" y="108" font-size="7.8" class="s-ink mono">Rajma Chawal  3  120</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Hive reads JSON <tspan font-weight="700" class="s-acc">at query time</tspan> (functions) or <tspan font-weight="700" class="s-acc">through a SerDe</tspan> (typed table).</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, the file is 2,000 lines of JSON. Do I need to convert it to CSV first?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>No. There are two ways. Keep each line as one STRING column and pull fields out at query time with <code>get_json_object</code> or <code>json_tuple</code>. Or define a typed table with the <b>JsonSerDe</b>, where nested objects become STRUCT and lists become ARRAY columns.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>And the broken line?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>That is where the two ways differ, and we will see it fail for real. Today: path syntax and its limits, json_tuple, JsonSerDe, quarantining bad lines, turning JSON into an ORC table, and a quick look at URLs and XML. All outputs are real.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Semi-structured data in Hive</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Semi-structured data</b> carries its own structure in the data itself (field names, nesting, optional fields), as in JSON or XML, rather than in a fixed table schema. Hive handles it in two ways: <b>schema-on-read functions</b> that parse a string column at query time (<code>get_json_object</code>, <code>json_tuple</code>, <code>xpath</code>, <code>parse_url_tuple</code>), and <b>SerDes</b> that map each record to typed columns when the table is read (JsonSerDe, including nested STRUCT and ARRAY types).</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>JSON is text that describes itself: each value has a name, and values can sit inside other values. Hive can either look up one value at a time from the text, or read the text as a proper table with columns.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>JSON Lines</b><span>One complete JSON document per line. The format Hive tables expect.</span></div>
+    <div class="term"><b>JSONPath</b><span>A path like <code>$.items[0].dish</code>. <code>$</code> is the root.</span></div>
+    <div class="term"><b>get_json_object</b><span>Returns one value at a path, as a STRING.</span></div>
+    <div class="term"><b>json_tuple</b><span>Returns several top-level values in one parse (a UDTF).</span></div>
+    <div class="term"><b>JsonSerDe</b><span>Reads each JSON line into typed columns.</span></div>
+    <div class="term"><b>Quarantine</b><span>Moving bad records aside so the good ones can load.</span></div>
+    <div class="term"><b>xpath</b><span>Path language for XML: <code>/order/city</code>.</span></div>
+  </div>
+
+  <h3>get_json_object paths on a real event</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:600px">
+    <thead><tr><th>Path</th><th>Real result</th><th>Note</th></tr></thead>
+    <tbody><tr><td><code>$.event</code></td><td>order_placed</td><td>Top-level key</td></tr><tr><td><code>$.user.city</code></td><td>Chennai</td><td>Nested object</td></tr><tr><td><code>$.items[0].dish</code></td><td>Rajma Chawal</td><td>First list element</td></tr><tr><td><code>$.items[*].dish</code></td><td>["Rajma Chawal","Chai","Idli"]</td><td>JSON text, not a Hive array</td></tr><tr><td><code>$.User.id</code></td><td>NULL</td><td>Keys are case-sensitive</td></tr><tr><td><code>$.items[9].dish</code></td><td>NULL</td><td>No such element</td></tr><tr><td>get_json_object('{"a":1', '$.a')</td><td>NULL</td><td>Broken JSON</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">JSON in Hive at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A form with boxes inside boxes</h4>
+      <ul>
+        <li>JSON stores data as <b>name: value</b> pairs. A value can be another object (<code>"user": {"id": 1376}</code>) or a list (<code>"items": [ … ]</code>).</li>
+        <li>To read a value you give its <b>path</b>: <code>$.user.city</code> means “start at the top, open user, take city”.</li>
+        <li>Hive can read the path in a query, or read the whole file as a table whose columns follow the JSON.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> Three tools</h4>
+      <ul>
+        <li><code>get_json_object(json, '$.path')</code>: one value per call; supports <code>.key</code>, <code>[index]</code> and <code>[*]</code>; returns a STRING (lists come back as JSON text).</li>
+        <li><code>json_tuple(json, 'k1', 'k2', …)</code>: several top-level keys in one parse, used with LATERAL VIEW; nested objects need a second json_tuple.</li>
+        <li><b>JsonSerDe</b> (<code>org.apache.hive.hcatalog.data.JsonSerDe</code>): a table definition where each JSON field is a typed column, including STRUCT and ARRAY&lt;STRUCT&gt;.</li>
+        <li>Missing keys, wrong case and broken JSON all give <b>NULL</b> with the functions.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Production choices</h4>
+      <ul>
+        <li><b>Parse once.</b> Functions re-parse the JSON text for every call and every query. Land raw JSON, then build a typed ORC table (CTAS) and query that.</li>
+        <li><b>Schema on read is strict with the SerDe:</b> one malformed line made a full scan of the JsonSerDe table fail (JsonEOFException). Quarantine bad lines first using a raw STRING table.</li>
+        <li><b>Path limits</b> (official docs): no recursive <code>..</code>, no filters <code>?()</code>, no slices or unions; keys with special characters are a problem.</li>
+        <li><b>Reserved words:</b> a JSON key such as <code>user</code> needs back-ticks as a column name.</li>
+        <li><b>Hive 4 additions</b> listed by <code>SHOW FUNCTIONS LIKE '%json%'</code>: <code>json_read(json, type)</code> parses into a typed value, plus <code>parse_json</code>, <code>to_json</code> and <code>variant_get</code> for the VARIANT type. In our Docker lab json_read worked in a quick fetch query but failed inside a Tez job (a Java 17 module-access error), so test new functions on your cluster before building pipelines on them.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “get_json_object vs json_tuple vs JsonSerDe.” get_json_object: one path per call, nested paths allowed, re-parses each call. json_tuple: many top-level keys in one parse with LATERAL VIEW, no nested paths. JsonSerDe: typed table with STRUCT/ARRAY columns; strict about malformed lines. Production: land raw, quarantine bad lines, CTAS into ORC.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Choosing a JSON approach</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:760px">
+    <thead><tr><th>Approach</th><th>Strengths</th><th>Weaknesses</th><th>Use when</th></tr></thead>
+    <tbody><tr><td>Raw STRING + <code>get_json_object</code></td><td>No schema needed; nested paths; bad lines just give NULL</td><td>Parses again for every field and query; all results are STRING</td><td>Exploring, a few fields, messy sources</td></tr><tr><td>Raw STRING + <code>json_tuple</code></td><td>Several keys in one parse</td><td>Top-level keys only; needs LATERAL VIEW</td><td>Many flat fields</td></tr><tr><td>JsonSerDe table</td><td>Typed columns, STRUCT and ARRAY, normal SQL</td><td>Malformed line fails the scan; schema must be maintained</td><td>Clean, stable feeds</td></tr><tr><td>CTAS to ORC (from either)</td><td>Parse once, fast columnar reads, statistics</td><td>One more pipeline step</td><td>Anything queried repeatedly</td></tr></tbody>
+  </table>
+  </div>
+  <h3>Other semi-structured helpers (real results)</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Call</th><th>Real result</th></tr></thead>
+    <tbody><tr><td><code>parse_url('https://tiffingo.in/menu/pune?dish=poha&amp;src=ad', 'HOST')</code></td><td>tiffingo.in</td></tr><tr><td><code>parse_url(…, 'QUERY', 'src')</code></td><td>ad</td></tr><tr><td><code>parse_url_tuple(…, 'HOST', 'PATH', 'QUERY:dish')</code></td><td>tiffingo.in · /menu/pune · poha</td></tr><tr><td><code>xpath_string('&lt;order&gt;…&lt;city&gt;Pune&lt;/city&gt;…', '/order/city')</code></td><td>Pune</td></tr><tr><td><code>xpath(xml, '/order/dish/text()')</code></td><td>["Poha","Chai"]</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>A single malformed line can stop a whole JsonSerDe query. In our lab <code>LIMIT 3</code> on the SerDe table worked (it read only the first lines), but <code>COUNT(*)</code> failed on line 1,500 with a JsonEOFException. Validate or quarantine raw files before pointing a typed table at them.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>From raw app events to revenue per city</h2>
+  <p>All outputs are real, from the Hive 4.2.1 lab (2,000 generated events, one deliberately truncated).</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Land the raw JSON as one STRING column</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE EXTERNAL TABLE events_raw (line STRING) LOCATION &#x27;/data/events&#x27;;
+SELECT COUNT(*) AS lines FROM events_raw;
+SELECT line FROM events_raw LIMIT 1;</code></pre><div class="output">+--------+
+| lines  |
++--------+
+| 2000   |
++--------+
++----------------------------------------------------+
+|                        line                        |
++----------------------------------------------------+
+| {&quot;event&quot;:&quot;app_open&quot;,&quot;ts&quot;:&quot;2026-10-02T09:01:00+05:30&quot;,&quot;user&quot;:{&quot;id&quot;:586,&quot;city&quot;:&quot;Chennai&quot;},&quot;device&quot;:{&quot;os&quot;:&quot;Android&quot;,&quot;app_ver&quot;:&quot;5.3.1&quot;}} |
++----------------------------------------------------+</div></div>
+      <span class="behind">With the default text format, each line becomes one row, whatever it contains. Nothing can fail at this stage.</span></li>
+    <li><h4>Step 2 · Pull fields with get_json_object</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT get_json_object(line, &#x27;$.event&#x27;) AS event,
+  get_json_object(line, &#x27;$.user.id&#x27;) AS user_id,
+  get_json_object(line, &#x27;$.user.city&#x27;) AS city,
+  get_json_object(line, &#x27;$.items[0].dish&#x27;) AS first_dish,
+  get_json_object(line, &#x27;$.items[*].dish&#x27;) AS all_dishes,
+  get_json_object(line, &#x27;$.coupon&#x27;) AS coupon
+FROM events_raw LIMIT 3;</code></pre><div class="output">+---------------+----------+----------+---------------+---------------------------------+---------+
+|     event     | user_id  |   city   |  first_dish   |           all_dishes            | coupon  |
++---------------+----------+----------+---------------+---------------------------------+---------+
+| app_open      | 586      | Chennai  | NULL          | NULL                            | NULL    |
+| order_placed  | 1376     | Chennai  | Rajma Chawal  | [&quot;Rajma Chawal&quot;,&quot;Chai&quot;,&quot;Idli&quot;]  | NULL    |
+| order_placed  | 1279     | Delhi    | Poha          | [&quot;Poha&quot;,&quot;Idli&quot;]                 | NULL    |
++---------------+----------+----------+---------------+---------------------------------+---------+</div></div>
+      <span class="behind">Nested paths and list indexes work. Fields that an event does not have (items on app_open, coupon on orders) come back NULL. <code>[*]</code> returns JSON text, not a Hive array.</span></li>
+    <li><h4>Step 3 · Traps: case, lists as text, broken JSON</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT get_json_object(line, &#x27;$.User.id&#x27;) AS wrong_case,
+  get_json_object(line, &#x27;$.items&#x27;) AS items_text,
+  get_json_object(&#x27;{&quot;a&quot;:1&#x27;, &#x27;$.a&#x27;) AS broken,
+  get_json_object(line, &#x27;$.items[9].dish&#x27;) AS no_item
+FROM events_raw WHERE get_json_object(line, &#x27;$.event&#x27;) = &#x27;order_placed&#x27; LIMIT 1;</code></pre><div class="output">+-------------+----------------------------------------------------+---------+----------+
+| wrong_case  |                     items_text                     | broken  | no_item  |
++-------------+----------------------------------------------------+---------+----------+
+| NULL        | [{&quot;dish&quot;:&quot;Rajma Chawal&quot;,&quot;qty&quot;:3,&quot;price&quot;:120},{&quot;dish&quot;:&quot;Chai&quot;,&quot;qty&quot;:2,&quot;price&quot;:20},{&quot;dish&quot;:&quot;Idli&quot;,&quot;qty&quot;:3,&quot;price&quot;:60}] | NULL    | NULL     |
++-------------+----------------------------------------------------+---------+----------+</div></div>
+      <span class="behind">All silent: a wrong-case key, a missing element and invalid JSON all return NULL. The items list comes back as a plain string.</span></li>
+    <li><h4>Step 4 · Find the bad line</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT COUNT(*) AS lines, COUNT(get_json_object(line, &#x27;$.event&#x27;)) AS parsed,
+  SUM(IF(get_json_object(line, &#x27;$.event&#x27;) IS NULL, 1, 0)) AS unparsed
+FROM events_raw;
+
+SELECT get_json_object(line, &#x27;$.event&#x27;) AS event, COUNT(*) AS n
+FROM events_raw GROUP BY get_json_object(line, &#x27;$.event&#x27;) ORDER BY n DESC;</code></pre><div class="output">+--------+---------+-----------+
+| lines  | parsed  | unparsed  |
++--------+---------+-----------+
+| 2000   | 1999    | 1         |
++--------+---------+-----------+
++-----------------+------+
+|      event      |  n   |
++-----------------+------+
+| order_placed    | 779  |
+| coupon_applied  | 411  |
+| search          | 410  |
+| app_open        | 399  |
+| NULL            | 1    |
++-----------------+------+</div></div>
+      <span class="behind">One line could not be parsed. With functions it only shows up as a NULL group, which is easy to miss unless you count it.</span></li>
+    <li><h4>Step 5 · json_tuple: several keys in one parse</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT j.event, j.ts, u.id, u.city
+FROM events_raw r
+LATERAL VIEW json_tuple(r.line, &#x27;event&#x27;, &#x27;ts&#x27;, &#x27;user&#x27;) j AS event, ts, user_json
+LATERAL VIEW json_tuple(j.user_json, &#x27;id&#x27;, &#x27;city&#x27;) u AS id, city
+LIMIT 3;
+
+SELECT j.user_json FROM events_raw r
+LATERAL VIEW json_tuple(r.line, &#x27;user&#x27;) j AS user_json LIMIT 1;
+SELECT j.uid FROM events_raw r
+LATERAL VIEW json_tuple(r.line, &#x27;user.id&#x27;) j AS uid LIMIT 1;</code></pre><div class="output">+---------------+----------------------------+-------+----------+
+|    j.event    |            j.ts            | u.id  |  u.city  |
++---------------+----------------------------+-------+----------+
+| app_open      | 2026-10-02T09:01:00+05:30  | 586   | Chennai  |
+| order_placed  | 2026-10-03T10:02:00+05:30  | 1376  | Chennai  |
+| order_placed  | 2026-10-04T11:03:00+05:30  | 1279  | Delhi    |
++---------------+----------------------------+-------+----------+
++------------------------------+
+|         j.user_json          |
++------------------------------+
+| {&quot;id&quot;:586,&quot;city&quot;:&quot;Chennai&quot;}  |
++------------------------------+
++--------+
+| j.uid  |
++--------+
+| NULL   |
++--------+</div></div>
+      <span class="behind">json_tuple takes key names, not paths. The nested user object comes back as JSON text, so a second json_tuple opens it. A dotted key like <code>user.id</code> just returns NULL.</span></li>
+    <li><h4>Step 6 · A typed JsonSerDe table, and how one bad line breaks it</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE EXTERNAL TABLE events_json (
+  event STRING, ts STRING,
+  `user` STRUCT&lt;id:INT, city:STRING&gt;,
+  device STRUCT&lt;os:STRING, app_ver:STRING&gt;,
+  items ARRAY&lt;STRUCT&lt;dish:STRING, qty:INT, price:INT&gt;&gt;,
+  coupon STRING, query STRING)
+ROW FORMAT SERDE &#x27;org.apache.hive.hcatalog.data.JsonSerDe&#x27;
+LOCATION &#x27;/data/events&#x27;;
+
+SELECT event, `user`.city AS city, size(items) AS n_items FROM events_json LIMIT 3;
+SELECT COUNT(*) AS n FROM events_json WHERE event = &#x27;order_placed&#x27;;</code></pre><div class="output">+---------------+----------+----------+
+|     event     |   city   | n_items  |
++---------------+----------+----------+
+| app_open      | Chennai  | -1       |
+| order_placed  | Chennai  | 3        |
+| order_placed  | Delhi    | 2        |
++---------------+----------+----------+
+Error: … TezTask. Vertex failed … Hive Runtime Error while processing row
+(root cause in the HiveServer2 log)
+SerDeException: … JsonEOFException: Unexpected end-of-input in field name</div></div>
+      <span class="behind">The first three lines read fine (size is -1 where there is no items list). The full scan fails when it reaches the truncated line. <code>user</code> is a reserved word, so it needs back-ticks: without them the query fails with “cannot recognize input near 'user' '.' 'city'”.</span></li>
+    <li><h4>Step 7 · Quarantine bad lines, then parse once into ORC</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>INSERT OVERWRITE DIRECTORY &#x27;/data/events_good&#x27;
+SELECT line FROM events_raw WHERE get_json_object(line, &#x27;$.event&#x27;) IS NOT NULL;
+INSERT OVERWRITE DIRECTORY &#x27;/data/events_bad&#x27;
+SELECT line FROM events_raw WHERE get_json_object(line, &#x27;$.event&#x27;) IS NULL;
+-- recreate events_json with LOCATION &#x27;/data/events_good&#x27;
+SELECT COUNT(*) AS n FROM events_json;
+
+CREATE TABLE events_clean STORED AS ORC AS
+SELECT event, CAST(substr(ts, 1, 10) AS DATE) AS event_date,
+       `user`.id AS user_id, `user`.city AS city, device.os AS os, items, coupon
+FROM events_json;
+DESCRIBE events_clean;</code></pre><div class="output">+-------+
+|   n   |
++-------+
+| 1999  |
++-------+
++-------------+-----------------------------------------------+----------+
+|  col_name   |                   data_type                   | comment  |
++-------------+-----------------------------------------------+----------+
+| event       | string                                        |          |
+| event_date  | date                                          |          |
+| user_id     | int                                           |          |
+| city        | string                                        |          |
+| os          | string                                        |          |
+| items       | array&lt;struct&lt;dish:string,qty:int,price:int&gt;&gt;  |          |
+| coupon      | string                                        |          |
++-------------+-----------------------------------------------+----------+</div></div>
+      <span class="behind">The raw STRING table acts as a safety net: good lines go to one folder, the single bad line to another for investigation. The typed ORC table keeps <code>items</code> as an array of structs, so it is parsed once and queried many times.</span></li>
+    <li><h4>Step 8 · Answer the product team</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT city, COUNT(DISTINCT user_id) AS buyers, SUM(it.qty * it.price) AS revenue
+FROM events_clean LATERAL VIEW inline(items) it
+WHERE event = &#x27;order_placed&#x27;
+GROUP BY city ORDER BY revenue DESC;
+
+SELECT os, COUNT(*) AS events, SUM(IF(event = &#x27;order_placed&#x27;, 1, 0)) AS orders,
+  ROUND(100 * SUM(IF(event = &#x27;order_placed&#x27;, 1, 0)) / COUNT(*), 1) AS order_pct
+FROM events_clean GROUP BY os;</code></pre><div class="output">+------------+---------+----------+
+|    city    | buyers  | revenue  |
++------------+---------+----------+
+| Chennai    | 119     | 39330    |
+| Mumbai     | 110     | 38750    |
+| Thane      | 115     | 36795    |
+| Pune       | 112     | 36415    |
+| Hyderabad  | 98      | 32380    |
+| Delhi      | 100     | 30930    |
+| Bengaluru  | 108     | 28655    |
++------------+---------+----------+
++----------+---------+---------+------------+
+|    os    | events  | orders  | order_pct  |
++----------+---------+---------+------------+
+| Android  | 1334    | 508     | 38.1       |
+| iOS      | 665     | 271     | 40.8       |
++----------+---------+---------+------------+</div></div>
+      <span class="behind"><code>inline</code> (Lesson 4.2) turns each item struct into dish, qty and price columns. iOS events turned into orders slightly more often (40.8% vs 38.1%) in this generated data.</span></li>
+    <li><h4>Step 9 · URLs and XML</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT parse_url(&#x27;https://tiffingo.in/menu/pune?dish=poha&amp;src=ad&#x27;, &#x27;HOST&#x27;) AS host,
+  parse_url(&#x27;https://tiffingo.in/menu/pune?dish=poha&amp;src=ad&#x27;, &#x27;QUERY&#x27;, &#x27;src&#x27;) AS src;
+SELECT t.* FROM (SELECT 1) x LATERAL VIEW parse_url_tuple(
+  &#x27;https://tiffingo.in/menu/pune?dish=poha&amp;src=ad&#x27;, &#x27;HOST&#x27;, &#x27;PATH&#x27;, &#x27;QUERY:dish&#x27;) t AS host, path, dish;
+
+SELECT xpath_string(&#x27;&lt;order&gt;&lt;id&gt;100001&lt;/id&gt;&lt;city&gt;Pune&lt;/city&gt;…&lt;/order&gt;&#x27;, &#x27;/order/city&#x27;) AS city,
+  xpath_int(&#x27;&lt;order&gt;&lt;id&gt;100001&lt;/id&gt;&lt;/order&gt;&#x27;, &#x27;/order/id&#x27;) AS id,
+  xpath(&#x27;&lt;order&gt;&lt;dish&gt;Poha&lt;/dish&gt;&lt;dish&gt;Chai&lt;/dish&gt;&lt;/order&gt;&#x27;, &#x27;/order/dish/text()&#x27;) AS dishes;</code></pre><div class="output">+--------------+------+
+|     host     | src  |
++--------------+------+
+| tiffingo.in  | ad   |
++--------------+------+
++--------------+-------------+---------+
+|    t.host    |   t.path    | t.dish  |
++--------------+-------------+---------+
+| tiffingo.in  | /menu/pune  | poha    |
++--------------+-------------+---------+
++-------+---------+------------------+
+| city  |   id    |      dishes      |
++-------+---------+------------------+
+| Pune  | 100001  | [&quot;Poha&quot;,&quot;Chai&quot;]  |
++-------+---------+------------------+</div></div>
+      <span class="behind">parse_url and parse_url_tuple split web links into host, path and query parameters, useful for campaign tracking. The xpath family reads XML stored in a string column; <code>xpath</code> returns an array of all matches.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Reading the JSON tree</h2>
+  <p>Left: real Beeline output. Right: which part of the JSON is read.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Paths, tuples and SerDes <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real Beeline output">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT get_json_object(line, &#x27;$.user.city&#x27;)</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Chennai |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Chennai |</text><text x="26" y="92" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Delhi   |</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … &#x27;$.items[0].dish&#x27;, &#x27;$.items[*].dish&#x27;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Rajma Chawal | [&quot;Rajma Chawal&quot;,&quot;Chai&quot;,&quot;Idli&quot;] |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Poha         | [&quot;Poha&quot;,&quot;Idli&quot;]                |</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … json_tuple(r.line, &#x27;event&#x27;,&#x27;ts&#x27;,&#x27;user&#x27;) j</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  … json_tuple(j.user_json, &#x27;id&#x27;,&#x27;city&#x27;) u</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| order_placed | … | 1376 | Chennai |</text><text x="26" y="92" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| order_placed | … | 1279 | Delhi   |</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT COUNT(*) FROM events_json …</text><text x="26" y="64" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Error: Vertex failed … processing row</text><text x="26" y="78" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  JsonEOFException: Unexpected</text><text x="26" y="92" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  end-of-input in field name</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; CREATE TABLE events_clean STORED AS ORC AS …</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| items | array&lt;struct&lt;dish:string,</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">|       |   qty:int,price:int&gt;&gt;      |</text><text x="26" y="92" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … LATERAL VIEW inline(items) it …</text><text x="26" y="106" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Chennai | 119 | 39330 |</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>get_json_object reads a nested field.</li>
+          <li>An index picks one list element; [*] returns all of them as JSON text.</li>
+          <li>Two json_tuple calls read the top level, then the nested user object.</li>
+          <li>A full scan of the JsonSerDe table fails on the truncated line.</li>
+          <li>The cleaned data is stored once as typed ORC and queried with inline.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Which part of the JSON tree is read">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A path walks the tree</text><path d="M170 54L80 72" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M85.6 67.8L80 72L86.8 73.7" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M180 54L180 72" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M177.0 65.7L180 72L183.0 65.7" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M190 54L286 72" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M279.2 73.8L286 72L280.4 67.8" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M174 90L116 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M121.1 103.2L116 108L122.9 109.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M180 90L180 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M177.0 101.7L180 108L183.0 101.7" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M284 90L258 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M261.4 101.9L258 108L264.9 106.9" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M296 90L320 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M313.1 106.7L320 108L316.8 101.8" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><rect x="149" y="36" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="180" y="49" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">$</text><rect x="39" y="72" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="70" y="85" text-anchor="middle" font-size="7.6" class="s-ink mono">event</text><rect x="149" y="72" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="180" y="85" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">user</text><rect x="259" y="72" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="290" y="85" text-anchor="middle" font-size="7.6" class="s-ink mono">items[ ]</text><rect x="79" y="108" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="110" y="121" text-anchor="middle" font-size="7.6" class="s-ink mono">id</text><rect x="149" y="108" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="180" y="121" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">city</text><rect x="223" y="108" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="254" y="121" text-anchor="middle" font-size="7.6" class="s-ink mono">[0].dish</text><rect x="293" y="108" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="324" y="121" text-anchor="middle" font-size="7.6" class="s-ink mono">[1].dish</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">$.user.city → Chennai</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Index one element, or [*] for all</text><path d="M170 54L80 72" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M85.6 67.8L80 72L86.8 73.7" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M180 54L180 72" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M177.0 65.7L180 72L183.0 65.7" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M190 54L286 72" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M279.2 73.8L286 72L280.4 67.8" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M174 90L116 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M121.1 103.2L116 108L122.9 109.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M180 90L180 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M177.0 101.7L180 108L183.0 101.7" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M284 90L258 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M261.4 101.9L258 108L264.9 106.9" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M296 90L320 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M313.1 106.7L320 108L316.8 101.8" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><rect x="149" y="36" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="180" y="49" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">$</text><rect x="39" y="72" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="70" y="85" text-anchor="middle" font-size="7.6" class="s-ink mono">event</text><rect x="149" y="72" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="180" y="85" text-anchor="middle" font-size="7.6" class="s-ink mono">user</text><rect x="259" y="72" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="290" y="85" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">items[ ]</text><rect x="79" y="108" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="110" y="121" text-anchor="middle" font-size="7.6" class="s-ink mono">id</text><rect x="149" y="108" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="180" y="121" text-anchor="middle" font-size="7.6" class="s-ink mono">city</text><rect x="223" y="108" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="254" y="121" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">[0].dish</text><rect x="293" y="108" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="324" y="121" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">[1].dish</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">[*] returns JSON text: ["Rajma Chawal","Chai",…]</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">json_tuple opens one level per call</text><path d="M170 54L80 72" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M85.6 67.8L80 72L86.8 73.7" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M180 54L180 72" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M177.0 65.7L180 72L183.0 65.7" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M190 54L286 72" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M279.2 73.8L286 72L280.4 67.8" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M174 90L116 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M121.1 103.2L116 108L122.9 109.0" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M180 90L180 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M177.0 101.7L180 108L183.0 101.7" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M284 90L258 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M261.4 101.9L258 108L264.9 106.9" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M296 90L320 108" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><path d="M313.1 106.7L320 108L316.8 101.8" style="fill:none;stroke:#8A94A0;stroke-width:1.2"/><rect x="149" y="36" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="180" y="49" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">$</text><rect x="39" y="72" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="70" y="85" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">event</text><rect x="149" y="72" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="180" y="85" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">user</text><rect x="259" y="72" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="290" y="85" text-anchor="middle" font-size="7.6" class="s-ink mono">items[ ]</text><rect x="79" y="108" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="110" y="121" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">id</text><rect x="149" y="108" width="62" height="18" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="180" y="121" text-anchor="middle" font-size="7.6" font-weight="700" class="s-ink mono">city</text><rect x="223" y="108" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="254" y="121" text-anchor="middle" font-size="7.6" class="s-ink mono">[0].dish</text><rect x="293" y="108" width="62" height="18" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="324" y="121" text-anchor="middle" font-size="7.6" class="s-ink mono">[1].dish</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">First call: event, user. Second call: id, city.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">SerDe reads every line strictly</text><rect x="30" y="58" width="54" height="26" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="57" y="75" text-anchor="middle" font-size="7.6" class="s-ink mono">1</text><rect x="92" y="58" width="54" height="26" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="119" y="75" text-anchor="middle" font-size="7.6" class="s-ink mono">2</text><rect x="154" y="58" width="54" height="26" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="181" y="75" text-anchor="middle" font-size="7.6" class="s-ink mono">…</text><rect x="216" y="58" width="54" height="26" rx="4" class="s-soft-acc" style="stroke:#D64545"/><text x="243" y="75" text-anchor="middle" font-size="7.6" class="s-ink mono">1500</text><rect x="278" y="58" width="54" height="26" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="305" y="75" text-anchor="middle" font-size="7.6" class="s-ink mono">2000</text><text x="180" y="112" text-anchor="middle" font-size="8.2" class="s-red">line 1500 is cut off → the whole task fails</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Functions return NULL; the SerDe stops.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Parse once, query many times</text><rect x="20" y="60" width="96" height="30" rx="5" class="s-card2" style="stroke:var(--line)"/><text x="68" y="79" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">raw STRING</text><rect x="132" y="60" width="96" height="30" rx="5" class="s-soft-acc" style="stroke:#E0A100"/><text x="180" y="79" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">good / bad</text><rect x="244" y="60" width="96" height="30" rx="5" class="s-soft-green" style="stroke:var(--green)"/><text x="292" y="79" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">ORC typed</text><path d="M118 75L130 75" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M123.7 78.0L130 75L123.7 72.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M230 75L242 75" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><path d="M235.7 78.0L242 75L235.7 72.0" style="fill:none;stroke:#8A94A0;stroke-width:1.6"/><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Quarantine, then CTAS into ORC.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The path starts at the root ($) and follows keys down the tree.</li>
+          <li>Array positions start at 0; [*] collects every element.</li>
+          <li>json_tuple only reads one level, so nested objects need another call.</li>
+          <li>The SerDe must parse every line into columns; one broken line stops the task.</li>
+          <li>Raw data is split into good and bad lines, then converted once to ORC.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a broken line, parsing once, and changing JSON.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-badline">One truncated line stops the nightly job</h3>
+  <p class="anim-intro">A partial upload left one broken JSON line. The counts and errors are real.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Bad records <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A truncated JSON line failed the SerDe scan; the raw table found it and quarantine let the pipeline continue">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-red">Nightly job failed at 2 a.m.</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">Vertex failed … JsonEOFException</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One partial upload, whole job down.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Find the culprit with the raw table</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">WHERE get_json_object(line, '$.event') IS NULL</text><text x="180" y="78" text-anchor="middle" font-size="8.6" font-weight="700" class="s-red mono">→ 1 line of 2,000 (real)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">NULL from get_json_object marks unparsable lines.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink">Quarantine</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-green mono">good lines → /data/events_good (1,999)</text><text x="180" y="76" text-anchor="middle" font-size="8.4" class="s-red mono">bad lines  → /data/events_bad  (1)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The pipeline continues; bad data is kept for review.</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT COUNT(*) AS n FROM events_json;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 1999 |</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.6" font-weight="700" class="s-acc">Add a data-quality metric</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">bad_lines / total_lines per day; alert above 0.1%</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bad data is expected; silent failure is not.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The typed table failed on a broken line.</li>
+          <li>The raw STRING table finds lines that do not parse.</li>
+          <li>Good and bad lines go to separate folders.</li>
+          <li>The typed table over the good folder reads all 1,999 events.</li>
+          <li>Track the bad-line rate as a quality metric.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-parse-once">Parse JSON once, not on every query</h3>
+  <p class="anim-intro">Turning a raw JSON table into a typed ORC table. Query results are real; the speed remarks are general guidance.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Parse once <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Raw JSON parsed by functions on every query is converted once into an ORC table with typed columns">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Dashboard on raw JSON is slow</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">6 × get_json_object per row, every refresh</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each call parses the whole line again.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink">Parse once with CTAS</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">CREATE TABLE events_clean STORED AS ORC AS …</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Typed columns, compression, statistics.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink">Columnar reads</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">a query on city reads only the city column</text><text x="180" y="76" text-anchor="middle" font-size="8.2" class="s-ink2">(raw JSON must read and parse every byte)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">ORC is covered in Module 6.</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT os, COUNT(*), … FROM events_clean GROUP BY os;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Android | 1334 | 508 | 38.1 |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| iOS     | 665  | 271 | 40.8 |</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.6" font-weight="700" class="s-acc">Pattern</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">raw (keep forever) → clean ORC (rebuildable) → reports</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bronze → silver → gold, in lakehouse terms.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Functions re-parse JSON every time a dashboard refreshes.</li>
+          <li>CTAS writes typed columns into ORC once.</li>
+          <li>Columnar files let queries read only needed columns.</li>
+          <li>Reports run on the clean table.</li>
+          <li>Keep raw data, rebuild clean tables when logic changes.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-drift">When the JSON changes shape</h3>
+  <p class="anim-intro">Apps evolve and so do their events. A plan for new, missing and changed fields. (Guidance; the NULL behaviour matches our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Schema drift <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="New JSON keys are ignored until added, missing keys give NULL, and type changes need checks and an agreed contract">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink">App 5.4 adds a field</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">"payment":{"mode":"UPI","wallet":"none"}</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Old table definitions do not know it.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.6" font-weight="700" class="s-green">JsonSerDe ignores unknown keys</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">queries keep working; payment is just not visible</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Add the column with ALTER TABLE … ADD COLUMNS.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink">Missing keys → NULL</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">old events have no payment: NULL, not an error</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Like coupon on order events in our data.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.6" font-weight="700" class="s-red">Type changes are dangerous</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">"price": 120  →  "price": "120.00"</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check types in the quarantine step too.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.6" font-weight="700" class="s-acc">Contract with the app team</text><text x="26" y="52" font-size="8.4" class="s-ink">• version field in every event</text><text x="26" y="71" font-size="8.4" class="s-ink">• additive changes only</text><text x="26" y="90" font-size="8.4" class="s-ink">• schema registry or shared JSON Schema</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Agree changes before they ship.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A new app version adds a nested payment object.</li>
+          <li>The SerDe ignores keys that are not columns; add them when needed.</li>
+          <li>Older events without the key show NULL.</li>
+          <li>Changed types are the real risk; validate them.</li>
+          <li>Agree an event contract with the producers.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>JSON and semi-structured data at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-green">events</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">clickstream</text></svg></div>
+    <div><h4>1. App and web clickstream</h4>
+      <p>Mobile apps and websites send JSON events; Hive tables over the landing folders feed funnels, retention and A/B test reports.</p>
+      <div class="uc-flow"><span>JSON events</span><i>→</i><span class="java">Raw → ORC</span><i>→</i><span>Funnels</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-blue">API</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">payloads</text></svg></div>
+    <div><h4>2. API and payment logs</h4>
+      <p>Payment gateways and partner APIs return JSON responses that are stored as-is for audit and parsed into tables for reconciliation.</p>
+      <div class="uc-flow"><span>API responses</span><i>→</i><span class="java">get_json_object</span><i>→</i><span>Reconciliation</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-violet">IoT</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">sensors</text></svg></div>
+    <div><h4>3. Device telemetry</h4>
+      <p>Delivery bikes, smart meters and machines send nested JSON readings; SerDe tables with STRUCT columns make them queryable.</p>
+      <div class="uc-flow"><span>Telemetry</span><i>→</i><span class="java">JsonSerDe</span><i>→</i><span>Health dashboards</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc mono">UTM</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">campaigns</text></svg></div>
+    <div><h4>4. Campaign tracking</h4>
+      <p>parse_url_tuple extracts utm_source and utm_campaign from landing-page URLs to attribute orders to ads.</p>
+      <div class="uc-flow"><span>Page URLs</span><i>→</i><span class="java">parse_url_tuple</span><i>→</i><span>Attribution</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc mono">XML</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">legacy feeds</text></svg></div>
+    <div><h4>5. Legacy XML feeds</h4>
+      <p>Banks and government systems still exchange XML; xpath functions read fields from XML strings during migration to modern formats.</p>
+      <div class="uc-flow"><span>XML files</span><i>→</i><span class="java">xpath_string</span><i>→</i><span>Tables</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: paths, tuples and bad lines</h2>
+  <p>These programs mimic Hive’s JSON functions with Python’s json module, on the same kind of events used in the lab. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># get_json_object in Python: follow a path through nested JSON, NULL (None) if anything is missing
+import json
+line = &#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;user&quot;:{&quot;id&quot;:1376,&quot;city&quot;:&quot;Chennai&quot;},&quot;items&quot;:[{&quot;dish&quot;:&quot;Rajma Chawal&quot;,&quot;qty&quot;:3,&quot;price&quot;:120},{&quot;dish&quot;:&quot;Chai&quot;,&quot;qty&quot;:2,&quot;price&quot;:20}]}&#x27;
+
+def get(line, path):                     # path like [&quot;user&quot;, &quot;city&quot;] or [&quot;items&quot;, 0, &quot;dish&quot;]
+    try:
+        node = json.loads(line)
+    except ValueError:
+        return None                      # broken JSON -&gt; NULL
+    for step in path:
+        try:
+            node = node[step]
+        except (KeyError, IndexError, TypeError):
+            return None                  # missing key or index -&gt; NULL
+    return node
+
+print(get(line, [&quot;user&quot;, &quot;city&quot;]))       # $.user.city
+print(get(line, [&quot;items&quot;, 0, &quot;dish&quot;]))   # $.items[0].dish
+print(get(line, [&quot;User&quot;, &quot;id&quot;]))         # $.User.id  (keys are case-sensitive)
+print(get(line[:-15], [&quot;event&quot;]))        # truncated line</code></pre><div class="output">Chennai
+Rajma Chawal
+None
+None</div></div>
+  <ul class="anno"><li><code>        node = json.loads(line)</code><span>Like get_json_object, this parses the whole line on every call. Hive does the same for each call, which is why parsing once into ORC is faster.</span></li><li><code>            return None                  # missing key or index -&gt; NULL</code><span>Hive also returns NULL here instead of raising an error.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Follow paths",
+   "hint": "Press <b>Run<\/b>: Chennai, Rajma Chawal, None, None, matching Steps 2 and 3.",
+   "code": "# get_json_object in Python: follow a path through nested JSON, NULL (None) if anything is missing\nimport json\nline = '{\"event\":\"order_placed\",\"user\":{\"id\":1376,\"city\":\"Chennai\"},\"items\":[{\"dish\":\"Rajma Chawal\",\"qty\":3,\"price\":120},{\"dish\":\"Chai\",\"qty\":2,\"price\":20}]}'\n\ndef get(line, path):                     # path like [\"user\", \"city\"] or [\"items\", 0, \"dish\"]\n    try:\n        node = json.loads(line)\n    except ValueError:\n        return None                      # broken JSON -> NULL\n    for step in path:\n        try:\n            node = node[step]\n        except (KeyError, IndexError, TypeError):\n            return None                  # missing key or index -> NULL\n    return node\n\nprint(get(line, [\"user\", \"city\"]))       # $.user.city\nprint(get(line, [\"items\", 0, \"dish\"]))   # $.items[0].dish\nprint(get(line, [\"User\", \"id\"]))         # $.User.id  (keys are case-sensitive)\nprint(get(line[:-15], [\"event\"]))        # truncated line\n"
+  },
+  {
+   "label": "2 · [*] returns all elements",
+   "hint": "<b>Predict first:<\/b> what does $.items[*].dish give? In Hive it is JSON text.",
+   "code": "import json\nline = '{\"items\":[{\"dish\":\"Rajma Chawal\"},{\"dish\":\"Chai\"},{\"dish\":\"Idli\"}]}'\ndishes = [it[\"dish\"] for it in json.loads(line)[\"items\"]]\nprint(json.dumps(dishes, separators=(\",\", \":\")))\n"
+  },
+  {
+   "label": "3 · json_tuple: one parse, several keys",
+   "hint": "The nested user object comes back as text and needs a second parse.",
+   "code": "import json\nline = '{\"event\":\"order_placed\",\"ts\":\"2026-10-03T10:02:00+05:30\",\"user\":{\"id\":1376,\"city\":\"Chennai\"}}'\ndoc = json.loads(line)                                  # parse once\nevent, ts, user_json = doc.get(\"event\"), doc.get(\"ts\"), json.dumps(doc.get(\"user\"))\nu = json.loads(user_json)                               # second json_tuple\nprint(event, ts, u[\"id\"], u[\"city\"])\nprint(\"dotted key:\", doc.get(\"user.id\"))                # json_tuple(line, 'user.id') -> NULL\n"
+  },
+  {
+   "label": "4 · Quarantine bad lines",
+   "hint": "Split lines into good and bad, as in Step 7.",
+   "code": "import json\nlines = ['{\"event\":\"app_open\"}', '{\"event\":\"search\",\"query\":\"dosa\"}', '{\"event\":\"order_placed\",\"user\":{\"id\":5']\ngood, bad = [], []\nfor l in lines:\n    try:\n        json.loads(l); good.append(l)\n    except ValueError:\n        bad.append(l)\nprint(len(good), \"good,\", len(bad), \"bad:\", bad)\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "The strict reader stops at the broken line, like the JsonSerDe scan. Make it skip bad lines and count them instead.",
+   "code": "import json\nlines = ['{\"event\":\"app_open\"}', '{\"event\":\"order_placed\",\"user\":{\"id\":5', '{\"event\":\"search\"}']\nevents = [json.loads(l)[\"event\"] for l in lines]       # strict, like the SerDe\nassert len(events) == 2\nprint(events)\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: unknown keys, JSON functions and coupons</h3>
+  <p>Three more checks for Beeline on the events data. <b>Outputs are real</b>, from Hive 4.2.1.</p>
+  <div class="pcrun"><h4>1 · Unknown and missing keys in a SerDe table</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>CREATE EXTERNAL TABLE events_min (event STRING, payment STRING)
+ROW FORMAT SERDE &#x27;org.apache.hive.hcatalog.data.JsonSerDe&#x27; LOCATION &#x27;/data/events_good&#x27;;
+SELECT event, payment, COUNT(*) AS n FROM events_min GROUP BY event, payment ORDER BY n DESC;</code></pre><div class="output">+-----------------+----------+------+
+|      event      | payment  |  n   |
++-----------------+----------+------+
+| order_placed    | NULL     | 779  |
+| coupon_applied  | NULL     | 411  |
+| search          | NULL     | 410  |
+| app_open        | NULL     | 399  |
++-----------------+----------+------+</div></div>
+  <p class="muted">Keys in the JSON that are not columns (user, items, ts…) are ignored. A column with no matching key (payment) is NULL. This is what makes adding fields to events safe.</p></div>
+  <div class="pcrun"><h4>2 · Which JSON functions does your Hive have?</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SHOW FUNCTIONS LIKE &#x27;%json%&#x27;;
+DESCRIBE FUNCTION json_read;</code></pre><div class="output">+---------------------+
+|      tab_name       |
++---------------------+
+| get_json_object     |
+| json_read           |
+| json_tuple          |
+| parse_json          |
+| st_asgeojson        |
+| st_asjson           |
+| st_geomfromgeojson  |
+| st_geomfromjson     |
+| to_json             |
++---------------------+
++----------------------------------------------------+
+|                      tab_name                      |
++----------------------------------------------------+
+| json_read(json,type) - Parses the given json according to the given complex type specification |
++----------------------------------------------------+</div></div>
+  <p class="muted">Hive 4 adds json_read (JSON text to a typed value), to_json and parse_json for the VARIANT type, alongside the classic get_json_object and json_tuple. The st_* functions are for geographic data.</p></div>
+  <div class="pcrun"><h4>3 · Coupons, including JSON null</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SELECT coalesce(coupon, &#x27;(null)&#x27;) AS coupon, COUNT(*) AS n
+FROM events_clean WHERE event = &#x27;coupon_applied&#x27;
+GROUP BY coupon ORDER BY n DESC;</code></pre><div class="output">+------------+------+
+|   coupon   |  n   |
++------------+------+
+| (null)     | 142  |
+| DIWALI20   | 135  |
+| WELCOME50  | 134  |
++------------+------+</div></div>
+  <p class="muted">A JSON <code>null</code> and a missing key both arrive as SQL NULL. 142 coupon events had no code: worth asking the app team why.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Walking the path $.items[0].dish</h2>
+  <p>The path is followed one step at a time. Watch <code>node</code> get smaller.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import json",
+  "node = json.loads('{\"items\":[{\"dish\":\"Idli\",\"qty\":2}]}')",
+  "for step in [\"items\", 0, \"dish\"]:",
+  "    node = node[step]",
+  "print(node)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Parse",
+   "note": "The text becomes nested dicts and lists. <code>node<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;items&#x27;: → list #2} A new list object (#2) is created: [→ dict #3] A new dict object (#3) is created: {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 2}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;items&#x27;: → list #2}",
+    "<b>#2 list (1)<\/b> [→ dict #3]",
+    "<b>#3 dict (2)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 2}"
+   ],
+   "newVar": "node"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>step<\/code> is created: &#x27;items&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node",
+       "→ dict #1"
+      ],
+      [
+       "step",
+       "'items'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (1)<\/b> {&#x27;items&#x27;: → list #2}",
+    "<b>#2 list (1)<\/b> [→ dict #3]",
+    "<b>#3 dict (2)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 2}"
+   ],
+   "newVar": "step"
+  },
+  {
+   "line": 4,
+   "phase": "Step",
+   "note": "items → list, 0 → first item, dish → its value. <code>node<\/code> changes to → list #2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node",
+       "→ list #2"
+      ],
+      [
+       "step",
+       "'items'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#2 list (1)<\/b> [→ dict #3]",
+    "<b>#3 dict (2)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 2}"
+   ],
+   "newVar": "node"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>step<\/code> changes to 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node",
+       "→ list #2"
+      ],
+      [
+       "step",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#2 list (1)<\/b> [→ dict #3]",
+    "<b>#3 dict (2)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 2}"
+   ],
+   "newVar": "step"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>node<\/code> changes to → dict #3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node",
+       "→ dict #3"
+      ],
+      [
+       "step",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#3 dict (2)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 2}"
+   ],
+   "newVar": "node"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>step<\/code> changes to &#x27;dish&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node",
+       "→ dict #3"
+      ],
+      [
+       "step",
+       "'dish'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#3 dict (2)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 2}"
+   ],
+   "newVar": "step"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>node<\/code> changes to &#x27;Idli&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node",
+       "'Idli'"
+      ],
+      [
+       "step",
+       "'dish'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "node"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node",
+       "'Idli'"
+      ],
+      [
+       "step",
+       "'dish'"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "node",
+       "'Idli'"
+      ],
+      [
+       "step",
+       "'dish'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "Idli\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three JSON jobs: revenue from item lists, campaign parameters from URLs, and checking a feed before loading.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Analytics · items array</span></div>
+    <h4>Revenue of one order</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Order event items: Rajma Chawal 3 × 120, Chai 2 × 20, Idli 3 × 60. In Hive: <code>SUM(it.qty * it.price)</code> after <code>LATERAL VIEW inline(items) it</code>.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>items of the real event from user 1376</pre></div><div><small>Expected output</small><pre>[(&#x27;Rajma Chawal&#x27;, 360), (&#x27;Chai&#x27;, 40), (&#x27;Idli&#x27;, 180)] total: 580</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Turn each item into a row (inline).</li><li>Multiply qty by price.</li><li>Sum per order.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The real query listed 360, 40 and 180 for these three items. Total 580.",
+   "code": "items = [{\"dish\": \"Rajma Chawal\", \"qty\": 3, \"price\": 120},\n         {\"dish\": \"Chai\", \"qty\": 2, \"price\": 20},\n         {\"dish\": \"Idli\", \"qty\": 3, \"price\": 60}]\nlines = [(it[\"dish\"], it[\"qty\"] * it[\"price\"]) for it in items]\nprint(lines, \"total:\", sum(v for _, v in lines))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "items = [{\"dish\": \"Rajma Chawal\", \"qty\": 3, \"price\": 120},",
+  "         {\"dish\": \"Chai\", \"qty\": 2, \"price\": 20},",
+  "         {\"dish\": \"Idli\", \"qty\": 3, \"price\": 60}]",
+  "lines = [(it[\"dish\"], it[\"qty\"] * it[\"price\"]) for it in items]",
+  "print(lines, \"total:\", sum(v for _, v in lines))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>items<\/code> is created: → list #1. A new list object (#1) is created: [→ dict #2, → dict #3, → dict #4] A new dict object (#2) is created: {&#x27;dish&#x27;: &#x27;Rajma Chawal&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 120} A new dict object (#3) is created: {&#x27;dish&#x27;: &#x27;Chai&#x27;, &#x27;qty&#x27;: 2, &#x27;price&#x27;: 20} A new dict object (#4) is created: {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 60}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "items",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ dict #2, → dict #3, → dict #4]",
+    "<b>#2 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Rajma Chawal&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 120}",
+    "<b>#3 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Chai&#x27;, &#x27;qty&#x27;: 2, &#x27;price&#x27;: 20}",
+    "<b>#4 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 60}"
+   ],
+   "newVar": "items"
+  },
+  {
+   "line": 4,
+   "phase": "Line total",
+   "note": "qty × price, as in the real Step 8 output.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "items",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ dict #2, → dict #3, → dict #4]",
+    "<b>#2 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Rajma Chawal&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 120}",
+    "<b>#3 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Chai&#x27;, &#x27;qty&#x27;: 2, &#x27;price&#x27;: 20}",
+    "<b>#4 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 60}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "items",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ dict #2, → dict #3, → dict #4]",
+    "<b>#2 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Rajma Chawal&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 120}",
+    "<b>#3 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Chai&#x27;, &#x27;qty&#x27;: 2, &#x27;price&#x27;: 20}",
+    "<b>#4 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 60}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "items",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ dict #2, → dict #3, → dict #4]",
+    "<b>#2 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Rajma Chawal&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 120}",
+    "<b>#3 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Chai&#x27;, &#x27;qty&#x27;: 2, &#x27;price&#x27;: 20}",
+    "<b>#4 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 60}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>lines<\/code> is created: → list #5. A new list object (#5) is created: [→ tuple #6, → tuple #7, → tuple #8] A new tuple object (#6) is created: (&#x27;Rajma Chawal&#x27;, 360) A new tuple object (#7) is created: (&#x27;Chai&#x27;, 40) A new tuple object (#8) is created: (&#x27;Idli&#x27;, 180)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "items",
+       "→ list #1"
+      ],
+      [
+       "lines",
+       "→ list #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ dict #2, → dict #3, → dict #4]",
+    "<b>#2 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Rajma Chawal&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 120}",
+    "<b>#3 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Chai&#x27;, &#x27;qty&#x27;: 2, &#x27;price&#x27;: 20}",
+    "<b>#4 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 60}",
+    "<b>#5 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#6 tuple (2)<\/b> (&#x27;Rajma Chawal&#x27;, 360)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Chai&#x27;, 40)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Idli&#x27;, 180)"
+   ],
+   "newVar": "lines"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "items",
+       "→ list #1"
+      ],
+      [
+       "lines",
+       "→ list #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ dict #2, → dict #3, → dict #4]",
+    "<b>#2 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Rajma Chawal&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 120}",
+    "<b>#3 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Chai&#x27;, &#x27;qty&#x27;: 2, &#x27;price&#x27;: 20}",
+    "<b>#4 dict (3)<\/b> {&#x27;dish&#x27;: &#x27;Idli&#x27;, &#x27;qty&#x27;: 3, &#x27;price&#x27;: 60}",
+    "<b>#5 list (3)<\/b> [→ tuple #6, → tuple #7, → tuple #8]",
+    "<b>#6 tuple (2)<\/b> (&#x27;Rajma Chawal&#x27;, 360)",
+    "<b>#7 tuple (2)<\/b> (&#x27;Chai&#x27;, 40)",
+    "<b>#8 tuple (2)<\/b> (&#x27;Idli&#x27;, 180)"
+   ],
+   "out": "[('Rajma Chawal', 360), ('Chai', 40), ('Idli', 180)] total: 580\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Marketing · parse_url</span></div>
+    <h4>Which campaign brought the visit?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>From landing URLs, extract the host, path and the <code>src</code> parameter, as <code>parse_url_tuple(url, 'HOST', 'PATH', 'QUERY:src')</code>.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>https://tiffingo.in/menu/pune?dish=poha&amp;amp;src=ad</pre></div><div><small>Expected output</small><pre>tiffingo.in /menu/pune ad poha</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Split the URL into parts.</li><li>Read query parameters by name.</li><li>Count visits per src.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Real Hive gave tiffingo.in, /menu/pune and ad. A URL without src gives NULL, which you can report as “direct”.",
+   "code": "url = \"https://tiffingo.in/menu/pune?dish=poha&src=ad\"\nrest = url.split(\"://\", 1)[1]\nhost, _, tail = rest.partition(\"/\")\npath, _, query = tail.partition(\"?\")\nparams = dict(p.split(\"=\", 1) for p in query.split(\"&\") if p)\nprint(host, \"/\" + path, params.get(\"src\"), params.get(\"dish\"))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "url = \"https://tiffingo.in/menu/pune?dish=poha&src=ad\"",
+  "rest = url.split(\"://\", 1)[1]",
+  "host, _, tail = rest.partition(\"/\")",
+  "path, _, query = tail.partition(\"?\")",
+  "params = dict(p.split(\"=\", 1) for p in query.split(\"&\") if p)",
+  "print(host, \"/\" + path, params.get(\"src\"), params.get(\"dish\"))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>url<\/code> is created: &#x27;https://tiffingo.in/menu/pune?dish=poha&amp;src=ad&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "url",
+       "'https://tiffingo.in/menu/pune?dish=poha&src=ad'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "url"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>rest<\/code> is created: &#x27;tiffingo.in/menu/pune?dish=poha&amp;src=ad&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "url",
+       "'https://tiffingo.in/menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "rest",
+       "'tiffingo.in/menu/pune?dish=poha&src=ad'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "rest"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>host<\/code> is created: &#x27;tiffingo.in&#x27;. <code>_<\/code> is created: &#x27;/&#x27;. <code>tail<\/code> is created: &#x27;menu/pune?dish=poha&amp;src=ad&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "url",
+       "'https://tiffingo.in/menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "rest",
+       "'tiffingo.in/menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "host",
+       "'tiffingo.in'"
+      ],
+      [
+       "_",
+       "'/'"
+      ],
+      [
+       "tail",
+       "'menu/pune?dish=poha&src=ad'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "tail"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>_<\/code> changes to &#x27;?&#x27;. <code>path<\/code> is created: &#x27;menu/pune&#x27;. <code>query<\/code> is created: &#x27;dish=poha&amp;src=ad&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "url",
+       "'https://tiffingo.in/menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "rest",
+       "'tiffingo.in/menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "host",
+       "'tiffingo.in'"
+      ],
+      [
+       "_",
+       "'?'"
+      ],
+      [
+       "tail",
+       "'menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "path",
+       "'menu/pune'"
+      ],
+      [
+       "query",
+       "'dish=poha&src=ad'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "query"
+  },
+  {
+   "line": 5,
+   "phase": "QUERY:key",
+   "note": "Like parse_url(url, 'QUERY', 'src'). <code>params<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;dish&#x27;: &#x27;poha&#x27;, &#x27;src&#x27;: &#x27;ad&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "url",
+       "'https://tiffingo.in/menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "rest",
+       "'tiffingo.in/menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "host",
+       "'tiffingo.in'"
+      ],
+      [
+       "_",
+       "'?'"
+      ],
+      [
+       "tail",
+       "'menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "path",
+       "'menu/pune'"
+      ],
+      [
+       "query",
+       "'dish=poha&src=ad'"
+      ],
+      [
+       "params",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;dish&#x27;: &#x27;poha&#x27;, &#x27;src&#x27;: &#x27;ad&#x27;}"
+   ],
+   "newVar": "params"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "url",
+       "'https://tiffingo.in/menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "rest",
+       "'tiffingo.in/menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "host",
+       "'tiffingo.in'"
+      ],
+      [
+       "_",
+       "'?'"
+      ],
+      [
+       "tail",
+       "'menu/pune?dish=poha&src=ad'"
+      ],
+      [
+       "path",
+       "'menu/pune'"
+      ],
+      [
+       "query",
+       "'dish=poha&src=ad'"
+      ],
+      [
+       "params",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;dish&#x27;: &#x27;poha&#x27;, &#x27;src&#x27;: &#x27;ad&#x27;}"
+   ],
+   "out": "tiffingo.in /menu/pune ad poha\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Data quality · validation</span></div>
+    <h4>Validate a feed before loading</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Before pointing a JsonSerDe table at a folder, check each line: valid JSON, has <code>event</code>, and <code>items[].qty</code> is an integer. Route failures to quarantine.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>four sample lines, two of them bad</pre></div><div><small>Expected output</small><pre>2 good, 2 bad, 50% bad</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Try to parse each line.</li><li>Check required keys and types.</li><li>Count good and bad; stop if the bad rate is too high.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "In Hive, the same checks can be written on the raw table with get_json_object and a regular expression, before the typed table is used.",
+   "code": "import json\nlines = ['{\"event\":\"order_placed\",\"items\":[{\"qty\":2}]}', '{\"event\":\"search\"}',\n         '{\"event\":\"order_placed\",\"items\":[{\"qty\":\"two\"}]}', '{\"event\":\"app_op']\ngood = bad = 0\nfor l in lines:\n    try:\n        d = json.loads(l)\n        ok = \"event\" in d and all(isinstance(i.get(\"qty\"), int) for i in d.get(\"items\", []))\n    except ValueError:\n        ok = False\n    good, bad = (good + 1, bad) if ok else (good, bad + 1)\nprint(good, \"good,\", bad, \"bad,\", f\"{bad / len(lines):.0%} bad\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import json",
+  "lines = ['{\"event\":\"order_placed\",\"items\":[{\"qty\":2}]}', '{\"event\":\"search\"}',",
+  "         '{\"event\":\"order_placed\",\"items\":[{\"qty\":\"two\"}]}', '{\"event\":\"app_op']",
+  "good = bad = 0",
+  "for l in lines:",
+  "    try:",
+  "        d = json.loads(l)",
+  "        ok = \"event\" in d and all(isinstance(i.get(\"qty\"), int) for i in d.get(\"items\", []))",
+  "    except ValueError:",
+  "        ok = False",
+  "    good, bad = (good + 1, bad) if ok else (good, bad + 1)",
+  "print(good, \"good,\", bad, \"bad,\", f\"{bad / len(lines):.0%} bad\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>lines<\/code> is created: → list #1. A new list object (#1) is created: [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…"
+   ],
+   "newVar": "lines"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>good<\/code> is created: 0. <code>bad<\/code> is created: 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "0"
+      ],
+      [
+       "bad",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…"
+   ],
+   "newVar": "bad"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>l<\/code> is created: &#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "0"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"order_placed\",\"items\":[{\"qty\":2}]}'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…"
+   ],
+   "newVar": "l"
+  },
+  {
+   "line": 6,
+   "phase": "Type check",
+   "note": "Catches \"qty\":\"two\" before it becomes NULL or an error in Hive.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "0"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"order_placed\",\"items\":[{\"qty\":2}]}'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>d<\/code> is created: → dict #2. A new dict object (#2) is created: {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #3} A new list object (#3) is created: [→ dict #4] A new dict object (#4) is created: {&#x27;qty&#x27;: 2}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "0"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"order_placed\",\"items\":[{\"qty\":2}]}'"
+      ],
+      [
+       "d",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#2 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #3}",
+    "<b>#3 list (1)<\/b> [→ dict #4]",
+    "<b>#4 dict (1)<\/b> {&#x27;qty&#x27;: 2}"
+   ],
+   "newVar": "d"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>ok<\/code> is created: True.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "0"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"order_placed\",\"items\":[{\"qty\":2}]}'"
+      ],
+      [
+       "d",
+       "→ dict #2"
+      ],
+      [
+       "ok",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#2 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #3}",
+    "<b>#3 list (1)<\/b> [→ dict #4]",
+    "<b>#4 dict (1)<\/b> {&#x27;qty&#x27;: 2}"
+   ],
+   "newVar": "ok"
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "<code>good<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "1"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"order_placed\",\"items\":[{\"qty\":2}]}'"
+      ],
+      [
+       "d",
+       "→ dict #2"
+      ],
+      [
+       "ok",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#2 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #3}",
+    "<b>#3 list (1)<\/b> [→ dict #4]",
+    "<b>#4 dict (1)<\/b> {&#x27;qty&#x27;: 2}"
+   ],
+   "newVar": "good"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>l<\/code> changes to &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "1"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"search\"}'"
+      ],
+      [
+       "d",
+       "→ dict #2"
+      ],
+      [
+       "ok",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#2 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #3}",
+    "<b>#3 list (1)<\/b> [→ dict #4]",
+    "<b>#4 dict (1)<\/b> {&#x27;qty&#x27;: 2}"
+   ],
+   "newVar": "l"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "1"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"search\"}'"
+      ],
+      [
+       "d",
+       "→ dict #2"
+      ],
+      [
+       "ok",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#2 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #3}",
+    "<b>#3 list (1)<\/b> [→ dict #4]",
+    "<b>#4 dict (1)<\/b> {&#x27;qty&#x27;: 2}"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>d<\/code> changes to → dict #5. A new dict object (#5) is created: {&#x27;event&#x27;: &#x27;search&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "1"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"search\"}'"
+      ],
+      [
+       "d",
+       "→ dict #5"
+      ],
+      [
+       "ok",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#5 dict (1)<\/b> {&#x27;event&#x27;: &#x27;search&#x27;}"
+   ],
+   "newVar": "d"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "1"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"search\"}'"
+      ],
+      [
+       "d",
+       "→ dict #5"
+      ],
+      [
+       "ok",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#5 dict (1)<\/b> {&#x27;event&#x27;: &#x27;search&#x27;}"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "<code>good<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"search\"}'"
+      ],
+      [
+       "d",
+       "→ dict #5"
+      ],
+      [
+       "ok",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#5 dict (1)<\/b> {&#x27;event&#x27;: &#x27;search&#x27;}"
+   ],
+   "newVar": "good"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>l<\/code> changes to &#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:&quot;two&quot;}]}&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"order_placed\",\"items\":[{\"qty\":\"two\"}]}'"
+      ],
+      [
+       "d",
+       "→ dict #5"
+      ],
+      [
+       "ok",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#5 dict (1)<\/b> {&#x27;event&#x27;: &#x27;search&#x27;}"
+   ],
+   "newVar": "l"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"order_placed\",\"items\":[{\"qty\":\"two\"}]}'"
+      ],
+      [
+       "d",
+       "→ dict #5"
+      ],
+      [
+       "ok",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#5 dict (1)<\/b> {&#x27;event&#x27;: &#x27;search&#x27;}"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>d<\/code> changes to → dict #6. A new dict object (#6) is created: {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7} A new list object (#7) is created: [→ dict #8] A new dict object (#8) is created: {&#x27;qty&#x27;: &#x27;two&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"order_placed\",\"items\":[{\"qty\":\"two\"}]}'"
+      ],
+      [
+       "d",
+       "→ dict #6"
+      ],
+      [
+       "ok",
+       "True"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#6 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7}",
+    "<b>#7 list (1)<\/b> [→ dict #8]",
+    "<b>#8 dict (1)<\/b> {&#x27;qty&#x27;: &#x27;two&#x27;}"
+   ],
+   "newVar": "d"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>ok<\/code> changes to False.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "0"
+      ],
+      [
+       "l",
+       "'{\"event\":\"order_placed\",\"items\":[{\"qty\":\"two\"}]}'"
+      ],
+      [
+       "d",
+       "→ dict #6"
+      ],
+      [
+       "ok",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#6 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7}",
+    "<b>#7 list (1)<\/b> [→ dict #8]",
+    "<b>#8 dict (1)<\/b> {&#x27;qty&#x27;: &#x27;two&#x27;}"
+   ],
+   "newVar": "ok"
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "<code>bad<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "1"
+      ],
+      [
+       "l",
+       "'{\"event\":\"order_placed\",\"items\":[{\"qty\":\"two\"}]}'"
+      ],
+      [
+       "d",
+       "→ dict #6"
+      ],
+      [
+       "ok",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#6 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7}",
+    "<b>#7 list (1)<\/b> [→ dict #8]",
+    "<b>#8 dict (1)<\/b> {&#x27;qty&#x27;: &#x27;two&#x27;}"
+   ],
+   "newVar": "bad"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>l<\/code> changes to &#x27;{&quot;event&quot;:&quot;app_op&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "1"
+      ],
+      [
+       "l",
+       "'{\"event\":\"app_op'"
+      ],
+      [
+       "d",
+       "→ dict #6"
+      ],
+      [
+       "ok",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#6 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7}",
+    "<b>#7 list (1)<\/b> [→ dict #8]",
+    "<b>#8 dict (1)<\/b> {&#x27;qty&#x27;: &#x27;two&#x27;}"
+   ],
+   "newVar": "l"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "1"
+      ],
+      [
+       "l",
+       "'{\"event\":\"app_op'"
+      ],
+      [
+       "d",
+       "→ dict #6"
+      ],
+      [
+       "ok",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#6 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7}",
+    "<b>#7 list (1)<\/b> [→ dict #8]",
+    "<b>#8 dict (1)<\/b> {&#x27;qty&#x27;: &#x27;two&#x27;}"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "1"
+      ],
+      [
+       "l",
+       "'{\"event\":\"app_op'"
+      ],
+      [
+       "d",
+       "→ dict #6"
+      ],
+      [
+       "ok",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#6 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7}",
+    "<b>#7 list (1)<\/b> [→ dict #8]",
+    "<b>#8 dict (1)<\/b> {&#x27;qty&#x27;: &#x27;two&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "1"
+      ],
+      [
+       "l",
+       "'{\"event\":\"app_op'"
+      ],
+      [
+       "d",
+       "→ dict #6"
+      ],
+      [
+       "ok",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#6 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7}",
+    "<b>#7 list (1)<\/b> [→ dict #8]",
+    "<b>#8 dict (1)<\/b> {&#x27;qty&#x27;: &#x27;two&#x27;}"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "1"
+      ],
+      [
+       "l",
+       "'{\"event\":\"app_op'"
+      ],
+      [
+       "d",
+       "→ dict #6"
+      ],
+      [
+       "ok",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#6 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7}",
+    "<b>#7 list (1)<\/b> [→ dict #8]",
+    "<b>#8 dict (1)<\/b> {&#x27;qty&#x27;: &#x27;two&#x27;}"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "<code>bad<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "2"
+      ],
+      [
+       "l",
+       "'{\"event\":\"app_op'"
+      ],
+      [
+       "d",
+       "→ dict #6"
+      ],
+      [
+       "ok",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#6 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7}",
+    "<b>#7 list (1)<\/b> [→ dict #8]",
+    "<b>#8 dict (1)<\/b> {&#x27;qty&#x27;: &#x27;two&#x27;}"
+   ],
+   "newVar": "bad"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "2"
+      ],
+      [
+       "l",
+       "'{\"event\":\"app_op'"
+      ],
+      [
+       "d",
+       "→ dict #6"
+      ],
+      [
+       "ok",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#6 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7}",
+    "<b>#7 list (1)<\/b> [→ dict #8]",
+    "<b>#8 dict (1)<\/b> {&#x27;qty&#x27;: &#x27;two&#x27;}"
+   ]
+  },
+  {
+   "line": 12,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "lines",
+       "→ list #1"
+      ],
+      [
+       "good",
+       "2"
+      ],
+      [
+       "bad",
+       "2"
+      ],
+      [
+       "l",
+       "'{\"event\":\"app_op'"
+      ],
+      [
+       "d",
+       "→ dict #6"
+      ],
+      [
+       "ok",
+       "False"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;{&quot;event&quot;:&quot;order_placed&quot;,&quot;items&quot;:[{&quot;qty&quot;:2}]}&#x27;, &#x27;{&quot;event&quot;:&quot;search&quot;}&#x27;, &#x27;{&quot;event&quot;:&quot;order_p…",
+    "<b>#6 dict (2)<\/b> {&#x27;event&#x27;: &#x27;order_placed&#x27;, &#x27;items&#x27;: → list #7}",
+    "<b>#7 list (1)<\/b> [→ dict #8]",
+    "<b>#8 dict (1)<\/b> {&#x27;qty&#x27;: &#x27;two&#x27;}"
+   ],
+   "out": "2 good, 2 bad, 50% bad\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: Which path reads the city inside the user object?",
+  "options": [
+   "$user.city",
+   "user->city",
+   "$.user.city",
+   "$.city.user"
+  ],
+  "answer": 2,
+  "why": "$ is the root, then .user, then .city."
+ },
+ {
+  "q": "Beginner: get_json_object on invalid JSON returns…",
+  "options": [
+   "An error",
+   "NULL",
+   "An empty string",
+   "0"
+  ],
+  "answer": 1,
+  "why": "The truncated line gave NULL; that is how we found it."
+ },
+ {
+  "q": "Beginner: What type does get_json_object return?",
+  "options": [
+   "Always STRING",
+   "The JSON type (int, array…)",
+   "BINARY",
+   "MAP"
+  ],
+  "answer": 0,
+  "why": "Even lists come back as JSON text, e.g. [\"Poha\",\"Idli\"]."
+ },
+ {
+  "q": "Intermediate: json_tuple(line, 'user.id') returned NULL. Why?",
+  "options": [
+   "user is reserved",
+   "IDs must be strings",
+   "Needs GROUP BY",
+   "json_tuple takes top-level key names, not paths"
+  ],
+  "answer": 3,
+  "why": "Read user first, then call json_tuple again on it."
+ },
+ {
+  "q": "Intermediate: A JsonSerDe table: LIMIT 3 worked, COUNT(*) failed. Most likely?",
+  "options": [
+   "Too much data",
+   "Wrong LOCATION",
+   "A malformed line later in the file",
+   "Metastore down"
+  ],
+  "answer": 2,
+  "why": "LIMIT read only the first lines; the full scan reached line 1,500 (JsonEOFException)."
+ },
+ {
+  "q": "Intermediate: Why does `user`.city need back-ticks?",
+  "options": [
+   "Dots need quotes",
+   "USER is a reserved word in HiveQL",
+   "Structs always need them",
+   "They do not"
+  ],
+  "answer": 1,
+  "why": "Without them: “cannot recognize input near 'user' '.' 'city'”."
+ },
+ {
+  "q": "Advanced: Best production pattern for a JSON feed queried daily?",
+  "options": [
+   "Raw STRING table → quarantine bad lines → CTAS into ORC → reports",
+   "get_json_object in every report",
+   "Convert to CSV by hand",
+   "Load into the metastore"
+  ],
+  "answer": 0,
+  "why": "Parse once, keep raw data, isolate bad records."
+ },
+ {
+  "q": "Advanced: A new key appears in the JSON. What happens to an existing JsonSerDe table?",
+  "options": [
+   "Queries fail",
+   "Hive adds the column automatically",
+   "All columns become NULL",
+   "The key is ignored until you add a column"
+  ],
+  "answer": 3,
+  "why": "Unknown keys are ignored; columns without keys are NULL (tested with events_min)."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 4.3 in one screen</h3>
+    <ul><li><b>Land raw:</b> <code>CREATE EXTERNAL TABLE raw (line STRING) LOCATION …</code>: never fails.</li><li><b>get_json_object(json, '$.a.b[0].c')</b>: one value, STRING result, NULL on missing key, wrong case or bad JSON. <code>[*]</code> returns JSON text.</li><li>Path limits: no <code>..</code>, no filters <code>?()</code>, no slices or unions.</li><li><b>json_tuple(json, 'k1', 'k2')</b> with LATERAL VIEW: one parse, top-level keys only; nest a second json_tuple for objects.</li><li><b>JsonSerDe</b> (<code>org.apache.hive.hcatalog.data.JsonSerDe</code>): typed STRUCT/ARRAY columns; unknown keys ignored, missing keys NULL; <b>a malformed line fails the scan</b>.</li><li>Reserved words as JSON keys (<code>user</code>) need back-ticks.</li><li><b>Pattern:</b> raw → quarantine (good/bad folders) → CTAS ORC → reports. Track the bad-line rate.</li><li><b>Others:</b> parse_url / parse_url_tuple (HOST, PATH, QUERY:key), xpath / xpath_string / xpath_int for XML. Hive 4: json_read, to_json, parse_json, variant_get.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Does Hive need one JSON object per line?</summary><p>Yes. Text-based tables split records at line breaks, so a pretty-printed JSON document spread over many lines cannot be read row by row. Convert such files to JSON Lines (one compact object per line) before loading.</p></details>
+    <details><summary>get_json_object or json_tuple: which is faster?</summary><p>json_tuple parses the document once for all the keys you ask for, while each get_json_object call parses it again. For many top-level fields json_tuple is cheaper. For a one-off nested field get_json_object is simpler. For repeated queries, parse once into ORC and neither matters.</p></details>
+    <details><summary>Can the JsonSerDe skip bad lines?</summary><p>The Hive JsonSerDe in our lab failed the whole task on one malformed line. Other SerDes (such as the third-party OpenX JSON SerDe) offer an option to ignore malformed JSON, but the safest pattern does not depend on it: validate and quarantine with a raw STRING table first.</p></details>
+    <details><summary>What about json_read in Hive 4?</summary><p>json_read(json, 'array&lt;struct&lt;…&gt;&gt;') converts JSON text straight into a typed value and worked in a small fetch-mode query in our lab. Inside a Tez job on the official Docker image it failed while serialising the plan (a Java 17 module-access error, “Error caching map.xml”). It may work on your cluster; test it before relying on it.</p></details>
+    <details><summary>How should I handle XML?</summary><p>For a few fields from XML strings, the xpath family is enough. For large XML feeds, convert them to JSON or Avro/Parquet upstream (Spark, NiFi) and load those; XML SerDes exist but are third-party and slower.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs that reproduce Hive’s JSON behaviour on real-shaped events, with the HiveQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Read a nested field</h4></div>
+      <p>Return the city of the user in an event.</p>
+      <div class="prob__io"><div><small>Input</small><pre>{&quot;user&quot;:{&quot;id&quot;:1279,&quot;city&quot;:&quot;Delhi&quot;}}</pre></div><div><small>Expected output</small><pre>Delhi</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import json
+print(json.loads(&#x27;{&quot;user&quot;:{&quot;id&quot;:1279,&quot;city&quot;:&quot;Delhi&quot;}}&#x27;)[&quot;user&quot;][&quot;city&quot;])</code></pre><div class="output">Delhi</div></div>
+        <p><b>How it works:</b> get_json_object(line, '$.user.city') = Delhi.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Missing key is NULL</h4></div>
+      <p>Read coupon from an order event that has no coupon.</p>
+      <div class="prob__io"><div><small>Input</small><pre>{&quot;event&quot;:&quot;order_placed&quot;}</pre></div><div><small>Expected output</small><pre>None</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import json
+print(json.loads(&#x27;{&quot;event&quot;:&quot;order_placed&quot;}&#x27;).get(&quot;coupon&quot;))</code></pre><div class="output">None</div></div>
+        <p><b>How it works:</b> None, like NULL from get_json_object(line, '$.coupon').</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Count bad lines</h4></div>
+      <p>How many of these lines are not valid JSON?</p>
+      <div class="prob__io"><div><small>Input</small><pre>three lines</pre></div><div><small>Expected output</small><pre>1</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import json
+lines = [&#x27;{&quot;a&quot;:1}&#x27;, &#x27;{&quot;a&quot;:&#x27;, &#x27;{&quot;b&quot;:2}&#x27;]
+bad = 0
+for l in lines:
+    try: json.loads(l)
+    except ValueError: bad += 1
+print(bad)</code></pre><div class="output">1</div></div>
+        <p><b>How it works:</b> 1. In Hive: SUM(IF(get_json_object(line, '$.a') IS NULL, 1, 0)), as in Step 4 (real: 1 of 2,000).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>All dishes as text</h4></div>
+      <p>Build the $.items[*].dish result for an order.</p>
+      <div class="prob__io"><div><small>Input</small><pre>items Poha, Idli</pre></div><div><small>Expected output</small><pre>[&quot;Poha&quot;,&quot;Idli&quot;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import json
+items = [{&quot;dish&quot;: &quot;Poha&quot;}, {&quot;dish&quot;: &quot;Idli&quot;}]
+print(json.dumps([i[&quot;dish&quot;] for i in items], separators=(&quot;,&quot;, &quot;:&quot;)))</code></pre><div class="output">[&quot;Poha&quot;,&quot;Idli&quot;]</div></div>
+        <p><b>How it works:</b> ["Poha","Idli"], exactly the real output. Note it is a string; use the SerDe or json_read for a real array.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Event mix</h4></div>
+      <p>Using the real counts, what share of events are orders?</p>
+      <div class="prob__io"><div><small>Input</small><pre>order_placed 779, coupon_applied 411, search 410, app_open 399</pre></div><div><small>Expected output</small><pre>39.0% of 1999 parsed events</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>c = {&quot;order_placed&quot;: 779, &quot;coupon_applied&quot;: 411, &quot;search&quot;: 410, &quot;app_open&quot;: 399}
+print(f&quot;{c[&#x27;order_placed&#x27;] / sum(c.values()):.1%} of {sum(c.values())} parsed events&quot;)</code></pre><div class="output">39.0% of 1999 parsed events</div></div>
+        <p><b>How it works:</b> 39.0% of 1,999 parsed events (the 2,000th line was broken).</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Query parameter</h4></div>
+      <p>Extract dish from a URL query string.</p>
+      <div class="prob__io"><div><small>Input</small><pre>?dish=poha&amp;src=ad</pre></div><div><small>Expected output</small><pre>poha</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>params = dict(p.split(&quot;=&quot;, 1) for p in &quot;dish=poha&amp;src=ad&quot;.split(&quot;&amp;&quot;))
+print(params[&quot;dish&quot;])</code></pre><div class="output">poha</div></div>
+        <p><b>How it works:</b> parse_url(url, 'QUERY', 'dish') = poha; parse_url_tuple(url, 'QUERY:dish') too.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Revenue leader</h4></div>
+      <p>From the real revenue per city, how far ahead is Chennai of Bengaluru, in percent?</p>
+      <div class="prob__io"><div><small>Input</small><pre>Chennai 39,330 · Bengaluru 28,655</pre></div><div><small>Expected output</small><pre>37.3% higher</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{(39330 - 28655) / 28655:.1%} higher&quot;)</code></pre><div class="output">37.3% higher</div></div>
+        <p><b>How it works:</b> About 37.3% higher in this generated sample. Real conclusions need the full event history.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Bad-line alert</h4></div>
+      <p>A day has 1,250,000 events and 1,800 bad lines. Is it above a 0.1% alert threshold?</p>
+      <div class="prob__io"><div><small>Input</small><pre>illustrative daily counts</pre></div><div><small>Expected output</small><pre>0.144% ALERT</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>rate = 1800 / 1_250_000
+print(f&quot;{rate:.3%}&quot;, &quot;ALERT&quot; if rate &gt; 0.001 else &quot;ok&quot;)</code></pre><div class="output">0.144% ALERT</div></div>
+        <p><b>How it works:</b> 0.144%: above 0.1%, so alert the app team while the good lines still load.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">JSON questions test whether you know the functions and the production pattern, not just the syntax.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · HiveQL</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“Extract fields from a JSON column”</h4>
+      <p class="scn__situation">A table has a STRING column payload with JSON like {"user":{"id":7},"amount":250}. Return user id and amount.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know get_json_object paths?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <pre>SELECT CAST(get_json_object(payload, '$.user.id') AS INT) AS user_id,
+       CAST(get_json_object(payload, '$.amount') AS DECIMAL(10,2)) AS amount
+FROM payments;</pre>
+        <p>Cast the results: get_json_object always returns STRING.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Forgetting the $ root or leaving amounts as strings.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>The JSON job failed overnight</h4>
+      <p class="scn__situation">A JsonSerDe table query fails with “Hive Runtime Error while processing row … JsonEOFException”.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you isolate bad records?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Query the folder through a raw STRING table and find lines where a required key parses to NULL.</li>
+          <li>Write good and bad lines to separate folders; point the typed table at the good one.</li>
+          <li>Report the bad-line rate and fix the producer (here: a truncated upload).</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Deleting files until the error goes away.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Analytics engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Dashboards on raw JSON are slow</h4>
+      <p class="scn__situation">Ten reports each call get_json_object six times on a billion-row raw table.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know to parse once?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Build a typed ORC table with CTAS (or INSERT OVERWRITE per date partition) from the SerDe or json_tuple.</li>
+          <li>Point the reports at it; keep the raw table for reprocessing.</li>
+          <li>Partition by event date (Module 5) so daily reports read one folder.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Adding more nodes while every query keeps re-parsing JSON.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Design ingestion for evolving app events</h4>
+      <p class="scn__situation">Event JSON changes every app release. Design the Hive side.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you plan for schema drift?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Raw zone: STRING or JsonSerDe table with only stable fields; unknown keys are ignored, missing ones are NULL.</li>
+          <li>Event version field and an agreed JSON Schema; additive changes only.</li>
+          <li>Clean zone in ORC or Iceberg (Module 7); ALTER TABLE ADD COLUMNS for new fields; validate types in the quarantine step.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Recreating tables by hand after every release.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

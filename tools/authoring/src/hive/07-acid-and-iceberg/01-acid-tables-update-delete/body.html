@@ -1,0 +1,362 @@
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“A customer upgraded to Gold. Do we rewrite the whole table?”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> you need managed vs external tables (<a href="../../02-hiveql/02-managed-vs-external-tables/">2.2</a>), partitions (<a href="../../05-partitioning-and-bucketing/01-partitioning/">5.1</a>) and ORC (<a href="../../06-file-formats/02-orc-deep-dive/">6.2</a>).</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s support team changes customer plans, refunds cancelled orders and deletes test accounts every day. Kabir’s tables are plain Hive tables, and his first <code>UPDATE</code> fails with “table … is not transactional”. The old workaround was to rewrite a whole table or partition for every correction.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Without ACID, fixing one row means rewriting the whole table. With an ACID table, an UPDATE writes a small delete_delta file that removes the old row and a delta file with the new row; readers merge them.">
+        <rect x="10" y="12" width="300" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="160" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">Before: no UPDATE in Hive</text><text x="22" y="54" font-size="7.6" class="s-ink2">1. copy the whole table without the row</text><text x="22" y="70" font-size="7.6" class="s-ink2">2. INSERT OVERWRITE everything back</text><text x="22" y="86" font-size="7.6" class="s-red">3. hope nobody read it meanwhile</text><text x="160" y="120" text-anchor="middle" font-size="8" font-weight="700" class="s-red">50,000 rows rewritten to fix 1</text><rect x="330" y="12" width="300" height="128" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="480" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-green">ACID table: UPDATE / DELETE</text><rect x="344" y="46" width="84" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="386.0" y="59" text-anchor="middle" font-size="6.8" font-weight="700" class="s-ink mono">delta_1</text><text x="386.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2">insert</text><rect x="436" y="46" width="90" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="481.0" y="59" text-anchor="middle" font-size="6.8" font-weight="700" class="s-ink mono">delete_delta_2</text><text x="481.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2">old row out</text><rect x="534" y="46" width="84" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="576.0" y="59" text-anchor="middle" font-size="6.8" font-weight="700" class="s-ink mono">delta_2</text><text x="576.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2">new row in</text><text x="480" y="104" text-anchor="middle" font-size="7.6" class="s-ink2">old files never change; new small files</text><text x="480" y="122" text-anchor="middle" font-size="7.6" font-weight="700" class="s-green">readers merge them on the fly</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">ACID tables turn UPDATE and DELETE into <tspan font-weight="700" class="s-acc">small new files</tspan> that readers merge, never edits in place.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+K> Sir, HDFS files cannot be edited. How can Hive UPDATE anything?
+A> It never edits a file. On a <b>transactional (ACID)</b> table, an UPDATE writes two small new folders: a <code>delete_delta</code> that says “row 1 of write 1 is gone”, and a <code>delta</code> with the new version. A reader opens the base data plus all deltas and merges them. Each statement is its own transaction, so readers see either all of it or none.
+R> Then the folder fills up with deltas?
+A> Yes, and a background <b>compactor</b> merges them (Lesson 7.3). Today we create ACID tables, run INSERT, UPDATE and DELETE, read the real delta files, see the hidden <code>ROW__ID</code>, and collect the errors you will meet: non-transactional tables, partition columns, external tables, BEGIN TRANSACTION and insert-only tables. All outputs are real, from Hive 4.2.1.
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>ACID (transactional) tables in Hive</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A <b>transactional table</b> (ACID table) is a managed table, stored as ORC for full support, declared with <code>TBLPROPERTIES ('transactional'='true')</code>, on which Hive supports <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code> and <code>MERGE</code> with <b>atomicity</b>, <b>consistency</b>, <b>isolation</b> (snapshot isolation) and <b>durability</b>. Each statement runs in its own transaction managed by the metastore. Changes are written as new <b>delta</b> and <b>delete_delta</b> directories identified by write ids; readers merge the base and delta files at read time, and a <b>compactor</b> periodically rewrites them into fewer files.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>An ACID table is a Hive table you can UPDATE and DELETE. Hive never changes old files; it adds small files describing the changes, and every reader combines them. Each statement either fully happens or not at all.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Transactional table</b><span>Managed ORC table with <code>transactional=true</code>.</span></div>
+    <div class="term"><b>Write id</b><span>A number per table for each write; appears in folder names.</span></div>
+    <div class="term"><b>delta_x_y_s</b><span>New rows from write ids x to y (statement s).</span></div>
+    <div class="term"><b>delete_delta_x_y_s</b><span>Row ids deleted by write ids x to y.</span></div>
+    <div class="term"><b>base_N</b><span>All data up to write N after major compaction (7.3).</span></div>
+    <div class="term"><b>ROW__ID</b><span>Hidden struct (writeid, bucketid, rowid) identifying each row.</span></div>
+    <div class="term"><b>Snapshot isolation</b><span>A query sees the data as of when it started; later commits are invisible to it.</span></div>
+    <div class="term"><b>Insert-only table</b><span>Transactional table that allows INSERT only, in any file format.</span></div>
+  </div>
+
+  <h3>Regular vs insert-only vs full ACID</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:720px">
+    <thead><tr><th></th><th>Regular (external) table</th><th>Insert-only ACID</th><th>Full ACID</th></tr></thead>
+    <tbody><tr><td>Property</td><td>(none)</td><td><code>transactional=true</code>, <code>transactional_properties=insert_only</code></td><td><code>transactional=true</code></td></tr><tr><td>File format</td><td>Any</td><td>Any (we used TEXTFILE)</td><td>ORC</td></tr><tr><td>INSERT</td><td>Yes</td><td>Yes, atomic</td><td>Yes, atomic</td></tr><tr><td>UPDATE / DELETE / MERGE</td><td>No (Error 10297)</td><td>No (Error 10414)</td><td>Yes</td></tr><tr><td>Table type</td><td>External or managed</td><td>Managed</td><td>Managed (external refused)</td></tr><tr><td>Folders</td><td>Plain files</td><td><code>delta_N_N_0/000000_0</code></td><td><code>delta_…</code>, <code>delete_delta_…</code>, <code>base_…</code></td></tr></tbody>
+  </table>
+  </div>
+LEVELS> ACID tables at three levels
+L1> A notebook you never erase
+      <ul>
+        <li>Imagine a register written in pen. To change an entry you do not erase it: you add a note at the end, “entry 2 is cancelled, new entry: …”.</li>
+        <li>Whoever reads the register reads the original pages and all the notes, and works out the current state.</li>
+        <li>That is how Hive ACID tables work on HDFS, where files cannot be edited.</li>
+      </ul>
+L2> What ACID means in Hive
+      <ul>
+        <li><b>A</b>tomic: a statement is all or nothing. <b>C</b>onsistent and <b>I</b>solated: readers see a snapshot of committed writes (snapshot isolation). <b>D</b>urable: committed data stays.</li>
+        <li>Create with <code>TBLPROPERTIES ('transactional'='true')</code> on a <b>managed ORC</b> table. Needs <code>hive.support.concurrency=true</code> and <code>hive.txn.manager=…DbTxnManager</code> (already set in our lab).</li>
+        <li>Every write gets a <b>write id</b>; data goes into <code>delta_&lt;from&gt;_&lt;to&gt;_&lt;stmt&gt;</code>, deletes into <code>delete_delta_…</code>, and after major compaction into <code>base_&lt;writeid&gt;</code>.</li>
+        <li>Each row has a hidden <code>ROW__ID</code> (writeid, bucketid, rowid) that deletes refer to.</li>
+        <li><b>Insert-only</b> tables (<code>'transactional_properties'='insert_only'</code>) work with any format but allow only INSERT.</li>
+      </ul>
+L3> What Hive 4.2.1 did (and refused) in our lab
+      <ul>
+        <li>An ACID table needed <b>no buckets</b> (Num Buckets −1). Old documentation saying “must be bucketed” describes Hive 1.x/2.x.</li>
+        <li>UPDATE = delete_delta (old row, by ROW__ID) + delta (new row) <b>in the same write id</b>; only the touched partitions got new folders.</li>
+        <li>Each statement auto-commits: <code>START TRANSACTION</code> → “not supported yet”.</li>
+        <li>Refused: UPDATE on a non-ACID table (10297), on a partition column (10292), on an insert-only table (10414), and an EXTERNAL transactional table.</li>
+        <li><code>DELETE … WHERE id IN (SELECT …)</code> worked: subqueries are allowed in the WHERE of UPDATE and DELETE.</li>
+      </ul>
+/LEVELS
+
+EXAM> “How does Hive support UPDATE and DELETE when HDFS files are immutable?” Answer: ACID tables write changes as new delta and delete_delta directories tagged with write ids; readers merge base and deltas using the hidden ROW__ID; compaction later merges them. Mention the requirements: managed ORC table, <code>transactional=true</code>, DbTxnManager, and that each statement auto-commits.
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>DML on ACID tables</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:720px">
+    <thead><tr><th>Statement</th><th>Example</th><th>Writes</th></tr></thead>
+    <tbody><tr><td>INSERT</td><td><code>INSERT INTO cust_acid VALUES (6, 'Diya Patil', 'Pune', 'Silver');</code></td><td><code>delta_N_N_0000</code></td></tr><tr><td>UPDATE</td><td><code>UPDATE cust_acid SET plan = 'Gold' WHERE customer_id = 2;</code></td><td><code>delete_delta_N…</code> + <code>delta_N_N_0001</code></td></tr><tr><td>DELETE</td><td><code>DELETE FROM cust_acid WHERE customer_id = 5;</code></td><td><code>delete_delta_N…</code></td></tr><tr><td>DELETE with subquery</td><td><code>DELETE FROM t WHERE id IN (SELECT id FROM …);</code></td><td>delete_delta in touched partitions only</td></tr><tr><td>MERGE</td><td><code>MERGE INTO t USING s ON … WHEN MATCHED … WHEN NOT MATCHED …</code></td><td>Lesson 7.2</td></tr><tr><td>Compaction</td><td><code>ALTER TABLE t COMPACT 'major';</code></td><td>Lesson 7.3</td></tr></tbody>
+  </table>
+  </div>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:560px">
+    <thead><tr><th>Command</th><th>Shows</th></tr></thead>
+    <tbody><tr><td><code>SHOW TRANSACTIONS;</code></td><td>Open and aborted transactions</td></tr><tr><td><code>SHOW LOCKS;</code></td><td>Locks held, including the metastore’s own housekeeping locks</td></tr><tr><td><code>SHOW COMPACTIONS;</code></td><td>Queued, running and finished compactions (7.3)</td></tr><tr><td><code>SELECT ROW__ID, * FROM t;</code></td><td>Which write created each row version</td></tr></tbody>
+  </table>
+  </div>
+WARN> ACID is designed for <b>occasional</b> corrections and batch upserts on large tables, not for a stream of single-row updates like an OLTP database. Each statement is a transaction with metastore round trips and new files; thousands of tiny updates create thousands of deltas. Batch them into one UPDATE or MERGE.
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Kabir’s first transactional table</h2>
+  <p>All outputs are real, from the Hive 4.2.1 lab (database <code>tiffingo</code>).</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · The settings behind ACID</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.support.concurrency;
+SET hive.txn.manager;
+SET hive.create.as.acid;</code></pre><div class="output">| hive.support.concurrency=true |
+| hive.txn.manager=org.apache.hadoop.hive.ql.lockmgr.DbTxnManager |
+| hive.create.as.acid=false |</div></div>
+      <span class="behind">The transaction manager keeps transactions, write ids and locks in the metastore database. Our lab image has it switched on. <code>hive.create.as.acid=false</code> means tables are not transactional unless you ask (some vendor distributions make every managed table ACID by default).</span></li>
+    <li><h4>Step 2 · Create a transactional table and insert</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE cust_acid (customer_id INT, name STRING, city STRING, plan STRING)
+STORED AS ORC TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;);
+INSERT INTO cust_acid SELECT customer_id, name, city, plan FROM customers WHERE customer_id &lt;= 5;
+SELECT * FROM cust_acid ORDER BY customer_id;
+DESCRIBE FORMATTED cust_acid;     -- selected lines</code></pre><div class="output">+------------------------+-----------------+-----------------+-----------------+
+| cust_acid.customer_id  | cust_acid.name  | cust_acid.city  | cust_acid.plan  |
++------------------------+-----------------+-----------------+-----------------+
+| 1                      | Aarav Desai     | Bengaluru       | Silver          |
+| 2                      | Ananya Iyer     | Mumbai          | Basic           |
+| 3                      | Arjun Nair      | Mumbai          | Gold            |
+| 4                      | Gurpreet Das    | Bengaluru       | Basic           |
+| 5                      | Aarav Singh     | Bengaluru       | Basic           |
++------------------------+-----------------+-----------------+-----------------+
+
+| Table Type:   | MANAGED_TABLE |
+|               | transactional             | true    |
+|               | transactional_properties  | default |
+| Num Buckets:  | -1            |</div></div>
+      <span class="behind">Unlike our earlier plain CREATE TABLEs, which Hive 4 turned into external tables, this one is <b>MANAGED</b>: Hive must own the files to manage deltas. <code>transactional_properties=default</code> means full ACID. No buckets were needed.</span></li>
+    <li><h4>Step 3 · UPDATE, DELETE and another INSERT</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>UPDATE cust_acid SET plan = &#x27;Gold&#x27; WHERE customer_id = 2;
+DELETE FROM cust_acid WHERE customer_id = 5;
+INSERT INTO cust_acid VALUES (6, &#x27;Diya Patil&#x27;, &#x27;Pune&#x27;, &#x27;Silver&#x27;);
+SELECT * FROM cust_acid ORDER BY customer_id;</code></pre><div class="output">+------------------------+-----------------+-----------------+-----------------+
+| cust_acid.customer_id  | cust_acid.name  | cust_acid.city  | cust_acid.plan  |
++------------------------+-----------------+-----------------+-----------------+
+| 1                      | Aarav Desai     | Bengaluru       | Silver          |
+| 2                      | Ananya Iyer     | Mumbai          | Gold            |
+| 3                      | Arjun Nair      | Mumbai          | Gold            |
+| 4                      | Gurpreet Das    | Bengaluru       | Basic           |
+| 6                      | Diya Patil      | Pune            | Silver          |
++------------------------+-----------------+-----------------+-----------------+</div></div>
+      <span class="behind">Ananya is now Gold, Aarav Singh (5) is gone, Diya (6) is new. Each statement committed on its own; there is no BEGIN … COMMIT around them.</span></li>
+    <li><h4>Step 4 · What changed on disk</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>find /opt/hive/data/warehouse/tiffingo.db/cust_acid | sort</code></pre><div class="output">delete_delta_0000002_0000002_0000/bucket_00000_0      ← UPDATE (write 2): old version of customer 2 deleted
+delete_delta_0000003_0000003_0000/bucket_00000_0      ← DELETE (write 3): customer 5
+delta_0000001_0000001_0000/bucket_00000_0             ← INSERT (write 1): customers 1–5
+delta_0000002_0000002_0001/bucket_00000_0             ← UPDATE (write 2): new version of customer 2
+delta_0000004_0000004_0000/bucket_00000_0             ← INSERT (write 4): customer 6
+(each folder also holds _orc_acid_version)</div></div>
+      <span class="behind">Four statements, five folders, and no existing file was modified. The folder names carry the write id twice (a range, so compaction can merge several) and a statement number. The UPDATE produced a delete_delta and a delta with the <b>same write id 2</b>: it is one transaction.</span></li>
+    <li><h4>Step 5 · Read the delta files</h4>
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>hive --orcfiledump -d &lt;folder&gt;/bucket_00000_0</code></pre><div class="output">$ hive --orcfiledump -d delete_delta_0000002_0000002_0000/bucket_00000_0
+{&quot;operation&quot;:2,&quot;originalTransaction&quot;:1,&quot;bucket&quot;:536870912,&quot;rowId&quot;:1,&quot;currentTransaction&quot;:2,&quot;row&quot;:null}
+$ hive --orcfiledump -d delete_delta_0000003_0000003_0000/bucket_00000_0
+{&quot;operation&quot;:2,&quot;originalTransaction&quot;:1,&quot;bucket&quot;:536870912,&quot;rowId&quot;:4,&quot;currentTransaction&quot;:3,&quot;row&quot;:null}
+$ hive --orcfiledump -d delta_0000002_0000002_0001/bucket_00000_0
+{&quot;operation&quot;:0,&quot;originalTransaction&quot;:2,&quot;bucket&quot;:536870913,&quot;rowId&quot;:0,&quot;currentTransaction&quot;:2,
+ &quot;row&quot;:{&quot;customer_id&quot;:2,&quot;name&quot;:&quot;Ananya Iyer&quot;,&quot;city&quot;:&quot;Mumbai&quot;,&quot;plan&quot;:&quot;Gold&quot;}}</div></div>
+      <span class="behind">A delete record stores no data, only which row it kills: “row 1 of write 1” (customer 2’s old version) and “row 4 of write 1” (customer 5). Operation 0 is an insert, 2 a delete. The new version of customer 2 is a fresh row created by write 2. This is how Hive “updates” immutable files.</span></li>
+    <li><h4>Step 6 · The hidden ROW__ID</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT ROW__ID, customer_id, plan FROM cust_acid ORDER BY customer_id;</code></pre><div class="output">+-----------------------------------------------+--------------+---------+
+|                    row__id                    | customer_id  |  plan   |
++-----------------------------------------------+--------------+---------+
+| {&quot;writeid&quot;:1,&quot;bucketid&quot;:536870912,&quot;rowid&quot;:0}  | 1            | Silver  |
+| {&quot;writeid&quot;:2,&quot;bucketid&quot;:536870913,&quot;rowid&quot;:0}  | 2            | Gold    |
+| {&quot;writeid&quot;:1,&quot;bucketid&quot;:536870912,&quot;rowid&quot;:2}  | 3            | Gold    |
+| {&quot;writeid&quot;:1,&quot;bucketid&quot;:536870912,&quot;rowid&quot;:3}  | 4            | Basic   |
+| {&quot;writeid&quot;:4,&quot;bucketid&quot;:536870912,&quot;rowid&quot;:0}  | 6            | Silver  |
++-----------------------------------------------+--------------+---------+</div></div>
+      <span class="behind">Customers 1, 3 and 4 still come from write 1 (rows 0, 2, 3). Customer 2 now comes from write 2 and customer 6 from write 4. Readers drop any row whose (writeid, bucketid, rowid) appears in a delete_delta. The bucketid value also encodes the statement number, which is why the updated row shows 536870913.</span></li>
+    <li><h4>Step 7 · Partitioned ACID: refunds in one day</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE orders_acid (order_id INT, customer_id INT, amount DECIMAL(10,2), status STRING)
+PARTITIONED BY (order_date DATE) STORED AS ORC TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;);
+INSERT INTO orders_acid PARTITION (order_date)
+  SELECT order_id, customer_id, amount, status, order_date FROM orders WHERE order_date &lt;= &#x27;2026-10-03&#x27;;
+
+UPDATE orders_acid SET status = &#x27;REFUNDED&#x27; WHERE order_date = &#x27;2026-10-02&#x27; AND status = &#x27;CANCELLED&#x27;;
+DELETE FROM orders_acid WHERE order_id IN
+  (SELECT order_id FROM orders WHERE order_date = &#x27;2026-10-03&#x27; AND amount &lt; 50);
+
+SELECT order_date, status, COUNT(*) AS n FROM orders_acid GROUP BY order_date, status;
+$ find …/orders_acid -maxdepth 2 -type d</code></pre><div class="output">+-------------+------------+-------+
+| order_date  |   status   |   n   |
++-------------+------------+-------+
+| 2026-10-01  | CANCELLED  | 98    |
+| 2026-10-01  | DELIVERED  | 1511  |
+| 2026-10-01  | REFUNDED   | 32    |
+| 2026-10-02  | DELIVERED  | 1476  |
+| 2026-10-02  | REFUNDED   | 141   |
+| 2026-10-03  | CANCELLED  | 106   |
+| 2026-10-03  | DELIVERED  | 1527  |
+| 2026-10-03  | REFUNDED   | 35    |
++-------------+------------+-------+
+
+./order_date=2026-10-01/delta_0000001_0000001_0000
+./order_date=2026-10-02/delete_delta_0000002_0000002_0000
+./order_date=2026-10-02/delta_0000001_0000001_0000
+./order_date=2026-10-02/delta_0000002_0000002_0001
+./order_date=2026-10-03/delete_delta_0000003_0000003_0000
+./order_date=2026-10-03/delta_0000001_0000001_0000</div></div>
+      <span class="behind">All 102 cancelled orders of 2 October became refunds (39 + 102 = 141), and 40 cheap orders of 3 October were deleted (1,668 → 1,628). Partition pruning works for DML too: 1 October was not touched, and each change landed only in its own partition folder.</span></li>
+    <li><h4>Step 8 · What ACID refuses</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>UPDATE customers …;  START TRANSACTION;  CREATE EXTERNAL TABLE … transactional …;
+UPDATE orders_acid SET order_date = …;  UPDATE events_mm …;</code></pre><div class="output">&gt; UPDATE customers SET plan = &#x27;Gold&#x27; WHERE customer_id = 2;
+Error: … [Error 10297]: Attempt to do update or delete on table customers that is not transactional
+&gt; START TRANSACTION;
+Error: … IllegalStateException START_TRANSACTION is not supported yet.
+&gt; CREATE EXTERNAL TABLE ext_acid (id INT) STORED AS ORC TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;);
+Error: … MetaException(message:tiffingo.ext_acid cannot be declared transactional because it&#x27;s an external table)
+&gt; UPDATE orders_acid SET order_date = &#x27;2026-10-02&#x27; WHERE order_id = 100013;
+Error: … [Error 10292]: Updating values of partition columns is not supported
+&gt; UPDATE events_mm SET event = &#x27;x&#x27; WHERE id = 1;          -- insert-only table
+Error: … [Error 10414]: Attempt to do update or delete on table events_mm that is insert-only transactional</div></div>
+      <span class="behind">Five real refusals: the table must be transactional and managed; there are no multi-statement transactions; you cannot move a row to another partition with UPDATE (delete and insert it instead); and insert-only tables accept only INSERT.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>How an UPDATE becomes two small folders</h2>
+  <p>Left: real Beeline output. Right: what the metastore and the folders record.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Deltas, delete deltas and ROW__ID <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real Beeline output">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; UPDATE customers SET plan = &#x27;Gold&#x27; …;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Error 10297: … not transactional</text><text x="26" y="78" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; CREATE TABLE cust_acid (…) STORED AS ORC</text><text x="26" y="92" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">    TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;);</text><text x="26" y="106" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Table Type: MANAGED_TABLE |</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; INSERT INTO cust_acid SELECT … ;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  delta_0000001_0000001_0000/</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 1 | Aarav Desai | … | Silver |</text><text x="26" y="92" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 2 | Ananya Iyer | … | Basic  |</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; UPDATE cust_acid SET plan = &#x27;Gold&#x27;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">    WHERE customer_id = 2;</text><text x="26" y="78" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  delete_delta_0000002_0000002_0000/</text><text x="26" y="92" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  delta_0000002_0000002_0001/</text><text x="26" y="106" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 2 | Ananya Iyer | … | Gold |</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; DELETE FROM cust_acid WHERE customer_id = 5;</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  delete_delta_0000003_0000003_0000/</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">{&quot;operation&quot;:2,&quot;originalTransaction&quot;:1,</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve"> &quot;rowId&quot;:4,&quot;row&quot;:null}</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT ROW__ID, customer_id, plan …;</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| {&quot;writeid&quot;:1,…,&quot;rowid&quot;:0} | 1 | Silver |</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| {&quot;writeid&quot;:2,…,&quot;rowid&quot;:0} | 2 | Gold   |</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| {&quot;writeid&quot;:4,…,&quot;rowid&quot;:0} | 6 | Silver |</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>UPDATE fails on a plain table; a transactional table is managed.</li>
+          <li>The first INSERT creates a delta folder for write 1.</li>
+          <li>UPDATE writes a delete_delta and a delta in the same write.</li>
+          <li>DELETE writes only the id of the dead row.</li>
+          <li>ROW__ID shows which write produced each visible row.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What the metastore and the folders record">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Transactional = managed + metastore-tracked</text><rect x="20" y="44" width="150" height="70" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="95" y="62" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink">metastore</text><text x="95" y="80" text-anchor="middle" font-size="7.2" class="s-ink2 mono">TXNS · write ids</text><text x="95" y="94" text-anchor="middle" font-size="7.2" class="s-ink2 mono">locks</text><path d="M172 78L196 78" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M189.7 81.0L196 78L189.7 75.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="198" y="44" width="142" height="70" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="269" y="62" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink mono">cust_acid/</text><text x="269" y="82" text-anchor="middle" font-size="7.2" class="s-ink2">Hive owns the files</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">External tables cannot be ACID.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Write 1: a delta folder</text><rect x="20" y="40" width="120" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="80.0" y="53" text-anchor="middle" font-size="6.8" font-weight="700" class="s-ink mono">delta_1_1_0</text><rect x="160" y="38" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="166" y="51" font-size="7" class="s-ink mono">w1 r0  customer 1</text><rect x="160" y="58" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="166" y="71" font-size="7" class="s-ink mono">w1 r1  customer 2</text><rect x="160" y="78" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="166" y="91" font-size="7" class="s-ink mono">w1 r2  customer 3</text><rect x="160" y="98" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="166" y="111" font-size="7" class="s-ink mono">w1 r3  customer 4</text><rect x="160" y="118" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="166" y="131" font-size="7" class="s-ink mono">w1 r4  customer 5</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rows numbered within the write.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Write 2: UPDATE = delete + insert</text><rect x="20" y="46" width="140" height="18" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="26" y="59" font-size="7" class="s-ink mono">w1 r1  customer 2 Basic</text><line x1="24" y1="55" x2="156" y2="55" stroke="#D64545" stroke-width="1.6"/><rect x="20" y="70" width="140" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="90.0" y="83" text-anchor="middle" font-size="6.8" font-weight="700" class="s-ink mono">delete_delta_2</text><text x="90.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2">w1 r1 is dead</text><rect x="200" y="46" width="140" height="18" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="206" y="59" font-size="7" class="s-ink mono">w2 r0  customer 2 Gold</text><rect x="200" y="70" width="140" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="270.0" y="83" text-anchor="middle" font-size="6.8" font-weight="700" class="s-ink mono">delta_2_2_0001</text><text x="270.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2">new version</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Both parts share write id 2: atomic.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Write 3: DELETE records row ids only</text><rect x="20" y="50" width="140" height="18" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="26" y="63" font-size="7" class="s-ink mono">w1 r4  customer 5</text><line x1="24" y1="59" x2="156" y2="59" stroke="#D64545" stroke-width="1.6"/><rect x="200" y="44" width="140" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="270.0" y="57" text-anchor="middle" font-size="6.8" font-weight="700" class="s-ink mono">delete_delta_3</text><text x="270.0" y="69" text-anchor="middle" font-size="6.4" class="s-ink2">{w1, r4}</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No data copied, just “this row is gone”.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Reader: merge base + deltas</text><rect x="20" y="36" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="49" font-size="7" class="s-ink mono">w1 r0  customer 1</text><rect x="20" y="56" width="140" height="18" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="26" y="69" font-size="7" class="s-ink mono">w1 r1  customer 2</text><line x1="24" y1="65" x2="156" y2="65" stroke="#D64545" stroke-width="1.6"/><rect x="20" y="76" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="89" font-size="7" class="s-ink mono">w1 r2  customer 3</text><rect x="20" y="96" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="109" font-size="7" class="s-ink mono">w1 r3  customer 4</text><rect x="20" y="116" width="140" height="18" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="26" y="129" font-size="7" class="s-ink mono">w1 r4  customer 5</text><line x1="24" y1="125" x2="156" y2="125" stroke="#D64545" stroke-width="1.6"/><rect x="200" y="46" width="140" height="18" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="206" y="59" font-size="7" class="s-ink mono">w2 r0  customer 2 Gold</text><rect x="200" y="70" width="140" height="18" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="206" y="83" font-size="7" class="s-ink mono">w4 r0  customer 6</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Skip deleted ROW__IDs, add new rows.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The metastore tracks transactions, write ids and locks for transactional tables.</li>
+          <li>Each row is identified by its write id and row number.</li>
+          <li>The old version is marked deleted and a new version is written; old files stay untouched.</li>
+          <li>A delete record points at (write, bucket, row) with no data.</li>
+          <li>Readers combine all folders, skipping rows listed in delete deltas.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: deleting a customer’s data, correcting a day of orders, and choosing a table type.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-erasure">Deleting one customer’s data on request</h3>
+  <p class="anim-intro">Data-protection requests are a classic reason for ACID tables. (Typical process; the DELETE pattern ran in our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Right to erasure <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="ACID DELETE marks a customer’s rows deleted in delete deltas; major compaction removes them physically; requests are batched">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A customer asks to delete their data</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">privacy rules: remove within a deadline</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Plain tables: rewrite every partition with that customer.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">ACID: one DELETE per table</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink mono">DELETE FROM orders_acid WHERE customer_id = 1492;</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Delete deltas in the partitions that hold the customer.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Is the data really gone?</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-red">old rows still sit in older delta files</text><text x="180" y="74" text-anchor="middle" font-size="8.4" class="s-ink2">until compaction rewrites them</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Logically deleted ≠ physically deleted.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Finish the job</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">ALTER TABLE … COMPACT 'major' (Lesson 7.3)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Major compaction writes a base without the rows.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Batch the requests</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink2 mono">collect a day of requests → one DELETE … IN (SELECT …)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One transaction instead of hundreds.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A customer requests deletion of their data.</li>
+          <li>One DELETE per table marks the rows.</li>
+          <li>The old row versions remain in files until compaction.</li>
+          <li>Major compaction rewrites the data without them.</li>
+          <li>Batch daily requests into one statement.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-corrections">Correcting a day of orders safely</h3>
+  <p class="anim-intro">A set-based UPDATE on one partition, with real results.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Data corrections <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A single UPDATE converts a day of cancelled orders to refunds, touching only that partition, atomically">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Payments team: 102 orders were refunded</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">status must change from CANCELLED to REFUNDED</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Correcting yesterday’s data.</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; UPDATE orders_acid SET status = &#x27;REFUNDED&#x27;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">    WHERE order_date = &#x27;2026-10-02&#x27;</text><text x="26" y="78" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">      AND status = &#x27;CANCELLED&#x27;;</text><text x="26" y="92" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 2026-10-02 | REFUNDED | 141 |</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Only one partition touched</text><rect x="20" y="50" width="100" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="70.0" y="63" text-anchor="middle" font-size="6.8" font-weight="700" class="s-ink mono">date=10-01</text><text x="70.0" y="75" text-anchor="middle" font-size="6.4" class="s-ink2">unchanged</text><rect x="130" y="50" width="100" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="63" text-anchor="middle" font-size="6.8" font-weight="700" class="s-ink mono">date=10-02</text><text x="180.0" y="75" text-anchor="middle" font-size="6.4" class="s-ink2">+2 folders</text><rect x="240" y="50" width="100" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="290.0" y="63" text-anchor="middle" font-size="6.8" font-weight="700" class="s-ink mono">date=10-03</text><text x="290.0" y="75" text-anchor="middle" font-size="6.4" class="s-ink2">unchanged</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Partition pruning applies to UPDATE too.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Readers never see half an update</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink2">a report started before the commit sees the old state</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Snapshot isolation.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Prefer one big statement</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-red mono">102 single-row UPDATEs = 102 transactions, 204 folders</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One set-based UPDATE = 1 transaction, 2 folders.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The payments team sends a correction.</li>
+          <li>One UPDATE fixes all 102 orders.</li>
+          <li>Only that day’s partition gets new delta folders.</li>
+          <li>Readers see either the old or the new state, never a mix.</li>
+          <li>Avoid row-by-row updates.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-choice">Choosing between external, insert-only, ACID and Iceberg</h3>
+  <p class="anim-intro">A design decision every Hive warehouse faces. (Typical guidance.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Table type choice <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Append-only data stays in external or insert-only tables; changing dimensions use ACID with MERGE; multi-engine tables consider Iceberg">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Which tables should be ACID?</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">not every table needs UPDATE</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">ACID adds files, locks and compaction work.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Append-only facts (clicks, logs)</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">external or insert-only tables</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Re-load whole partitions to fix them.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Dimensions that change (customers)</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">full ACID + MERGE (Lesson 7.2)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Upserts every night.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Shared with Spark / Trino?</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">Hive ACID support varies by engine</text><text x="180" y="74" text-anchor="middle" font-size="8.4" font-weight="700" class="s-green">Iceberg is engine-neutral (Lesson 7.3)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check every reader before choosing.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Rule of thumb</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">ACID or Iceberg only where rows really change</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Keep the rest simple.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>ACID has costs, so use it where needed.</li>
+          <li>Append-only facts do not need UPDATE.</li>
+          <li>Changing dimensions are the classic ACID use.</li>
+          <li>If other engines must write the table, consider Iceberg.</li>
+          <li>Use transactional tables only where rows change.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>ACID tables at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green mono">DELETE</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">privacy</text></svg></div>
+    <div><h4>1. Privacy deletions</h4>
+      <p>Data-protection laws such as India’s DPDP Act and Europe’s GDPR give people rights over their personal data; ACID DELETE plus compaction removes a person’s rows without rebuilding tables.</p>
+      <div class="uc-flow"><span>Request</span><i>→</i><span class="java">DELETE + compact</span><i>→</i><span>Data removed</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue mono">UPDATE</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">corrections</text></svg></div>
+    <div><h4>2. Late corrections</h4>
+      <p>Refunds, chargebacks and status changes arrive after the original load; a set-based UPDATE fixes them in the right partitions.</p>
+      <div class="uc-flow"><span>Correction feed</span><i>→</i><span class="java">UPDATE</span><i>→</i><span>Accurate reports</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet mono">MERGE</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">upserts</text></svg></div>
+    <div><h4>3. Nightly upserts from databases</h4>
+      <p>Changes from MySQL or PostgreSQL (CDC) are merged into Hive dimension tables every night with MERGE (Lesson 7.2).</p>
+      <div class="uc-flow"><span>CDC changes</span><i>→</i><span class="java">MERGE</span><i>→</i><span>Current dimensions</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">atomic</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">no half loads</text></svg></div>
+    <div><h4>4. Atomic loads</h4>
+      <p>Insert-only transactional tables guarantee that a failed load leaves no partial files visible to readers.</p>
+      <div class="uc-flow"><span>Load job</span><i>→</i><span class="java">insert-only ACID</span><i>→</i><span>All or nothing</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc">streaming</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">ingest</text></svg></div>
+    <div><h4>5. Streaming ingestion</h4>
+      <p>Hive’s streaming API writes micro-batches as transactions into ACID tables, so data is queryable within minutes (with compaction keeping deltas in check).</p>
+      <div class="uc-flow"><span>Events</span><i>→</i><span class="java">transactions</span><i>→</i><span>Fresh table</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>

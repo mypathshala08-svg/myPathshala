@@ -1,0 +1,1499 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The commit log and segments | MyPhatshala</title>
+<meta name="description" content="How Kafka stores a partition on disk as a chain of segments: .log, .index, .timeindex, .snapshot, leader-epoch-checkpoint and partition.metadata, base-offset file names, the active segment and roll rules (segment.bytes, segment.ms). Real Kafka 4.4 lab: 10,000 orders roll into three 1 MiB segments, the 1 MiB minimum is enforced, and pre-allocated indexes shrink when a segment closes.">
+<meta name="mp:minutes" content="22">
+<link rel="canonical" href="https://myphatshala.in/courses/kafka/04-storage-internals/01-the-commit-log-and-segments/">
+<meta property="og:title" content="The commit log and segments · MyPhatshala">
+<meta property="og:description" content="10,000 orders, three segments, files named by base offset: Kafka’s on-disk log opened up on 4.4.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "The commit log and segments", "learningResourceType": "Lesson", "educationalLevel": "Intermediate", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Kafka", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="04-storage-internals/01-the-commit-log-and-segments" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Kafka syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Kafka</a><span>›</span><b>Lesson 4.1</b></nav>
+    <h1>The commit log and segments</h1>
+    <p class="lead">A partition is not one file. We force a real <b>Kafka 4.4</b> partition to <b>roll segments</b>, list every file it creates, and learn why files are named by <b>base offset</b> and why only one segment is ever written. <b>All outputs are real.</b></p>
+    <div class="lesson-meta"><span>Module 4 · Storage internals</span><span>⏱ 22 min</span><span>Intermediate</span><span>3 segments rolled</span><span>Every file explained</span><span>1 MiB minimum found</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Why is my data in “…3413.log”?</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> <a href="../../01-introduction/03-kafka-architecture/">1.3 Architecture</a> and <a href="../../02-producers/03-batching-and-compression/">2.3 Batches</a>.</p></div>
+  <div class="story">
+<div class="callout callout--exam" style="display:block"><p style="font-size:1.12rem;margin:0 0 6px"><b>🤔 Kafka stored 10,000 orders in a file named 00000000000000003413.log. Why that strange name?</b></p><p style="margin:0 0 6px">A partition is not one big file. It is a chain of <b>segments</b>, each named after the first offset inside it. We forced Kafka to roll segments, listed every file it created, and found two tiny surprises: a minimum segment size, and index files that shrink when a segment is closed.</p><ul style="margin:0 0 0 18px"><li>Why a partition is split into segments at all.</li><li>What each of the 5 file types in a partition folder is for.</li><li>Which segment is “active”, and why only it is written.</li></ul></div>
+
+    <p class="narration">Kabir opens a broker’s data folder during an incident and sees files named <code>00000000000000003413.log</code>, <code>.index</code>, <code>.snapshot</code>. Riya asks what each of them is.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Partition seg-41-0 split into three segments: offsets 0 to 3,412 and 3,413 to 6,829 are closed; offsets 6,830 to 9,999 are in the active segment.">
+        <rect x="14" y="30" width="196" height="70" rx="8" class="s-soft-green" style="stroke:var(--green)"/><g transform="translate(22 38) scale(0.9)" fill="none" stroke="var(--ink)" stroke-width="1.78" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></g><text x="52" y="52" font-size="8.4" font-weight="700" class="s-ink mono">00…000.log</text><text x="112" y="72" text-anchor="middle" font-size="8" class="s-ink2">offsets 0 – 3,412</text><text x="112" y="88" text-anchor="middle" font-size="7.8" font-weight="700" class="s-green">closed</text><path d="M210 65L220 65" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M213.7 68.0L220 65L213.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="220" y="30" width="196" height="70" rx="8" class="s-soft-green" style="stroke:var(--green)"/><g transform="translate(228 38) scale(0.9)" fill="none" stroke="var(--ink)" stroke-width="1.78" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></g><text x="258" y="52" font-size="8.4" font-weight="700" class="s-ink mono">00…3413.log</text><text x="318" y="72" text-anchor="middle" font-size="8" class="s-ink2">offsets 3,413 – 6,829</text><text x="318" y="88" text-anchor="middle" font-size="7.8" font-weight="700" class="s-green">closed</text><path d="M416 65L426 65" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><path d="M419.7 68.0L426 65L419.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.4"/><rect x="426" y="30" width="196" height="70" rx="8" class="s-soft-acc" style="stroke:var(--track)"/><g transform="translate(434 38) scale(0.9)" fill="none" stroke="var(--ink)" stroke-width="1.78" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></g><text x="464" y="52" font-size="8.4" font-weight="700" class="s-ink mono">00…6830.log</text><text x="524" y="72" text-anchor="middle" font-size="8" class="s-ink2">offsets 6,830 – 9,999</text><text x="524" y="88" text-anchor="middle" font-size="7.8" font-weight="700" class="s-acc">ACTIVE</text><text x="320" y="120" text-anchor="middle" font-size="8" class="s-ink2">partition seg-41-0 · 10,000 orders · segment.bytes = 1 MiB · new records go only to the active segment</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">A partition is a <tspan font-weight="700" class="s-acc">chain of segment files</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>Sir, in Lesson 1.3 each partition was a folder. Is all the data in one file?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>No. A partition is a chain of <b>segments</b>. Kafka writes only to the newest one, the <b>active</b> segment. When it gets big or old enough, Kafka closes it and opens another.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Why bother?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Because deleting old data then means deleting a whole old file, not rewriting a giant one. Let’s make segments small so we can watch them roll.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>The commit log and segments</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>Each partition replica is stored as a <b>log</b>: an ordered sequence of <b>segments</b> in the partition directory. A segment consists of a <code>.log</code> file holding record batches and associated <code>.index</code> and <code>.timeindex</code> files, named by the segment’s <b>base offset</b> (20 digits). Only the last, <b>active</b> segment is appended to; Kafka <b>rolls</b> a new active segment when <code>segment.bytes</code>, <code>segment.ms</code> or the index size limit is reached. Closed segments are immutable and are the unit of retention, compaction and tiered-storage upload.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>A partition is a series of files. Kafka writes only to the newest file; when it is full or old, Kafka starts a new one named after the first record number it will hold. Old files are never changed, only deleted or cleaned as a whole.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Segment</b><span>One file of a partition’s log.</span></div>
+    <div class="term"><b>Active segment</b><span>The one being written.</span></div>
+    <div class="term"><b>Base offset</b><span>First offset in a segment (its name).</span></div>
+    <div class="term"><b>Roll</b><span>Close the active segment, open a new one.</span></div>
+    <div class="term"><b>segment.bytes</b><span>Size that triggers a roll.</span></div>
+    <div class="term"><b>segment.ms</b><span>Age that triggers a roll.</span></div>
+    <div class="term"><b>.snapshot</b><span>Producer state checkpoint.</span></div>
+    <div class="term"><b>log.dirs</b><span>Broker data directories.</span></div>
+  </div>
+
+  <h3>Why, how, where</h3>
+  <div class="cards">
+    <div class="card"><h4>Why</h4><p>One endless file could never be cleaned up cheaply: deleting old data would mean rewriting it. Segments let Kafka delete or compact whole files.</p><span class="tag">the problem it solves</span></div>
+    <div class="card"><h4>How</h4><p>Each partition appends to its active segment; when it reaches segment.bytes or segment.ms, Kafka closes it and starts a new one named after the next offset.</p><span class="tag">the mechanism</span></div>
+    <div class="card"><h4>Where</h4><p>Every Kafka topic; segment size affects retention granularity, file handles, recovery time and tiered storage uploads.</p><span class="tag">in real systems</span></div>
+    <div class="card"><h4>When not</h4><p>Very small segments create thousands of files and open handles; very large ones delay retention and compaction.</p><span class="tag">know the limits</span></div>
+  </div>
+
+  <h3>Concept map: what depends on what</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 230" role="img" aria-label="Concept map. Beginner: commit log, partition folder, segment. Intermediate: segment.bytes and segment.ms, active segment, base offset names, producer snapshots. Advanced: indexes, retention by segment, compaction, tiered storage.">
+        <rect x="14" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="112" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-green">Beginner</text><a href="../../01-introduction/01-what-is-kafka/"><rect x="28" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="112.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Commit log</text><text x="112.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">append-only</text></a><a href="../../01-introduction/03-kafka-architecture/"><rect x="28" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="112.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Partition folder</text><text x="112.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">topic-partition</text></a><rect x="28" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="112.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Segment</text><text x="112.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">.log file</text><rect x="224" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="322" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-blue">Intermediate</text><rect x="238" y="36" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Roll rules</text><text x="322.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">segment.bytes / .ms</text><rect x="238" y="74" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Active segment</text><text x="322.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">only one written</text><rect x="238" y="112" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Base offset name</text><text x="322.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">20 digits</text><rect x="238" y="150" width="168" height="30" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="322.0" y="161" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Snapshots</text><text x="322.0" y="171" text-anchor="middle" font-size="6.4" class="s-ink2 mono">producer state</text><rect x="434" y="8" width="196" height="190" rx="8" class="s-card2" style="stroke:var(--line)"/><text x="532" y="24" text-anchor="middle" font-size="9" font-weight="700" class="s-violet">Advanced</text><a href="../../04-storage-internals/02-indexes-and-how-a-read-works/"><rect x="448" y="36" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="47" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Indexes</text><text x="532.0" y="57" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 4.2</text></a><a href="../../04-storage-internals/03-retention-and-compaction/"><rect x="448" y="74" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="85" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Retention + compaction</text><text x="532.0" y="95" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 4.3</text></a><a href="../../04-storage-internals/04-tiered-storage-and-zero-copy/"><rect x="448" y="112" width="168" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="532.0" y="123" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Tiered storage</text><text x="532.0" y="133" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Lesson 4.4</text></a><path d="M112 66L112 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M109.0 105.7L112 112L115.0 105.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M112 104L112 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M109.0 105.7L112 112L115.0 105.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 127L238 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M237.6 58.0L238 51L232.3 55.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 66L322 74" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 67.7L322 74L325.0 67.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M196 127L238 127" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M231.7 130.0L238 127L231.7 124.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M322 104L322 150" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M319.0 143.7L322 150L325.0 143.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 127L448 51" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M447.6 58.0L448 51L442.3 55.0" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M406 51L448 89" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M441.3 87.0L448 89L445.4 82.5" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M532 104L532 112" style="fill:none;stroke:#8A94A0;stroke-width:1"/><path d="M529.0 105.7L532 112L535.0 105.7" style="fill:none;stroke:#8A94A0;stroke-width:1"/><text x="320" y="212" text-anchor="middle" font-size="8" class="s-ink2">Orange = this lesson · arrows = “you need this first” · click a box to jump</text>
+        
+        <text x="632" y="228" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>  <p class="muted"><b>Builds on:</b> <a href="../../01-introduction/03-kafka-architecture/">1.3</a>, <a href="../../02-producers/03-batching-and-compression/">2.3</a>. <b>Next:</b> <a href="../02-indexes-and-how-a-read-works/">4.2 Indexes</a>.</p>
+
+
+  <h3>Dissect a partition folder</h3>
+    <div class="scene">
+      <svg viewBox="0 0 640 252" role="img" aria-label="Dissection of a partition folder: closed segment files with trimmed index sizes, the active segment with 10 MB pre-allocated index files, producer state snapshot files, the leader epoch checkpoint and partition metadata.">
+        <text x="16" y="22" font-size="8.6" font-weight="700" class="s-ink">/var/lib/kafka/data/seg-41-0  (sizes in bytes)</text><rect x="16" y="34" width="101.528" height="22" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="66.76400000000001" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">1,047,693 …0000.log</text><circle cx="18" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="18" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><rect x="121.528" y="34" width="92.104" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="167.58" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">1,488 …0000.index</text><circle cx="123.528" cy="32" r="8" class="s-acc" style="fill:var(--track)"/><text x="123.528" y="35" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><rect x="217.632" y="34" width="101.528" height="22" rx="3" class="s-soft-blue" style="stroke:var(--blue)"/><text x="268.396" y="48.0" text-anchor="middle" font-size="7.6" class="s-ink mono">516 …0000.timeindex</text><rect x="16" y="70" width="92.104" height="22" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="62.052" y="84.0" text-anchor="middle" font-size="7.6" class="s-ink mono">971,323 …6830.log</text><circle cx="18" cy="68" r="8" class="s-acc" style="fill:var(--track)"/><text x="18" y="71" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><rect x="112.104" y="70" width="115.66399999999999" height="22" rx="3" class="s-soft-acc" style="stroke:#E0A100"/><text x="169.93599999999998" y="84.0" text-anchor="middle" font-size="7.6" class="s-ink mono">10,485,760 …6830.index</text><circle cx="114.104" cy="68" r="8" class="s-acc" style="fill:var(--track)"/><text x="114.104" y="71" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><rect x="231.76799999999997" y="70" width="92.104" height="22" rx="3" class="s-soft-violet" style="stroke:var(--violet)"/><text x="277.82" y="84.0" text-anchor="middle" font-size="7.6" class="s-ink mono">10 …6830.snapshot</text><circle cx="233.76799999999997" cy="68" r="8" class="s-acc" style="fill:var(--track)"/><text x="233.76799999999997" y="71" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">5</text><rect x="16" y="106" width="129.8" height="22" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="80.9" y="120.0" text-anchor="middle" font-size="7.6" class="s-ink mono">8 leader-epoch-checkpoint</text><circle cx="18" cy="104" r="8" class="s-acc" style="fill:var(--track)"/><text x="18" y="107" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">6</text><rect x="149.8" y="106" width="110.952" height="22" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="205.276" y="120.0" text-anchor="middle" font-size="7.6" class="s-ink mono">43 partition.metadata</text><circle cx="24" cy="149" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="152" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">1</text><text x="38" y="152" font-size="8" font-weight="700" class="s-ink">Closed segment</text><text x="136" y="152" font-size="7.6" class="s-ink2">just under 1 MiB: the next batch would not fit, so Kafka rolled</text><circle cx="24" cy="164" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="167" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">2</text><text x="38" y="167" font-size="8" font-weight="700" class="s-ink">Trimmed index</text><text x="136" y="167" font-size="7.6" class="s-ink2">shrunk to its real size when the segment closed</text><circle cx="24" cy="179" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="182" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">3</text><text x="38" y="182" font-size="8" font-weight="700" class="s-ink">Active segment</text><text x="136" y="182" font-size="7.6" class="s-ink2">the only file receiving new batches</text><circle cx="24" cy="194" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="197" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">4</text><text x="38" y="197" font-size="8" font-weight="700" class="s-ink">Pre-allocated index</text><text x="136" y="197" font-size="7.6" class="s-ink2">10 MiB reserved while active</text><circle cx="24" cy="209" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="212" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">5</text><text x="38" y="212" font-size="8" font-weight="700" class="s-ink">Producer snapshot</text><text x="136" y="212" font-size="7.6" class="s-ink2">idempotence state at the segment boundary</text><circle cx="24" cy="224" r="8" class="s-acc" style="fill:var(--track)"/><text x="24" y="227" text-anchor="middle" font-size="8" font-weight="700" class="s-ink" style="fill:#fff">6</text><text x="38" y="227" font-size="8" font-weight="700" class="s-ink">Epoch checkpoint</text><text x="136" y="227" font-size="7.6" class="s-ink2">which leader epoch started at which offset</text>
+        <text x="320" y="242" text-anchor="middle" font-size="10.5" class="s-ink2">Real file sizes from our lab.</text>
+        <text x="632" y="250" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+  <h3 id="levels">Segments at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A register with numbered notebooks</h4>
+      <ul>
+        <li>The order clerk writes in notebook #1 until it is full, then starts notebook #3413, named after the first order number in it. Old notebooks are closed and can be thrown away whole.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The files in a partition folder</h4>
+      <ul>
+        <li><code>.log</code>: the record batches (Lesson 2.3’s format). <code>.index</code>: offset → byte position. <code>.timeindex</code>: timestamp → offset (Lesson 4.2).</li>
+        <li><code>.snapshot</code>: producer state (producer ids and sequences for idempotence, Lesson 2.5) at that segment boundary, so restarts do not need to scan everything.</li>
+        <li><code>leader-epoch-checkpoint</code> and <code>partition.metadata</code> (topic id) for replication safety.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Roll rules and limits</h4>
+      <ul>
+        <li>A new segment is rolled when the active one would exceed <code>segment.bytes</code> (default 1 GiB; minimum 1 MiB in Kafka 4.x), or is older than <code>segment.ms</code> (7 days), or its index is full.</li>
+        <li>Indexes of the active segment are pre-allocated (<code>segment.index.bytes</code>, 10 MiB) and trimmed to their real size when the segment closes.</li>
+        <li>Each segment is a few open file handles; brokers with thousands of partitions need high <code>ulimit -n</code> and <code>vm.max_map_count</code>.</li>
+      </ul>
+
+    </div>
+  </div>
+<div class="callout callout--warn" style="display:block"><p style="margin:0 0 6px"><b>Myth vs reality: things many websites still say</b></p><ul style="margin:0 0 0 18px"><li><b>Myth:</b> A partition is one big file.<br><b>Reality (Kafka 4.4):</b> It is a chain of segment files.<br><span class="muted">Proof: Step 2: three segments.</span></li><li><b>Myth:</b> Segment names are random ids.<br><b>Reality (Kafka 4.4):</b> They are the base offset of the first record.<br><span class="muted">Proof: Step 3: …3413.log starts at 3413.</span></li><li><b>Myth:</b> You can set segments as small as you like.<br><b>Reality (Kafka 4.4):</b> Kafka 4.x enforces a 1 MiB minimum for segment.bytes.<br><span class="muted">Proof: Step 1.</span></li></ul></div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “How does Kafka store a partition on disk?” As a directory of segments; each has .log (record batches), .index (offset→position), .timeindex (time→offset), named by base offset; only the active segment is appended; roll on segment.bytes/segment.ms; retention and compaction work per closed segment.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Settings and files</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:560px">
+    <thead><tr><th>Setting</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody><tr><td>segment.bytes</td><td>1 GiB (min 1 MiB)</td><td>roll when the active segment is this big</td></tr><tr><td>segment.ms</td><td>7 days</td><td>roll at least this often (even if small)</td></tr><tr><td>segment.index.bytes</td><td>10 MiB</td><td>pre-allocated index size; roll when full</td></tr><tr><td>segment.jitter.ms</td><td>0</td><td>random delay to avoid all partitions rolling at once</td></tr><tr><td>log.dirs</td><td>broker setting</td><td>one or more disks; partitions spread across them</td></tr></tbody>
+  </table>
+  </div>  <div class="table-wrap">
+  <table class="compare" style="min-width:560px">
+    <thead><tr><th>File</th><th>Contains</th><th>Read by</th></tr></thead>
+    <tbody><tr><td>NNN.log</td><td>record batches</td><td>fetch, replication, dump-log</td></tr><tr><td>NNN.index</td><td>offset → position (sparse)</td><td>fetch by offset</td></tr><tr><td>NNN.timeindex</td><td>timestamp → offset (sparse)</td><td>offsetsForTimes, time retention</td></tr><tr><td>NNN.snapshot</td><td>producer ids, sequences</td><td>restart, idempotence</td></tr><tr><td>leader-epoch-checkpoint</td><td>epoch → start offset</td><td>replica truncation</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Kafka 4.x rejects <code>segment.bytes</code> below 1 MiB (our first attempt failed with “Value must be at least 1048576”). Tiny segments were a common trick in old tutorials; with real traffic they mean huge file counts and slow restarts.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Make segments roll</h2>
+  <p>All outputs are real: Kafka 4.4.0, 3 brokers; topic <code>seg-41</code>, 1 partition, RF 3, <code>segment.bytes=1048576</code>; 10,000 JSON orders of about 300 bytes. Script: <code>jobs/m4/l41_segments.py</code>.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Try a tiny segment</h4>
+      <div class="code" data-lang="python" data-file="l41_segments.py"><pre><code>fresh(&quot;seg-41&quot;, 1, 3, {&quot;segment.bytes&quot;: &quot;16384&quot;})</code></pre><div class="output">== 0) try a 16 KB segment size
+   Invalid value 16384 for configuration segment.bytes: Value must be at least 1048576</div></div>
+      <span class="behind">Kafka 4.4 refuses: the minimum is 1 MiB. So we used exactly 1 MiB and wrote 10,000 orders of about 300 bytes each.</span></li>
+    <li><h4>Step 2 · The folder</h4>
+      <div class="code" data-lang="bash" data-file="terminal"><pre><code>cd /var/lib/kafka/data/seg-41-0 &amp;&amp; stat -c &quot;%10s  %n&quot; *</code></pre><div class="output">== 1) the partition folder after 10,000 orders (segment.bytes=1 MiB)
+      1488  00000000000000000000.index
+   1047693  00000000000000000000.log
+       516  00000000000000000000.timeindex
+      1480  00000000000000003413.index
+   1048092  00000000000000003413.log
+        10  00000000000000003413.snapshot
+       552  00000000000000003413.timeindex
+  10485760  00000000000000006830.index
+    971323  00000000000000006830.log
+        10  00000000000000006830.snapshot
+  10485756  00000000000000006830.timeindex
+         8  leader-epoch-checkpoint
+        43  partition.metadata</div></div>
+      <span class="behind">Three segments. The two closed ones are just under 1 MiB with small, trimmed indexes; the active one has 10 MiB pre-allocated <code>.index</code> and <code>.timeindex</code> files. <code>.snapshot</code> files appear at segment boundaries.</span></li>
+    <li><h4>Step 3 · Names are base offsets</h4>
+      <div class="code" data-lang="bash" data-file="terminal"><pre><code>ls *.log
+kafka-dump-log.sh --files 00000000000000003413.log | head -2</code></pre><div class="output">== 2) file names = base offset of the first record in that segment
+00000000000000000000.log
+00000000000000003413.log
+00000000000000006830.log
+== 3) dump the start of the SECOND segment
+  00000000000000003413.log:
+baseOffset: 3413 lastOffset: 3422 count: 10 position: 0 size: 3011
+baseOffset: 3423 lastOffset: 3432 count: 10 position: 3011 size: 3011</div></div>
+      <span class="behind">The second file is called <code>…3413.log</code> because its first batch starts at offset 3413, at byte position 0. To find offset 5000 Kafka only has to compare file names (Lesson 4.2).</span></li>
+    <li><h4>Step 4 · Offsets and size</h4>
+      <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-get-offsets.sh --topic seg-41 --time -2    # log start
+kafka-get-offsets.sh --topic seg-41 --time -1    # log end
+kafka-log-dirs.sh --describe --topic-list seg-41</code></pre><div class="output">== 4) end offsets and log start
+seg-41:0:0
+seg-41:0:10000
+== 5) segment size on disk via kafka-log-dirs (one partition, three replicas)
+  sizes per broker: [&#x27;3067108&#x27;, &#x27;3067108&#x27;, &#x27;3067108&#x27;]</div></div>
+      <span class="behind">Log start 0, log end 10,000. About 3 MB on each of the 3 brokers: replication multiplies disk use.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Two views of the same run</h2>
+  <p>Left: real lab output. Right: what happens inside.</p>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">Roll, name, replicate <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real outputs from the lab">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">segment.bytes=16384:</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Value must be at least 1048576</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">1047693  …0000.log</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">1048092  …3413.log</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve"> 971323  …6830.log (active)</text><text x="26" y="92" font-size="7.0" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">10485760 …6830.index</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">00000000000000003413.log</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">baseOffset: 3413 position: 0</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">log start seg-41:0:0</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">log end   seg-41:0:10000</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">3,067,108 bytes × 3 brokers</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Limit.</li>
+          <li>Folder.</li>
+          <li>Names.</li>
+          <li>Size.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="The segment chain">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Minimum 1 MiB</text><rect x="14" y="50" width="105" height="40" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="66" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">0</text><rect x="129" y="50" width="105" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="181" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">3413</text><rect x="244" y="50" width="105" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="296" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">6830</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Minimum 1 MiB</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Two closed, one active</text><rect x="14" y="50" width="105" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="66" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">0</text><rect x="129" y="50" width="105" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="181" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">3413</text><rect x="244" y="50" width="105" height="40" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="296" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">6830</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Two closed, one active</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Name = first offset</text><rect x="14" y="50" width="105" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="66" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">0</text><rect x="129" y="50" width="105" height="40" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="181" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">3413</text><rect x="244" y="50" width="105" height="40" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="296" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">6830</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Name = first offset</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Replicated 3×</text><rect x="14" y="50" width="105" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="66" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">0</text><rect x="129" y="50" width="105" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="181" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">3413</text><rect x="244" y="50" width="105" height="40" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="296" y="74" text-anchor="middle" font-size="9" font-weight="700" class="s-ink mono">6830</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Replicated 3×</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Refused.</li>
+          <li>Roll.</li>
+          <li>Base offset.</li>
+          <li>Copies.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Now peel where one batch is written.</p>
+
+  <span class="live">Layer by layer</span>
+  <h3 id="scenario-peel">A batch arrives at the leader</h3>
+  <p class="anim-intro">Where it is written. (Simplified.)</p>
+  <div class="anim anim--one" data-frames="6" data-delay="5000">
+    <div class="anim__title">Layers <span>6 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Each layer of the system, from your code down to the disk">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce request</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Validate</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Active segment</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Append</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Index entry?</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Roll?</text><rect x="134" y="26" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="35.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Produce request</text><text x="184" y="53" font-size="7.4" class="s-ink2">batch for seg-41-0</text><text x="184" y="66" font-size="7.4" class="s-ink2">10 records, 3,011 bytes</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce request</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Validate</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Active segment</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Append</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Index entry?</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Roll?</text><rect x="134" y="48" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="57.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 40L149 48" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 41.7L149 48L152.0 41.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Validate</text><text x="184" y="53" font-size="7.4" class="s-ink2">CRC, sequence (idempotence)</text><text x="184" y="66" font-size="7.4" class="s-ink2">assign offsets</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce request</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Validate</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Active segment</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Append</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Index entry?</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Roll?</text><rect x="134" y="70" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="79.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 62L149 70" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 63.7L149 70L152.0 63.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Active segment</text><text x="184" y="53" font-size="7.4" class="s-ink2">…6830.log</text><text x="184" y="66" font-size="7.4" class="s-ink2">is the only writable file</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce request</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Validate</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Active segment</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Append</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Index entry?</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Roll?</text><rect x="134" y="92" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="101.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 84L149 92" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 85.7L149 92L152.0 85.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Append</text><text x="184" y="53" font-size="7.4" class="s-ink2">write at the end</text><text x="184" y="66" font-size="7.4" class="s-ink2">(page cache, sequential)</text><text x="184" y="79" font-size="7.4" class="s-ink2"></text></g><g data-on="5"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce request</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Validate</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Active segment</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Append</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Index entry?</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-card2" style="stroke:var(--line)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Roll?</text><rect x="134" y="114" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="123.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 106L149 114" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 107.7L149 114L152.0 107.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Index entry?</text><text x="184" y="53" font-size="7.4" class="s-ink2">every index.interval.bytes</text><text x="184" y="66" font-size="7.4" class="s-ink2">add offset → position</text><text x="184" y="79" font-size="7.4" class="s-ink2">and time → offset</text></g><g data-on="6"><text x="180" y="14" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">Peel it layer by layer</text><rect x="16" y="24" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="37" font-size="7.6" font-weight="700" class="s-ink">1. Produce request</text><rect x="16" y="46" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="59" font-size="7.6" font-weight="700" class="s-ink">2. Validate</text><rect x="16" y="68" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="81" font-size="7.6" font-weight="700" class="s-ink">3. Active segment</text><rect x="16" y="90" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="103" font-size="7.6" font-weight="700" class="s-ink">4. Append</text><rect x="16" y="112" width="150" height="19" rx="3" class="s-soft-green" style="stroke:var(--green)"/><text x="24" y="125" font-size="7.6" font-weight="700" class="s-ink">5. Index entry?</text><rect x="16" y="134" width="150" height="19" rx="3" class="s-soft-acc" style="stroke:var(--track)"/><text x="24" y="147" font-size="7.6" font-weight="700" class="s-ink">6. Roll?</text><rect x="134" y="136" width="30" height="14" rx="3" style="fill:var(--track)"/><text x="149.0" y="145.8" text-anchor="middle" font-size="6.6" font-weight="700" class="s-ink" style="fill:#fff">event</text><path d="M149 128L149 136" style="fill:none;stroke:var(--track);stroke-width:1"/><path d="M146.0 129.7L149 136L152.0 129.7" style="fill:none;stroke:var(--track);stroke-width:1"/><rect x="176" y="24" width="168" height="129" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="184" y="40" font-size="7.4" font-weight="700" class="s-ink">Roll?</text><text x="184" y="53" font-size="7.4" class="s-ink2">next batch > segment.bytes</text><text x="184" y="66" font-size="7.4" class="s-ink2">or segment.ms passed →</text><text x="184" y="79" font-size="7.4" class="s-ink2">close, open new file</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Arrive.</li>
+          <li>Check.</li>
+          <li>Pick file.</li>
+          <li>Write.</li>
+          <li>Index.</li>
+          <li>Roll.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios: too many files, retention that never deletes, and slow recovery.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-files">Too many open files</h3>
+  <p class="anim-intro">Small segments at scale. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Segment sizing <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Keep segments large enough; raise file limits">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Broker with 4,000 partitions</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">segment.ms = 1 hour</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Many segments.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each segment = 3+ files</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">mmap’d indexes</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">100k+ handles.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Broker crashes</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">“Too many open files”</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Outage.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Raise ulimit, vm.max_map_count</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">bigger segments</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Defaults are sane.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Stable</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">fewer files</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fixed.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Many.</li>
+          <li>Handles.</li>
+          <li>Crash.</li>
+          <li>Tune.</li>
+          <li>Stable.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-granularity">Retention that never deletes</h3>
+  <p class="anim-intro">Huge segments, low traffic. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Retention granularity <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Only closed segments can be deleted">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Topic retention 1 day</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">segment.bytes 1 GiB</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Low traffic.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Segment never fills</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">active for 7 days</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cannot delete.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Data kept 7+ days</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">compliance risk</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Surprise.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Set segment.ms = 1 hour</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">segments roll hourly</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Deletable.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Retention works</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">Lesson 4.3</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fixed.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Config.</li>
+          <li>No roll.</li>
+          <li>Too long.</li>
+          <li>Fix.</li>
+          <li>Works.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-recovery">Slow restart after a crash</h3>
+  <p class="anim-intro">Log recovery. (Typical.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Recovery <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Unflushed segments are checked on unclean restart">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Broker killed (power loss)</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">no clean shutdown</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Recovery needed.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Active segments re-validated</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">CRCs, indexes rebuilt</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Takes time.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Snapshots help</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">producer state not rescanned</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Faster.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">num.recovery.threads.per.data.dir</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">parallel recovery</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Tune.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Replication covers data</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">followers serve meanwhile</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No loss with RF 3.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Crash.</li>
+          <li>Validate.</li>
+          <li>Snapshots.</li>
+          <li>Threads.</li>
+          <li>Safe.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Segments at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">ops</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">disk</text></svg></div>
+    <div><h4>1. Capacity planning</h4>
+      <p>Segments explain disk use per partition and replica.</p>
+      <div class="uc-flow"><span>Partitions</span><i>→</i><span class="java">segments</span><i>→</i><span>GB</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-green">ret</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">cleanup</text></svg></div>
+    <div><h4>2. Retention</h4>
+      <p>Old segments are deleted whole (Lesson 4.3).</p>
+      <div class="uc-flow"><span>Old files</span><i>→</i><span class="java">delete</span><i>→</i><span>Free disk</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">tier</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">cloud</text></svg></div>
+    <div><h4>3. Tiered storage</h4>
+      <p>Closed segments are uploaded to object storage (4.4).</p>
+      <div class="uc-flow"><span>Segment</span><i>→</i><span class="java">upload</span><i>→</i><span>S3</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">debug</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">dump</text></svg></div>
+    <div><h4>4. Debugging</h4>
+      <p>kafka-dump-log reads segments directly during incidents.</p>
+      <div class="uc-flow"><span>Issue</span><i>→</i><span class="java">dump-log</span><i>→</i><span>Evidence</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">backup</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">files</text></svg></div>
+    <div><h4>5. Recovery</h4>
+      <p>Snapshots and indexes speed up broker restarts.</p>
+      <div class="uc-flow"><span>Restart</span><i>→</i><span class="java">snapshots</span><i>→</i><span>Fast</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified descriptions of common practice.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: rolling segments</h2>
+  <p>The roll rule with our lab’s batch size. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># A partition as a chain of segments
+SEGMENT_BYTES = 1_048_576
+segments = [[0, 0]]                      # [base_offset, size_bytes]
+def append(offset, size):
+    if segments[-1][1] + size &gt; SEGMENT_BYTES:   # roll: next batch would not fit
+        segments.append([offset, 0])
+    segments[-1][1] += size
+
+offset = 0
+while offset &lt; 10_000:
+    append(offset, 3011)                 # one batch of 10 records, 3,011 bytes
+    offset += 10
+
+for base, size in segments:
+    print(f&quot;{base:020d}.log  {size:&gt;9,} bytes&quot;)
+print(&quot;active segment:&quot;, f&quot;{segments[-1][0]:020d}.log&quot;)</code></pre><div class="output">00000000000000000000.log  1,047,828 bytes
+00000000000000003480.log  1,047,828 bytes
+00000000000000006960.log    915,344 bytes
+active segment: 00000000000000006960.log</div></div>
+  <ul class="anno"><li><code>    if segments[-1][1] + size &gt; SEGMENT_BYTES:   # roll: next batch would not fit</code><span>Kafka rolls before a batch would exceed segment.bytes.</span></li><li><code>    print(f&quot;{base:020d}.log  {size:&gt;9,} bytes&quot;)</code><span>File names are the base offset padded to 20 digits.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Compare with the lab’s 3413 and 6830.",
+   "code": "# A partition as a chain of segments\nSEGMENT_BYTES = 1_048_576\nsegments = [[0, 0]]                      # [base_offset, size_bytes]\ndef append(offset, size):\n    if segments[-1][1] + size > SEGMENT_BYTES:   # roll: next batch would not fit\n        segments.append([offset, 0])\n    segments[-1][1] += size\n\noffset = 0\nwhile offset < 10_000:\n    append(offset, 3011)                 # one batch of 10 records, 3,011 bytes\n    offset += 10\n\nfor base, size in segments:\n    print(f\"{base:020d}.log  {size:>9,} bytes\")\nprint(\"active segment:\", f\"{segments[-1][0]:020d}.log\")\n"
+  },
+  {
+   "label": "2 · Predict first: segments",
+   "hint": "<b>Predict first:<\/b> 1 GiB of data, 1 GiB segments?",
+   "code": "print(1)\n"
+  },
+  {
+   "label": "3 · File name",
+   "hint": "Name for base offset 6830.",
+   "code": "print(f\"{6830:020d}.log\")\n"
+  },
+  {
+   "label": "4 · Files per partition",
+   "hint": "Segments × 4 files.",
+   "code": "print(3 * 4, \"files (+2 metadata)\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "Too small a segment.",
+   "code": "seg = 16384\nif seg < 1048576:\n    raise ValueError(f\"Invalid value {seg} for configuration segment.bytes: Value must be at least 1048576\")\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: look at segments</h3>
+  <p>Inside the broker container. <b>Outputs are real.</b></p>
+  <div class="pcrun"><h4>1 · Topic</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-topics.sh --bootstrap-server localhost:9092 --create --topic seg-41 --config segment.bytes=1048576</code></pre><div class="output">Created topic seg-41.</div></div>
+  <p class="muted">1 MiB minimum.</p></div>
+  <div class="pcrun"><h4>2 · Files</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>ls -l /var/lib/kafka/data/seg-41-0/</code></pre><div class="output">00000000000000000000.log
+00000000000000003413.log
+00000000000000006830.log …</div></div>
+  <p class="muted">After ~3 MB.</p></div>
+  <div class="pcrun"><h4>3 · First batch of a segment</h4>
+  <div class="code" data-lang="bash" data-file="terminal"><pre><code>kafka-dump-log.sh --files /var/lib/kafka/data/seg-41-0/00000000000000003413.log | head -2</code></pre><div class="output">baseOffset: 3413 lastOffset: 3422 count: 10 … position: 0 size: 3011</div></div>
+  <p class="muted">Position 0 in the new file.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>When does it roll?</h2>
+  <p>Size check before each append.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "limit, size, segs = 10, 0, [0]",
+  "for off, s in enumerate([4, 4, 4, 4]):",
+  "    if size + s > limit:",
+  "        segs.append(off); size = 0",
+  "    size += s",
+  "print(segs)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>limit<\/code> is created: 10. <code>size<\/code> is created: 0. <code>segs<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "0"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [0]"
+   ],
+   "newVar": "segs"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>off<\/code> is created: 0. <code>s<\/code> is created: 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "0"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "0"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [0]"
+   ],
+   "newVar": "s"
+  },
+  {
+   "line": 3,
+   "phase": "Check",
+   "note": "Would this batch overflow? The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "0"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "0"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [0]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>size<\/code> changes to 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "4"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "0"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [0]"
+   ],
+   "newVar": "size"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>off<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "4"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "1"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [0]"
+   ],
+   "newVar": "off"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "4"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "1"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [0]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>size<\/code> changes to 8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "8"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "1"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [0]"
+   ],
+   "newVar": "size"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>off<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "8"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "2"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [0]"
+   ],
+   "newVar": "off"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "8"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "2"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (1)<\/b> [0]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Roll",
+   "note": "New segment named by offset. <code>size<\/code> changes to 0. Object #1 list now holds [0, 2]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "0"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "2"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [0, 2]"
+   ],
+   "newVar": "size"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>size<\/code> changes to 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "4"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "2"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [0, 2]"
+   ],
+   "newVar": "size"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>off<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "4"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "3"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [0, 2]"
+   ],
+   "newVar": "off"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "4"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "3"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [0, 2]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>size<\/code> changes to 8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "8"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "3"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [0, 2]"
+   ],
+   "newVar": "size"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "8"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "3"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [0, 2]"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "10"
+      ],
+      [
+       "size",
+       "8"
+      ],
+      [
+       "segs",
+       "→ list #1"
+      ],
+      [
+       "off",
+       "3"
+      ],
+      [
+       "s",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (2)<\/b> [0, 2]"
+   ],
+   "out": "[0, 2]\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three segment decisions.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Segments · read</span></div>
+    <h4>Find the segment for an offset</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Which file holds offset 5000?</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>bases</pre></div><div><small>Expected output</small><pre>3413</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>List base offsets.</li><li>Pick the largest ≤ 5000.</li><li>Open that file.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Lesson 4.2.",
+   "code": "import bisect\nbases = [0, 3413, 6830]\nprint(bases[bisect.bisect_right(bases, 5000) - 1])\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import bisect",
+  "bases = [0, 3413, 6830]",
+  "print(bases[bisect.bisect_right(bases, 5000) - 1])"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Binary search",
+   "note": "Names make it fast.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>bases<\/code> is created: → list #1. A new list object (#1) is created: [0, 3413, 6830]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "bases",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [0, 3413, 6830]"
+   ],
+   "newVar": "bases"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "bases",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [0, 3413, 6830]"
+   ],
+   "out": "3413\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Segments · retention</span></div>
+    <h4>Make retention precise</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>1-day retention, 50 MB/day traffic.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>traffic</pre></div><div><small>Expected output</small><pre>{&#x27;retention.ms&#x27;: 86400000, &#x27;segment.ms&#x27;: 3600000}</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Segments must close to be deleted.</li><li>segment.ms 1 hour.</li><li>Deletion lag ≤ 1 hour.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Scenario 2.",
+   "code": "print({\"retention.ms\": 86400000, \"segment.ms\": 3600000})\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print({\"retention.ms\": 86400000, \"segment.ms\": 3600000})"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Granularity",
+   "note": "Roll often enough. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "{'retention.ms': 86400000, 'segment.ms': 3600000}\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Segments · ops</span></div>
+    <h4>Estimate file handles</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>2,000 partitions, 20 segments each.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>counts</pre></div><div><small>Expected output</small><pre>120000 file handles; set ulimit -n &gt;= 200000</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>~3 open files per segment (log + 2 indexes).</li><li>Multiply.</li><li>Set ulimit well above.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Scenario 1.",
+   "code": "print(2000 * 20 * 3, \"file handles; set ulimit -n >= 200000\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "print(2000 * 20 * 3, \"file handles; set ulimit -n >= 200000\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Ops",
+   "note": "Plan limits. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "120000 file handles; set ulimit -n >= 200000\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: A partition on disk is…",
+  "options": [
+   "One file",
+   "A database table",
+   "A chain of segments",
+   "In ZooKeeper"
+  ],
+  "answer": 2,
+  "why": "Step 2."
+ },
+ {
+  "q": "Beginner: Which segment receives new records?",
+  "options": [
+   "The oldest",
+   "The active (newest)",
+   "All of them",
+   "Random"
+  ],
+  "answer": 1,
+  "why": "Only one."
+ },
+ {
+  "q": "Beginner: A segment file is named after…",
+  "options": [
+   "Its base offset",
+   "The time",
+   "The topic id",
+   "A random id"
+  ],
+  "answer": 0,
+  "why": "…3413.log."
+ },
+ {
+  "q": "Intermediate: Default segment.bytes is…",
+  "options": [
+   "1 MiB",
+   "10 GiB",
+   "100 KB",
+   "1 GiB"
+  ],
+  "answer": 3,
+  "why": "Minimum 1 MiB."
+ },
+ {
+  "q": "Intermediate: Why was the active .index 10 MiB?",
+  "options": [
+   "Corrupt",
+   "Full of data",
+   "Pre-allocated; trimmed when closed",
+   "Compression"
+  ],
+  "answer": 2,
+  "why": "segment.index.bytes."
+ },
+ {
+  "q": "Intermediate: .snapshot files store…",
+  "options": [
+   "Record data",
+   "Producer state (ids, sequences)",
+   "Consumer offsets",
+   "ACLs"
+  ],
+  "answer": 1,
+  "why": "Idempotence state."
+ },
+ {
+  "q": "Advanced: Retention can delete…",
+  "options": [
+   "Whole closed segments",
+   "Single records",
+   "The active segment only",
+   "Indexes only"
+  ],
+  "answer": 0,
+  "why": "Per segment."
+ },
+ {
+  "q": "Advanced: A low-traffic topic with 1 GiB segments keeps data longer than retention because…",
+  "options": [
+   "Bug",
+   "Compression",
+   "Replication",
+   "The segment never closes"
+  ],
+  "answer": 3,
+  "why": "Use segment.ms."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 4.1 in one screen</h3>
+    <ul><li>Partition = chain of segments; only the active one is written.</li><li>Files: .log, .index, .timeindex, .snapshot, leader-epoch-checkpoint, partition.metadata.</li><li>Name = 20-digit base offset (lab: 0, 3413, 6830).</li><li>Roll: segment.bytes (1 GiB, min 1 MiB), segment.ms (7 days), index full.</li><li>Active indexes pre-allocated 10 MiB, trimmed on close.</li><li>Retention/compaction/tiering work on closed segments.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Does Kafka fsync every write?</summary><p>No. It writes to the OS page cache and relies on replication for durability; flush.messages/flush.ms exist but are rarely changed.</p></details>
+    <details><summary>Can I read segment files directly?</summary><p>Yes, with kafka-dump-log.sh, for debugging. Never edit them while the broker runs.</p></details>
+    <details><summary>What is in partition.metadata?</summary><p>The topic id, so a re-created topic with the same name cannot be confused with old data.</p></details>
+    <details><summary>Do followers have the same segment names?</summary><p>Usually the same offsets, but followers roll on their own; segment boundaries can differ between replicas.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Segment programs.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Pad</h4></div>
+      <p>Format 42 as a segment name.</p>
+      <div class="prob__io"><div><small>Input</small><pre>42</pre></div><div><small>Expected output</small><pre>00000000000000000042.log</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{42:020d}.log&quot;)</code></pre><div class="output">00000000000000000042.log</div></div>
+        <p><b>How it works:</b> 20 digits.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Segments</h4></div>
+      <p>3 MB of data with 1 MiB segments.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 MB</pre></div><div><small>Expected output</small><pre>3</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+print(math.ceil(3 * 1_000_000 / 1_048_576))</code></pre><div class="output">3</div></div>
+        <p><b>How it works:</b> 3.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Batches per segment</h4></div>
+      <p>1 MiB / 3,011-byte batches.</p>
+      <div class="prob__io"><div><small>Input</small><pre>numbers</pre></div><div><small>Expected output</small><pre>348</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(1_048_576 // 3011)</code></pre><div class="output">348</div></div>
+        <p><b>How it works:</b> 348 batches.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Pick segment</h4></div>
+      <p>Segment for offset 7000.</p>
+      <div class="prob__io"><div><small>Input</small><pre>bases</pre></div><div><small>Expected output</small><pre>6830</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>bases = [0, 3413, 6830]
+print(max(b for b in bases if b &lt;= 7000))</code></pre><div class="output">6830</div></div>
+        <p><b>How it works:</b> 6830.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Roll by time</h4></div>
+      <p>Segments per day with segment.ms 1 hour.</p>
+      <div class="prob__io"><div><small>Input</small><pre>24</pre></div><div><small>Expected output</small><pre>24</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(24)</code></pre><div class="output">24</div></div>
+        <p><b>How it works:</b> At least 24.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Parse name</h4></div>
+      <p>Base offset from a file name.</p>
+      <div class="prob__io"><div><small>Input</small><pre>name</pre></div><div><small>Expected output</small><pre>3413</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(int(&quot;00000000000000003413.log&quot;.split(&quot;.&quot;)[0]))</code></pre><div class="output">3413</div></div>
+        <p><b>How it works:</b> 3413.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Disk per replica</h4></div>
+      <p>3 MB × 3 replicas.</p>
+      <div class="prob__io"><div><small>Input</small><pre>numbers</pre></div><div><small>Expected output</small><pre>9 MB</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(3 * 3, &quot;MB&quot;)</code></pre><div class="output">9 MB</div></div>
+        <p><b>How it works:</b> RF multiplies.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Files per broker</h4></div>
+      <p>1,000 partitions × 10 segments × 4 files.</p>
+      <div class="prob__io"><div><small>Input</small><pre>numbers</pre></div><div><small>Expected output</small><pre>40000</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(1000 * 10 * 4)</code></pre><div class="output">40000</div></div>
+        <p><b>How it works:</b> 40,000 files.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Storage interview questions.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · data</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“How is a Kafka partition stored?”</h4>
+      <p class="scn__situation">Explain.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> answer?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>As a directory of segments. Each segment has a .log of record batches plus .index and .timeindex, named by base offset. Only the active segment is appended; closed segments are immutable and deleted or compacted as a whole.</p>
+        <p class="scn__avoid"><b>Avoid:</b> “In a database.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Retention not working</h4>
+      <p class="scn__situation">Data older than retention is still there.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> cause?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>Active segment never rolled.</li><li>Lower segment.ms.</li><li>Check retention check interval.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> “Kafka ignores retention.”</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>File limits</h4>
+      <p class="scn__situation">Broker crashes with too many open files.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> fix?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>Raise ulimit and vm.max_map_count.</li><li>Fewer/larger segments, fewer partitions.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> Restarting repeatedly.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Segment sizing</h4>
+      <p class="scn__situation">Choose segment settings for a 2 TB/day topic with 3-day retention.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> design?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul><li>Default 1 GiB is fine (thousands of segments).</li><li>segment.ms bounds deletion delay.</li><li>Consider tiered storage for longer history.</li></ul>
+        <p class="scn__avoid"><b>Avoid:</b> Tiny segments.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Kafka syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/kafka.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,3311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MERGE and slowly changing dimensions | MyPhatshala</title>
+<meta name="description" content="Hive MERGE explained with real Hive 4.2.1 results: upserts with WHEN MATCHED UPDATE / DELETE and WHEN NOT MATCHED INSERT in one transaction, the delta folders and ROW__IDs a MERGE writes, the cardinality violation with duplicate source keys, SCD type 1, 2 and 3, a working SCD type 2 MERGE using a NULL join key, proof that it is idempotent, and a point-in-time join that splits a customer’s orders by the plan they had at the time.">
+<meta name="mp:minutes" content="35">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/07-acid-and-iceberg/02-merge-and-scd/">
+<meta property="og:title" content="MERGE and slowly changing dimensions · MyPhatshala">
+<meta property="og:description" content="One statement to update, delete and insert, and a type 2 MERGE that keeps history. Real Hive 4.2.1 results, including the error duplicate keys cause.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "MERGE and slowly changing dimensions", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="07-acid-and-iceberg/02-merge-and-scd" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 7.2</b></nav>
+    <h1>MERGE and slowly changing dimensions</h1>
+    <p class="lead">Every night TiffinGo’s app database sends changed customers: upgrades, moves, closed accounts and sign-ups. <b>MERGE</b> applies them to a Hive ACID table in one statement and one transaction. When finance also wants history, the same statement can maintain a <b>slowly changing dimension type 2</b>. Kabir builds both, hits the duplicate-key error, re-runs the job to prove it is safe, and shows why history changes the revenue report. <b>All outputs are real</b>, from Hive 4.2.1.</p>
+    <div class="lesson-meta"><span>Module 7 · Transactions, MERGE and Iceberg</span><span>⏱ 35 min</span><span>Intermediate → Advanced</span><span>Real Hive 4.2.1 outputs</span><span>Upsert in one statement</span><span>Working SCD type 2</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Every night the app database sends changed customers. Apply them.”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> finish ACID tables (<a href="../01-acid-tables-update-delete/">7.1</a>), joins (<a href="../../03-querying/03-joins/">3.3</a>) and window functions (<a href="../../03-querying/06-window-functions/">3.6</a>).</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s app runs on PostgreSQL. Every night a job exports the customers that changed: plan upgrades, address moves, closed accounts and new sign-ups. Kabir must apply them to the Hive customer table. Writing a separate UPDATE, DELETE and INSERT would mean three transactions and three chances to fail half-way.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Five staged changes go into one MERGE statement: two customers are updated, one unchanged customer is left alone, one closed account is deleted and one new customer is inserted, all in one transaction.">
+        <rect x="10" y="12" width="190" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="105" y="30" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">Tonight’s changes (staging)</text><text x="20" y="52" font-size="7.2" class="s-ink2 mono">2 Ananya  plan → Gold</text><text x="20" y="68" font-size="7.2" class="s-ink2 mono">3 Arjun   city → Pune</text><text x="20" y="84" font-size="7.2" class="s-ink2 mono">4 Gurpreet (no change)</text><text x="20" y="100" font-size="7.2" class="s-ink2 mono">6 Diya    closed (D)</text><text x="20" y="116" font-size="7.2" class="s-ink2 mono">7 Kavya   new</text><path d="M206 76L246 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M239.7 79.0L246 76L239.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="252" y="50" width="96" height="52" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="300" y="72" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">one MERGE</text><text x="300" y="88" text-anchor="middle" font-size="8" class="s-ink2">statement</text><path d="M354 76L394 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M387.7 79.0L394 76L387.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="400" y="12" width="230" height="128" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="515" y="30" text-anchor="middle" font-size="8.4" font-weight="700" class="s-green">dim_customer, atomically</text><text x="412" y="52" font-size="7.2" class="s-ink mono">2 → UPDATE</text><text x="412" y="68" font-size="7.2" class="s-ink mono">3 → UPDATE</text><text x="412" y="84" font-size="7.2" class="s-ink2 mono">4 → untouched</text><text x="412" y="100" font-size="7.2" class="s-red mono">6 → DELETE</text><text x="412" y="116" font-size="7.2" class="s-green mono">7 → INSERT</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">MERGE applies <tspan font-weight="700" class="s-acc">inserts, updates and deletes</tspan> from one source in a single transaction.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, can one statement insert new customers and update existing ones?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>That is <b>MERGE</b>: compare a source with a target on a key, then <code>WHEN MATCHED … UPDATE</code> or <code>DELETE</code>, and <code>WHEN NOT MATCHED … INSERT</code>. One statement, one transaction. People call it an <b>upsert</b>.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>And the finance team wants history: what plan was the customer on when they ordered?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Then you keep old versions with dates: a <b>slowly changing dimension type 2</b>. MERGE can do that too, with a small trick. Today: a type 1 MERGE, the error you get with duplicate keys, a type 2 MERGE that keeps history, a re-run to prove it is safe, and a point-in-time join. All outputs are real, from Hive 4.2.1.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>MERGE and slowly changing dimensions</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>MERGE</b> is a DML statement that synchronises a <b>target</b> transactional table with a <b>source</b> relation using a join condition. For each source row that matches a target row, the first applicable <code>WHEN MATCHED</code> clause updates or deletes the target row; for each source row without a match, a <code>WHEN NOT MATCHED</code> clause inserts a new row. The whole statement executes as one transaction. A <b>slowly changing dimension (SCD)</b> is a dimension table whose attributes change over time: <b>type 1</b> overwrites old values, <b>type 2</b> keeps full history by adding a new row per change with validity dates and a current flag, and <b>type 3</b> keeps a limited history in additional columns.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>MERGE compares new data with a table by key and, in one statement, updates the rows that changed, deletes the ones marked for removal and inserts the new ones. SCD is the name for the ways of keeping (or not keeping) old values of things like a customer’s city or plan.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Target / source</b><span>The ACID table being changed / the new data.</span></div>
+    <div class="term"><b>Upsert</b><span>Update if the key exists, insert if not.</span></div>
+    <div class="term"><b>WHEN MATCHED</b><span>Clause for source rows whose key exists in the target.</span></div>
+    <div class="term"><b>WHEN NOT MATCHED</b><span>Clause for source rows with no matching target row.</span></div>
+    <div class="term"><b>Cardinality violation</b><span>Two source rows match the same target row; Hive refuses.</span></div>
+    <div class="term"><b>SCD type 1</b><span>Overwrite: only the current value exists.</span></div>
+    <div class="term"><b>SCD type 2</b><span>History: <code>eff_from</code>, <code>eff_to</code>, <code>is_current</code> per version.</span></div>
+    <div class="term"><b>Idempotent</b><span>Running a job twice gives the same result as running it once.</span></div>
+  </div>
+
+  <h3>SCD types compared</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Type</th><th>What happens when Ananya upgrades to Gold</th><th>Rows for her</th><th>Answers “plan at order time”?</th></tr></thead>
+    <tbody><tr><td>0</td><td>Nothing: values never change</td><td>1 (Basic)</td><td>No</td></tr><tr><td>1</td><td>plan overwritten to Gold</td><td>1 (Gold)</td><td>No</td></tr><tr><td>2</td><td>old row closed (eff_to = 2026-10-26), new row Gold from 2026-10-27</td><td>2</td><td><b>Yes</b></td></tr><tr><td>3</td><td>plan = Gold, prev_plan = Basic</td><td>1</td><td>Only one step back</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">MERGE and SCD at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Updating an address book</h4>
+      <ul>
+        <li>You get a list of changes. For each person: if they are already in your book, change their entry; if not, add them; if they asked to be removed, cross them out.</li>
+        <li>MERGE does exactly this for a whole table in one go.</li>
+        <li>Sometimes you must not lose the old entry (“where did she live last year?”). Then you close the old entry with an end date and add a new one: that is SCD type 2.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The MERGE statement</h4>
+      <ul>
+        <li><code>MERGE INTO target t USING source s ON t.key = s.key</code>, then up to three clauses: <code>WHEN MATCHED [AND cond] THEN UPDATE SET …</code>, <code>WHEN MATCHED [AND cond] THEN DELETE</code>, <code>WHEN NOT MATCHED [AND cond] THEN INSERT VALUES (…)</code>.</li>
+        <li>The target must be a <b>full ACID</b> table (7.1); the source can be any table, view or subquery.</li>
+        <li><b>SCD type 1:</b> overwrite the old value (no history). <b>Type 2:</b> keep every version with <code>eff_from</code>, <code>eff_to</code>, <code>is_current</code>. <b>Type 3:</b> keep the previous value in an extra column.</li>
+        <li>Add a change condition (<code>t.plan &lt;&gt; s.plan OR …</code>) so unchanged rows are not rewritten.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Hive specifics we verified</h4>
+      <ul>
+        <li><b>Cardinality check:</b> if two source rows match one target row, Hive fails the MERGE (“Cardinality Violation in Merge statement”, <code>hive.merge.cardinality.check=true</code>). The target stayed unchanged. De-duplicate the source first.</li>
+        <li>One MERGE wrote two delete_deltas and two deltas under <b>one write id</b>: atomic. Untouched rows kept their old ROW__ID.</li>
+        <li><b>SCD2 in one MERGE:</b> a changed row must both <i>close</i> the old version (MATCHED) and <i>insert</i> a new one (NOT MATCHED). The trick: feed changed rows twice, once with the real key and once with a NULL join key, which can never match.</li>
+        <li>Re-running the same SCD2 MERGE changed nothing (9 rows, 7 current): it is idempotent, so a failed night can simply be re-run.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “What is SCD type 2 and how do you implement it in Hive?” Explain the validity columns, then the MERGE: match current rows on the key and close them when attributes differ; insert new versions using a NULL join key for changed rows plus the real key for new rows. Mention that the target must be an ACID table and that duplicate source keys cause a cardinality violation.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>MERGE patterns</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Pattern</th><th>Clauses</th><th>Use</th></tr></thead>
+    <tbody><tr><td>Upsert (SCD1)</td><td>MATCHED AND changed → UPDATE · NOT MATCHED → INSERT</td><td>Current state of customers, products</td></tr><tr><td>Upsert with deletes</td><td>+ MATCHED AND s.op = 'D' → DELETE</td><td>CDC feeds with I/U/D operations</td></tr><tr><td>Insert only new keys</td><td>NOT MATCHED → INSERT</td><td>De-duplicated loads of events</td></tr><tr><td>SCD2</td><td>MATCHED AND changed → UPDATE (close) · NOT MATCHED → INSERT (new version)</td><td>History for reporting and audits</td></tr><tr><td>Soft delete</td><td>MATCHED AND s.op = 'D' → UPDATE SET is_deleted = true</td><td>Keep closed accounts for audits</td></tr></tbody>
+  </table>
+  </div>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th>Rule</th><th>Why</th></tr></thead>
+    <tbody><tr><td>Target must be full ACID (ORC, transactional=true)</td><td>MERGE writes deltas and delete deltas</td></tr><tr><td>Each target row may match at most one source row</td><td>Otherwise: Cardinality Violation, nothing applied</td></tr><tr><td>Put the more specific MATCHED clause first</td><td>The first applicable clause wins (DELETE before UPDATE)</td></tr><tr><td>Add “AND changed” to UPDATE</td><td>Unchanged rows are not rewritten, fewer files</td></tr><tr><td>Filter the target in ON (e.g. partitions, is_current)</td><td>Less data scanned and joined</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Comparisons with <code>&lt;&gt;</code> ignore NULLs: if the old city is NULL and the new one is Pune, <code>t.city &lt;&gt; s.city</code> is NULL, not true, and the change is missed. In real jobs compare with <code>NOT (t.city &lt;=&gt; s.city)</code> (null-safe equality) or compare a hash of all columns.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Type 1, a failure, then type 2</h2>
+  <p>All outputs are real, from the Hive 4.2.1 lab (database <code>tiffingo</code>).</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Target and staging tables</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE dim_customer (customer_id INT, name STRING, city STRING, plan STRING)
+STORED AS ORC TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;);
+INSERT INTO dim_customer SELECT customer_id, name, city, plan FROM customers WHERE customer_id &lt;= 6;
+
+CREATE TABLE stg_customer (customer_id INT, name STRING, city STRING, plan STRING, op STRING);
+INSERT INTO stg_customer VALUES (2,&#x27;Ananya Iyer&#x27;,&#x27;Mumbai&#x27;,&#x27;Gold&#x27;,&#x27;U&#x27;), (3,&#x27;Arjun Nair&#x27;,&#x27;Pune&#x27;,&#x27;Gold&#x27;,&#x27;U&#x27;),
+  (4,&#x27;Gurpreet Das&#x27;,&#x27;Bengaluru&#x27;,&#x27;Basic&#x27;,&#x27;U&#x27;), (6,NULL,NULL,NULL,&#x27;D&#x27;), (7,&#x27;Kavya Reddy&#x27;,&#x27;Hyderabad&#x27;,&#x27;Silver&#x27;,&#x27;I&#x27;);</code></pre><div class="output">+---------------------------+--------------------+--------------------+--------------------+
+| dim_customer.customer_id  | dim_customer.name  | dim_customer.city  | dim_customer.plan  |
++---------------------------+--------------------+--------------------+--------------------+
+| 1                         | Aarav Desai        | Bengaluru          | Silver             |
+| 2                         | Ananya Iyer        | Mumbai             | Basic              |
+| 3                         | Arjun Nair         | Mumbai             | Gold               |
+| 4                         | Gurpreet Das       | Bengaluru          | Basic              |
+| 5                         | Aarav Singh        | Bengaluru          | Basic              |
+| 6                         | Diya Nair          | Pune               | Basic              |
++---------------------------+--------------------+--------------------+--------------------+
++---------------------------+--------------------+--------------------+--------------------+------------------+
+| stg_customer.customer_id  | stg_customer.name  | stg_customer.city  | stg_customer.plan  | stg_customer.op  |
++---------------------------+--------------------+--------------------+--------------------+------------------+
+| 2                         | Ananya Iyer        | Mumbai             | Gold               | U                |
+| 3                         | Arjun Nair         | Pune               | Gold               | U                |
+| 4                         | Gurpreet Das       | Bengaluru          | Basic              | U                |
+| 6                         | NULL               | NULL               | NULL               | D                |
+| 7                         | Kavya Reddy        | Hyderabad          | Silver             | I                |
++---------------------------+--------------------+--------------------+--------------------+------------------+</div></div>
+      <span class="behind">The target is an ACID table; the staging table is an ordinary table. <code>op</code> says what happened in the source system: U(pdate), D(elete), I(nsert). Customer 4 is in the feed although nothing changed, which is common in real exports.</span></li>
+    <li><h4>Step 2 · One MERGE: update, delete and insert</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>MERGE INTO dim_customer t USING stg_customer s ON t.customer_id = s.customer_id
+WHEN MATCHED AND s.op = &#x27;D&#x27; THEN DELETE
+WHEN MATCHED AND (t.city &lt;&gt; s.city OR t.plan &lt;&gt; s.plan)
+  THEN UPDATE SET city = s.city, plan = s.plan
+WHEN NOT MATCHED THEN INSERT VALUES (s.customer_id, s.name, s.city, s.plan);
+SELECT * FROM dim_customer ORDER BY customer_id;</code></pre><div class="output">+---------------------------+--------------------+--------------------+--------------------+
+| dim_customer.customer_id  | dim_customer.name  | dim_customer.city  | dim_customer.plan  |
++---------------------------+--------------------+--------------------+--------------------+
+| 1                         | Aarav Desai        | Bengaluru          | Silver             |
+| 2                         | Ananya Iyer        | Mumbai             | Gold               |
+| 3                         | Arjun Nair         | Pune               | Gold               |
+| 4                         | Gurpreet Das       | Bengaluru          | Basic              |
+| 5                         | Aarav Singh        | Bengaluru          | Basic              |
+| 7                         | Kavya Reddy        | Hyderabad          | Silver             |
++---------------------------+--------------------+--------------------+--------------------+</div></div>
+      <span class="behind">Ananya is Gold, Arjun moved to Pune, Diya (6) is deleted and Kavya (7) is new. The DELETE clause is listed first so that a “D” row is never treated as an update. This is SCD type 1: the old values are gone.</span></li>
+    <li><h4>Step 3 · What one MERGE wrote</h4>
+      <div class="code" data-lang="bash" data-file="Beeline / Terminal"><pre><code>$ ls …/dim_customer
+SELECT ROW__ID.writeid AS writeid, customer_id, plan FROM dim_customer ORDER BY customer_id;</code></pre><div class="output">delete_delta_0000002_0000002_0000
+delete_delta_0000002_0000002_0001
+delta_0000001_0000001_0000
+delta_0000002_0000002_0002
+delta_0000002_0000002_0003
+
++----------+--------------+---------+
+| writeid  | customer_id  |  plan   |
++----------+--------------+---------+
+| 1        | 1            | Silver  |
+| 2        | 2            | Gold    |
+| 2        | 3            | Gold    |
+| 1        | 4            | Basic   |
+| 1        | 5            | Basic   |
+| 2        | 7            | Silver  |
++----------+--------------+---------+</div></div>
+      <span class="behind">All changes share write id 2, in four folders (one per clause type and statement part). Customer 4 kept write id 1: the “AND changed” condition stopped Hive from rewriting an unchanged row.</span></li>
+    <li><h4>Step 4 · Duplicate keys in the source: cardinality violation</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>INSERT INTO stg_customer VALUES (2, &#x27;Ananya Iyer&#x27;, &#x27;Mumbai&#x27;, &#x27;Silver&#x27;, &#x27;U&#x27;);   -- a second row for customer 2
+-- run the same MERGE again
+SELECT customer_id, plan FROM dim_customer WHERE customer_id = 2;</code></pre><div class="output">Error: … Vertex failed … Reducer 4 …
+Caused by: org.apache.hadoop.hive.ql.metadata.HiveException: Error evaluating cardinality_violation(_col0)
+Caused by: java.lang.RuntimeException: Cardinality Violation in Merge statement: [2, 536870914, 0 …
+
++--------------+-------+
+| customer_id  | plan  |
++--------------+-------+
+| 2            | Gold  |
++--------------+-------+</div></div>
+      <span class="behind">Two source rows (Gold and Silver) matched customer 2, so Hive could not know which one wins and failed the whole statement. The table was not changed at all. Fix: keep one row per key in the source, e.g. the latest with ROW_NUMBER() (Lesson 3.6).</span></li>
+    <li><h4>Step 5 · A type 2 table and the changes</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE dim_customer_hist (customer_id INT, name STRING, city STRING, plan STRING,
+  eff_from DATE, eff_to DATE, is_current BOOLEAN)
+STORED AS ORC TBLPROPERTIES (&#x27;transactional&#x27;=&#x27;true&#x27;);
+INSERT INTO dim_customer_hist SELECT customer_id, name, city, plan,
+  DATE &#x27;2026-10-01&#x27;, DATE &#x27;9999-12-31&#x27;, true FROM customers WHERE customer_id &lt;= 6;
+
+CREATE TABLE stg2 (customer_id INT, name STRING, city STRING, plan STRING);
+INSERT INTO stg2 VALUES (2,&#x27;Ananya Iyer&#x27;,&#x27;Mumbai&#x27;,&#x27;Gold&#x27;), (3,&#x27;Arjun Nair&#x27;,&#x27;Pune&#x27;,&#x27;Gold&#x27;),
+  (4,&#x27;Gurpreet Das&#x27;,&#x27;Bengaluru&#x27;,&#x27;Basic&#x27;), (7,&#x27;Kavya Reddy&#x27;,&#x27;Hyderabad&#x27;,&#x27;Silver&#x27;);</code></pre><div class="output">-- 6 rows, all current, valid from 2026-10-01 to 9999-12-31</div></div>
+      <span class="behind">Every version has a validity range. “9999-12-31” is a common convention for “still valid”, so a simple BETWEEN works in joins. The staging table holds the same changes as before, without the delete.</span></li>
+    <li><h4>Step 6 · The SCD2 MERGE with a NULL join key</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>MERGE INTO dim_customer_hist t
+USING (
+  SELECT s.customer_id AS join_key, s.customer_id, s.name, s.city, s.plan FROM stg2 s
+  UNION ALL
+  SELECT CAST(NULL AS INT) AS join_key, s.customer_id, s.name, s.city, s.plan
+  FROM stg2 s JOIN dim_customer_hist d ON s.customer_id = d.customer_id AND d.is_current
+  WHERE s.city &lt;&gt; d.city OR s.plan &lt;&gt; d.plan
+) u
+ON t.customer_id = u.join_key AND t.is_current
+WHEN MATCHED AND (t.city &lt;&gt; u.city OR t.plan &lt;&gt; u.plan)
+  THEN UPDATE SET eff_to = DATE &#x27;2026-10-26&#x27;, is_current = false
+WHEN NOT MATCHED THEN INSERT VALUES (u.customer_id, u.name, u.city, u.plan,
+  DATE &#x27;2026-10-27&#x27;, DATE &#x27;9999-12-31&#x27;, true);
+SELECT * FROM dim_customer_hist ORDER BY customer_id, eff_from;</code></pre><div class="output">+--------------------------------+-------------------------+-------------------------+-------------------------+-----------------------------+---------------------------+-------------------------------+
+| dim_customer_hist.customer_id  | dim_customer_hist.name  | dim_customer_hist.city  | dim_customer_hist.plan  | dim_customer_hist.eff_from  | dim_customer_hist.eff_to  | dim_customer_hist.is_current  |
++--------------------------------+-------------------------+-------------------------+-------------------------+-----------------------------+---------------------------+-------------------------------+
+| 1                              | Aarav Desai             | Bengaluru               | Silver                  | 2026-10-01                  | 9999-12-31                | true                          |
+| 2                              | Ananya Iyer             | Mumbai                  | Basic                   | 2026-10-01                  | 2026-10-26                | false                         |
+| 2                              | Ananya Iyer             | Mumbai                  | Gold                    | 2026-10-27                  | 9999-12-31                | true                          |
+| 3                              | Arjun Nair              | Mumbai                  | Gold                    | 2026-10-01                  | 2026-10-26                | false                         |
+| 3                              | Arjun Nair              | Pune                    | Gold                    | 2026-10-27                  | 9999-12-31                | true                          |
+| 4                              | Gurpreet Das            | Bengaluru               | Basic                   | 2026-10-01                  | 9999-12-31                | true                          |
+| 5                              | Aarav Singh             | Bengaluru               | Basic                   | 2026-10-01                  | 9999-12-31                | true                          |
+| 6                              | Diya Nair               | Pune                    | Basic                   | 2026-10-01                  | 9999-12-31                | true                          |
+| 7                              | Kavya Reddy             | Hyderabad               | Silver                  | 2026-10-27                  | 9999-12-31                | true                          |
++--------------------------------+-------------------------+-------------------------+-------------------------+-----------------------------+---------------------------+-------------------------------+</div></div>
+      <span class="behind">Changed customers 2 and 3 appear twice in the source. With their real key they <b>match</b> the current row, which is closed (eff_to 10-26, is_current false). With a NULL key they can never match, so they are <b>inserted</b> as new current versions. Customer 4 matched but nothing changed; customer 7 had no match and was inserted. Old values are kept.</span></li>
+    <li><h4>Step 7 · Re-run it: nothing changes</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>-- run exactly the same MERGE again
+SELECT COUNT(*) AS rows_after_rerun, SUM(IF(is_current, 1, 0)) AS current_rows
+FROM dim_customer_hist;</code></pre><div class="output">+-------------------+---------------+
+| rows_after_rerun  | current_rows  |
++-------------------+---------------+
+| 9                 | 7             |
++-------------------+---------------+</div></div>
+      <span class="behind">Still 9 rows with 7 current. The current rows now equal the staging values, so the change condition is false everywhere and the NULL-key branch selects nothing. An idempotent job can be safely re-run after a failure, which matters for nightly pipelines.</span></li>
+    <li><h4>Step 8 · Why type 2: the plan at order time</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>-- point in time: the version valid on the order date
+SELECT h.plan AS plan_then, COUNT(*) AS orders FROM orders o
+JOIN dim_customer_hist h ON o.customer_id = h.customer_id
+ AND o.order_date BETWEEN h.eff_from AND h.eff_to
+WHERE o.customer_id = 2 GROUP BY h.plan;
+
+-- current version only
+SELECT h.plan AS plan_now, COUNT(*) AS orders FROM orders o
+JOIN dim_customer_hist h ON o.customer_id = h.customer_id AND h.is_current
+WHERE o.customer_id = 2 GROUP BY h.plan;</code></pre><div class="output">+------------+---------+
+| plan_then  | orders  |
++------------+---------+
+| Basic      | 14      |
+| Gold       | 5       |
++------------+---------+
++-----------+---------+
+| plan_now  | orders  |
++-----------+---------+
+| Gold      | 19      |
++-----------+---------+</div></div>
+      <span class="behind">Ananya placed 14 orders as a Basic customer and 5 after upgrading. A report joined on the current row only would say all 19 orders were Gold, overstating Gold revenue. This is why finance and analytics teams ask for SCD2.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>How MERGE decides what to do with each row</h2>
+  <p>Left: real Beeline output. Right: how MERGE routes each row.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Upserts, cardinality and SCD2 <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real Beeline output">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; MERGE INTO dim_customer t USING stg_customer s</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">    ON t.customer_id = s.customer_id</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  WHEN MATCHED AND s.op = &#x27;D&#x27; THEN DELETE</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  WHEN MATCHED AND (changed) THEN UPDATE …</text><text x="26" y="106" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  WHEN NOT MATCHED THEN INSERT …;</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 2 | Ananya Iyer  | Mumbai    | Gold   |</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 3 | Arjun Nair   | Pune      | Gold   |</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">| 4 | Gurpreet Das | Bengaluru | Basic  |</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 7 | Kavya Reddy  | Hyderabad | Silver |</text><text x="26" y="106" font-size="7.6" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  (6 deleted)</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … same MERGE, two source rows for customer 2</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Cardinality Violation in Merge statement</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SELECT plan FROM dim_customer</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">    WHERE customer_id = 2;   | Gold |</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">| 2 | Basic | 2026-10-01 | 2026-10-26 | false |</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 2 | Gold  | 2026-10-27 | 9999-12-31 | true  |</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">| 3 | Mumbai… | 2026-10-01 | 2026-10-26 | false |</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 3 | Pune …  | 2026-10-27 | 9999-12-31 | true  |</text><text x="26" y="106" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 7 | Silver | 2026-10-27 | 9999-12-31 | true |</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">| plan_then | orders |</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Basic     | 14     |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Gold      | 5      |</text><text x="26" y="92" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">| plan_now  | orders |</text><text x="26" y="106" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">| Gold      | 19     |</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A single MERGE with DELETE, UPDATE and INSERT clauses.</li>
+          <li>The result: two updates, one insert, one delete, one row untouched.</li>
+          <li>Duplicate keys in the source make the MERGE fail; nothing changes.</li>
+          <li>SCD2 keeps the old versions with closed date ranges.</li>
+          <li>A point-in-time join splits Ananya’s orders by the plan she had then.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="How MERGE routes each row">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Join source and target on the key</text><rect x="20" y="40" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="53" font-size="6.8" class="s-ink mono">s 2  Gold</text><rect x="20" y="60" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="73" font-size="6.8" class="s-ink mono">s 3  Pune</text><rect x="20" y="80" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="93" font-size="6.8" class="s-ink mono">s 4  same</text><rect x="20" y="100" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="113" font-size="6.8" class="s-ink mono">s 6  D</text><rect x="20" y="120" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="133" font-size="6.8" class="s-ink mono">s 7  new</text><rect x="200" y="40" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="206" y="53" font-size="6.8" class="s-ink mono">t 2  Basic</text><rect x="200" y="60" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="206" y="73" font-size="6.8" class="s-ink mono">t 3  Mumbai</text><rect x="200" y="80" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="206" y="93" font-size="6.8" class="s-ink mono">t 4  Basic</text><rect x="200" y="100" width="140" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="206" y="113" font-size="6.8" class="s-ink mono">t 6  Pune</text><rect x="200" y="120" width="140" height="18" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="206" y="133" font-size="6.8" class="s-ink mono">(no row)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Matched rows go to WHEN MATCHED; unmatched to NOT MATCHED.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">First applicable clause wins</text><rect x="20" y="40" width="320" height="18" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="26" y="53" font-size="6.8" class="s-ink mono">2  MATCHED, changed     → UPDATE</text><rect x="20" y="60" width="320" height="18" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="26" y="73" font-size="6.8" class="s-ink mono">3  MATCHED, changed     → UPDATE</text><rect x="20" y="80" width="320" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="93" font-size="6.8" class="s-ink mono">4  MATCHED, unchanged   → nothing</text><rect x="20" y="100" width="320" height="18" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="26" y="113" font-size="6.8" class="s-ink mono">6  MATCHED, op = D      → DELETE</text><rect x="20" y="120" width="320" height="18" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="26" y="133" font-size="6.8" class="s-ink mono">7  NOT MATCHED          → INSERT</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">All in one transaction (write id 2).</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Two source rows → one target row</text><rect x="20" y="50" width="120" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="63" font-size="6.8" class="s-ink mono">s 2  Gold</text><rect x="20" y="74" width="120" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="87" font-size="6.8" class="s-ink mono">s 2  Silver</text><path d="M144 60L196 70" style="fill:none;stroke:#D64545;stroke-width:1.8"/><path d="M189.2 71.8L196 70L190.4 65.8" style="fill:none;stroke:#D64545;stroke-width:1.8"/><path d="M144 84L196 74" style="fill:none;stroke:#D64545;stroke-width:1.8"/><path d="M190.4 78.2L196 74L189.2 72.2" style="fill:none;stroke:#D64545;stroke-width:1.8"/><rect x="200" y="62" width="120" height="18" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="206" y="75" font-size="6.8" class="s-ink mono">t 2</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Which value wins? Hive refuses and changes nothing.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">De-duplicate the source first.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">SCD2: changed rows enter twice</text><rect x="20" y="40" width="120" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="53" font-size="6.8" class="s-ink mono">key=2  Gold</text><text x="150" y="52" font-size="7" class="s-ink2">→ matches current → close it</text><rect x="20" y="64" width="120" height="18" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="26" y="77" font-size="6.8" class="s-ink mono">key=NULL  Gold</text><text x="150" y="76" font-size="7" class="s-ink2">→ never matches → insert new</text><rect x="20" y="92" width="120" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="26" y="105" font-size="6.8" class="s-ink mono">key=7  Silver</text><text x="150" y="104" font-size="7" class="s-ink2">→ no match → insert</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">NULL = NULL is never true in a join.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Join on the validity range</text><rect x="30" y="60" width="240" height="22" rx="4" style="fill:var(--blue)"/><text x="150" y="75" text-anchor="middle" font-size="7.6" class="s-ink mono" style="fill:#fff">Basic: 10-01 … 10-26</text><rect x="270" y="60" width="60" height="22" rx="4" style="fill:var(--green)"/><text x="300" y="75" text-anchor="middle" font-size="7.6" class="s-ink" style="fill:#fff">Gold</text><circle cx="40" cy="98" r="3" class="s-ink2"/><circle cx="55" cy="98" r="3" class="s-ink2"/><circle cx="70" cy="98" r="3" class="s-ink2"/><circle cx="85" cy="98" r="3" class="s-ink2"/><circle cx="100" cy="98" r="3" class="s-ink2"/><circle cx="115" cy="98" r="3" class="s-ink2"/><circle cx="130" cy="98" r="3" class="s-ink2"/><circle cx="145" cy="98" r="3" class="s-ink2"/><circle cx="160" cy="98" r="3" class="s-ink2"/><circle cx="175" cy="98" r="3" class="s-ink2"/><circle cx="190" cy="98" r="3" class="s-ink2"/><circle cx="205" cy="98" r="3" class="s-ink2"/><circle cx="220" cy="98" r="3" class="s-ink2"/><circle cx="235" cy="98" r="3" class="s-ink2"/><circle cx="276" cy="98" r="3" class="s-ink2"/><circle cx="288" cy="98" r="3" class="s-ink2"/><circle cx="300" cy="98" r="3" class="s-ink2"/><circle cx="312" cy="98" r="3" class="s-ink2"/><circle cx="324" cy="98" r="3" class="s-ink2"/><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">14 orders as Basic, 5 as Gold.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Hive joins source and target on the key, then routes each row to a clause.</li>
+          <li>The first clause whose condition is true decides the action; all actions commit together.</li>
+          <li>A target row may be changed by only one source row.</li>
+          <li>A NULL join key forces the second copy of a changed row into the INSERT branch.</li>
+          <li>Each order is matched to the version whose eff_from–eff_to range contains its date.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a CDC feed, revenue by historical plan, and big-merge performance.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-cdc">Applying a CDC feed every night</h3>
+  <p class="anim-intro">Change data capture from an OLTP database into a Hive ACID table. (Typical pipeline; the MERGE pattern ran in our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">CDC upsert <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Change events are de-duplicated to the latest per key and applied with a three-clause MERGE in one transaction">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">CDC feed from PostgreSQL</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink2">every change event: op (I/U/D), key, values, ts</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A customer can change 3 times in a day.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Keep the latest event per key</text><text x="180" y="54" text-anchor="middle" font-size="7.8" class="s-ink mono">ROW_NUMBER() OVER (PARTITION BY customer_id</text><text x="180" y="70" text-anchor="middle" font-size="7.8" class="s-ink mono">                   ORDER BY ts DESC) = 1</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Prevents the cardinality violation.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MERGE with three clauses</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">D → DELETE · U → UPDATE · I → INSERT</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One transaction per night.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check the counts</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2 mono">target rows = before + inserts − deletes</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Real lab: 6 + 1 − 1 = 6 rows.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Watch for late events</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">apply only events newer than the target’s ts</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Add AND s.ts > t.ts to the UPDATE clause.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The database emits insert, update and delete events.</li>
+          <li>Keep only the latest event per key.</li>
+          <li>One MERGE applies deletes, updates and inserts.</li>
+          <li>Reconcile row counts after the merge.</li>
+          <li>Ignore events older than what the target already has.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-pit">Revenue by the plan customers really had</h3>
+  <p class="anim-intro">Why SCD2 matters for reporting. Both results are real.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Point-in-time reporting <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Joining orders to current customer rows misattributes revenue; joining on the validity range gives the plan at order time">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Finance: “revenue by plan, last quarter”</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">customers upgrade and downgrade all the time</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="176.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Which plan counts: today’s or the one at order time?</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">| plan_now | orders |</text><text x="26" y="64" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">| Gold     | 19     |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  current-row join: all orders “Gold”</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">| plan_then | orders |</text><text x="26" y="64" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Basic     | 14     |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| Gold      | 5      |</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Point-in-time join</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">o.order_date BETWEEN h.eff_from AND h.eff_to</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each order meets exactly one version.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Guard rail</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">versions must not overlap: test it nightly</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Overlaps double-count revenue.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Finance needs revenue by plan.</li>
+          <li>Joining on current rows labels every order with today’s plan.</li>
+          <li>Joining on the validity range uses the plan at order time.</li>
+          <li>The BETWEEN join picks exactly one version per order.</li>
+          <li>Test that versions never overlap.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-perf">Making a big MERGE fast</h3>
+  <p class="anim-intro">Typical techniques used on very large targets. (Guidance; sizes are illustrative.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">MERGE performance <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Prune target partitions in the ON clause, send only changed rows, and compact after large merges">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MERGE on a 2-billion-row target is slow</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-red">the join reads the whole target every night</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Only a few lakh rows actually change.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">(illustrative sizes)</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Prune the target</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink mono">ON t.id = s.id AND t.order_date >= '2026-10-01'</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Partition filters in ON limit what is joined.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Shrink the source</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">only changed rows; compare a hash of columns</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fewer matches, fewer deltas.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Keep the target compact</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">compaction after big merges (Lesson 7.3)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each merge adds delta folders.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Measure</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">rows read, rows written, deltas created</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Tune the slowest part first.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A nightly merge reads far more than it changes.</li>
+          <li>Add partition filters to the ON clause.</li>
+          <li>Send only real changes in the source.</li>
+          <li>Compact the target after big merges.</li>
+          <li>Measure each part before tuning.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>MERGE and SCD at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-green mono">CDC</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">nightly upsert</text></svg></div>
+    <div><h4>1. Syncing OLTP databases</h4>
+      <p>Change data from MySQL, PostgreSQL or Oracle is merged into the warehouse every night or hour, keeping Hive tables close to the source.</p>
+      <div class="uc-flow"><span>Change events</span><i>→</i><span class="java">MERGE</span><i>→</i><span>Synced table</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-blue mono">SCD2</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">history</text></svg></div>
+    <div><h4>2. Customer and product history</h4>
+      <p>Banks, insurers and retailers keep SCD2 dimensions for customers, branches and products so that reports use the attributes valid at transaction time.</p>
+      <div class="uc-flow"><span>Attribute change</span><i>→</i><span class="java">close + insert</span><i>→</i><span>Point-in-time reports</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">dedupe</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">insert new only</text></svg></div>
+    <div><h4>3. De-duplicated event loads</h4>
+      <p>When a source re-sends events, a MERGE with only WHEN NOT MATCHED THEN INSERT adds new event ids and ignores repeats.</p>
+      <div class="uc-flow"><span>Re-sent events</span><i>→</i><span class="java">NOT MATCHED → INSERT</span><i>→</i><span>No duplicates</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">audit</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">who was it then</text></svg></div>
+    <div><h4>4. Audits and regulators</h4>
+      <p>Auditors ask what a customer’s risk category or address was on a given date; SCD2 answers without restoring old backups.</p>
+      <div class="uc-flow"><span>Question about the past</span><i>→</i><span class="java">BETWEEN eff dates</span><i>→</i><span>Answer</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc">soft delete</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">keep closed</text></svg></div>
+    <div><h4>5. Closed accounts</h4>
+      <p>Instead of deleting closed accounts, many teams MERGE an is_deleted flag, so history and joins stay complete.</p>
+      <div class="uc-flow"><span>op = D</span><i>→</i><span class="java">UPDATE flag</span><i>→</i><span>History kept</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: how MERGE routes rows</h2>
+  <p>These programs mimic MERGE and SCD type 2 with the same data as the real lab. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># MERGE in plain Python: route each source row to a clause
+target = {1: (&quot;Bengaluru&quot;, &quot;Silver&quot;), 2: (&quot;Mumbai&quot;, &quot;Basic&quot;), 3: (&quot;Mumbai&quot;, &quot;Gold&quot;),
+          4: (&quot;Bengaluru&quot;, &quot;Basic&quot;), 5: (&quot;Bengaluru&quot;, &quot;Basic&quot;), 6: (&quot;Pune&quot;, &quot;Basic&quot;)}
+source = [(2, &quot;Mumbai&quot;, &quot;Gold&quot;, &quot;U&quot;), (3, &quot;Pune&quot;, &quot;Gold&quot;, &quot;U&quot;), (4, &quot;Bengaluru&quot;, &quot;Basic&quot;, &quot;U&quot;),
+          (6, None, None, &quot;D&quot;), (7, &quot;Hyderabad&quot;, &quot;Silver&quot;, &quot;I&quot;)]
+
+for cid, city, plan, op in source:
+    if cid in target:                                   # WHEN MATCHED
+        if op == &quot;D&quot;:
+            del target[cid]; print(cid, &quot;DELETE&quot;)
+        elif target[cid] != (city, plan):              # AND changed
+            target[cid] = (city, plan); print(cid, &quot;UPDATE&quot;)
+        else:
+            print(cid, &quot;no change&quot;)
+    else:                                               # WHEN NOT MATCHED
+        target[cid] = (city, plan); print(cid, &quot;INSERT&quot;)
+print(target)</code></pre><div class="output">2 UPDATE
+3 UPDATE
+4 no change
+6 DELETE
+7 INSERT
+{1: (&#x27;Bengaluru&#x27;, &#x27;Silver&#x27;), 2: (&#x27;Mumbai&#x27;, &#x27;Gold&#x27;), 3: (&#x27;Pune&#x27;, &#x27;Gold&#x27;), 4: (&#x27;Bengaluru&#x27;, &#x27;Basic&#x27;), 5: (&#x27;Bengaluru&#x27;, &#x27;Basic&#x27;), 7: (&#x27;Hyderabad&#x27;, &#x27;Silver&#x27;)}</div></div>
+  <ul class="anno"><li><code>        if op == &quot;D&quot;:</code><span>Listed first, like WHEN MATCHED AND s.op = 'D' THEN DELETE: the first applicable clause wins.</span></li><li><code>        elif target[cid] != (city, plan):              # AND changed</code><span>The change condition keeps customer 4 untouched, as its real ROW__ID showed.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Route the rows",
+   "hint": "Press <b>Run<\/b>. The result matches the real table after Step 2.",
+   "code": "# MERGE in plain Python: route each source row to a clause\ntarget = {1: (\"Bengaluru\", \"Silver\"), 2: (\"Mumbai\", \"Basic\"), 3: (\"Mumbai\", \"Gold\"),\n          4: (\"Bengaluru\", \"Basic\"), 5: (\"Bengaluru\", \"Basic\"), 6: (\"Pune\", \"Basic\")}\nsource = [(2, \"Mumbai\", \"Gold\", \"U\"), (3, \"Pune\", \"Gold\", \"U\"), (4, \"Bengaluru\", \"Basic\", \"U\"),\n          (6, None, None, \"D\"), (7, \"Hyderabad\", \"Silver\", \"I\")]\n\nfor cid, city, plan, op in source:\n    if cid in target:                                   # WHEN MATCHED\n        if op == \"D\":\n            del target[cid]; print(cid, \"DELETE\")\n        elif target[cid] != (city, plan):              # AND changed\n            target[cid] = (city, plan); print(cid, \"UPDATE\")\n        else:\n            print(cid, \"no change\")\n    else:                                               # WHEN NOT MATCHED\n        target[cid] = (city, plan); print(cid, \"INSERT\")\nprint(target)\n"
+  },
+  {
+   "label": "2 · Predict first: duplicate keys",
+   "hint": "<b>Predict first:<\/b> what should happen when the source has two rows for customer 2? (Real Hive: Cardinality Violation, nothing applied.)",
+   "code": "source = [(2, \"Gold\"), (3, \"Gold\"), (2, \"Silver\")]\nkeys = [k for k, _ in source]\ndupes = sorted({k for k in keys if keys.count(k) > 1})\nif dupes:\n    print(f\"Cardinality Violation: keys {dupes} match more than once -> MERGE refused, nothing applied\")\nelse:\n    print(\"ok: every target row matches at most one source row\")\n"
+  },
+  {
+   "label": "3 · SCD type 2",
+   "hint": "Changed customers are closed and re-inserted. Real result: 9 rows, 7 current.",
+   "code": "hist = [[c, p, \"2026-10-01\", \"9999-12-31\", True] for c, p in [(1, \"Silver\"), (2, \"Basic\"), (3, \"Mumbai/Gold\"), (4, \"Basic\"), (5, \"Basic\"), (6, \"Basic\")]]\nchanges = {2: \"Gold\", 3: \"Pune/Gold\", 4: \"Basic\", 7: \"Silver\"}\nfor cid, new in changes.items():\n    cur = next((r for r in hist if r[0] == cid and r[4]), None)\n    if cur and cur[1] != new:\n        cur[3], cur[4] = \"2026-10-26\", False                    # close\n        hist.append([cid, new, \"2026-10-27\", \"9999-12-31\", True])\n    elif cur is None:\n        hist.append([cid, new, \"2026-10-27\", \"9999-12-31\", True])\nprint(len(hist), \"rows,\", sum(r[4] for r in hist), \"current\")\nfor r in sorted(hist):\n    print(r)\n"
+  },
+  {
+   "label": "4 · Point in time",
+   "hint": "Which version was valid on each order date? Real answer for customer 2: 14 Basic, 5 Gold.",
+   "code": "versions = [(\"Basic\", \"2026-10-01\", \"2026-10-26\"), (\"Gold\", \"2026-10-27\", \"9999-12-31\")]\norders = [\"2026-10-03\", \"2026-10-15\", \"2026-10-26\", \"2026-10-27\", \"2026-10-29\"]\nfor d in orders:\n    plan = next(p for p, a, b in versions if a <= d <= b)\n    print(d, plan)\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This change check misses a city that was NULL before. Use a null-safe comparison (like Hive’s &lt;=&gt;).",
+   "code": "def changed(old, new):\n    if old is None or new is None:\n        return False            # like SQL: NULL <> 'Pune' is NULL, not true\n    return old != new\nold_city, new_city = None, \"Pune\"\nassert changed(old_city, new_city), \"a NULL -> Pune change was missed\"\nprint(\"detected\")\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: SCD2 checks</h3>
+  <p>Checks every SCD2 table should pass. Run them on <code>dim_customer_hist</code> in the lab.</p>
+  <div class="pcrun"><h4>1 · Exactly one current row per key</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SELECT customer_id, COUNT(*) AS current_rows
+FROM dim_customer_hist WHERE is_current
+GROUP BY customer_id HAVING COUNT(*) &lt;&gt; 1;</code></pre><div class="output">+--------------+---------------+
+| customer_id  | current_rows  |
++--------------+---------------+
++--------------+---------------+
+(no rows: the check passes)</div></div>
+  <p class="muted">Any row returned means the MERGE logic produced two current versions or none.</p></div>
+  <div class="pcrun"><h4>2 · History after the merge, and the re-run</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SELECT COUNT(*) AS rows_after_rerun, SUM(IF(is_current, 1, 0)) AS current_rows
+FROM dim_customer_hist;</code></pre><div class="output">+-------------------+---------------+
+| rows_after_rerun  | current_rows  |
++-------------------+---------------+
+| 9                 | 7             |
++-------------------+---------------+</div></div>
+  <p class="muted">6 original rows + 2 new versions + 1 new customer = 9; 7 customers are current. The same numbers after a second run prove the job is idempotent.</p></div>
+  <div class="pcrun"><h4>3 · Which version was valid on a date</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SELECT customer_id, city, plan FROM dim_customer_hist
+WHERE DATE &#x27;2026-10-20&#x27; BETWEEN eff_from AND eff_to AND customer_id IN (2, 3)
+ORDER BY customer_id;</code></pre><div class="output">+--------------+---------+--------+
+| customer_id  |  city   |  plan  |
++--------------+---------+--------+
+| 2            | Mumbai  | Basic  |
+| 3            | Mumbai  | Gold   |
++--------------+---------+--------+</div></div>
+  <p class="muted">The same BETWEEN condition used in the point-in-time join. On 20 October Ananya was still Basic.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>The NULL-key trick, row by row</h2>
+  <p>The SCD2 source contains each changed row twice. Watch which copy matches a current target row and which one is inserted.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "current = {2: \"Basic\", 3: \"Mumbai\", 4: \"Basic\"}",
+  "source = [(2, 2, \"Gold\"), (3, 3, \"Pune\"), (4, 4, \"Basic\"), (None, 2, \"Gold\"), (None, 3, \"Pune\")]",
+  "actions = []",
+  "for join_key, cid, val in source:",
+  "    if join_key in current:",
+  "        if current[join_key] != val:",
+  "            actions.append((cid, \"close old\"))",
+  "    else:",
+  "        actions.append((cid, \"insert new\"))",
+  "print(actions)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>current<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}"
+   ],
+   "newVar": "current"
+  },
+  {
+   "line": 2,
+   "phase": "Source",
+   "note": "The UNION ALL from Step 6: real keys for all rows, NULL keys for changed rows only. <code>source<\/code> is created: → list #2. A new list object (#2) is created: [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7] A new tuple object (#3) is created: (2, 2, &#x27;Gold&#x27;) A new tuple object (#4) is created: (3, 3, &#x27;Pune&#x27;) A new tuple object (#5) is created: (4, 4, &#x27;Basic&#x27;) A new tuple object (#6) is created: (None, 2, &#x27;Gold&#x27;) A new tuple object (#7) is created: (None, 3, &#x27;Pune&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)"
+   ],
+   "newVar": "source"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>actions<\/code> is created: → list #8. A new list object (#8) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (0)<\/b> []"
+   ],
+   "newVar": "actions"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>join_key<\/code> is created: 2. <code>cid<\/code> is created: 2. <code>val<\/code> is created: &#x27;Gold&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "2"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "val",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (0)<\/b> []"
+   ],
+   "newVar": "val"
+  },
+  {
+   "line": 5,
+   "phase": "Match",
+   "note": "A NULL join key never matches, exactly like NULL = 2 in SQL. The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "2"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "val",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "2"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "val",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #8 list now holds [→ tuple #9] A new tuple object (#9) is created: (2, &#x27;close old&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "2"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "val",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (1)<\/b> [→ tuple #9]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>join_key<\/code> changes to 3. <code>cid<\/code> changes to 3. <code>val<\/code> changes to &#x27;Pune&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "3"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "val",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (1)<\/b> [→ tuple #9]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)"
+   ],
+   "newVar": "val"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "3"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "val",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (1)<\/b> [→ tuple #9]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "3"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "val",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (1)<\/b> [→ tuple #9]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "Object #8 list now holds [→ tuple #9, → tuple #10] A new tuple object (#10) is created: (3, &#x27;close old&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "3"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "val",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (2)<\/b> [→ tuple #9, → tuple #10]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>join_key<\/code> changes to 4. <code>cid<\/code> changes to 4. <code>val<\/code> changes to &#x27;Basic&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "4"
+      ],
+      [
+       "cid",
+       "4"
+      ],
+      [
+       "val",
+       "'Basic'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (2)<\/b> [→ tuple #9, → tuple #10]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)"
+   ],
+   "newVar": "val"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "4"
+      ],
+      [
+       "cid",
+       "4"
+      ],
+      [
+       "val",
+       "'Basic'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (2)<\/b> [→ tuple #9, → tuple #10]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "4"
+      ],
+      [
+       "cid",
+       "4"
+      ],
+      [
+       "val",
+       "'Basic'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (2)<\/b> [→ tuple #9, → tuple #10]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>join_key<\/code> changes to None. <code>cid<\/code> changes to 2. <code>val<\/code> changes to &#x27;Gold&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "None"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "val",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (2)<\/b> [→ tuple #9, → tuple #10]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)"
+   ],
+   "newVar": "val"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "None"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "val",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (2)<\/b> [→ tuple #9, → tuple #10]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "Object #8 list now holds [→ tuple #9, → tuple #10, → tuple #11] A new tuple object (#11) is created: (2, &#x27;insert new&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "None"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "val",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (3)<\/b> [→ tuple #9, → tuple #10, → tuple #11]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)",
+    "<b>#11 tuple (2)<\/b> (2, &#x27;insert new&#x27;)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>cid<\/code> changes to 3. <code>val<\/code> changes to &#x27;Pune&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "None"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "val",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (3)<\/b> [→ tuple #9, → tuple #10, → tuple #11]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)",
+    "<b>#11 tuple (2)<\/b> (2, &#x27;insert new&#x27;)"
+   ],
+   "newVar": "val"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "None"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "val",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (3)<\/b> [→ tuple #9, → tuple #10, → tuple #11]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)",
+    "<b>#11 tuple (2)<\/b> (2, &#x27;insert new&#x27;)"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "Object #8 list now holds [→ tuple #9, → tuple #10, → tuple #11, → tuple #12] A new tuple object (#12) is created: (3, &#x27;insert new&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "None"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "val",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (4)<\/b> [→ tuple #9, → tuple #10, → tuple #11, → tuple #12]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)",
+    "<b>#11 tuple (2)<\/b> (2, &#x27;insert new&#x27;)",
+    "<b>#12 tuple (2)<\/b> (3, &#x27;insert new&#x27;)"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "None"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "val",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (4)<\/b> [→ tuple #9, → tuple #10, → tuple #11, → tuple #12]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)",
+    "<b>#11 tuple (2)<\/b> (2, &#x27;insert new&#x27;)",
+    "<b>#12 tuple (2)<\/b> (3, &#x27;insert new&#x27;)"
+   ]
+  },
+  {
+   "line": 10,
+   "phase": "Result",
+   "note": "Customers 2 and 3 are closed and re-inserted; 4 is matched but unchanged. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "current",
+       "→ dict #1"
+      ],
+      [
+       "source",
+       "→ list #2"
+      ],
+      [
+       "actions",
+       "→ list #8"
+      ],
+      [
+       "join_key",
+       "None"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "val",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (3)<\/b> {2: &#x27;Basic&#x27;, 3: &#x27;Mumbai&#x27;, 4: &#x27;Basic&#x27;}",
+    "<b>#2 list (5)<\/b> [→ tuple #3, → tuple #4, → tuple #5, → tuple #6, → tuple #7]",
+    "<b>#3 tuple (3)<\/b> (2, 2, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, 3, &#x27;Pune&#x27;)",
+    "<b>#5 tuple (3)<\/b> (4, 4, &#x27;Basic&#x27;)",
+    "<b>#6 tuple (3)<\/b> (None, 2, &#x27;Gold&#x27;)",
+    "<b>#7 tuple (3)<\/b> (None, 3, &#x27;Pune&#x27;)",
+    "<b>#8 list (4)<\/b> [→ tuple #9, → tuple #10, → tuple #11, → tuple #12]",
+    "<b>#9 tuple (2)<\/b> (2, &#x27;close old&#x27;)",
+    "<b>#10 tuple (2)<\/b> (3, &#x27;close old&#x27;)",
+    "<b>#11 tuple (2)<\/b> (2, &#x27;insert new&#x27;)",
+    "<b>#12 tuple (2)<\/b> (3, &#x27;insert new&#x27;)"
+   ],
+   "out": "[(2, 'close old'), (3, 'close old'), (2, 'insert new'), (3, 'insert new')]\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three MERGE tasks from TiffinGo’s data team.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Pipeline · reconciliation</span></div>
+    <h4>Check a MERGE with counts</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Before the MERGE the target had 6 rows. The source has 2 updates, 1 delete, 1 insert and 1 unchanged row. Predict the row count after the MERGE and the number of rows that get a new write id.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>target 6 rows; source: U, U, unchanged, D, I</pre></div><div><small>Expected output</small><pre>rows after: 6  rows with write id 2: 3</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Rows after = before + inserts − deletes.</li><li>Rewritten rows = updates + inserts.</li><li>Compare with the real table.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "6 rows and 3 rows with write id 2, exactly as in Step 3. A count check like this catches silent logic errors.",
+   "code": "before = 6\nops = [\"U\", \"U\", \"same\", \"D\", \"I\"]\nafter = before + ops.count(\"I\") - ops.count(\"D\")\nnew_writeid = ops.count(\"U\") + ops.count(\"I\")\nprint(\"rows after:\", after, \" rows with write id 2:\", new_writeid)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "before = 6",
+  "ops = [\"U\", \"U\", \"same\", \"D\", \"I\"]",
+  "after = before + ops.count(\"I\") - ops.count(\"D\")",
+  "new_writeid = ops.count(\"U\") + ops.count(\"I\")",
+  "print(\"rows after:\", after, \" rows with write id 2:\", new_writeid)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>before<\/code> is created: 6.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "before",
+       "6"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "before"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>ops<\/code> is created: → list #1. A new list object (#1) is created: [&#x27;U&#x27;, &#x27;U&#x27;, &#x27;same&#x27;, &#x27;D&#x27;, &#x27;I&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "before",
+       "6"
+      ],
+      [
+       "ops",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;U&#x27;, &#x27;U&#x27;, &#x27;same&#x27;, &#x27;D&#x27;, &#x27;I&#x27;]"
+   ],
+   "newVar": "ops"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>after<\/code> is created: 6.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "before",
+       "6"
+      ],
+      [
+       "ops",
+       "→ list #1"
+      ],
+      [
+       "after",
+       "6"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;U&#x27;, &#x27;U&#x27;, &#x27;same&#x27;, &#x27;D&#x27;, &#x27;I&#x27;]"
+   ],
+   "newVar": "after"
+  },
+  {
+   "line": 4,
+   "phase": "Write ids",
+   "note": "The real ROW__ID query showed write id 2 for customers 2, 3 and 7. <code>new_writeid<\/code> is created: 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "before",
+       "6"
+      ],
+      [
+       "ops",
+       "→ list #1"
+      ],
+      [
+       "after",
+       "6"
+      ],
+      [
+       "new_writeid",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;U&#x27;, &#x27;U&#x27;, &#x27;same&#x27;, &#x27;D&#x27;, &#x27;I&#x27;]"
+   ],
+   "newVar": "new_writeid"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "before",
+       "6"
+      ],
+      [
+       "ops",
+       "→ list #1"
+      ],
+      [
+       "after",
+       "6"
+      ],
+      [
+       "new_writeid",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;U&#x27;, &#x27;U&#x27;, &#x27;same&#x27;, &#x27;D&#x27;, &#x27;I&#x27;]"
+   ],
+   "out": "rows after: 6  rows with write id 2: 3\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Data quality · de-duplication</span></div>
+    <h4>Make the source safe for MERGE</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>The CDC feed has several events per customer. Keep only the latest per customer before merging, to avoid the cardinality violation.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>events (customer, ts, plan): (2, 09:00, Silver), (2, 21:30, Gold), (3, 10:15, Gold)</pre></div><div><small>Expected output</small><pre>{2: (&#x27;21:30&#x27;, &#x27;Gold&#x27;), 3: (&#x27;10:15&#x27;, &#x27;Gold&#x27;)}</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Group events by customer.</li><li>Keep the one with the latest timestamp.</li><li>Merge the result.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Without this step the real MERGE failed with “Cardinality Violation” and changed nothing.",
+   "code": "events = [(2, \"09:00\", \"Silver\"), (2, \"21:30\", \"Gold\"), (3, \"10:15\", \"Gold\")]\nlatest = {}\nfor cid, ts, plan in sorted(events, key=lambda e: e[1]):\n    latest[cid] = (ts, plan)\nprint(latest)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "events = [(2, \"09:00\", \"Silver\"), (2, \"21:30\", \"Gold\"), (3, \"10:15\", \"Gold\")]",
+  "latest = {}",
+  "for cid, ts, plan in sorted(events, key=lambda e: e[1]):",
+  "    latest[cid] = (ts, plan)",
+  "print(latest)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>events<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "events",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (2, &#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#3 tuple (3)<\/b> (2, &#x27;21:30&#x27;, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, &#x27;10:15&#x27;, &#x27;Gold&#x27;)"
+   ],
+   "newVar": "events"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>latest<\/code> is created: → dict #5. A new dict object (#5) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "events",
+       "→ list #1"
+      ],
+      [
+       "latest",
+       "→ dict #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (2, &#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#3 tuple (3)<\/b> (2, &#x27;21:30&#x27;, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, &#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#5 dict (0)<\/b> {}"
+   ],
+   "newVar": "latest"
+  },
+  {
+   "line": 3,
+   "phase": "Latest wins",
+   "note": "In HiveQL: ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY ts DESC) = 1 in a subquery used as the MERGE source. <code>cid<\/code> is created: 2. <code>ts<\/code> is created: &#x27;09:00&#x27;. <code>plan<\/code> is created: &#x27;Silver&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "events",
+       "→ list #1"
+      ],
+      [
+       "latest",
+       "→ dict #5"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "ts",
+       "'09:00'"
+      ],
+      [
+       "plan",
+       "'Silver'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (2, &#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#3 tuple (3)<\/b> (2, &#x27;21:30&#x27;, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, &#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#5 dict (0)<\/b> {}"
+   ],
+   "newVar": "plan"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #5 dict now holds {2: → tuple #6} A new tuple object (#6) is created: (&#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "events",
+       "→ list #1"
+      ],
+      [
+       "latest",
+       "→ dict #5"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "ts",
+       "'09:00'"
+      ],
+      [
+       "plan",
+       "'Silver'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (2, &#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#3 tuple (3)<\/b> (2, &#x27;21:30&#x27;, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, &#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#5 dict (1)<\/b> {2: → tuple #6}",
+    "<b>#6 tuple (2)<\/b> (&#x27;09:00&#x27;, &#x27;Silver&#x27;)"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>cid<\/code> changes to 3. <code>ts<\/code> changes to &#x27;10:15&#x27;. <code>plan<\/code> changes to &#x27;Gold&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "events",
+       "→ list #1"
+      ],
+      [
+       "latest",
+       "→ dict #5"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "ts",
+       "'10:15'"
+      ],
+      [
+       "plan",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (2, &#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#3 tuple (3)<\/b> (2, &#x27;21:30&#x27;, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, &#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#5 dict (1)<\/b> {2: → tuple #6}",
+    "<b>#6 tuple (2)<\/b> (&#x27;09:00&#x27;, &#x27;Silver&#x27;)"
+   ],
+   "newVar": "plan"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #5 dict now holds {2: → tuple #6, 3: → tuple #7} A new tuple object (#7) is created: (&#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "events",
+       "→ list #1"
+      ],
+      [
+       "latest",
+       "→ dict #5"
+      ],
+      [
+       "cid",
+       "3"
+      ],
+      [
+       "ts",
+       "'10:15'"
+      ],
+      [
+       "plan",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (2, &#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#3 tuple (3)<\/b> (2, &#x27;21:30&#x27;, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, &#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#5 dict (2)<\/b> {2: → tuple #6, 3: → tuple #7}",
+    "<b>#6 tuple (2)<\/b> (&#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#7 tuple (2)<\/b> (&#x27;10:15&#x27;, &#x27;Gold&#x27;)"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>cid<\/code> changes to 2. <code>ts<\/code> changes to &#x27;21:30&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "events",
+       "→ list #1"
+      ],
+      [
+       "latest",
+       "→ dict #5"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "ts",
+       "'21:30'"
+      ],
+      [
+       "plan",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (2, &#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#3 tuple (3)<\/b> (2, &#x27;21:30&#x27;, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, &#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#5 dict (2)<\/b> {2: → tuple #6, 3: → tuple #7}",
+    "<b>#6 tuple (2)<\/b> (&#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#7 tuple (2)<\/b> (&#x27;10:15&#x27;, &#x27;Gold&#x27;)"
+   ],
+   "newVar": "ts"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Object #5 dict now holds {2: → tuple #8, 3: → tuple #7} A new tuple object (#8) is created: (&#x27;21:30&#x27;, &#x27;Gold&#x27;)",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "events",
+       "→ list #1"
+      ],
+      [
+       "latest",
+       "→ dict #5"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "ts",
+       "'21:30'"
+      ],
+      [
+       "plan",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (2, &#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#3 tuple (3)<\/b> (2, &#x27;21:30&#x27;, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, &#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#5 dict (2)<\/b> {2: → tuple #8, 3: → tuple #7}",
+    "<b>#7 tuple (2)<\/b> (&#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#8 tuple (2)<\/b> (&#x27;21:30&#x27;, &#x27;Gold&#x27;)"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "events",
+       "→ list #1"
+      ],
+      [
+       "latest",
+       "→ dict #5"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "ts",
+       "'21:30'"
+      ],
+      [
+       "plan",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (2, &#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#3 tuple (3)<\/b> (2, &#x27;21:30&#x27;, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, &#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#5 dict (2)<\/b> {2: → tuple #8, 3: → tuple #7}",
+    "<b>#7 tuple (2)<\/b> (&#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#8 tuple (2)<\/b> (&#x27;21:30&#x27;, &#x27;Gold&#x27;)"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "events",
+       "→ list #1"
+      ],
+      [
+       "latest",
+       "→ dict #5"
+      ],
+      [
+       "cid",
+       "2"
+      ],
+      [
+       "ts",
+       "'21:30'"
+      ],
+      [
+       "plan",
+       "'Gold'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [→ tuple #2, → tuple #3, → tuple #4]",
+    "<b>#2 tuple (3)<\/b> (2, &#x27;09:00&#x27;, &#x27;Silver&#x27;)",
+    "<b>#3 tuple (3)<\/b> (2, &#x27;21:30&#x27;, &#x27;Gold&#x27;)",
+    "<b>#4 tuple (3)<\/b> (3, &#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#5 dict (2)<\/b> {2: → tuple #8, 3: → tuple #7}",
+    "<b>#7 tuple (2)<\/b> (&#x27;10:15&#x27;, &#x27;Gold&#x27;)",
+    "<b>#8 tuple (2)<\/b> (&#x27;21:30&#x27;, &#x27;Gold&#x27;)"
+   ],
+   "out": "{2: ('21:30', 'Gold'), 3: ('10:15', 'Gold')}\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Analytics · SCD2</span></div>
+    <h4>Revenue by the plan at order time</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Using the two versions of customer 2 and her orders, compute revenue by plan with a point-in-time join and with a current-row join, and the difference reported as Gold.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>versions: Basic 10-01…10-26, Gold 10-27…; orders: 14 before 10-27 at ₹300, 5 after at ₹350 (sample amounts)</pre></div><div><small>Expected output</small><pre>point in time: {&#x27;Basic&#x27;: 4200, &#x27;Gold&#x27;: 1750}
+current-row join: Gold = 5950</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Assign each order the version valid on its date.</li><li>Sum by plan.</li><li>Compare with all orders labelled Gold.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "The current-row join overstates Gold revenue by ₹4,200 for just one customer. Counts match the real query: 14 and 5 orders.",
+   "code": "orders = {\"2026-10-02..10-26\": (14, 300), \"2026-10-27..10-31\": (5, 350)}   # (count, amount)\ndef plan_on(period):\n    return \"Basic\" if period.startswith(\"2026-10-02\") else \"Gold\"\nby_plan = {}\nfor period, (n, amt) in orders.items():\n    by_plan[plan_on(period)] = by_plan.get(plan_on(period), 0) + n * amt\nprint(\"point in time:\", by_plan)\nprint(\"current-row join: Gold =\", sum(n * a for n, a in orders.values()))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "orders = {\"2026-10-02..10-26\": (14, 300), \"2026-10-27..10-31\": (5, 350)}   # (count, amount)",
+  "def plan_on(period):",
+  "    return \"Basic\" if period.startswith(\"2026-10-02\") else \"Gold\"",
+  "by_plan = {}",
+  "for period, (n, amt) in orders.items():",
+  "    by_plan[plan_on(period)] = by_plan.get(plan_on(period), 0) + n * amt",
+  "print(\"point in time:\", by_plan)",
+  "print(\"current-row join: Gold =\", sum(n * a for n, a in orders.values()))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>orders<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)"
+   ],
+   "newVar": "orders"
+  },
+  {
+   "line": 2,
+   "phase": "Validity",
+   "note": "Equivalent to o.order_date BETWEEN eff_from AND eff_to. <code>plan_on<\/code> is created: function plan_on().",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)"
+   ],
+   "newVar": "plan_on"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>by_plan<\/code> is created: → dict #4. A new dict object (#4) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (0)<\/b> {}"
+   ],
+   "newVar": "by_plan"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>period<\/code> is created: &#x27;2026-10-02..10-26&#x27;. <code>n<\/code> is created: 14. <code>amt<\/code> is created: 300.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-02..10-26'"
+      ],
+      [
+       "n",
+       "14"
+      ],
+      [
+       "amt",
+       "300"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (0)<\/b> {}"
+   ],
+   "newVar": "amt"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>plan_on()<\/code> is called: a new frame is pushed with <code>period<\/code> = &#x27;2026-10-02..10-26&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-02..10-26'"
+      ],
+      [
+       "n",
+       "14"
+      ],
+      [
+       "amt",
+       "300"
+      ]
+     ]
+    },
+    {
+     "frame": "plan_on()",
+     "vars": [
+      [
+       "period",
+       "'2026-10-02..10-26'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (0)<\/b> {}"
+   ],
+   "newVar": "period"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-02..10-26'"
+      ],
+      [
+       "n",
+       "14"
+      ],
+      [
+       "amt",
+       "300"
+      ]
+     ]
+    },
+    {
+     "frame": "plan_on()",
+     "vars": [
+      [
+       "period",
+       "'2026-10-02..10-26'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (0)<\/b> {}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Return",
+   "note": "<code>plan_on()<\/code> returns <b>&#x27;Basic&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-02..10-26'"
+      ],
+      [
+       "n",
+       "14"
+      ],
+      [
+       "amt",
+       "300"
+      ]
+     ]
+    },
+    {
+     "frame": "plan_on()",
+     "vars": [
+      [
+       "period",
+       "'2026-10-02..10-26'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (0)<\/b> {}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-02..10-26'"
+      ],
+      [
+       "n",
+       "14"
+      ],
+      [
+       "amt",
+       "300"
+      ]
+     ]
+    },
+    {
+     "frame": "plan_on()",
+     "vars": [
+      [
+       "period",
+       "'2026-10-02..10-26'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (0)<\/b> {}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Return",
+   "note": "<code>plan_on()<\/code> returns <b>&#x27;Basic&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-02..10-26'"
+      ],
+      [
+       "n",
+       "14"
+      ],
+      [
+       "amt",
+       "300"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (1)<\/b> {&#x27;Basic&#x27;: 4200}"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>period<\/code> changes to &#x27;2026-10-27..10-31&#x27;. <code>n<\/code> changes to 5. <code>amt<\/code> changes to 350.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "amt",
+       "350"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (1)<\/b> {&#x27;Basic&#x27;: 4200}"
+   ],
+   "newVar": "amt"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>plan_on()<\/code> is called: a new frame is pushed with <code>period<\/code> = &#x27;2026-10-27..10-31&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "amt",
+       "350"
+      ]
+     ]
+    },
+    {
+     "frame": "plan_on()",
+     "vars": [
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (1)<\/b> {&#x27;Basic&#x27;: 4200}"
+   ],
+   "newVar": "period"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "amt",
+       "350"
+      ]
+     ]
+    },
+    {
+     "frame": "plan_on()",
+     "vars": [
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (1)<\/b> {&#x27;Basic&#x27;: 4200}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Return",
+   "note": "<code>plan_on()<\/code> returns <b>&#x27;Gold&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "amt",
+       "350"
+      ]
+     ]
+    },
+    {
+     "frame": "plan_on()",
+     "vars": [
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (1)<\/b> {&#x27;Basic&#x27;: 4200}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "amt",
+       "350"
+      ]
+     ]
+    },
+    {
+     "frame": "plan_on()",
+     "vars": [
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (1)<\/b> {&#x27;Basic&#x27;: 4200}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Return",
+   "note": "<code>plan_on()<\/code> returns <b>&#x27;Gold&#x27;<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "amt",
+       "350"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (2)<\/b> {&#x27;Basic&#x27;: 4200, &#x27;Gold&#x27;: 1750}"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "amt",
+       "350"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (2)<\/b> {&#x27;Basic&#x27;: 4200, &#x27;Gold&#x27;: 1750}"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "amt",
+       "350"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (2)<\/b> {&#x27;Basic&#x27;: 4200, &#x27;Gold&#x27;: 1750}"
+   ],
+   "out": "point in time: {'Basic': 4200, 'Gold': 1750}\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "orders",
+       "→ dict #1"
+      ],
+      [
+       "plan_on",
+       "function plan_on()"
+      ],
+      [
+       "by_plan",
+       "→ dict #4"
+      ],
+      [
+       "period",
+       "'2026-10-27..10-31'"
+      ],
+      [
+       "n",
+       "5"
+      ],
+      [
+       "amt",
+       "350"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (2)<\/b> {&#x27;2026-10-02..10-26&#x27;: → tuple #2, &#x27;2026-10-27..10-31&#x27;: → tuple #3}",
+    "<b>#2 tuple (2)<\/b> (14, 300)",
+    "<b>#3 tuple (2)<\/b> (5, 350)",
+    "<b>#4 dict (2)<\/b> {&#x27;Basic&#x27;: 4200, &#x27;Gold&#x27;: 1750}"
+   ],
+   "out": "current-row join: Gold = 5950\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: What does MERGE do?",
+  "options": [
+   "Joins two tables in a SELECT",
+   "Merges small files",
+   "Applies inserts, updates and deletes from a source to a target in one statement",
+   "Combines two partitions"
+  ],
+  "answer": 2,
+  "why": "One statement, one transaction."
+ },
+ {
+  "q": "Beginner: Which table must be transactional in a MERGE?",
+  "options": [
+   "The source",
+   "The target",
+   "Both",
+   "Neither"
+  ],
+  "answer": 1,
+  "why": "Only the target is written; the source can be any table or subquery."
+ },
+ {
+  "q": "Beginner: In SCD type 2, what happens when a customer changes city?",
+  "options": [
+   "The old row is closed and a new row added",
+   "The row is overwritten",
+   "A column prev_city is filled",
+   "Nothing"
+  ],
+  "answer": 0,
+  "why": "Type 1 overwrites, type 3 uses a previous-value column."
+ },
+ {
+  "q": "Intermediate: Two source rows match the same target row. What did Hive 4.2.1 do?",
+  "options": [
+   "Used the first row",
+   "Used the last row",
+   "Inserted a duplicate",
+   "Failed with Cardinality Violation and changed nothing"
+  ],
+  "answer": 3,
+  "why": "hive.merge.cardinality.check=true. De-duplicate the source."
+ },
+ {
+  "q": "Intermediate: Why add “AND (t.city <> s.city OR t.plan <> s.plan)” to WHEN MATCHED … UPDATE?",
+  "options": [
+   "It is required syntax",
+   "To delete rows",
+   "So unchanged rows are not rewritten",
+   "To speed up the join"
+  ],
+  "answer": 2,
+  "why": "Customer 4 kept write id 1 in our lab."
+ },
+ {
+  "q": "Intermediate: In the SCD2 MERGE, why do changed rows appear with a NULL join key?",
+  "options": [
+   "To delete them",
+   "Because NULL never matches, so they reach WHEN NOT MATCHED and are inserted",
+   "To skip them",
+   "NULL means unchanged"
+  ],
+  "answer": 1,
+  "why": "The same change must both close the old version (match) and insert a new one (no match)."
+ },
+ {
+  "q": "Advanced: What did re-running the SCD2 MERGE do?",
+  "options": [
+   "Nothing: still 9 rows, 7 current",
+   "Added duplicate versions",
+   "Failed",
+   "Deleted history"
+  ],
+  "answer": 0,
+  "why": "The job is idempotent, so failed nights can be re-run safely."
+ },
+ {
+  "q": "Advanced: t.city is NULL and s.city is 'Pune'. Is the change detected by t.city <> s.city?",
+  "options": [
+   "Yes",
+   "Only in strict mode",
+   "Hive raises an error",
+   "No: the comparison is NULL, not true"
+  ],
+  "answer": 3,
+  "why": "Use NOT (t.city <=> s.city) or compare hashes."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 7.2 in one screen</h3>
+    <ul><li><code>MERGE INTO t USING s ON key WHEN MATCHED [AND c] THEN UPDATE SET … | DELETE WHEN NOT MATCHED [AND c] THEN INSERT VALUES (…)</code>.</li><li>Target = full ACID table; source = anything. One statement = one write id = one transaction.</li><li>First applicable clause wins: put DELETE (op = 'D') before UPDATE.</li><li>Add a change condition to UPDATE; use null-safe <code>&lt;=&gt;</code> or hashes for NULLs.</li><li><b>Cardinality violation:</b> one target row matched by two source rows → whole MERGE fails, nothing applied. De-duplicate with ROW_NUMBER.</li><li><b>SCD1</b> overwrite · <b>SCD2</b> eff_from / eff_to / is_current · <b>SCD3</b> previous-value column.</li><li><b>SCD2 MERGE:</b> source = all rows with real key ∪ changed rows with NULL key; match on key AND is_current; close on MATCHED, insert on NOT MATCHED.</li><li>Idempotent: re-run gave 9 rows, 7 current. Check one current row per key.</li><li><b>Point-in-time join:</b> <code>o.date BETWEEN h.eff_from AND h.eff_to</code> (14 Basic + 5 Gold vs 19 “Gold”).</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Can I MERGE into an Iceberg table?</summary><p>Yes. Hive 4 supports MERGE on Iceberg tables with the same syntax, writing Iceberg delete files and data files instead of Hive deltas (Lesson 7.3). This is useful when Spark or Trino also read the table.</p></details>
+    <details><summary>Is MERGE faster than a separate UPDATE, DELETE and INSERT?</summary><p>Usually yes: it reads the source and target once, and it is one transaction instead of three, so readers never see a half-applied change. The cost is a join between source and target, so filter the target (partitions, is_current) in the ON clause.</p></details>
+    <details><summary>How do I choose eff_from for a change?</summary><p>Use the time the change happened in the source system if you have it (from CDC), otherwise the load date. Keep the convention consistent, and make eff_to the day before the next version’s eff_from (or use half-open ranges, eff_from ≤ date &lt; eff_to) so versions never overlap.</p></details>
+    <details><summary>Should every dimension be SCD2?</summary><p>No. Keep history only for attributes that matter for analysis (plan, city, segment). Fast-changing or irrelevant attributes (last login time) belong in a separate table or SCD1, otherwise the dimension grows a new version for every small change.</p></details>
+    <details><summary>What does MERGE do with rows in the target that are not in the source?</summary><p>Nothing. Hive’s MERGE has no WHEN NOT MATCHED BY SOURCE clause. To delete target rows that disappeared from a full extract, add an explicit delete marker to the source or run a separate DELETE … WHERE key NOT IN (…).</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs that simulate MERGE and SCD logic, with the HiveQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Classify source rows</h4></div>
+      <p>Mark each source key as MATCHED or NOT MATCHED against the target keys.</p>
+      <div class="prob__io"><div><small>Input</small><pre>target {1..6}, source {2, 3, 4, 6, 7}</pre></div><div><small>Expected output</small><pre>2 MATCHED
+3 MATCHED
+4 MATCHED
+6 MATCHED
+7 NOT MATCHED</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>target = {1, 2, 3, 4, 5, 6}
+for k in [2, 3, 4, 6, 7]:
+    print(k, &quot;MATCHED&quot; if k in target else &quot;NOT MATCHED&quot;)</code></pre><div class="output">2 MATCHED
+3 MATCHED
+4 MATCHED
+6 MATCHED
+7 NOT MATCHED</div></div>
+        <p><b>How it works:</b> Only customer 7 is new, as in the real MERGE.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Find duplicate keys</h4></div>
+      <p>Find keys that appear more than once in the source.</p>
+      <div class="prob__io"><div><small>Input</small><pre>[2, 3, 4, 6, 7, 2]</pre></div><div><small>Expected output</small><pre>[2]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>keys = [2, 3, 4, 6, 7, 2]
+print(sorted({k for k in keys if keys.count(k) &gt; 1}))</code></pre><div class="output">[2]</div></div>
+        <p><b>How it works:</b> Key 2 caused the real Cardinality Violation. In HiveQL: GROUP BY customer_id HAVING COUNT(*) &gt; 1.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>SCD type for a column</h4></div>
+      <p>Choose SCD1 or SCD2 for each attribute.</p>
+      <div class="prob__io"><div><small>Input</small><pre>plan, city, last_login, phone</pre></div><div><small>Expected output</small><pre>{&#x27;plan&#x27;: &#x27;SCD2&#x27;, &#x27;city&#x27;: &#x27;SCD2&#x27;, &#x27;last_login&#x27;: &#x27;SCD1&#x27;, &#x27;phone&#x27;: &#x27;SCD1&#x27;}</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>choice = {&quot;plan&quot;: &quot;SCD2&quot;, &quot;city&quot;: &quot;SCD2&quot;, &quot;last_login&quot;: &quot;SCD1&quot;, &quot;phone&quot;: &quot;SCD1&quot;}
+print(choice)</code></pre><div class="output">{&#x27;plan&#x27;: &#x27;SCD2&#x27;, &#x27;city&#x27;: &#x27;SCD2&#x27;, &#x27;last_login&#x27;: &#x27;SCD1&#x27;, &#x27;phone&#x27;: &#x27;SCD1&#x27;}</div></div>
+        <p><b>How it works:</b> Keep history where analysis needs it; overwrite volatile or irrelevant attributes.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Rows after SCD2</h4></div>
+      <p>6 current customers; 2 change, 1 is new, 1 is unchanged. How many rows and current rows after the MERGE?</p>
+      <div class="prob__io"><div><small>Input</small><pre>6, 2 changes, 1 new</pre></div><div><small>Expected output</small><pre>9 7</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>rows = 6 + 2 + 1
+current = 6 + 1
+print(rows, current)</code></pre><div class="output">9 7</div></div>
+        <p><b>How it works:</b> 9 rows, 7 current: the real result.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Build the SCD2 source</h4></div>
+      <p>Generate the (join_key, customer) pairs for the SCD2 MERGE source.</p>
+      <div class="prob__io"><div><small>Input</small><pre>all staging keys {2, 3, 4, 7}; changed {2, 3}</pre></div><div><small>Expected output</small><pre>[(2, 2), (3, 3), (4, 4), (7, 7), (None, 2), (None, 3)]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>staging, changed = [2, 3, 4, 7], {2, 3}
+src = [(k, k) for k in staging] + [(None, k) for k in staging if k in changed]
+print(src)</code></pre><div class="output">[(2, 2), (3, 3), (4, 4), (7, 7), (None, 2), (None, 3)]</div></div>
+        <p><b>How it works:</b> Six source rows: four with real keys, two with NULL keys for the changed customers.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Null-safe change check</h4></div>
+      <p>Detect changes including NULL → value.</p>
+      <div class="prob__io"><div><small>Input</small><pre>pairs of old/new city</pre></div><div><small>Expected output</small><pre>Mumbai Pune True
+None Pune True
+None None False
+Pune Pune False</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>def changed(a, b):
+    return not (a == b or (a is None and b is None))
+for old, new in [(&quot;Mumbai&quot;, &quot;Pune&quot;), (None, &quot;Pune&quot;), (None, None), (&quot;Pune&quot;, &quot;Pune&quot;)]:
+    print(old, new, changed(old, new))</code></pre><div class="output">Mumbai Pune True
+None Pune True
+None None False
+Pune Pune False</div></div>
+        <p><b>How it works:</b> Hive: NOT (t.city <=> s.city). Plain <> would miss the second case.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Revenue overstatement</h4></div>
+      <p>How much Gold revenue does a current-row join overstate for customer 2?</p>
+      <div class="prob__io"><div><small>Input</small><pre>14 Basic orders at ₹300 (sample)</pre></div><div><small>Expected output</small><pre>4200 rupees wrongly counted as Gold</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(14 * 300, &quot;rupees wrongly counted as Gold&quot;)</code></pre><div class="output">4200 rupees wrongly counted as Gold</div></div>
+        <p><b>How it works:</b> ₹4,200 for one customer; across thousands of upgrades the plan report would be badly wrong.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Nightly job checklist</h4></div>
+      <p>Print the steps of a safe nightly SCD2 job.</p>
+      <div class="prob__io"><div><small>Input</small><pre>—</pre></div><div><small>Expected output</small><pre>1 load staging
+2 keep latest row per key
+3 MERGE (close + insert)
+4 check one current row per key
+5 check counts
+6 compact if many deltas</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>steps = [&quot;load staging&quot;, &quot;keep latest row per key&quot;, &quot;MERGE (close + insert)&quot;,
+         &quot;check one current row per key&quot;, &quot;check counts&quot;, &quot;compact if many deltas&quot;]
+for i, s in enumerate(steps, 1):
+    print(i, s)</code></pre><div class="output">1 load staging
+2 keep latest row per key
+3 MERGE (close + insert)
+4 check one current row per key
+5 check counts
+6 compact if many deltas</div></div>
+        <p><b>How it works:</b> Each step corresponds to something we ran or a failure we hit in this lesson.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">MERGE and SCD questions are standard for data engineering roles, often as a whiteboard exercise.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · SQL</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is an upsert?”</h4>
+      <p class="scn__situation">Explain upsert and how to do it in Hive.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know MERGE and its requirement?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>Update the row if its key exists, insert it if not. In Hive: <code>MERGE INTO target t USING source s ON t.id = s.id WHEN MATCHED THEN UPDATE SET … WHEN NOT MATCHED THEN INSERT VALUES (…)</code>, where the target is a transactional ORC table. It runs as one transaction.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Describing INSERT OVERWRITE of the whole table as an upsert.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>MERGE fails with a cardinality violation</h4>
+      <p class="scn__situation">The nightly MERGE fails: “Cardinality Violation in Merge statement”.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know the cause and the fix?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>The source has more than one row for some keys (several CDC events, or a bad join).</li>
+          <li>Find them: GROUP BY key HAVING COUNT(*) &gt; 1.</li>
+          <li>Keep the latest per key with ROW_NUMBER in the source subquery; the target was not changed, so just re-run.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Setting hive.merge.cardinality.check=false, which makes the result unpredictable.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Analytics</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Design an SCD2 customer dimension</h4>
+      <p class="scn__situation">Design a customer dimension that answers “which plan was the customer on when they ordered?”.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you design columns, load logic and queries?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Columns: business key, attributes, eff_from, eff_to (9999-12-31 for current), is_current; optionally a surrogate key.</li>
+          <li>Load: MERGE closing changed current rows and inserting new versions (NULL-key trick), idempotent.</li>
+          <li>Query: join facts on key AND fact_date BETWEEN eff_from AND eff_to; test one current row per key.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Storing only the current value and trying to rebuild history from logs later.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Large nightly MERGE too slow</h4>
+      <p class="scn__situation">A MERGE of 50 lakh changes into a 2-billion-row ACID table takes 4 hours.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you optimise reads, writes and table health?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Prune the target in ON (partitions, is_current), send only real changes (hash compare).</li>
+          <li>Check deltas and compaction status; compact after the merge.</li>
+          <li>Consider partitioning the target by the column most changes are filtered on, or Iceberg with merge-on-read deletes.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Running the MERGE more often without measuring where the time goes.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

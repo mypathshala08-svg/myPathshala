@@ -1,0 +1,3601 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Partition design, small files and skew | MyPhatshala</title>
+<meta name="description" content="How to design Hive table layouts, with real Hive 4.2.1 measurements: over-partitioning (2,000 customer partitions: 4× the disk, twice the query time), the small files problem (INSERT INTO _copy_N files, CONCATENATE refused on external tables, compaction by INSERT OVERWRITE, hive.merge.tezfiles), and data skew (a key with 37.5% of rows, map-side aggregation, hive.groupby.skewindata, SKEWED BY … STORED AS DIRECTORIES, skew joins and salting).">
+<meta name="mp:minutes" content="35">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/05-partitioning-and-bucketing/04-partition-design-small-files-and-skew/">
+<meta property="og:title" content="Partition design, small files and skew · MyPhatshala">
+<meta property="og:description" content="We partitioned by customer and the query got twice as slow. Real measurements of over-partitioning, small files and skew in Hive 4.2.1, and how to fix each.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Partition design, small files and skew", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="05-partitioning-and-bucketing/04-partition-design-small-files-and-skew" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 5.4</b></nav>
+    <h1>Partition design, small files and skew</h1>
+    <p class="lead">Partitions and buckets speed Hive up only when the layout fits the data. This lesson measures what happens when it does not: <b>too many partitions</b> (2,000 tiny folders), <b>small files</b> from frequent loads, and <b>skew</b> where one key owns 37.5% of the rows. Then it fixes each one with tools you can run today. <b>All outputs are real</b>, from Hive 4.2.1.</p>
+    <div class="lesson-meta"><span>Module 5 · Partitioning and bucketing</span><span>⏱ 35 min</span><span>Intermediate → Advanced</span><span>Real Hive 4.2.1 measurements</span><span>Small files: detect and compact</span><span>Skew tools compared</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“We partitioned everything. Why is it slower?”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> finish Lessons <a href="../01-partitioning/">5.1</a>, <a href="../02-dynamic-partitions-and-msck/">5.2</a> and <a href="../03-bucketing/">5.3</a>.</p></div>
+  <div class="story">
+    <p class="narration">Excited by Lessons 5.1–5.3, Kabir’s team partitions a copy of orders by <code>customer_id</code>, loads an events table every three hours, and onboards a cloud-kitchen chain that brings 30,000 orders under a single restaurant id. A week later, three complaints arrive: a simple report takes twice as long, a partition holds a pile of tiny files, and one job always waits for one last task.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Three panels: on the left a grid of two thousand tiny partition folders, in the middle many tiny files, on the right eight reducer bars where one bar is five times taller than the others.">
+        <rect x="10" y="12" width="196" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="108" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-red">Too many partitions</text><rect x="22" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="33" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="44" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="55" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="66" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="77" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="88" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="99" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="110" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="121" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="132" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="143" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="154" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="165" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="176" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="187" y="42" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="22" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="33" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="44" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="55" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="66" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="77" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="88" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="99" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="110" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="121" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="132" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="143" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="154" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="165" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="176" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="187" y="53" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="22" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="33" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="44" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="55" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="66" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="77" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="88" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="99" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="110" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="121" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="132" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="143" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="154" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="165" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="176" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="187" y="64" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="22" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="33" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="44" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="55" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="66" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="77" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="88" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="99" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="110" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="121" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="132" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="143" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="154" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="165" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="176" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="187" y="75" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="22" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="33" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="44" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="55" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="66" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="77" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="88" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="99" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="110" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="121" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="132" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="143" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="154" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="165" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="176" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="187" y="86" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="22" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="33" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="44" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="55" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="66" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="77" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="88" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="99" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="110" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="121" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="132" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="143" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="154" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="165" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="176" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="187" y="97" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="22" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="33" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="44" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="55" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="66" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="77" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="88" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="99" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="110" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="121" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="132" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="143" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="154" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="165" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="176" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><rect x="187" y="108" width="8" height="8" rx="1" style="fill:#D64545"/><text x="108" y="132" text-anchor="middle" font-size="7.2" class="s-ink2">2,000 folders × 858-byte files</text><rect x="222" y="12" width="196" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="320" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-acc">Small files</text><rect x="236" y="46" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="257" y="46" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="278" y="46" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="299" y="46" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="320" y="46" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="341" y="46" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="362" y="46" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="383" y="46" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="236" y="68" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="257" y="68" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="278" y="68" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="299" y="68" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="320" y="68" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="341" y="68" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="362" y="68" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="383" y="68" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="236" y="90" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="257" y="90" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="278" y="90" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="299" y="90" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="320" y="90" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="341" y="90" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="362" y="90" width="16" height="14" rx="2" style="fill:#E0A100"/><rect x="383" y="90" width="16" height="14" rx="2" style="fill:#E0A100"/><text x="320" y="132" text-anchor="middle" font-size="7.2" class="s-ink2">8 tiny files from 8 small inserts</text><rect x="434" y="12" width="196" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="532" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-acc">Skew</text><rect x="448" y="106" width="16" height="14" rx="2" style="fill:var(--blue)"/><rect x="470" y="42" width="16" height="78" rx="2" style="fill:#D64545"/><rect x="492" y="104" width="16" height="16" rx="2" style="fill:var(--blue)"/><rect x="514" y="97" width="16" height="23" rx="2" style="fill:var(--blue)"/><rect x="536" y="102" width="16" height="18" rx="2" style="fill:var(--blue)"/><rect x="558" y="95" width="16" height="25" rx="2" style="fill:var(--blue)"/><rect x="580" y="100" width="16" height="20" rx="2" style="fill:var(--blue)"/><rect x="602" y="105" width="16" height="15" rx="2" style="fill:var(--blue)"/><text x="532" y="132" text-anchor="middle" font-size="7.2" class="s-ink2">one reducer gets 35,419 rows</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Three ways a good layout goes bad: <tspan font-weight="700" class="s-acc">too many partitions, small files and skew</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, partitions and buckets were supposed to make things faster!</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>They do, when the layout fits the data. Partition by customer and you get 2,000 folders of 858-byte files: our real test ran a full GROUP BY in 7.3 seconds instead of 3.2. Load every three hours and each insert adds another small file. And when one key owns 37.5% of the rows, the task that receives it does five times the work of the others.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So how do we decide?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>With a few numbers and a few rules. Today we measure all three problems in the lab, fix the small files two ways (and find that CONCATENATE refuses Hive 4’s default tables), and look at Hive’s skew tools: map-side aggregation, <code>hive.groupby.skewindata</code> and skewed tables. All outputs are real, from Hive 4.2.1.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Layout design, the small files problem and data skew</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Partition design</b> is the choice of partition (and bucket) columns so that common queries prune most data while each partition remains large enough to be read efficiently. The <b>small files problem</b> occurs when a table consists of many files much smaller than the storage block size, which increases NameNode (or object store) metadata load, task start-up and file-open overhead. <b>Data skew</b> is an uneven distribution of rows across keys, so that the partitions of a shuffle (or the partitions or buckets of a table) receive very different amounts of data and the slowest task determines the job’s run time.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>A good layout prunes a lot but keeps folders and files big. Too many partitions or too many tiny files make every query open more files than needed. Skew means one key has far more rows than the others, so one task does most of the work while the rest wait.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Over-partitioning</b><span>So many partitions that each one holds very little data.</span></div>
+    <div class="term"><b>Small file</b><span>A file much smaller than the block size (128 MB on HDFS by default).</span></div>
+    <div class="term"><b>Compaction</b><span>Rewriting many small files into fewer large ones.</span></div>
+    <div class="term"><b>hive.merge.tezfiles</b><span>Merge small output files at the end of a Tez job (default false).</span></div>
+    <div class="term"><b>Skew</b><span>A few keys have far more rows than the rest.</span></div>
+    <div class="term"><b>Straggler</b><span>The last, slow task that keeps the whole job waiting.</span></div>
+    <div class="term"><b>hive.groupby.skewindata</b><span>Two-stage GROUP BY: random spread first, then final aggregation.</span></div>
+    <div class="term"><b>Skewed table</b><span><code>SKEWED BY (col) ON (values)</code>: stores heavy values separately.</span></div>
+  </div>
+
+  <h3>The three problems in numbers (real lab)</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Problem</th><th>What we measured</th><th>Effect</th></tr></thead>
+    <tbody><tr><td>Over-partitioning</td><td><code>orders_by_cust</code>: 2,000 partitions, 2,000 files, median 858 bytes</td><td>1.72 MB on disk instead of 0.44 MB; GROUP BY 7.3 s instead of 3.2 s</td></tr><tr><td>Small files</td><td>8 small inserts → 8 files of 1.3–1.5 KB in one partition</td><td>8 files to open; after rewrite: 1 file, 7.5 KB</td></tr><tr><td>Skew</td><td>restaurant 0 = 30,000 of 80,000 rows (37.5%)</td><td>one of 8 reducers gets 35,419 rows, the others 4,398–7,966</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Layout design at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Shelves, boxes and one overloaded worker</h4>
+      <ul>
+        <li><b>Too many partitions:</b> a shelf with 2,000 boxes, each holding one sheet. Finding anything means opening many boxes.</li>
+        <li><b>Small files:</b> every small delivery adds a new envelope to the box. Eventually the box is full of envelopes, each with a few lines.</li>
+        <li><b>Skew:</b> eight workers share the work by first letter, but half the parcels start with “A”. One worker is still busy long after the others go home.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The rules of thumb</h4>
+      <ul>
+        <li><b>Partition column:</b> used in most filters, with a number of values that keeps each partition large (in production, hundreds of MB or more). Dates are the classic choice; ids almost never are.</li>
+        <li><b>Count before you choose:</b> distinct values × years of history = partitions. 2,000 customers gave 2,000 folders and 2,000 files on day one.</li>
+        <li><b>Small files</b> come from frequent small inserts, many tasks writing to many partitions, and streaming. Fix with fewer, bigger writes, <code>DISTRIBUTE BY</code> the partition key, <code>hive.merge.tezfiles=true</code>, or periodic compaction by rewriting partitions.</li>
+        <li><b>Skew:</b> check the top keys first: <code>SELECT key, COUNT(*) … ORDER BY 2 DESC LIMIT 10</code>.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What Hive 4.2.1 really did in our lab</h4>
+      <ul>
+        <li><code>ALTER TABLE … CONCATENATE</code> was refused (Error 30034: managed tables only), and a plain <code>CREATE TABLE</code> in Hive 4 makes an external table (Lesson 2.2). Rewriting the partition with <code>INSERT OVERWRITE … SELECT</code> from itself merged 8 files into 1.</li>
+        <li><code>hive.merge.tezfiles</code> is <b>false</b> by default; turning it on merged 4 output files into 1 in the same statement (threshold <code>hive.merge.smallfiles.avgsize</code> = 16 MB).</li>
+        <li>GROUP BY already aggregates in the map tasks (<code>hive.map.aggr=true</code>), which shrinks most GROUP BY skew. <code>hive.groupby.skewindata=true</code> adds a second reduce stage that first spreads keys randomly.</li>
+        <li><b>Skewed tables:</b> <code>SKEWED BY (restaurant_id) ON (0) STORED AS DIRECTORIES</code> stored the big key in its own folder; a query for it read 30,000 rows, other keys read the 50,000 in the default folder.</li>
+        <li>Skew joins: <code>hive.optimize.skewjoin</code> (default false) handles keys above <code>hive.skewjoin.key</code> (100,000 rows) with a follow-up map join.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “What is the small files problem in Hadoop/Hive and how do you fix it?” Say: many files much smaller than the block size overload the NameNode and add task and file-open overhead; fix by writing fewer, larger files (batching, DISTRIBUTE BY partition key, merge settings) and by compacting existing partitions. For skew, mention identifying hot keys, map-side aggregation, <code>hive.groupby.skewindata</code>, skew join settings and salting.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>A checklist for designing and fixing layouts</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Question</th><th>Good sign</th><th>Warning sign</th></tr></thead>
+    <tbody><tr><td>How do most queries filter?</td><td>By date (and maybe region)</td><td>By an id or a free-text column</td></tr><tr><td>Distinct values of the partition column × history</td><td>Hundreds to a few thousand partitions per year</td><td>Tens of thousands per year</td></tr><tr><td>Data per partition</td><td>Hundreds of MB or more</td><td>KBs or a few MB</td></tr><tr><td>Files per partition</td><td>A few, of large size</td><td>Dozens of small ones (_copy_1, _copy_2 …)</td></tr><tr><td>Top key share</td><td>Below a few percent</td><td>One key holds 10%+ of rows</td></tr></tbody>
+  </table>
+  </div>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:720px">
+    <thead><tr><th>Problem</th><th>Fixes</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>Over-partitioning</td><td>Partition by a coarser column (date, month); move ids to <b>bucketing</b>; rely on ORC/Parquet statistics</td><td>Recreate the table and copy the data</td></tr><tr><td>Small files (new)</td><td>Batch inserts; <code>DISTRIBUTE BY</code> partition key; <code>SET hive.merge.tezfiles=true</code></td><td>Avg-size threshold 16 MB by default</td></tr><tr><td>Small files (existing)</td><td><code>INSERT OVERWRITE … PARTITION … SELECT</code> from itself; <code>ALTER TABLE … CONCATENATE</code> (managed tables only); ACID compaction (Module 7)</td><td>Run off-peak, partition by partition</td></tr><tr><td>GROUP BY skew</td><td>Map-side aggregation (on by default); <code>SET hive.groupby.skewindata=true</code></td><td>Adds a stage</td></tr><tr><td>JOIN skew</td><td><code>SET hive.optimize.skewjoin=true</code>; map join if one side is small; <b>salting</b> the hot key</td><td>Check EXPLAIN</td></tr><tr><td>Known hot values</td><td><code>SKEWED BY (col) ON (v) STORED AS DIRECTORIES</code></td><td>Hot value gets its own folder</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Do not “fix” slowness by adding partition levels. Every extra level multiplies the number of folders and divides the data per file. Measure with counters and file listings first.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Measure each problem, then fix it</h2>
+  <p>All outputs are real, from the Hive 4.2.1 lab (database <code>tiffingo</code>).</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Over-partitioning: partition by customer_id</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE orders_by_cust (order_id INT, city STRING, order_ts TIMESTAMP,
+  amount DECIMAL(10,2))
+PARTITIONED BY (customer_id INT) STORED AS ORC;
+
+INSERT OVERWRITE TABLE orders_by_cust PARTITION (customer_id)
+SELECT order_id, city, order_ts, amount, customer_id FROM orders;
+-- Error 20004: too many dynamic partitions (limit 100 per node)
+
+SET hive.exec.max.dynamic.partitions=3000;
+SET hive.exec.max.dynamic.partitions.pernode=3000;
+-- run the INSERT again
+SELECT COUNT(*) AS partitions FROM (SELECT DISTINCT customer_id FROM orders_by_cust) x;</code></pre><div class="output">+-------------+
+| partitions  |
+
+$ ls …/orders_by_cust | wc -l      → 2000 folders, 2000 files
+  file sizes: min 707, median 858, max 1047 bytes</div></div>
+      <span class="behind">The default limits stopped the first try, a hint that something is off. After raising them: 2,000 folders, each with one file under 1.1 KB. On HDFS every file and folder is an object in NameNode memory, whatever its size.</span></li>
+    <li><h4>Step 2 · Measure the cost</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SELECT city, COUNT(*), SUM(amount) FROM &lt;table&gt; GROUP BY city;
+-- run 3 times on each table, median shown</code></pre><div class="output">table             partitions  data files  bytes on disk  GROUP BY city (median of 3 runs)
+orders                     0           1        437,536    3.2 s
+orders_by_day             30          30        409,088    3.4 s
+orders_by_cust         2,000       2,000      1,723,882    7.3 s</div></div>
+      <span class="behind">Same 50,000 rows. The customer-partitioned table is <b>4 times bigger</b> on disk (each ORC file carries its own header, footer and statistics) and the full query takes more than twice as long, because Hive lists 2,000 partitions and opens 2,000 files. Partitioning by date (30 partitions) cost almost nothing.</span></li>
+    <li><h4>Step 3 · Small files from frequent loads</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE events_small (order_id INT, city STRING, amount DECIMAL(10,2))
+PARTITIONED BY (order_date DATE) STORED AS ORC;
+
+-- every 3 hours a job appends the latest orders:
+INSERT INTO events_small PARTITION (order_date=&#x27;2026-10-05&#x27;)
+SELECT order_id, city, amount FROM orders
+WHERE order_date = &#x27;2026-10-05&#x27; AND hour(order_ts) &lt; 3;
+-- … 7 more runs for 03–05, 06–08, …, 21–23</code></pre><div class="output">$ ls -l …/events_small/order_date=2026-10-05/      (after 8 INSERT INTO runs)
+1452  000000_0
+1354  000000_0_copy_1
+1429  000000_0_copy_2
+1480  000000_0_copy_3
+1455  000000_0_copy_4
+1363  000000_0_copy_5
+1420  000000_0_copy_6
+1347  000000_0_copy_7
+  8 files · 11,300 bytes · INPUT_FILES_Map_1: 8</div></div>
+      <span class="behind">Each <code>INSERT INTO</code> adds a new file (<code>_copy_1</code>, <code>_copy_2</code> …) instead of changing the old ones. One day already has 8 files; a year of 3-hourly loads would be 2,920 files for one table, and every query on a day must open all of them.</span></li>
+    <li><h4>Step 4 · Compact: CONCATENATE refused, rewrite works</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>ALTER TABLE events_small PARTITION (order_date=&#x27;2026-10-05&#x27;) CONCATENATE;
+
+-- rewrite the partition from itself instead:
+INSERT OVERWRITE TABLE events_small PARTITION (order_date=&#x27;2026-10-05&#x27;)
+SELECT order_id, city, amount FROM events_small WHERE order_date = &#x27;2026-10-05&#x27;;</code></pre><div class="output">Error: Error while compiling statement: FAILED: SemanticException [Error 30034]: Concatenate/Merge can only be performed on managed tables
+
+$ ls -l …/events_small/order_date=2026-10-05/
+7520  000000_0
+  1 file · 7,520 bytes · INPUT_FILES_Map_1: 1 · COUNT 1621 · SUM 467410.00 (unchanged)</div></div>
+      <span class="behind">CONCATENATE (a fast ORC/RCFile stripe merge) works only on managed tables, and Hive 4 turned our plain CREATE TABLE into an external one. Rewriting the partition reads it once and writes one file: 8 files and 11,300 bytes became 1 file and 7,520 bytes, with the same count and sum. Schedule this for “closed” partitions, such as yesterday.</span></li>
+    <li><h4>Step 5 · Prevent small files at write time</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET mapreduce.job.reduces=4;
+INSERT OVERWRITE TABLE events_small PARTITION (order_date=&#x27;2026-10-06&#x27;)
+SELECT order_id, city, amount FROM orders WHERE order_date = &#x27;2026-10-06&#x27;
+DISTRIBUTE BY rand();           -- 4 reducers → 4 files
+
+SET hive.merge.tezfiles=true;   -- then run the same INSERT again</code></pre><div class="output">-- SET hive.merge.tezfiles=false;  (default)
+2141  000000_0
+2025  000001_0
+2108  000002_0
+2118  000003_0
+
+-- SET hive.merge.tezfiles=true;
+7682  000000_0</div></div>
+      <span class="behind">Four reducers wrote four 2 KB files. With <code>hive.merge.tezfiles=true</code> Hive added a merge step and wrote one 7.5 KB file, because the average file was below <code>hive.merge.smallfiles.avgsize</code> (16 MB). For dynamic partition inserts, <code>DISTRIBUTE BY</code> the partition column does the same job: each partition is written by one reducer.</span></li>
+    <li><h4>Step 6 · Skew: find the hot key</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>-- a cloud-kitchen chain joins: 30,000 extra orders under restaurant_id 0
+SELECT restaurant_id, COUNT(*) AS n,
+       ROUND(100 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM orders_skew GROUP BY restaurant_id ORDER BY n DESC LIMIT 4;
+
+-- rows per reducer if keys are hashed into 8 reducers
+SELECT pmod(murmur_hash(restaurant_id), 8) AS reducer, COUNT(*) AS rows_to_reducer
+FROM orders_skew GROUP BY pmod(murmur_hash(restaurant_id), 8) ORDER BY reducer;</code></pre><div class="output">+----------------+--------+-------+
+| restaurant_id  |   n    |  pct  |
++----------------+--------+-------+
+| 0              | 30000  | 37.5  |
+| 40             | 1010   | 1.3   |
+| 65             | 1008   | 1.3   |
+| 10             | 992    | 1.2   |
++----------------+--------+-------+
++----------+------------------+
+| reducer  | rows_to_reducer  |
++----------+------------------+
+| 0        | 6821             |
+| 1        | 35419            |
+| 2        | 6737             |
+| 3        | 4398             |
+| 4        | 7966             |
+| 5        | 5821             |
+| 6        | 5141             |
+| 7        | 7697             |
++----------+------------------+</div></div>
+      <span class="behind">One restaurant owns 37.5% of the rows; the next is at 1.3%. With rows routed by key, reducer 1 gets 35,419 rows while the others get 4,398–7,966: the job waits for that one task. (The second query only illustrates the routing; Hive’s shuffle uses its own hash, but every row of a key always goes to the same reducer.)</span></li>
+    <li><h4>Step 7 · Hive’s skew tools</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.groupby.skewindata;   SET hive.optimize.skewjoin;   SET hive.map.aggr;
+
+SET hive.groupby.skewindata=true;
+EXPLAIN SELECT restaurant_id, SUM(amount) FROM orders_skew GROUP BY restaurant_id;
+
+CREATE TABLE orders_lb (order_id INT, customer_id INT, restaurant_id INT,
+  city STRING, amount DECIMAL(10,2))
+SKEWED BY (restaurant_id) ON (0) STORED AS DIRECTORIES
+STORED AS ORC;
+INSERT OVERWRITE TABLE orders_lb SELECT * FROM orders_skew;</code></pre><div class="output">hive.groupby.skewindata=false · hive.optimize.skewjoin=false · hive.map.aggr=true
+
+-- default plan:          Reducer 2 &lt;- Map 1 (SIMPLE_EDGE)
+-- with skewindata=true:  Reducer 2 &lt;- Map 1 (SIMPLE_EDGE)
+                          Reducer 3 &lt;- Reducer 2 (SIMPLE_EDGE)
+
+$ find …/orders_lb -type f
+./HIVE_DEFAULT_LIST_BUCKETING_DIR_NAME/000000_0
+./restaurant_id=0/000000_0
+
+SELECT COUNT(*) AS n FROM orders_lb WHERE restaurant_id = 0;
+  result 30000 · RECORDS_IN 30000 · INPUT_FILES 2
+SELECT COUNT(*) AS n FROM orders_lb WHERE restaurant_id = 40;
+  result 1010 · RECORDS_IN 50000 · INPUT_FILES 2</div></div>
+      <span class="behind">Even the default plan has a Group By in Map 1: map-side aggregation turns 30,000 rows of restaurant 0 into one partial sum per task, so GROUP BY skew is usually mild. <code>skewindata</code> adds Reducer 3 (spread randomly first, then combine). The skewed table put restaurant 0 in its own folder: querying it read 30,000 rows, while any other restaurant read the 50,000 in the default folder.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Why the layout goes bad, and how to fix it</h2>
+  <p>Left: real Beeline output. Right: why each problem costs time.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">Over-partitioning, small files and skew <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real Beeline output">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; INSERT … PARTITION (customer_id) …</text><text x="26" y="64" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  Error 20004: too many dynamic partitions</text><text x="26" y="78" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SET …max.dynamic.partitions(.pernode)=3000;</text><text x="26" y="92" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">| partitions |</text><text x="26" y="106" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">| 2000       |</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">table            files   bytes      GROUP BY</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">orders               1   437,536    3.2 s</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">orders_by_day       30   409,088    3.4 s</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">orders_by_cust    2000 1,723,882    7.3 s</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">$ ls …/order_date=2026-10-05/</text><text x="26" y="64" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">1452 000000_0</text><text x="26" y="78" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">1354 000000_0_copy_1</text><text x="26" y="92" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">…    (8 files)</text><text x="26" y="106" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">&gt; … CONCATENATE;  Error 30034</text><text x="26" y="120" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">&gt; INSERT OVERWRITE … → 7520 000000_0</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">| restaurant_id | n     | pct  |</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">| 0             | 30000 | 37.5 |</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 40            | 1010  | 1.3  |</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">| reducer 1     | 35419 rows   |</text><text x="26" y="106" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| reducers 0,2-7| 4398–7966    |</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SET hive.groupby.skewindata=true;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; EXPLAIN … GROUP BY restaurant_id;</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  Reducer 3 &lt;- Reducer 2 (SIMPLE_EDGE)</text><text x="26" y="92" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SKEWED BY (restaurant_id) ON (0) …</text><text x="26" y="106" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  ./restaurant_id=0/000000_0</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Partitioning by customer needed raised limits and created 2,000 partitions.</li>
+          <li>The same data took 4× the disk and twice the query time.</li>
+          <li>Small inserts left 8 tiny files; CONCATENATE was refused; a rewrite merged them.</li>
+          <li>One restaurant has 37.5% of rows; one reducer gets 35,419 of them.</li>
+          <li>Two-stage GROUP BY and a skewed table are Hive’s built-in answers.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Why each problem costs time">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One folder + one file per customer</text><rect x="20.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="32.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="45.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="57.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="70.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="82.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="95.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="107.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="120.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="132.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="145.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="157.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="170.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="182.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="195.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="207.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="220.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="232.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="245.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="257.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="270.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="282.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="295.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="307.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="320.0" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="332.5" y="42" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="20.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="32.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="45.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="57.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="70.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="82.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="95.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="107.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="120.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="132.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="145.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="157.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="170.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="182.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="195.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="207.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="220.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="232.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="245.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="257.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="270.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="282.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="295.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="307.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="320.0" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="332.5" y="54" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="20.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="32.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="45.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="57.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="70.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="82.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="95.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="107.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="120.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="132.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="145.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="157.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="170.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="182.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="195.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="207.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="220.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="232.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="245.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="257.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="270.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="282.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="295.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="307.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="320.0" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="332.5" y="66" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="20.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="32.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="45.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="57.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="70.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="82.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="95.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="107.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="120.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="132.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="145.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="157.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="170.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="182.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="195.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="207.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="220.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="232.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="245.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="257.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="270.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="282.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="295.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="307.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="320.0" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="332.5" y="78" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="20.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="32.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="45.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="57.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="70.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="82.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="95.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="107.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="120.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="132.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="145.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="157.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="170.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="182.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="195.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="207.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="220.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="232.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="245.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="257.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="270.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="282.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="295.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="307.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="320.0" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="332.5" y="90" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="20.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="32.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="45.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="57.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="70.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="82.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="95.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="107.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="120.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="132.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="145.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="157.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="170.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="182.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="195.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="207.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="220.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="232.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="245.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="257.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="270.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="282.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="295.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="307.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="320.0" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="332.5" y="102" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="20.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="32.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="45.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="57.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="70.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="82.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="95.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="107.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="120.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="132.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="145.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="157.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="170.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="182.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="195.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="207.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="220.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="232.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="245.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="257.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="270.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="282.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="295.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="307.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="320.0" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><rect x="332.5" y="114" width="9" height="9" rx="1" style="fill:#D64545"/><text x="180" y="136" text-anchor="middle" font-size="7.8" class="s-ink2">… 2,000 of them, ~858 bytes each</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each file and folder costs metadata and an open.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fixed overhead per file</text><rect x="30" y="50" width="76.14256660258648" height="18" rx="4" style="fill:var(--green)"/><text x="30" y="44" font-size="8" font-weight="700" class="s-green">flat: 437,536 bytes</text><rect x="30" y="96" width="300" height="18" rx="4" style="fill:#D64545"/><text x="30" y="90" font-size="8" font-weight="700" class="s-red">2,000 partitions: 1,723,882 bytes</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">ORC header, footer and statistics × 2,000 files.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Plus listing 2,000 folders per query.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">INSERT INTO adds a file every time</text><rect x="24" y="50" width="34" height="40" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="41" y="74" text-anchor="middle" font-size="7.4" class="s-ink mono">_0</text><rect x="64" y="50" width="34" height="40" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="81" y="74" text-anchor="middle" font-size="7.4" class="s-ink mono">_1</text><rect x="104" y="50" width="34" height="40" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="121" y="74" text-anchor="middle" font-size="7.4" class="s-ink mono">_2</text><rect x="144" y="50" width="34" height="40" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="161" y="74" text-anchor="middle" font-size="7.4" class="s-ink mono">_3</text><rect x="184" y="50" width="34" height="40" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="201" y="74" text-anchor="middle" font-size="7.4" class="s-ink mono">_4</text><rect x="224" y="50" width="34" height="40" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="241" y="74" text-anchor="middle" font-size="7.4" class="s-ink mono">_5</text><rect x="264" y="50" width="34" height="40" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="281" y="74" text-anchor="middle" font-size="7.4" class="s-ink mono">_6</text><rect x="304" y="50" width="34" height="40" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="321" y="74" text-anchor="middle" font-size="7.4" class="s-ink mono">_7</text><path d="M180 96L180 114" style="fill:none;stroke:var(--green);stroke-width:2"/><path d="M177.0 107.7L180 114L183.0 107.7" style="fill:none;stroke:var(--green);stroke-width:2"/><rect x="150" y="116" width="60" height="22" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180" y="131" text-anchor="middle" font-size="7.8" font-weight="700" class="s-ink">1 file</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rewrite the partition once it is closed.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rows per reducer</text><rect x="28" y="109" width="30" height="15" rx="4" style="fill:var(--blue)"/><text x="43" y="136" text-anchor="middle" font-size="7.4" class="s-ink2 mono">R0</text><rect x="68" y="45" width="30" height="79" rx="4" style="fill:#D64545"/><text x="83" y="136" text-anchor="middle" font-size="7.4" class="s-ink2 mono">R1</text><rect x="108" y="109" width="30" height="15" rx="4" style="fill:var(--blue)"/><text x="123" y="136" text-anchor="middle" font-size="7.4" class="s-ink2 mono">R2</text><rect x="148" y="114" width="30" height="10" rx="4" style="fill:var(--blue)"/><text x="163" y="136" text-anchor="middle" font-size="7.4" class="s-ink2 mono">R3</text><rect x="188" y="106" width="30" height="18" rx="4" style="fill:var(--blue)"/><text x="203" y="136" text-anchor="middle" font-size="7.4" class="s-ink2 mono">R4</text><rect x="228" y="111" width="30" height="13" rx="4" style="fill:var(--blue)"/><text x="243" y="136" text-anchor="middle" font-size="7.4" class="s-ink2 mono">R5</text><rect x="268" y="113" width="30" height="11" rx="4" style="fill:var(--blue)"/><text x="283" y="136" text-anchor="middle" font-size="7.4" class="s-ink2 mono">R6</text><rect x="308" y="107" width="30" height="17" rx="4" style="fill:var(--blue)"/><text x="323" y="136" text-anchor="middle" font-size="7.4" class="s-ink2 mono">R7</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One reducer holds the hot key: the straggler.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">All rows of a key go to the same reducer.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Spread first, combine later</text><rect x="24" y="48" width="92" height="70" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="70" y="64" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">Map 1</text><text x="70" y="80" text-anchor="middle" font-size="7.4" class="s-ink2">partial sums</text><text x="70" y="94" text-anchor="middle" font-size="7" class="s-ink2 mono">(map.aggr)</text><path d="M118 82L140 82" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M133.7 85.0L140 82L133.7 79.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="142" y="48" width="92" height="70" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="188" y="64" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">Reducer 2</text><text x="188" y="80" text-anchor="middle" font-size="7.4" class="s-ink2">random spread</text><path d="M236 82L258 82" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M251.7 85.0L258 82L251.7 79.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="260" y="48" width="80" height="70" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="300" y="64" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">Reducer 3</text><text x="300" y="80" text-anchor="middle" font-size="7.4" class="s-ink2">final sum</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">skewindata = two stages instead of one.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Every partition is a folder and a file, however few rows it holds.</li>
+          <li>Each ORC file carries fixed metadata, and each query lists and opens every file.</li>
+          <li>INSERT INTO never modifies existing files; it only adds new ones.</li>
+          <li>Rows are sent to reducers by key, so a hot key overloads one reducer.</li>
+          <li>Map-side partial sums and a random first stage spread the hot key’s work.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: designing a big table, five-minute loads, and a hot key in a join.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-design">Designing a clicks table before it exists</h3>
+  <p class="anim-intro">Choosing the layout for a high-volume table. (Typical design discussion; figures are illustrative.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Layout design <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Partitioning by day and user would create crores of tiny partitions; partition by day and bucket by user instead, and rely on ORC statistics for other columns">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Requirement: clicks, 40 crore rows a day</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">queries: by day; by day + user; by day + page</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Design before the first load.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">(sample figures)</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-red">Option A: PARTITIONED BY (dt, user_id)</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-red">crores of folders, KB-sized files</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Over-partitioning: rejected.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-green">Option B: PARTITIONED BY (dt)</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">CLUSTERED BY (user_id) INTO 256 BUCKETS</text><text x="180" y="74" text-anchor="middle" font-size="8.4" class="s-green">365 partitions a year, 256 big files each</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Date pruning + bucket pruning for users.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Page filters</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">no partition: ORC min/max + bloom filters on page</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Columnar statistics skip stripes (Module 6).</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Estimate first</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2 mono">size per partition = daily volume ÷ partitions per day</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">If it is KB or a few MB, partition coarser.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A big events table with three common query patterns.</li>
+          <li>Partitioning by user too would explode the folder count.</li>
+          <li>Partition by day and bucket by user: few folders, big files.</li>
+          <li>Other columns are filtered with ORC statistics, not partitions.</li>
+          <li>Always estimate data per partition before deciding.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-smallfiles">Five-minute loads and the growing pile of files</h3>
+  <p class="anim-intro">Near-real-time loads create many small files. Write-time merging and nightly compaction keep them under control. Compaction result is real.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Small files over time <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A five-minute load creates 288 files a day; merge settings help each run, and a nightly rewrite compacts yesterday’s partition">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A job writes every 5 minutes</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-red mono">288 inserts a day → 288 files per day</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Queries on “today” slow down hour by hour.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Write side</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">SET hive.merge.tezfiles=true;</text><text x="180" y="74" text-anchor="middle" font-size="8.2" class="s-ink2">merges files within each run only</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Helps each insert, not across inserts.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly compaction of yesterday</text><text x="180" y="52" text-anchor="middle" font-size="8" class="s-ink mono">INSERT OVERWRITE TABLE t PARTITION (dt='${y}')</text><text x="180" y="68" text-anchor="middle" font-size="8" class="s-ink mono">SELECT … FROM t WHERE dt='${y}';</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">288 files → a few large files.</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">8 files · 11,300 bytes</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; INSERT OVERWRITE … PARTITION (…) SELECT …;</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">1 file  ·  7,520 bytes · same COUNT, same SUM</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Or use a table format built for it</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">ACID tables (auto compaction) or Iceberg</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Module 7.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Each micro-batch adds files: 288 a day.</li>
+          <li>hive.merge.tezfiles merges files produced inside one job.</li>
+          <li>A nightly job rewrites yesterday’s partition into a few big files.</li>
+          <li>In our lab: 8 files became 1 with identical results.</li>
+          <li>ACID compaction and Iceberg automate this (Module 7).</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-skewjoin">A hot key in a join: map join, skew join or salting</h3>
+  <p class="anim-intro">The same hot restaurant in a join. Three standard remedies, from simplest to most manual. (Typical approach.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Skewed join <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A hot join key overloads one task; use a map join when one side is small, Hive skew join for large sides, or salt the key to spread it">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">orders ⋈ restaurants on restaurant_id</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-red mono">restaurant 0: 37.5% of orders</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One join task does a third of the work.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">First choice: map join</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">restaurants is small → broadcast it</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No shuffle by key, so no skew. Check EXPLAIN.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Both sides big? Skew join</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">SET hive.optimize.skewjoin=true;</text><text x="180" y="74" text-anchor="middle" font-size="7.6" class="s-ink2">keys over hive.skewjoin.key (100,000 rows) handled separately</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hot keys get a follow-up map join.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Manual fix: salting</text><text x="180" y="52" text-anchor="middle" font-size="7.8" class="s-ink mono">big side:   key || "_" || pmod(hash(order_id), 8)</text><text x="180" y="68" text-anchor="middle" font-size="7.8" class="s-ink mono">small side: key || "_" || 0..7  (8 copies)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The hot key is split over 8 reducers.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Measure</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">compare slowest task time before and after</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Skew fixes trade extra work for balance.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>The hot restaurant sends a third of the join to one task.</li>
+          <li>If the other side is small, a broadcast map join avoids the problem.</li>
+          <li>Hive’s skew join handles very large keys in a separate map join.</li>
+          <li>Salting splits the hot key into several sub-keys.</li>
+          <li>Measure the slowest task before and after.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Layout work in real teams</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-green">review</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">before create</text></svg></div>
+    <div><h4>1. Table design reviews</h4>
+      <p>Many data platform teams review new big tables before creation: partition column, expected data per partition, bucket count and file format.</p>
+      <div class="uc-flow"><span>Proposal</span><i>→</i><span class="java">size estimate</span><i>→</i><span>Approved layout</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-blue">compact</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">nightly</text></svg></div>
+    <div><h4>2. Scheduled compaction</h4>
+      <p>Pipelines that load often run a nightly job that rewrites yesterday’s partitions into large files, keeping NameNode and query costs stable.</p>
+      <div class="uc-flow"><span>Small files</span><i>→</i><span class="java">rewrite partition</span><i>→</i><span>Few big files</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="9" font-weight="700" class="s-violet mono">files/part</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">monitoring</text></svg></div>
+    <div><h4>3. Storage health dashboards</h4>
+      <p>Admins track average file size and files per partition from the metastore statistics (numFiles, totalSize) and alert on tables that drift into small files.</p>
+      <div class="uc-flow"><span>Metastore stats</span><i>→</i><span class="java">files & sizes</span><i>→</i><span>Alerts</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc">hot keys</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">big sellers</text></svg></div>
+    <div><h4>4. Marketplaces and hot sellers</h4>
+      <p>E-commerce and food delivery data often has a few giant sellers or a NULL / “unknown” key with many rows. Teams handle them separately or salt them in joins.</p>
+      <div class="uc-flow"><span>Top-key check</span><i>→</i><span class="java">skew handling</span><i>→</i><span>Balanced tasks</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc mono">NULL key</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">often the hottest</text></svg></div>
+    <div><h4>5. NULL join keys</h4>
+      <p>Rows with a NULL foreign key all hash to the same place. Filtering them out before the join (they never match anyway) often removes the worst skew.</p>
+      <div class="uc-flow"><span>Join input</span><i>→</i><span class="java">WHERE key IS NOT NULL</span><i>→</i><span>Even shuffle</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: estimate before you partition</h2>
+  <p>A few lines of arithmetic tell you whether a layout will produce healthy partitions. These programs also show small files and skew. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># Estimate a layout before creating it
+daily_rows   = 1_621          # orders per day (real lab average)
+bytes_per_row = 8             # compressed ORC bytes per row (real: 13,269 B / 1,621 rows)
+years = 3
+
+for name, parts_per_day in [(&quot;by day&quot;, 1), (&quot;by day + city&quot;, 8), (&quot;by day + customer&quot;, 2000)]:
+    partitions = parts_per_day * 365 * years
+    mb_per_part = daily_rows / parts_per_day * bytes_per_row / 1e6
+    print(f&quot;{name:18} {partitions:&gt;9,} partitions  {mb_per_part:10.4f} MB each&quot;)</code></pre><div class="output">by day                 1,095 partitions      0.0130 MB each
+by day + city          8,760 partitions      0.0016 MB each
+by day + customer  2,190,000 partitions      0.0000 MB each</div></div>
+  <ul class="anno"><li><code>bytes_per_row = 8             # compressed ORC bytes per row (real: 13,269 B / 1,621 rows)</code><span>From DESCRIBE FORMATTED of the real 10-05 partition in Lesson 5.1.</span></li><li><code>    mb_per_part = daily_rows / parts_per_day * bytes_per_row / 1e6</code><span>Data per partition. Our tiny lab data is far below healthy sizes even by day; real tables are millions of times bigger.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Partition count and size",
+   "hint": "Press <b>Run<\/b>. By customer gives 2.19 million partitions in 3 years, each a few bytes.",
+   "code": "# Estimate a layout before creating it\ndaily_rows   = 1_621          # orders per day (real lab average)\nbytes_per_row = 8             # compressed ORC bytes per row (real: 13,269 B / 1,621 rows)\nyears = 3\n\nfor name, parts_per_day in [(\"by day\", 1), (\"by day + city\", 8), (\"by day + customer\", 2000)]:\n    partitions = parts_per_day * 365 * years\n    mb_per_part = daily_rows / parts_per_day * bytes_per_row / 1e6\n    print(f\"{name:18} {partitions:>9,} partitions  {mb_per_part:10.4f} MB each\")\n"
+  },
+  {
+   "label": "2 · Predict first: a real-sized table",
+   "hint": "<b>Predict first:<\/b> with 50 lakh orders a day, how big is one day partition? Change the numbers and run.",
+   "code": "daily_rows = 50_00_000\nbytes_per_row = 8\nprint(round(daily_rows * bytes_per_row / 1e6), \"MB per day partition\")\nprint(round(daily_rows * bytes_per_row / 1e6 / 8), \"MB per day+city partition\")\n"
+  },
+  {
+   "label": "3 · Files from micro-batches",
+   "hint": "Every INSERT INTO adds a file. Change <code>every_minutes<\/code> to 60.",
+   "code": "every_minutes = 180\nloads_per_day = 24 * 60 // every_minutes\nprint(\"files per day:\", loads_per_day, \" per year:\", loads_per_day * 365)\n"
+  },
+  {
+   "label": "4 · Skew: rows per reducer",
+   "hint": "Real lab: reducer 1 got 35,419 rows. Salting splits the hot key into 8 sub-keys.",
+   "code": "hot, others = 30000, [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]\nbefore = max(o + (hot if i == 1 else 0) for i, o in enumerate(others))\nafter = max(o + hot // 8 for o in others)\nprint(\"slowest reducer before:\", before, \" after salting:\", after)\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "This compaction job “merges” files by appending them, but forgets that the partition must be rewritten from itself. Fix the count check.",
+   "code": "files = [203, 198, 205, 201, 199, 203, 206, 206]     # rows per small file (sums to 1,621)\nmerged = [sum(files)]                                # INSERT OVERWRITE ... SELECT from itself\nmerged_rows = sum(merged) + files[0]                 # bug: an old file was kept as well\nassert merged_rows == sum(files), f\"{merged_rows} rows after compaction, expected {sum(files)}\"\nprint(merged)\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: watch file counts and query the skewed table</h3>
+  <p>Statements to try in Beeline on the TiffinGo data. <b>Outputs are real</b>, from Hive 4.2.1.</p>
+  <div class="pcrun"><h4>1 · Merge settings and their defaults</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SET hive.merge.tezfiles;
+SET hive.merge.mapfiles;
+SET hive.merge.smallfiles.avgsize;
+SET hive.merge.size.per.task;
+SET hive.skewjoin.key;
+SET hive.map.aggr;</code></pre><div class="output">| hive.merge.tezfiles=false  |
+| hive.merge.mapfiles=true  |
+| hive.merge.mapredfiles=false  |
+| hive.merge.smallfiles.avgsize=16000000  |
+| hive.merge.size.per.task=256000000  |
+| hive.skewjoin.key=100000  |
+| hive.map.aggr=true  |</div></div>
+  <p class="muted">Tez jobs do not merge output files unless you set <code>hive.merge.tezfiles=true</code>. When they do, files are merged if their average size is below 16 MB, into files of about 256 MB.</p></div>
+  <div class="pcrun"><h4>2 · Find small files from the metastore</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>DESCRIBE FORMATTED events_small PARTITION (order_date=&#x27;2026-10-06&#x27;);
+-- look at numFiles and totalSize
+SELECT regexp_extract(INPUT__FILE__NAME, &#x27;[^/]+$&#x27;, 0) AS file, COUNT(*) AS n
+FROM events_small WHERE order_date = &#x27;2026-10-05&#x27; GROUP BY INPUT__FILE__NAME;</code></pre><div class="output">|   | numFiles   | 1     |
+|   | numRows    | 1678  |
+|   | totalSize  | 7682  |
+
++-----------+-------+
+|   file    |   n   |
++-----------+-------+
+| 000000_0  | 1621  |
++-----------+-------+</div></div>
+  <p class="muted">totalSize ÷ numFiles is the average file size of a partition. Both days now have one file after the merge and the rewrite. A query over the metastore tables (or a script over SHOW PARTITIONS) can flag partitions with many tiny files.</p></div>
+  <div class="pcrun"><h4>3 · The skewed table in action</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SET hive.tez.exec.print.summary=true;
+SELECT COUNT(*) AS n FROM orders_lb WHERE restaurant_id = 0;
+SELECT COUNT(*) AS n FROM orders_lb WHERE restaurant_id = 40;</code></pre><div class="output">SELECT COUNT(*) AS n FROM orders_lb WHERE restaurant_id = 0;
+  result 30000 · RECORDS_IN 30000 · INPUT_FILES 2
+SELECT COUNT(*) AS n FROM orders_lb WHERE restaurant_id = 40;
+  result 1010 · RECORDS_IN 50000 · INPUT_FILES 2</div></div>
+  <p class="muted">The hot value lives in its own folder, so a query for it skips the 50,000 other rows. A query for any other restaurant reads only the default folder, skipping the 30,000 hot rows.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Salting a hot key, one row at a time</h2>
+  <p>Salting appends a small number to the hot key so its rows spread over several reducers. Watch <code>load</code> per reducer.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "rows = [0, 0, 0, 0, 40, 0, 0, 65]       # restaurant ids; 0 is hot",
+  "SALTS = 4",
+  "load = {}",
+  "for i, rid in enumerate(rows):",
+  "    key = f\"{rid}_{i % SALTS}\" if rid == 0 else f\"{rid}_0\"",
+  "    load[key] = load.get(key, 0) + 1",
+  "print(load)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>rows<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]"
+   ],
+   "newVar": "rows"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>SALTS<\/code> is created: 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]"
+   ],
+   "newVar": "SALTS"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>load<\/code> is created: → dict #2. A new dict object (#2) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "load"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>i<\/code> is created: 0. <code>rid<\/code> is created: 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "0"
+      ],
+      [
+       "rid",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "rid"
+  },
+  {
+   "line": 5,
+   "phase": "Salt",
+   "note": "Only the hot key is split; other keys keep one sub-key. The small side of a join must be copied once per salt value. <code>key<\/code> is created: &#x27;0_0&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "0"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;0_0&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "0"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (1)<\/b> {&#x27;0_0&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>i<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "1"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (1)<\/b> {&#x27;0_0&#x27;: 1}"
+   ],
+   "newVar": "i"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;0_1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "1"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (1)<\/b> {&#x27;0_0&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "1"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (2)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>i<\/code> changes to 2.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "2"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (2)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1}"
+   ],
+   "newVar": "i"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;0_2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "2"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (2)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "2"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (3)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>i<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "3"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (3)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1}"
+   ],
+   "newVar": "i"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;0_3&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "3"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (3)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "3"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (4)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>i<\/code> changes to 4. <code>rid<\/code> changes to 40.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "4"
+      ],
+      [
+       "rid",
+       "40"
+      ],
+      [
+       "key",
+       "'0_3'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (4)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1}"
+   ],
+   "newVar": "rid"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;40_0&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "4"
+      ],
+      [
+       "rid",
+       "40"
+      ],
+      [
+       "key",
+       "'40_0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (4)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "4"
+      ],
+      [
+       "rid",
+       "40"
+      ],
+      [
+       "key",
+       "'40_0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (5)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>i<\/code> changes to 5. <code>rid<\/code> changes to 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "5"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'40_0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (5)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}"
+   ],
+   "newVar": "rid"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;0_1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "5"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (5)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 1, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "5"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (5)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>i<\/code> changes to 6.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "6"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (5)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}"
+   ],
+   "newVar": "i"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;0_2&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "6"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (5)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 1, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 2, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "6"
+      ],
+      [
+       "rid",
+       "0"
+      ],
+      [
+       "key",
+       "'0_2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (5)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 2, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>i<\/code> changes to 7. <code>rid<\/code> changes to 65.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "7"
+      ],
+      [
+       "rid",
+       "65"
+      ],
+      [
+       "key",
+       "'0_2'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (5)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 2, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}"
+   ],
+   "newVar": "rid"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;65_0&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "7"
+      ],
+      [
+       "rid",
+       "65"
+      ],
+      [
+       "key",
+       "'65_0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (5)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 2, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 2, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1, &#x27;65_0&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "7"
+      ],
+      [
+       "rid",
+       "65"
+      ],
+      [
+       "key",
+       "'65_0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (6)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 2, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1, &#x27;65_0&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "7"
+      ],
+      [
+       "rid",
+       "65"
+      ],
+      [
+       "key",
+       "'65_0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (6)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 2, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1, &#x27;65_0&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Result",
+   "note": "Restaurant 0’s six rows are spread over four sub-keys instead of one. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "SALTS",
+       "4"
+      ],
+      [
+       "load",
+       "→ dict #2"
+      ],
+      [
+       "i",
+       "7"
+      ],
+      [
+       "rid",
+       "65"
+      ],
+      [
+       "key",
+       "'65_0'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [0, 0, 0, 0, 40, 0, 0, 65]",
+    "<b>#2 dict (6)<\/b> {&#x27;0_0&#x27;: 1, &#x27;0_1&#x27;: 2, &#x27;0_2&#x27;: 2, &#x27;0_3&#x27;: 1, &#x27;40_0&#x27;: 1, &#x27;65_0&#x27;: 1}"
+   ],
+   "out": "{'0_0': 1, '0_1': 2, '0_2': 2, '0_3': 1, '40_0': 1, '65_0': 1}\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three layout reviews from TiffinGo’s data platform team.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Design review · partitions</span></div>
+    <h4>Is this partition column a good idea?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>For each proposed partition column, estimate partitions per year and MB per partition at 50 lakh orders a day (about 40 MB of ORC a day), and flag anything under 10 MB.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>order_date (1/day), city (8/day), restaurant_id (120/day), customer_id (2,000/day)</pre></div><div><small>Expected output</small><pre>order_date                  365/yr    40.00 MB  OK
+order_date+city           2,920/yr     5.00 MB  TOO SMALL
+order_date+restaurant    43,800/yr     0.33 MB  TOO SMALL
+order_date+customer     730,000/yr     0.02 MB  TOO SMALL</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Partitions per year = values per day × 365.</li><li>MB per partition = 40 MB ÷ values per day.</li><li>Flag small partitions.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Only order_date passes. City and restaurant are better as plain columns (or buckets), filtered with ORC statistics.",
+   "code": "day_mb = 40\ncols = {\"order_date\": 1, \"order_date+city\": 8, \"order_date+restaurant\": 120, \"order_date+customer\": 2000}\nfor c, per_day in cols.items():\n    mb = day_mb / per_day\n    print(f\"{c:22} {per_day * 365:>8,}/yr  {mb:7.2f} MB  {'OK' if mb >= 10 else 'TOO SMALL'}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "day_mb = 40",
+  "cols = {\"order_date\": 1, \"order_date+city\": 8, \"order_date+restaurant\": 120, \"order_date+customer\": 2000}",
+  "for c, per_day in cols.items():",
+  "    mb = day_mb / per_day",
+  "    print(f\"{c:22} {per_day * 365:>8,}/yr  {mb:7.2f} MB  {'OK' if mb >= 10 else 'TOO SMALL'}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>day_mb<\/code> is created: 40.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "day_mb"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>cols<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "newVar": "cols"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>c<\/code> is created: &#x27;order_date&#x27;. <code>per_day<\/code> is created: 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date'"
+      ],
+      [
+       "per_day",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "newVar": "per_day"
+  },
+  {
+   "line": 4,
+   "phase": "Size",
+   "note": "40 MB a day split 8 ways is 5 MB per partition, already too small for HDFS-sized blocks. <code>mb<\/code> is created: 40.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date'"
+      ],
+      [
+       "per_day",
+       "1"
+      ],
+      [
+       "mb",
+       "40.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "newVar": "mb"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date'"
+      ],
+      [
+       "per_day",
+       "1"
+      ],
+      [
+       "mb",
+       "40.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "out": "order_date                  365/yr    40.00 MB  OK\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>c<\/code> changes to &#x27;order_date+city&#x27;. <code>per_day<\/code> changes to 8.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date+city'"
+      ],
+      [
+       "per_day",
+       "8"
+      ],
+      [
+       "mb",
+       "40.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "newVar": "per_day"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>mb<\/code> changes to 5.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date+city'"
+      ],
+      [
+       "per_day",
+       "8"
+      ],
+      [
+       "mb",
+       "5.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "newVar": "mb"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date+city'"
+      ],
+      [
+       "per_day",
+       "8"
+      ],
+      [
+       "mb",
+       "5.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "out": "order_date+city           2,920/yr     5.00 MB  TOO SMALL\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>c<\/code> changes to &#x27;order_date+restaurant&#x27;. <code>per_day<\/code> changes to 120.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date+restaurant'"
+      ],
+      [
+       "per_day",
+       "120"
+      ],
+      [
+       "mb",
+       "5.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "newVar": "per_day"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>mb<\/code> changes to 0.3333.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date+restaurant'"
+      ],
+      [
+       "per_day",
+       "120"
+      ],
+      [
+       "mb",
+       "0.3333"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "newVar": "mb"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date+restaurant'"
+      ],
+      [
+       "per_day",
+       "120"
+      ],
+      [
+       "mb",
+       "0.3333"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "out": "order_date+restaurant    43,800/yr     0.33 MB  TOO SMALL\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>c<\/code> changes to &#x27;order_date+customer&#x27;. <code>per_day<\/code> changes to 2000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date+customer'"
+      ],
+      [
+       "per_day",
+       "2000"
+      ],
+      [
+       "mb",
+       "0.3333"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "newVar": "per_day"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>mb<\/code> changes to 0.02.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date+customer'"
+      ],
+      [
+       "per_day",
+       "2000"
+      ],
+      [
+       "mb",
+       "0.02"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "newVar": "mb"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date+customer'"
+      ],
+      [
+       "per_day",
+       "2000"
+      ],
+      [
+       "mb",
+       "0.02"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ],
+   "out": "order_date+customer     730,000/yr     0.02 MB  TOO SMALL\n"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "day_mb",
+       "40"
+      ],
+      [
+       "cols",
+       "→ dict #1"
+      ],
+      [
+       "c",
+       "'order_date+customer'"
+      ],
+      [
+       "per_day",
+       "2000"
+      ],
+      [
+       "mb",
+       "0.02"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;order_date&#x27;: 1, &#x27;order_date+city&#x27;: 8, &#x27;order_date+restaur…: 120, &#x27;order_date+custome…: …"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Operations · compaction</span></div>
+    <h4>Which partitions need compaction?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>From partition statistics (numFiles, totalSize), list partitions whose average file size is under 16 MB and that have more than 4 files: the candidates for a nightly rewrite.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>four partitions with (numFiles, totalSize MB)</pre></div><div><small>Expected output</small><pre>2026-10-04: 288 files, avg 1.424 MB -&gt; INSERT OVERWRITE ... PARTITION (order_date=&#x27;2026-10-04&#x27;)
+2026-10-05: 8 files, avg 0.001 MB -&gt; INSERT OVERWRITE ... PARTITION (order_date=&#x27;2026-10-05&#x27;)</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Average = totalSize ÷ numFiles.</li><li>Select small averages with many files.</li><li>Generate the rewrite statement.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "10-05 is our real lab partition (8 files, 11,300 bytes). After the rewrite it had 1 file.",
+   "code": "parts = {\"2026-10-03\": (2, 900), \"2026-10-04\": (288, 410), \"2026-10-05\": (8, 0.011), \"2026-10-06\": (1, 380)}\nfor dt, (n, mb) in parts.items():\n    avg = mb / n\n    if avg < 16 and n > 4:\n        print(f\"{dt}: {n} files, avg {avg:.3f} MB -> INSERT OVERWRITE ... PARTITION (order_date='{dt}')\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "parts = {\"2026-10-03\": (2, 900), \"2026-10-04\": (288, 410), \"2026-10-05\": (8, 0.011), \"2026-10-06\": (1, 380)}",
+  "for dt, (n, mb) in parts.items():",
+  "    avg = mb / n",
+  "    if avg < 16 and n > 4:",
+  "        print(f\"{dt}: {n} files, avg {avg:.3f} MB -> INSERT OVERWRITE ... PARTITION (order_date='{dt}')\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>parts<\/code> is created: → dict #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ],
+   "newVar": "parts"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>dt<\/code> is created: &#x27;2026-10-03&#x27;. <code>n<\/code> is created: 2. <code>mb<\/code> is created: 900.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-03'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "mb",
+       "900"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ],
+   "newVar": "mb"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>avg<\/code> is created: 450.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-03'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "mb",
+       "900"
+      ],
+      [
+       "avg",
+       "450.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ],
+   "newVar": "avg"
+  },
+  {
+   "line": 4,
+   "phase": "Rule",
+   "note": "The same threshold Hive’s merge uses by default (hive.merge.smallfiles.avgsize = 16 MB). The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-03'"
+      ],
+      [
+       "n",
+       "2"
+      ],
+      [
+       "mb",
+       "900"
+      ],
+      [
+       "avg",
+       "450.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>dt<\/code> changes to &#x27;2026-10-04&#x27;. <code>n<\/code> changes to 288. <code>mb<\/code> changes to 410.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-04'"
+      ],
+      [
+       "n",
+       "288"
+      ],
+      [
+       "mb",
+       "410"
+      ],
+      [
+       "avg",
+       "450.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ],
+   "newVar": "mb"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>avg<\/code> changes to 1.4236.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-04'"
+      ],
+      [
+       "n",
+       "288"
+      ],
+      [
+       "mb",
+       "410"
+      ],
+      [
+       "avg",
+       "1.4236"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ],
+   "newVar": "avg"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-04'"
+      ],
+      [
+       "n",
+       "288"
+      ],
+      [
+       "mb",
+       "410"
+      ],
+      [
+       "avg",
+       "1.4236"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-04'"
+      ],
+      [
+       "n",
+       "288"
+      ],
+      [
+       "mb",
+       "410"
+      ],
+      [
+       "avg",
+       "1.4236"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ],
+   "out": "2026-10-04: 288 files, avg 1.424 MB -> INSERT OVERWRITE ... PARTITION (order_date='2026-10-04')\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>dt<\/code> changes to &#x27;2026-10-05&#x27;. <code>n<\/code> changes to 8. <code>mb<\/code> changes to 0.011.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-05'"
+      ],
+      [
+       "n",
+       "8"
+      ],
+      [
+       "mb",
+       "0.011"
+      ],
+      [
+       "avg",
+       "1.4236"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ],
+   "newVar": "mb"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>avg<\/code> changes to 0.0014.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-05'"
+      ],
+      [
+       "n",
+       "8"
+      ],
+      [
+       "mb",
+       "0.011"
+      ],
+      [
+       "avg",
+       "0.0014"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ],
+   "newVar": "avg"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-05'"
+      ],
+      [
+       "n",
+       "8"
+      ],
+      [
+       "mb",
+       "0.011"
+      ],
+      [
+       "avg",
+       "0.0014"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-05'"
+      ],
+      [
+       "n",
+       "8"
+      ],
+      [
+       "mb",
+       "0.011"
+      ],
+      [
+       "avg",
+       "0.0014"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ],
+   "out": "2026-10-05: 8 files, avg 0.001 MB -> INSERT OVERWRITE ... PARTITION (order_date='2026-10-05')\n"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>dt<\/code> changes to &#x27;2026-10-06&#x27;. <code>n<\/code> changes to 1. <code>mb<\/code> changes to 380.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-06'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "mb",
+       "380"
+      ],
+      [
+       "avg",
+       "0.0014"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ],
+   "newVar": "mb"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>avg<\/code> changes to 380.0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-06'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "mb",
+       "380"
+      ],
+      [
+       "avg",
+       "380.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ],
+   "newVar": "avg"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-06'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "mb",
+       "380"
+      ],
+      [
+       "avg",
+       "380.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "parts",
+       "→ dict #1"
+      ],
+      [
+       "dt",
+       "'2026-10-06'"
+      ],
+      [
+       "n",
+       "1"
+      ],
+      [
+       "mb",
+       "380"
+      ],
+      [
+       "avg",
+       "380.0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;2026-10-03&#x27;: → tuple #2, &#x27;2026-10-04&#x27;: → tuple #3, &#x27;2026-10-05&#x27;: → tuple #4, &#x27;2026-10-0…",
+    "<b>#2 tuple (2)<\/b> (2, 900)",
+    "<b>#3 tuple (2)<\/b> (288, 410)",
+    "<b>#4 tuple (2)<\/b> (8, 0.011)",
+    "<b>#5 tuple (2)<\/b> (1, 380)"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Performance · skew</span></div>
+    <h4>Will salting help this join?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>The slowest task decides the runtime. Estimate the slowest reducer before and after salting the hot key 8 ways, when 8 reducers share 80,000 rows and one key has 30,000.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>real reducer loads: 6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697</pre></div><div><small>Expected output</small><pre>before 35419 after 11716 speed-up x3.0</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Remove the hot key from its reducer.</li><li>Spread it evenly over all 8.</li><li>Compare the maximum load.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "About 3× faster on the slowest task. The cost: the small side of the join is copied 8 times, so salting suits a hot key joined with a modest table.",
+   "code": "loads = [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]\nhot = 30000\nbase = loads[:]\nbase[1] -= hot\nsalted = [b + hot // 8 for b in base]\nprint(\"before\", max(loads), \"after\", max(salted), f\"speed-up x{max(loads) / max(salted):.1f}\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "loads = [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+  "hot = 30000",
+  "base = loads[:]",
+  "base[1] -= hot",
+  "salted = [b + hot // 8 for b in base]",
+  "print(\"before\", max(loads), \"after\", max(salted), f\"speed-up x{max(loads) / max(salted):.1f}\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>loads<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ],
+   "newVar": "loads"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>hot<\/code> is created: 30000.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ],
+   "newVar": "hot"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>base<\/code> is created: → list #2. A new list object (#2) is created: [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ],
+   "newVar": "base"
+  },
+  {
+   "line": 4,
+   "phase": "Base",
+   "note": "Reducer 1 without the hot key has 5,419 rows, like the others. Object #2 list now holds [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>salted<\/code> is created: → list #3. A new list object (#3) is created: [10571, 9169, 10487, 8148, 11716, 9571, 8891, 11447]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ],
+      [
+       "salted",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#3 list (8)<\/b> [10571, 9169, 10487, 8148, 11716, 9571, 8891, 11447]"
+   ],
+   "newVar": "salted"
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "loads",
+       "→ list #1"
+      ],
+      [
+       "hot",
+       "30000"
+      ],
+      [
+       "base",
+       "→ list #2"
+      ],
+      [
+       "salted",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (8)<\/b> [6821, 35419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#2 list (8)<\/b> [6821, 5419, 6737, 4398, 7966, 5821, 5141, 7697]",
+    "<b>#3 list (8)<\/b> [10571, 9169, 10487, 8148, 11716, 9571, 8891, 11447]"
+   ],
+   "out": "before 35419 after 11716 speed-up x3.0\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: Why is partitioning by customer_id usually a bad idea?",
+  "options": [
+   "Hive forbids it",
+   "customer_id cannot be a partition column",
+   "It creates a huge number of tiny partitions and files",
+   "It makes inserts impossible"
+  ],
+  "answer": 2,
+  "why": "Real lab: 2,000 partitions, 4× the disk and twice the query time for the same data."
+ },
+ {
+  "q": "Beginner: What does each INSERT INTO into the same partition do to the files?",
+  "options": [
+   "Rewrites the existing file",
+   "Adds a new file (_copy_N)",
+   "Appends to the last file",
+   "Deletes old files"
+  ],
+  "answer": 1,
+  "why": "That is how frequent loads create small files."
+ },
+ {
+  "q": "Beginner: What is data skew?",
+  "options": [
+   "Some keys have far more rows than others",
+   "Wrong data types",
+   "Too many columns",
+   "Unsorted files"
+  ],
+  "answer": 0,
+  "why": "All rows of a key go to one task, so a hot key makes one slow task."
+ },
+ {
+  "q": "Intermediate: ALTER TABLE … CONCATENATE failed with Error 30034. Why?",
+  "options": [
+   "ORC is not supported",
+   "The partition was empty",
+   "CONCATENATE needs Spark",
+   "It works only on managed tables, and Hive 4 created an external table"
+  ],
+  "answer": 3,
+  "why": "Rewrite the partition with INSERT OVERWRITE … SELECT from itself instead."
+ },
+ {
+  "q": "Intermediate: What is the default of hive.merge.tezfiles in our Hive 4.2.1 lab?",
+  "options": [
+   "true",
+   "auto",
+   "false",
+   "16 MB"
+  ],
+  "answer": 2,
+  "why": "Set it to true to merge small output files at the end of Tez jobs."
+ },
+ {
+  "q": "Intermediate: Why is GROUP BY skew usually milder than JOIN skew?",
+  "options": [
+   "GROUP BY is sorted",
+   "Map-side aggregation pre-sums each key in the map tasks",
+   "GROUP BY uses fewer reducers",
+   "It is not"
+  ],
+  "answer": 1,
+  "why": "hive.map.aggr=true: a hot key reaches the reducer as one partial result per map task."
+ },
+ {
+  "q": "Advanced: What did SET hive.groupby.skewindata=true change in EXPLAIN?",
+  "options": [
+   "An extra reducer stage: Reducer 3 <- Reducer 2",
+   "Nothing",
+   "A map join",
+   "Fewer map tasks"
+  ],
+  "answer": 0,
+  "why": "First stage spreads keys randomly, second stage combines partial results."
+ },
+ {
+  "q": "Advanced: SKEWED BY (restaurant_id) ON (0) STORED AS DIRECTORIES does what?",
+  "options": [
+   "Drops restaurant 0",
+   "Creates 0 buckets",
+   "Forces a skew join",
+   "Stores rows of restaurant 0 in their own sub-folder"
+  ],
+  "answer": 3,
+  "why": "Real lab: restaurant_id=0/ and HIVE_DEFAULT_LIST_BUCKETING_DIR_NAME/; a query for 0 read 30,000 rows."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 5.4 in one screen</h3>
+    <ul><li><b>Partition column:</b> used in most filters + few enough values that each partition stays large. Dates yes, ids no.</li><li><b>Estimate first:</b> values × history = partitions; daily size ÷ values per day = size per partition.</li><li><b>Over-partitioning (real):</b> 2,000 customer partitions → 1.72 MB vs 0.44 MB, GROUP BY 7.3 s vs 3.2 s.</li><li><b>Small files</b> come from INSERT INTO micro-batches (_copy_N), many tasks × many partitions, streaming.</li><li><b>Prevent:</b> batch loads, <code>DISTRIBUTE BY</code> the partition key, <code>hive.merge.tezfiles=true</code> (default false; avgsize 16 MB).</li><li><b>Compact:</b> <code>INSERT OVERWRITE … PARTITION … SELECT</code> from itself (8 files → 1). CONCATENATE = managed tables only (Error 30034).</li><li><b>Skew:</b> find top keys; GROUP BY → map-side aggregation (default) + <code>hive.groupby.skewindata</code>; JOIN → map join, <code>hive.optimize.skewjoin</code>, salting.</li><li><b>Skewed tables:</b> <code>SKEWED BY (col) ON (v) STORED AS DIRECTORIES</code> → hot value in its own folder.</li><li>NULL join keys are a common hidden hot key: filter them before joining.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What file size should I aim for?</summary><p>On HDFS, files near the block size (128 or 256 MB) are a common target; on cloud object stores, files of a few hundred MB work well. The exact number matters less than avoiding thousands of KB-sized files. Hive’s own merge defaults (merge below 16 MB average, into about 256 MB) are a sensible guide.</p></details>
+    <details><summary>Why do small files hurt the NameNode?</summary><p>The HDFS NameNode keeps every file, folder and block in memory, roughly 150 bytes each. A billion tiny files can exhaust it even if the data itself is small. Every query also pays to list, open and read the footer of each file.</p></details>
+    <details><summary>Is skew a problem for map tasks too?</summary><p>Much less. Map tasks split input by file and block, not by key, so they get similar amounts of data. Skew appears when rows are shuffled by key: GROUP BY, JOIN, DISTRIBUTE BY, window PARTITION BY and dynamic partition inserts with DISTRIBUTE BY.</p></details>
+    <details><summary>Should I use hive.groupby.skewindata all the time?</summary><p>No. It adds a stage to every GROUP BY, which costs time when there is no skew, and it does not support every query shape (for example several DISTINCT aggregates on different columns). Use it for specific queries with known hot keys.</p></details>
+    <details><summary>Do Iceberg tables fix these problems?</summary><p>They help a lot: hidden partitioning avoids wrong filters, partition specs can change without rewriting old data, and compaction is a built-in procedure. You still have to pick a sensible partition granularity and handle skew in joins. Module 7 covers Iceberg in Hive.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs that estimate and fix layouts, with the HiveQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Average file size</h4></div>
+      <p>Compute the average file size of a partition from its statistics.</p>
+      <div class="prob__io"><div><small>Input</small><pre>numFiles 8, totalSize 11,300</pre></div><div><small>Expected output</small><pre>1412.5 bytes per file</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(11300 / 8, &quot;bytes per file&quot;)</code></pre><div class="output">1412.5 bytes per file</div></div>
+        <p><b>How it works:</b> 1,412 bytes per file: the real 10-05 partition before compaction.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Partitions in 3 years</h4></div>
+      <p>How many partitions does a date + city layout create in 3 years?</p>
+      <div class="prob__io"><div><small>Input</small><pre>8 cities</pre></div><div><small>Expected output</small><pre>8760</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(365 * 3 * 8)</code></pre><div class="output">8760</div></div>
+        <p><b>How it works:</b> 8,760 partitions. Multiply by files per partition to get the file count.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Top key share</h4></div>
+      <p>What share of rows does the hot restaurant have?</p>
+      <div class="prob__io"><div><small>Input</small><pre>30,000 of 80,000</pre></div><div><small>Expected output</small><pre>37.5%</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(f&quot;{100 * 30000 / 80000:.1f}%&quot;)</code></pre><div class="output">37.5%</div></div>
+        <p><b>How it works:</b> 37.5%, as in the real query. In HiveQL: <code>COUNT(*) / SUM(COUNT(*)) OVER ()</code>.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Files written by a dynamic insert</h4></div>
+      <p>How many files does a dynamic insert write when 20 tasks each see all 30 days, with and without DISTRIBUTE BY order_date?</p>
+      <div class="prob__io"><div><small>Input</small><pre>20 tasks, 30 days</pre></div><div><small>Expected output</small><pre>600 without; 30 with DISTRIBUTE BY</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>tasks, days = 20, 30
+print(tasks * days, &quot;without;&quot;, days, &quot;with DISTRIBUTE BY&quot;)</code></pre><div class="output">600 without; 30 with DISTRIBUTE BY</div></div>
+        <p><b>How it works:</b> 600 vs 30. DISTRIBUTE BY sends each day to one reducer.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Is the merge triggered?</h4></div>
+      <p>Hive merges Tez output when the average file size is below 16 MB. Check three jobs.</p>
+      <div class="prob__io"><div><small>Input</small><pre>(files, total MB)</pre></div><div><small>Expected output</small><pre>4 0.008 avg 0.002 MB merge
+10 900 avg 90.000 MB no merge
+200 600 avg 3.000 MB merge</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for files, mb in [(4, 0.008), (10, 900), (200, 600)]:
+    avg = mb / files
+    print(files, mb, f&quot;avg {avg:.3f} MB&quot;, &quot;merge&quot; if avg &lt; 16 else &quot;no merge&quot;)</code></pre><div class="output">4 0.008 avg 0.002 MB merge
+10 900 avg 90.000 MB no merge
+200 600 avg 3.000 MB merge</div></div>
+        <p><b>How it works:</b> Our real job (4 files, 8 KB) was merged into one file once hive.merge.tezfiles was on.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Pick the coarser partition</h4></div>
+      <p>Choose day or month partitioning so that partitions are at least 100 MB.</p>
+      <div class="prob__io"><div><small>Input</small><pre>daily data 12 MB</pre></div><div><small>Expected output</small><pre>day 12 MB too small
+month 360 MB OK</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>daily = 12
+for name, days in [(&quot;day&quot;, 1), (&quot;month&quot;, 30)]:
+    print(name, daily * days, &quot;MB&quot;, &quot;OK&quot; if daily * days &gt;= 100 else &quot;too small&quot;)</code></pre><div class="output">day 12 MB too small
+month 360 MB OK</div></div>
+        <p><b>How it works:</b> Monthly partitions (360 MB) are healthy; daily ones (12 MB) are too small. Queries for one day still prune to one month and use ORC statistics inside.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Cost of NULL keys in a join</h4></div>
+      <p>3 crore orders have a NULL coupon_id. How many rows go to the NULL key’s reducer, and how many after filtering NULLs first?</p>
+      <div class="prob__io"><div><small>Input</small><pre>3 crore NULL rows</pre></div><div><small>Expected output</small><pre>to one reducer: 30000000
+after WHERE coupon_id IS NOT NULL: 0</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>null_rows = 3_00_00_000
+print(&quot;to one reducer:&quot;, null_rows)
+print(&quot;after WHERE coupon_id IS NOT NULL:&quot;, 0)</code></pre><div class="output">to one reducer: 30000000
+after WHERE coupon_id IS NOT NULL: 0</div></div>
+        <p><b>How it works:</b> NULL never matches in an inner join, so filtering it first removes the hottest key without changing the result.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Monthly compaction plan</h4></div>
+      <p>A table gets 96 loads a day. How many files does a nightly compaction of yesterday save per month?</p>
+      <div class="prob__io"><div><small>Input</small><pre>96 loads/day, 1 file after compaction</pre></div><div><small>Expected output</small><pre>files saved per month: 2850</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>loads, days = 96, 30
+print(&quot;files saved per month:&quot;, (loads - 1) * days)</code></pre><div class="output">files saved per month: 2850</div></div>
+        <p><b>How it works:</b> 2,850 files a month that no query has to open again.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Layout questions separate people who used Hive in production from people who read about it. Expect numbers.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Hadoop</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is the small files problem?”</h4>
+      <p class="scn__situation">Explain the small files problem and two ways to fix it.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know the cause and both prevention and cure?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>Many files much smaller than the block size overload the NameNode, which holds metadata for every file in memory, and slow queries because each file must be listed, opened and read. Prevent it by writing fewer, larger files (batch loads, DISTRIBUTE BY the partition key, <code>hive.merge.tezfiles</code>). Cure it by compacting: rewrite partitions with INSERT OVERWRITE, CONCATENATE for managed ORC tables, or ACID/Iceberg compaction.</p>
+        <p class="scn__avoid"><b>Avoid:</b> “Increase the block size”, which does not reduce the number of files.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>The partitioned table got slower</h4>
+      <p class="scn__situation">A colleague re-partitioned a table by (date, store_id) with 5,000 stores. Full-month reports became slower.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you reason with partition counts and sizes?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Count partitions (30 × 5,000 = 150,000 a month) and average file size.</li>
+          <li>Explain: listing and opening that many tiny files outweighs pruning.</li>
+          <li>Propose: partition by date only; bucket or sort by store_id; rely on ORC statistics; compare with counters.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Adding more memory to HiveServer2.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">E-commerce</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>One task runs for an hour</h4>
+      <p class="scn__situation">A daily join of orders and sellers finishes 99% of tasks in five minutes, then one task runs for an hour.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you recognise skew and know the remedies?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Find the hot key: top sellers by row count; check NULL keys too.</li>
+          <li>If sellers is small, force a map join; otherwise try <code>hive.optimize.skewjoin</code>, or salt the hot keys.</li>
+          <li>Filter NULL keys before joining; measure the slowest task again.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> “Add more reducers”: the hot key still goes to just one of them.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>A near-real-time table</h4>
+      <p class="scn__situation">Product wants orders queryable within 5 minutes in Hive, and the table must stay fast for a year.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you design for both freshness and file health?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Partition by date; land 5-minute batches (accepting small files for today).</li>
+          <li>Merge within each job (<code>hive.merge.tezfiles</code>) and compact yesterday nightly; monitor files per partition.</li>
+          <li>Better long-term: an ACID or Iceberg table with automatic compaction; document the freshness and cost trade-off.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Partitioning by minute to “make queries faster”.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

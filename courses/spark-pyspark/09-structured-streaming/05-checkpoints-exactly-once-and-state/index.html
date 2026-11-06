@@ -1,0 +1,1175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checkpoints, exactly-once and state | MyPhatshala</title>
+<meta name="description" content="Fault tolerance in Structured Streaming with PySpark 4.3.0 and Kafka 3.9: restarting a Kafka query from its checkpoint (only the 500 new rows read), the offsets and commits logs, a simulated crash inside foreachBatch where a plain append wrote 2,099 rows for 1,500 orders and an idempotent batch_id write kept 1,500, deduplicating 1,800 events to 1,500 with dropDuplicatesWithinWatermark on the RocksDB state store, and STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE after changing a grouping key.">
+<meta name="mp:minutes" content="32">
+<link rel="canonical" href="https://myphatshala.in/courses/spark-pyspark/09-structured-streaming/05-checkpoints-exactly-once-and-state/">
+<meta property="og:title" content="Checkpoints, exactly-once and state · MyPhatshala">
+<meta property="og:description" content="We crashed a Spark stream on purpose: a plain append wrote 2,099 rows for 1,500 orders; an idempotent sink kept 1,500. Checkpoints and exactly-once, explained.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Checkpoints, exactly-once and state", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Spark and PySpark", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="09-structured-streaming/05-checkpoints-exactly-once-and-state" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Spark and PySpark syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Spark and PySpark</a><span>›</span><b>Lesson 9.5</b></nav>
+    <h1>Checkpoints, exactly-once and state</h1>
+    <p class="lead">Exactly-once in streaming needs three things: a replayable source, a checkpoint and an idempotent sink. This lesson restarts a Kafka query, opens its checkpoint, <b>crashes a sink on purpose</b> with and without idempotent writes, deduplicates replays with <b>RocksDB state</b>, and breaks a checkpoint by changing the query. <b>All outputs are real</b> (PySpark 4.3.0, Kafka 3.9).</p>
+    <div class="lesson-meta"><span>Module 9 · Structured Streaming</span><span>⏱ 32 min</span><span>Intermediate → Advanced</span><span>PySpark 4.3.0</span><span>Crash simulated</span><span>RocksDB state</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Finance found 600 extra orders”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> sources, sinks and foreachBatch in <a href="../02-sources-and-sinks/">9.2</a>, watermarks in <a href="../03-output-modes-event-time-and-watermarks/">9.3</a>, RDD checkpointing in <a href="../../03-persistence-and-shared-variables/03-checkpointing-and-fault-tolerance/">3.3</a>.</p></div>
+  <div class="story">
+    <p class="narration">A TiffinGo streaming job crashed at 2 a.m. and restarted automatically. Nothing was lost, but the next morning the PostgreSQL city totals were higher than the orders in the lake. The difference was exactly one micro-batch.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="A checkpoint stores which offsets each micro-batch planned to read, which batches committed, and the query state. We restarted a Kafka query, crashed a foreachBatch sink mid-stream with and without idempotent writes, deduplicated replayed events in a RocksDB state store, and changed a stateful query on an old checkpoint.">
+        <text x="20" y="22" font-size="7.6" font-weight="700" class="s-ink2 mono">checkpointLocation/</text><rect x="20" y="32" width="180" height="20" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><text x="28" y="45" font-size="7.2" font-weight="700" class="s-ink mono">offsets/</text><text x="208" y="45" font-size="6.8" class="s-ink2">planned: batch N reads up to …</text><rect x="20" y="56" width="180" height="20" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="28" y="69" font-size="7.2" font-weight="700" class="s-ink mono">commits/</text><text x="208" y="69" font-size="6.8" class="s-ink2">done: batch N finished</text><rect x="20" y="80" width="180" height="20" rx="4" class="s-soft-violet" style="stroke:var(--violet)"/><text x="28" y="93" font-size="7.2" font-weight="700" class="s-ink mono">state/</text><text x="208" y="93" font-size="6.8" class="s-ink2">running totals, join buffers</text><rect x="20" y="104" width="180" height="20" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="28" y="117" font-size="7.2" font-weight="700" class="s-ink mono">sources/ + metadata</text><text x="208" y="117" font-size="6.8" class="s-ink2">query id, file lists</text><rect x="400" y="12" width="232" height="132" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="516" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured (Kafka → sinks)</text><text x="412" y="52" font-size="7.2" class="s-green mono">restart: batch 1, +500 rows</text><text x="412" y="68" font-size="7.2" class="s-green mono">file sink: 1500 = 1500</text><text x="412" y="84" font-size="7.2" class="s-red mono">crash + append: 2099 rows</text><text x="412" y="100" font-size="7.2" class="s-green mono">crash + idempotent: 1500</text><text x="412" y="116" font-size="7.2" class="s-green mono">dedup: 1800 in → 1500 out</text><text x="412" y="132" font-size="7.2" class="s-red mono">key type changed: ERROR</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Exactly-once = <tspan font-weight="700" class="s-acc">replayable source + checkpoint + idempotent sink</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, Spark promises exactly-once. How did one batch get written twice?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Spark guarantees that each batch’s <b>data</b> is processed exactly once into its state and committed exactly once in its checkpoint. But if your sink wrote the batch and the job died before the commit, Spark replays that batch. A plain append then writes it again.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So the sink must cope with replays?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Yes: <b>idempotent</b> writes keyed by <code>batch_id</code>. Today we restart a Kafka query from its checkpoint, open the checkpoint folder, crash a sink on purpose, deduplicate replayed events with state, and break a checkpoint by changing the query. All outputs are real (PySpark 4.3.0, Kafka 3.9).</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Checkpoints, exactly-once and state</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>The <b>checkpoint location</b> is a fault-tolerant directory (HDFS, S3, ADLS…) where a streaming query records, before each micro-batch, the source <b>offsets</b> it will process (write-ahead log), and after it the batch <b>commit</b>, together with versioned <b>state store</b> files for stateful operators. On restart Spark reads the last offsets and commits: an uncommitted batch is <b>re-executed with the same offsets and batch id</b>, and processing continues. Structured Streaming therefore provides <b>end-to-end exactly-once</b> semantics when the source is replayable and the sink is <b>idempotent</b> (it ignores or overwrites a batch it has already written, as the file sink does with its <code>_spark_metadata</code> log). Stateful operators keep data across batches in a state store (HDFS-backed by default, or RocksDB for large state), bounded by watermarks. The checkpoint is tied to the query: incompatible changes to stateful operators, such as a new grouping key schema, cannot reuse it.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>The checkpoint is the query’s memory: what it planned to read, what it finished, and its running state. After a crash Spark redoes any unfinished batch with exactly the same input. That gives exactly-once results only if the output can safely receive the same batch twice; file sinks can, your own foreachBatch code must be written to.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>offsets/</b><span>Write-ahead log of planned batches.</span></div>
+    <div class="term"><b>commits/</b><span>Batches that completed.</span></div>
+    <div class="term"><b>state/</b><span>State store files per operator.</span></div>
+    <div class="term"><b>Replay</b><span>Re-running an uncommitted batch.</span></div>
+    <div class="term"><b>Idempotent sink</b><span>Writing a batch twice = once.</span></div>
+    <div class="term"><b>At-least-once</b><span>May write duplicates on replay.</span></div>
+    <div class="term"><b>RocksDB state store</b><span>Off-heap state for large state.</span></div>
+    <div class="term"><b>dropDuplicatesWithinWatermark</b><span>Dedup with bounded state.</span></div>
+  </div>
+
+  <h3>Guarantees by sink</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Sink</th><th>On replay</th><th>End-to-end</th><th>Lab</th></tr></thead>
+    <tbody><tr><td>File (Parquet)</td><td>Batch already in _spark_metadata → skipped</td><td>Exactly-once</td><td>1,500 distinct of 1,500</td></tr><tr><td>Delta / Iceberg table</td><td>Transaction log with batch ids</td><td>Exactly-once</td><td></td></tr><tr><td>Kafka</td><td>Messages may be written again</td><td>At-least-once</td><td>consumers dedupe</td></tr><tr><td>foreachBatch append</td><td>Batch written again</td><td>At-least-once</td><td>2,099 rows for 1,500</td></tr><tr><td>foreachBatch keyed by batch_id</td><td>Overwrites same batch</td><td>Exactly-once</td><td>1,500 rows</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Fault tolerance at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> A cashier’s register book</h4>
+      <ul>
+        <li>Before counting a bundle, the cashier writes “bundle 7: notes 101–200” (offsets). After putting it in the safe, she ticks “bundle 7 done” (commit).</li>
+        <li>After a power cut she redoes any bundle without a tick. If the safe already had that bundle, she must check the bundle number first (idempotent) or the money is counted twice.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The pieces</h4>
+      <ul>
+        <li><code>option("checkpointLocation", path)</code>: offsets, commits, state, sources, metadata.</li>
+        <li>Sources must be replayable (Kafka, files); sinks idempotent (file/table sinks, or <code>foreachBatch</code> keyed by <code>batch_id</code>).</li>
+        <li>State: <code>dropDuplicatesWithinWatermark</code>, aggregations, joins; RocksDB via <code>spark.sql.streaming.stateStore.providerClass</code>.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>Restart read only batch 1 (500 new rows); the file sink had 1,500 distinct orders.</li>
+        <li>Crash after writing batch 1: append wrote 2,099 rows for 1,500; idempotent writes kept 1,500.</li>
+        <li>Changing the grouping key type on an old checkpoint failed with <code>STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE</code>.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “How does Structured Streaming achieve exactly-once?” Replayable sources (Kafka offsets, file lists) + a checkpoint with a write-ahead log of offsets and commit log + deterministic re-execution of uncommitted batches with the same batch id + idempotent sinks (file/table sinks, or foreachBatch writes keyed by batch_id/MERGE). State is checkpointed per batch. Without an idempotent sink you get at-least-once.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>What you can change on a checkpoint</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th>Change</th><th>Allowed?</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>Add a filter / stateless column</td><td>Usually yes</td><td>Output schema of sink must still fit</td></tr><tr><td>Trigger interval, maxOffsetsPerTrigger</td><td>Yes</td><td>Takes effect on restart</td></tr><tr><td>Add a new Kafka topic to subscribe</td><td>Yes (new topic starts per startingOffsets)</td><td></td></tr><tr><td>Grouping keys / aggregation state schema</td><td>No</td><td><code>STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE</code> (lab)</td></tr><tr><td>Add/remove a stateful operator, change join type</td><td>No</td><td>New checkpoint + backfill</td></tr><tr><td>Change sink type (files → Kafka)</td><td>Mostly no</td><td>New checkpoint</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>Never share one checkpoint between two queries, never copy a checkpoint to “restart from yesterday”, and never delete the <code>_spark_metadata</code> folder of a file sink: readers use it to ignore files of uncommitted batches. Keep checkpoints on durable storage (not a local disk of a driver that can disappear), and treat them as part of the job: version the path when the logic changes.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Breaking a stream on purpose</h2>
+  <p>All outputs are real: PySpark 4.3.0, <code>local[2]</code>, Kafka 3.9 in Docker with a 2-partition topic <code>pay</code>. Queries use <code>trigger(availableNow=True)</code> so “stop” and “restart” are just two runs on the same checkpoint.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Restart from the checkpoint</h4>
+      <div class="code" data-lang="python" data-file="l95_checkpoint.py"><pre><code>produce(0, 1000)
+stream().writeStream.format(&quot;parquet&quot;).option(&quot;path&quot;, OUT) \
+        .option(&quot;checkpointLocation&quot;, CK + &quot;/files&quot;).trigger(availableNow=True).start().awaitTermination()
+produce(1000, 500)
+# same query, same checkpoint</code></pre><div class="output">== 1) run, stop, produce more, restart from the checkpoint
+run 1: batches [0] | rows in sink: 1000
+run 2: batches [1] | rows in sink: 1500 | distinct order_id: 1500</div></div>
+      <span class="behind">Run 1 read the 1,000 events as batch 0. After 500 more events, the restarted query ran only <b>batch 1</b> with the new rows: 1,500 rows in the sink and <b>1,500 distinct</b> order ids. No duplicates and nothing missed.</span></li>
+    <li><h4>Step 2 · Inside the checkpoint</h4>
+      <div class="code" data-lang="python" data-file="l95_checkpoint.py"><pre><code>for d in sorted(os.listdir(CK + &quot;/files&quot;)): print(d, os.listdir(…))
+print(open(CK + &quot;/files/offsets/1&quot;).read().splitlines()[-1])</code></pre><div class="output">== 2) what is in a checkpoint
+  commits [&#x27;0&#x27;, &#x27;1&#x27;]
+  metadata 
+  offsets [&#x27;0&#x27;, &#x27;1&#x27;]
+  sources [&#x27;0&#x27;]
+  offsets/1: {&quot;pay&quot;:{&quot;0&quot;:762,&quot;1&quot;:738}}
+  sink log: [&#x27;0&#x27;, &#x27;1&#x27;]</div></div>
+      <span class="behind"><code>offsets/1</code> was written <b>before</b> batch 1 ran: “read partition 0 up to 762 and partition 1 up to 738”. <code>commits/1</code> was written after it succeeded. If a crash happens between the two, Spark replays batch 1 with exactly those offsets. The Parquet sink keeps its own log (<code>_spark_metadata/0</code>, <code>1</code>) to skip a batch it already wrote.</span></li>
+    <li><h4>Step 3 · A crash inside foreachBatch</h4>
+      <div class="code" data-lang="python" data-file="l95_checkpoint.py"><pre><code>def fb(df, bid):
+    rows = df.count()
+    if kind == &quot;append&quot;: store[&quot;append&quot;].append((bid, rows))      # INSERT
+    else:                store[&quot;idempotent&quot;][bid] = rows          # upsert by batch_id
+    if bid == 1 and first_attempt:
+        raise RuntimeError(&quot;simulated crash after writing batch 1&quot;)
+# maxOffsetsPerTrigger=600 → batches of 599, 599, 302; start, crash, start again</code></pre><div class="output">== 3) a crash inside foreachBatch: replay = at-least-once
+  append attempt 1: FAILED (simulated crash)
+  append attempt 2: finished
+  append: writes [(0, 599), (1, 599), (1, 599), (2, 302)] -&gt; total rows 2099 (source has 1500)
+  idempotent attempt 1: FAILED (simulated crash)
+  idempotent attempt 2: finished
+  idempotent: writes [(0, 599), (1, 599), (2, 302)] -&gt; total rows 1500 (source has 1500)</div></div>
+      <span class="behind">Both sinks wrote batch 1 and then “crashed” before Spark could commit it. On restart Spark <b>replayed batch 1</b> (same id, same 599 rows). The append sink now has batch 1 twice: <b>2,099 rows for 1,500 orders</b>, exactly the finance bug. The idempotent sink stored by <code>batch_id</code>, so the replay overwrote itself: <b>1,500</b>. In a database, use MERGE/upsert or delete-then-insert by batch id in one transaction.</span></li>
+    <li><h4>Step 4 · Deduplicating with state (RocksDB)</h4>
+      <div class="code" data-lang="python" data-file="l95_checkpoint.py"><pre><code>spark.conf.set(&quot;spark.sql.streaming.stateStore.providerClass&quot;,
+               &quot;org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider&quot;)
+produce(0, 300)      # the producer re-sends 300 old orders
+ded = events.withWatermark(&quot;timestamp&quot;, &quot;10 minutes&quot;).dropDuplicatesWithinWatermark([&quot;order_id&quot;])</code></pre><div class="output">== 4) stateful dedup with watermark + RocksDB state store
+  input rows: 1800 | output rows: 1500 | state rows: 1500 | provider: RocksDB</div></div>
+      <span class="behind">Producers retry, so Kafka often contains duplicates. 1,800 events came in, <b>1,500 unique orders</b> came out: each order id is remembered in the state store and later copies are dropped. With the watermark, ids older than 10 minutes are forgotten, so state stays bounded. RocksDB keeps state off the JVM heap, the usual choice for millions of keys.</span></li>
+    <li><h4>Step 5 · Changing a stateful query</h4>
+      <div class="code" data-lang="python" data-file="l95_checkpoint.py"><pre><code>agg1 = stream().groupBy((F.col(&quot;order_id&quot;) % 3).alias(&quot;k&quot;)).count()                    # run once
+agg2 = stream().groupBy((F.col(&quot;order_id&quot;) % 3).cast(&quot;string&quot;).alias(&quot;k&quot;)).count()   # same checkpoint</code></pre><div class="output">== 5) changing a stateful query on an old checkpoint
+  ERROR: [STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE] Provided key schema does not match existing state key schema. Please check number and type of fields. Existing key_schema=StructType(StructField(_groupingexpression,LongType,true)) and new k</div></div>
+      <span class="behind">The state store holds keys with the old schema (a long). The new query’s key is a string, so restarting on the same checkpoint failed with <b>STATE_STORE_<wbr>KEY_SCHEMA_<wbr>NOT_COMPATIBLE</b> as soon as a batch ran. Changing stateful logic means a new checkpoint (and usually reprocessing from the source), so plan it like a migration.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>What survives a crash</h2>
+  <p>Left: real outputs. Right: how checkpoints and sinks give exactly-once.</p>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">What survives a crash <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">run 1: batches [0], rows 1000</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">run 2: batches [1], rows 1500</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">distinct order_id: 1500</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">commits [0, 1]  offsets [0, 1]</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">offsets/1: {&quot;pay&quot;:{&quot;0&quot;:762,&quot;1&quot;:738}}</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">sink log: [0, 1]</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">append: (0,599) (1,599) (1,599) (2,302)</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  -&gt; 2099 rows for 1500</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">idempotent: -&gt; 1500 rows</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="6.8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">dedup: 1800 in -&gt; 1500 out</text><text x="26" y="64" font-size="6.8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">state rows 1500 (RocksDB)</text><text x="26" y="78" font-size="6.8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">key type changed:</text><text x="26" y="92" font-size="6.8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Restart.</li>
+          <li>Checkpoint contents.</li>
+          <li>Replay after a crash.</li>
+          <li>State: dedup and schema.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What Spark does">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Restart = read the logs</text><rect x="8" y="50" width="96" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="56.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">offsets/0</text><text x="56.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">committed</text><rect x="120" y="50" width="96" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="168.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">offsets/1</text><text x="168.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">new data</text><path d="M104 65.0L120 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M113.7 68.0L120 65.0L113.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="232" y="50" width="96" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="280.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">commit 1</text><text x="280.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">done</text><path d="M216 65.0L232 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M225.7 68.0L232 65.0L225.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Continue after the last commit.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Write-ahead, then commit</text><rect x="20" y="36" width="180" height="20" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="28" y="49" font-size="7.2" font-weight="700" class="s-ink mono">offsets/</text><text x="208" y="49" font-size="6.8" class="s-ink2">planned: batch N reads up to …</text><rect x="20" y="60" width="180" height="20" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="28" y="73" font-size="7.2" font-weight="700" class="s-ink mono">commits/</text><text x="208" y="73" font-size="6.8" class="s-ink2">done: batch N finished</text><rect x="20" y="84" width="180" height="20" rx="4" class="s-soft-violet" style="stroke:var(--violet)"/><text x="28" y="97" font-size="7.2" font-weight="700" class="s-ink mono">state/</text><text x="208" y="97" font-size="6.8" class="s-ink2">running totals, join buffers</text><rect x="20" y="108" width="180" height="20" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="28" y="121" font-size="7.2" font-weight="700" class="s-ink mono">sources/ + metadata</text><text x="208" y="121" font-size="6.8" class="s-ink2">query id, file lists</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Offsets first, commit last.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Crash between write and commit</text><rect x="8" y="50" width="96" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="56.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">write</text><text x="56.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">batch 1</text><rect x="120" y="50" width="96" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="168.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">crash</text><text x="168.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">no commit</text><path d="M104 65.0L120 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M113.7 68.0L120 65.0L113.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="232" y="50" width="96" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="280.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">replay</text><text x="280.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">batch 1 again</text><path d="M216 65.0L232 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M225.7 68.0L232 65.0L225.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><text x="180" y="110" text-anchor="middle" font-size="7.2" class="s-ink2">append → duplicate · upsert by batch_id → safe</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The sink decides.</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">State lives in the checkpoint</text><rect x="20" y="36" width="180" height="20" rx="4" class="s-soft-blue" style="stroke:var(--blue)"/><text x="28" y="49" font-size="7.2" font-weight="700" class="s-ink mono">offsets/</text><text x="208" y="49" font-size="6.8" class="s-ink2">planned: batch N reads up to …</text><rect x="20" y="60" width="180" height="20" rx="4" class="s-soft-green" style="stroke:var(--green)"/><text x="28" y="73" font-size="7.2" font-weight="700" class="s-ink mono">commits/</text><text x="208" y="73" font-size="6.8" class="s-ink2">done: batch N finished</text><rect x="20" y="84" width="180" height="20" rx="4" class="s-soft-acc" style="stroke:var(--track)"/><text x="28" y="97" font-size="7.2" font-weight="700" class="s-ink mono">state/</text><text x="208" y="97" font-size="6.8" class="s-ink2">running totals, join buffers</text><rect x="20" y="108" width="180" height="20" rx="4" class="s-card2" style="stroke:var(--line)"/><text x="28" y="121" font-size="7.2" font-weight="700" class="s-ink mono">sources/ + metadata</text><text x="208" y="121" font-size="6.8" class="s-ink2">query id, file lists</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Key schema must not change.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Resuming from commits.</li>
+          <li>Offsets and commits.</li>
+          <li>Why sinks must be idempotent.</li>
+          <li>State store rules.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a duplicated batch, retried events, and upgrading a stateful query.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-idempotent">The duplicated batch</h3>
+  <p class="anim-intro">Idempotent foreachBatch. (Typical; numbers from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Idempotent sink <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Make foreachBatch writes idempotent with batch_id or MERGE so replays do not duplicate">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Totals higher than the lake</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">difference = one batch</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">After a 2 a.m. restart.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">foreachBatch did INSERT</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">batch replayed after crash</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">2,099 for 1,500 in our lab.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Key rows by batch_id</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">delete batch_id, then insert</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One transaction.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or MERGE on business key</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">order_id / city + window</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Upsert.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Replays are harmless</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">1,500 = 1,500</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Exactly-once end to end.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Mismatch.</li>
+          <li>Replay.</li>
+          <li>batch_id.</li>
+          <li>MERGE.</li>
+          <li>Safe.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-dedup">Retries everywhere</h3>
+  <p class="anim-intro">Streaming deduplication. (Typical; numbers from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Dedup <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="dropDuplicatesWithinWatermark removes retried events with bounded state">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Payment events retried</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">same order_id sent 2–3 times</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Kafka has duplicates.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">dropDuplicates(order_id)</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">without watermark: state forever</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Grows without bound.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">WithinWatermark version</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">forget ids after 10 min</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bounded state.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">RocksDB state store</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">millions of keys off-heap</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No GC pressure.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">1,800 in, 1,500 out</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">our lab</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Duplicates removed.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Retries.</li>
+          <li>Unbounded.</li>
+          <li>Watermark.</li>
+          <li>RocksDB.</li>
+          <li>Result.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-migrate">Upgrading a stateful query</h3>
+  <p class="anim-intro">Checkpoint compatibility. (Typical; error from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Migration <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Incompatible stateful changes need a new checkpoint, output path and backfill">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Add a column to the groupBy</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">deploy, restart on old ckpt</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Job fails.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">STATE_STORE_KEY_SCHEMA_…</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">state written with old keys</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Incompatible.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">New checkpoint: ck/v2</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">new output path too</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Version both.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Backfill from the source</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">within Kafka retention</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Rebuild state.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Switch readers to v2</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">then retire v1</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Planned migration.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Change.</li>
+          <li>Error.</li>
+          <li>v2.</li>
+          <li>Backfill.</li>
+          <li>Switch.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Reliable streaming at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-blue">money</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">exactly-once</text></svg></div>
+    <div><h4>1. Payments and finance</h4>
+      <p>Totals are upserted by batch id or business key so restarts never double-count.</p>
+      <div class="uc-flow"><span>Payments</span><i>→</i><span class="java">idempotent MERGE</span><i>→</i><span>Correct totals</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-green">dedup</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">events</text></svg></div>
+    <div><h4>2. Event deduplication</h4>
+      <p>Retried app events are deduplicated within a watermark before analytics.</p>
+      <div class="uc-flow"><span>Raw events</span><i>→</i><span class="java">dedup within watermark</span><i>→</i><span>Unique events</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-violet">RocksDB</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">big state</text></svg></div>
+    <div><h4>3. Large state</h4>
+      <p>Per-user features over millions of users run on the RocksDB state store.</p>
+      <div class="uc-flow"><span>Users</span><i>→</i><span class="java">RocksDB</span><i>→</i><span>Stable memory</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">deploy</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">versions</text></svg></div>
+    <div><h4>4. Safe deployments</h4>
+      <p>Checkpoint paths carry a version; incompatible changes go to v2 with a backfill.</p>
+      <div class="uc-flow"><span>New logic</span><i>→</i><span class="java">ck/v2</span><i>→</i><span>Backfill</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">DR</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">storage</text></svg></div>
+    <div><h4>5. Durable checkpoints</h4>
+      <p>Checkpoints live on S3/ADLS/HDFS so a new driver on any node can resume.</p>
+      <div class="uc-flow"><span>Driver dies</span><i>→</i><span class="java">same checkpoint</span><i>→</i><span>Resume</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: replay after a crash</h2>
+  <p>The lab’s crash in miniature. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># Why a replayed batch duplicates an append sink (simplified)
+batches = {0: 599, 1: 599, 2: 302}
+committed = set()
+append_sink, idempotent_sink = [], {}
+crashed = False
+
+def run_batch(bid):
+    global crashed
+    rows = batches[bid]
+    append_sink.append((bid, rows))      # INSERT
+    idempotent_sink[bid] = rows          # upsert by batch_id
+    if bid == 1 and not crashed:
+        crashed = True
+        raise RuntimeError(&quot;crash before commit&quot;)
+    committed.add(bid)
+
+for attempt in (1, 2):
+    try:
+        for bid in batches:
+            if bid not in committed:
+                run_batch(bid)
+    except RuntimeError as e:
+        print(&quot;attempt&quot;, attempt, &quot;failed:&quot;, e)
+
+print(&quot;append    :&quot;, sum(r for _, r in append_sink), &quot;rows&quot;)
+print(&quot;idempotent:&quot;, sum(idempotent_sink.values()), &quot;rows&quot;)</code></pre><div class="output">attempt 1 failed: crash before commit
+append    : 2099 rows
+idempotent: 1500 rows</div></div>
+  <ul class="anno"><li><code>    committed.add(bid)</code><span>The commit log is written only after the sink has finished; a crash before it means a replay.</span></li><li><code>    idempotent_sink[bid] = rows          # upsert by batch_id</code><span>Keyed by batch id, a replay overwrites instead of adding.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>: 2,099 vs 1,500, as in the lab.",
+   "code": "# Why a replayed batch duplicates an append sink (simplified)\nbatches = {0: 599, 1: 599, 2: 302}\ncommitted = set()\nappend_sink, idempotent_sink = [], {}\ncrashed = False\n\ndef run_batch(bid):\n    global crashed\n    rows = batches[bid]\n    append_sink.append((bid, rows))      # INSERT\n    idempotent_sink[bid] = rows          # upsert by batch_id\n    if bid == 1 and not crashed:\n        crashed = True\n        raise RuntimeError(\"crash before commit\")\n    committed.add(bid)\n\nfor attempt in (1, 2):\n    try:\n        for bid in batches:\n            if bid not in committed:\n                run_batch(bid)\n    except RuntimeError as e:\n        print(\"attempt\", attempt, \"failed:\", e)\n\nprint(\"append    :\", sum(r for _, r in append_sink), \"rows\")\nprint(\"idempotent:\", sum(idempotent_sink.values()), \"rows\")\n"
+  },
+  {
+   "label": "2 · Predict first: restart",
+   "hint": "<b>Predict first:<\/b> batches 0–1 committed, 2 not. What runs on restart?",
+   "code": "committed, planned = {0, 1}, [0, 1, 2]\nprint([b for b in planned if b not in committed])\n"
+  },
+  {
+   "label": "3 · Dedup",
+   "hint": "Remove retried order ids.",
+   "code": "events = [1, 2, 3, 2, 1, 4]\nseen, out = set(), []\nfor e in events:\n    if e not in seen:\n        seen.add(e); out.append(e)\nprint(out, \"state:\", seen)\n"
+  },
+  {
+   "label": "4 · Offsets",
+   "hint": "Rows in batch 1 from the offsets log.",
+   "code": "b0 = {\"0\": 503, \"1\": 497}          # offsets/0 from the lab\nb1 = {\"0\": 762, \"1\": 738}\nprint(sum(b1[p] - b0[p] for p in b1), \"rows\")\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "Changing the grouping key type on an old checkpoint.",
+   "code": "old_key, new_key = \"long\", \"string\"\nassert old_key == new_key, \"STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE: use a new checkpoint\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: checkpoints</h3>
+  <p>After running the lab’s file-sink query twice. <b>Outputs are real</b> (PySpark 4.3.0).</p>
+  <div class="pcrun"><h4>1 · Checkpoint folders</h4>
+  <div class="code" data-lang="bash" data-file="bash"><pre><code>ls ck95/files</code></pre><div class="output">commits  metadata  offsets  sources</div></div>
+  <p class="muted">state/ appears for stateful queries.</p></div>
+  <div class="pcrun"><h4>2 · Offsets of batch 1</h4>
+  <div class="code" data-lang="bash" data-file="bash"><pre><code>tail -1 ck95/files/offsets/1</code></pre><div class="output">{&quot;pay&quot;:{&quot;0&quot;:762,&quot;1&quot;:738}}</div></div>
+  <p class="muted">Per partition.</p></div>
+  <div class="pcrun"><h4>3 · Sink log</h4>
+  <div class="code" data-lang="bash" data-file="bash"><pre><code>ls out95/_spark_metadata</code></pre><div class="output">0  1</div></div>
+  <p class="muted">Committed batches of the file sink.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Restart logic</h2>
+  <p>How Spark decides what to run after a restart.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "offsets = [0, 1, 2]",
+  "commits = [0, 1]",
+  "last_commit = max(commits)",
+  "todo = [b for b in offsets if b > last_commit]",
+  "print(\"replay:\", todo)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "WAL",
+   "note": "Batches planned. <code>offsets<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "offsets",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [0, 1, 2]"
+   ],
+   "newVar": "offsets"
+  },
+  {
+   "line": 2,
+   "phase": "Commits",
+   "note": "Batches finished. <code>commits<\/code> is created: → list #2. A new list object (#2) is created: [0, 1]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "offsets",
+       "→ list #1"
+      ],
+      [
+       "commits",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [0, 1, 2]",
+    "<b>#2 list (2)<\/b> [0, 1]"
+   ],
+   "newVar": "commits"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>last_commit<\/code> is created: 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "offsets",
+       "→ list #1"
+      ],
+      [
+       "commits",
+       "→ list #2"
+      ],
+      [
+       "last_commit",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [0, 1, 2]",
+    "<b>#2 list (2)<\/b> [0, 1]"
+   ],
+   "newVar": "last_commit"
+  },
+  {
+   "line": 4,
+   "phase": "Replay",
+   "note": "Same offsets, same batch id.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "offsets",
+       "→ list #1"
+      ],
+      [
+       "commits",
+       "→ list #2"
+      ],
+      [
+       "last_commit",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [0, 1, 2]",
+    "<b>#2 list (2)<\/b> [0, 1]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "offsets",
+       "→ list #1"
+      ],
+      [
+       "commits",
+       "→ list #2"
+      ],
+      [
+       "last_commit",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [0, 1, 2]",
+    "<b>#2 list (2)<\/b> [0, 1]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "offsets",
+       "→ list #1"
+      ],
+      [
+       "commits",
+       "→ list #2"
+      ],
+      [
+       "last_commit",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [0, 1, 2]",
+    "<b>#2 list (2)<\/b> [0, 1]"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>todo<\/code> is created: → list #3. A new list object (#3) is created: [2]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "offsets",
+       "→ list #1"
+      ],
+      [
+       "commits",
+       "→ list #2"
+      ],
+      [
+       "last_commit",
+       "1"
+      ],
+      [
+       "todo",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [0, 1, 2]",
+    "<b>#2 list (2)<\/b> [0, 1]",
+    "<b>#3 list (1)<\/b> [2]"
+   ],
+   "newVar": "todo"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "offsets",
+       "→ list #1"
+      ],
+      [
+       "commits",
+       "→ list #2"
+      ],
+      [
+       "last_commit",
+       "1"
+      ],
+      [
+       "todo",
+       "→ list #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (3)<\/b> [0, 1, 2]",
+    "<b>#2 list (2)<\/b> [0, 1]",
+    "<b>#3 list (1)<\/b> [2]"
+   ],
+   "out": "replay: [2]\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three reliability decisions at TiffinGo.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Checkpoint · basics</span></div>
+    <h4>Where should the checkpoint live?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>The driver runs on a node that may be replaced.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>cluster storage options</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Not local disk.</li><li>HDFS / S3 / ADLS / GCS.</li><li>One path per query.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 2.",
+   "code": "path = \"s3://tiffingo-streams/checkpoints/city_rev/v1\"\nprint(path.startswith((\"s3://\", \"abfss://\", \"hdfs://\", \"gs://\")))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "path = \"s3://tiffingo-streams/checkpoints/city_rev/v1\"",
+  "print(path.startswith((\"s3://\", \"abfss://\", \"hdfs://\", \"gs://\")))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Version",
+   "note": "v1 in the path for future migrations. <code>path<\/code> is created: &#x27;s3://tiffingo-streams/checkpoints/city_rev/v1&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "path",
+       "'s3://tiffingo-streams/checkpoints/city_rev/v1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "path"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "path",
+       "'s3://tiffingo-streams/checkpoints/city_rev/v1'"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "True\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Exactly-once · sink</span></div>
+    <h4>Make a JDBC sink idempotent</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>foreachBatch inserts city totals into PostgreSQL.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>batch_id</pre></div><div><small>Expected output</small><pre>BEGIN; DELETE FROM city_rev WHERE batch_id = :b; INSERT ... batch_id = :b; COMMIT</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Delete rows of this batch_id.</li><li>Insert the batch.</li><li>Same transaction.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 3.",
+   "code": "sql = [\"BEGIN\", \"DELETE FROM city_rev WHERE batch_id = :b\", \"INSERT ... batch_id = :b\", \"COMMIT\"]\nprint(\"; \".join(sql))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "sql = [\"BEGIN\", \"DELETE FROM city_rev WHERE batch_id = :b\", \"INSERT ... batch_id = :b\", \"COMMIT\"]",
+  "print(\"; \".join(sql))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>sql<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sql",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;BEGIN&#x27;, &#x27;DELETE FROM city_rev WHERE batch_id = :b&#x27;, &#x27;INSERT ... batch_id = :b&#x27;, &#x27;COMMIT…"
+   ],
+   "newVar": "sql"
+  },
+  {
+   "line": 2,
+   "phase": "Replay-safe",
+   "note": "A second run replaces the first. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "sql",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;BEGIN&#x27;, &#x27;DELETE FROM city_rev WHERE batch_id = :b&#x27;, &#x27;INSERT ... batch_id = :b&#x27;, &#x27;COMMIT…"
+   ],
+   "out": "BEGIN; DELETE FROM city_rev WHERE batch_id = :b; INSERT ... batch_id = :b; COMMIT\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">State · migration</span></div>
+    <h4>Change a stateful query</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Add <code>zone</code> to the grouping keys.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>running query</pre></div><div><small>Expected output</small><pre>deploy v2 with ck/v2 → startingOffsets=earliest → validate → switch readers → stop v1</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Key schema changes → incompatible.</li><li>New checkpoint + output path.</li><li>Backfill within retention, switch readers.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 5.",
+   "code": "steps = [\"deploy v2 with ck/v2\", \"startingOffsets=earliest\", \"validate\", \"switch readers\", \"stop v1\"]\nprint(\" → \".join(steps))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "steps = [\"deploy v2 with ck/v2\", \"startingOffsets=earliest\", \"validate\", \"switch readers\", \"stop v1\"]",
+  "print(\" → \".join(steps))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Plan",
+   "note": "Treat as a migration. <code>steps<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;deploy v2 with ck/v2&#x27;, &#x27;startingOffsets=earliest&#x27;, &#x27;validate&#x27;, &#x27;switch readers&#x27;, &#x27;stop …"
+   ],
+   "newVar": "steps"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "steps",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;deploy v2 with ck/v2&#x27;, &#x27;startingOffsets=earliest&#x27;, &#x27;validate&#x27;, &#x27;switch readers&#x27;, &#x27;stop …"
+   ],
+   "out": "deploy v2 with ck/v2 → startingOffsets=earliest → validate → switch readers → stop v1\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: What does the checkpoint store?",
+  "options": [
+   "Only data",
+   "Logs",
+   "Offsets, commits and state",
+   "Jars"
+  ],
+  "answer": 2,
+  "why": "Plus metadata."
+ },
+ {
+  "q": "Beginner: Restart with the same checkpoint reads…",
+  "options": [
+   "Everything again",
+   "Only uncommitted/new data",
+   "Nothing",
+   "Random data"
+  ],
+  "answer": 1,
+  "why": "Batch 1 only, 500 rows."
+ },
+ {
+  "q": "Beginner: Is the file sink exactly-once?",
+  "options": [
+   "Yes, via _spark_metadata",
+   "No",
+   "Only with Kafka",
+   "Only in complete mode"
+  ],
+  "answer": 0,
+  "why": "Skips committed batches."
+ },
+ {
+  "q": "Intermediate: Crash after writing, before commit. Spark…",
+  "options": [
+   "Skips the batch",
+   "Fails forever",
+   "Loses data",
+   "Replays it with the same batch id"
+  ],
+  "answer": 3,
+  "why": "Write-ahead log."
+ },
+ {
+  "q": "Intermediate: Plain append in foreachBatch gives…",
+  "options": [
+   "Exactly-once",
+   "At-most-once",
+   "At-least-once (2,099 for 1,500)",
+   "Nothing"
+  ],
+  "answer": 2,
+  "why": "Make it idempotent."
+ },
+ {
+  "q": "Intermediate: Deduplicate with bounded state using…",
+  "options": [
+   "distinct()",
+   "dropDuplicatesWithinWatermark",
+   "cache()",
+   "repartition"
+  ],
+  "answer": 1,
+  "why": "Needs a watermark."
+ },
+ {
+  "q": "Advanced: Changing grouping key type on an old checkpoint…",
+  "options": [
+   "Fails: state key schema not compatible",
+   "Works",
+   "Silently resets",
+   "Drops state"
+  ],
+  "answer": 0,
+  "why": "New checkpoint needed."
+ },
+ {
+  "q": "Advanced: Why RocksDB state store?",
+  "options": [
+   "Faster SQL",
+   "Needed for Kafka",
+   "Exactly-once",
+   "Large state off the JVM heap"
+  ],
+  "answer": 3,
+  "why": "Less GC pressure."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 9.5 in one screen</h3>
+    <ul><li>Checkpoint: offsets (WAL), commits, state, sources, metadata.</li><li>Restart replays uncommitted batches with the same offsets and batch id.</li><li>Exactly-once = replayable source + checkpoint + idempotent sink.</li><li>Crash lab: append 2,099 rows for 1,500; batch_id upsert 1,500.</li><li><code>dropDuplicatesWithinWatermark</code>: 1,800 → 1,500 with bounded state.</li><li>RocksDB state store for large state.</li><li>Stateful schema changes need a new checkpoint (STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE).</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Can I delete old checkpoint files?</summary><p>Spark cleans old batch files itself (spark.sql.streaming.minBatchesToRetain); never delete them by hand.</p></details>
+    <details><summary>Is the Kafka sink exactly-once?</summary><p>No, at-least-once; consumers should deduplicate (e.g. by key) or use idempotent processing.</p></details>
+    <details><summary>Can two queries share a checkpoint?</summary><p>No; each query needs its own location.</p></details>
+    <details><summary>How do I inspect state?</summary><p>Spark has a state data source: spark.read.format("statestore").load(checkpointPath) for debugging.</p></details>
+    <details><summary>What is transformWithState?</summary><p>A newer API (Spark 4) for arbitrary stateful processing with timers and TTL, replacing flatMapGroupsWithState for many cases.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs about checkpoints, replays and state.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Duplicate rows</h4></div>
+      <p>Extra rows from replaying batch 1.</p>
+      <div class="prob__io"><div><small>Input</small><pre>2099 vs 1500</pre></div><div><small>Expected output</small><pre>599</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(2099 - 1500)</code></pre><div class="output">599</div></div>
+        <p><b>How it works:</b> 599 = batch 1.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>New rows</h4></div>
+      <p>Rows read on restart.</p>
+      <div class="prob__io"><div><small>Input</small><pre>1500 − 1000</pre></div><div><small>Expected output</small><pre>500</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(1500 - 1000)</code></pre><div class="output">500</div></div>
+        <p><b>How it works:</b> Only new data.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Duplicates removed</h4></div>
+      <p>Events dropped by dedup.</p>
+      <div class="prob__io"><div><small>Input</small><pre>1800, 1500</pre></div><div><small>Expected output</small><pre>300</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(1800 - 1500)</code></pre><div class="output">300</div></div>
+        <p><b>How it works:</b> 300 retries.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Replay set</h4></div>
+      <p>Batches to replay.</p>
+      <div class="prob__io"><div><small>Input</small><pre>offsets 0..4, commits 0..2</pre></div><div><small>Expected output</small><pre>[3, 4]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print([b for b in range(5) if b &gt; 2])</code></pre><div class="output">[3, 4]</div></div>
+        <p><b>How it works:</b> [3, 4].</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Idempotent write</h4></div>
+      <p>Upsert by batch_id.</p>
+      <div class="prob__io"><div><small>Input</small><pre>writes</pre></div><div><small>Expected output</small><pre>1500</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>sink = {}
+for bid, rows in [(0, 599), (1, 599), (1, 599), (2, 302)]:
+    sink[bid] = rows
+print(sum(sink.values()))</code></pre><div class="output">1500</div></div>
+        <p><b>How it works:</b> 1,500.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Dedup</h4></div>
+      <p>Unique ids in order.</p>
+      <div class="prob__io"><div><small>Input</small><pre>events</pre></div><div><small>Expected output</small><pre>[5, 3, 9]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(list(dict.fromkeys([5, 3, 5, 9, 3])))</code></pre><div class="output">[5, 3, 9]</div></div>
+        <p><b>How it works:</b> Keep first.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Overstated revenue</h4></div>
+      <p>Revenue overstated by one replayed batch.</p>
+      <div class="prob__io"><div><small>Input</small><pre>599 orders × ₹250</pre></div><div><small>Expected output</small><pre>₹ 149750</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;₹&quot;, 599 * 250)</code></pre><div class="output">₹ 149750</div></div>
+        <p><b>How it works:</b> Why idempotency matters.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Backfill window</h4></div>
+      <p>Can v2 backfill 5 days with 7-day retention?</p>
+      <div class="prob__io"><div><small>Input</small><pre>5, 7</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(5 &lt;= 7)</code></pre><div class="output">True</div></div>
+        <p><b>How it works:</b> Yes, migrate before retention runs out.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Exactly-once and checkpoint questions separate senior streaming candidates.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Spark</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is a checkpoint in streaming?”</h4>
+      <p class="scn__situation">Explain checkpoints.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> what is inside?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>A directory on durable storage where the query saves the offsets each batch will read (write-ahead log), which batches committed, and state for stateful operators. On restart Spark resumes from it, replaying any uncommitted batch.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Confusing it with RDD checkpointing only.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Duplicate rows after restart</h4>
+      <p class="scn__situation">A database sink shows duplicated rows after a crash.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> why and fix?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Batch replayed after crash; foreachBatch did plain inserts.</li>
+          <li>Upsert / delete+insert by batch_id or MERGE on business key.</li>
+          <li>In my lab: 2,099 rows for 1,500 → fixed to 1,500.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Blaming Kafka.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Retried events</h4>
+      <p class="scn__situation">Producers resend events; counts are inflated.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> approach?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>dropDuplicatesWithinWatermark on the event id.</li>
+          <li>Watermark sized to the retry window.</li>
+          <li>RocksDB state store for many keys.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> dropDuplicates without a watermark (unbounded state).</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Stateful upgrades</h4>
+      <p class="scn__situation">How do you deploy a change to a stateful streaming job?</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> process?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Classify the change: compatible or not.</li>
+          <li>Incompatible: new checkpoint + output version, backfill, switch readers.</li>
+          <li>Versioned checkpoint paths and runbooks.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Deleting the checkpoint and restarting.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Spark and PySpark syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/spark-pyspark.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

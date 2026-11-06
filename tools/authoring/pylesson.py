@@ -424,6 +424,8 @@ def page(S, root):
   </div>
 </section>
 
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
 <div class="wrap lesson-layout">
 <article class="lesson-main">
 {S['BODY']}

@@ -1,0 +1,3681 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dynamic partitions and MSCK REPAIR TABLE | MyPhatshala</title>
+<meta name="description" content="Hive dynamic partitions and MSCK explained with real Hive 4.2.1 results: one INSERT that creates 30 partitions, nonstrict vs strict mode (the 4.2.1 default is nonstrict), mixed static and dynamic partitions, max partition limits (errors 20004 and the per-statement check), __HIVE_DEFAULT_PARTITION__ for NULLs, the wrong-column-order trap, MSCK REPAIR TABLE with ADD, DROP and SYNC PARTITIONS, hive.msck.path.validation, and ALTER TABLE ADD PARTITION with LOCATION.">
+<meta name="mp:minutes" content="35">
+<link rel="canonical" href="https://myphatshala.in/courses/hive/05-partitioning-and-bucketing/02-dynamic-partitions-and-msck/">
+<meta property="og:title" content="Dynamic partitions and MSCK REPAIR TABLE · MyPhatshala">
+<meta property="og:description" content="One INSERT, 30 partitions, and three traps we hit in a real Hive 4.2.1 lab: wrong column order, NULL partitions and a deleted folder. Plus what MSCK can and cannot repair.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Dynamic partitions and MSCK REPAIR TABLE", "learningResourceType": "Lesson", "educationalLevel": "Beginner → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Hive", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="05-partitioning-and-bucketing/02-dynamic-partitions-and-msck" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Hive syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Hive</a><span>›</span><b>Lesson 5.2</b></nav>
+    <h1>Dynamic partitions and MSCK REPAIR TABLE</h1>
+    <p class="lead">Static partitions need one statement per value. <b>Dynamic partitions</b> let Hive read the value from the data and create the folders itself, so a month is one statement. The reverse problem, folders written by other tools that Hive does not know about, is solved with <b>MSCK REPAIR TABLE</b>. Both are powerful and both have sharp edges; we hit five of them in the lab. <b>All outputs are real</b>, from Hive 4.2.1.</p>
+    <div class="lesson-meta"><span>Module 5 · Partitioning and bucketing</span><span>⏱ 35 min</span><span>Beginner → Advanced</span><span>Real Hive 4.2.1 outputs</span><span>One INSERT, 30 partitions</span><span>MSCK ADD / DROP / SYNC</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Thirty INSERT statements for one month? There must be a better way.”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> finish partitioning basics (<a href="../01-partitioning/">5.1</a>) and external tables (<a href="../../02-hiveql/02-managed-vs-external-tables/">2.2</a>).</p></div>
+  <div class="story">
+    <p class="narration">In Lesson 5.1 Kabir loaded two days of <code>orders_by_day</code> by hand, one static INSERT per day. Now he has to back-fill the whole month, and next week the app team will start dropping click files into date folders that Hive does not know about yet.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Fifty thousand orders flow through one INSERT statement whose partition value comes from the last column of the SELECT; Hive creates thirty date folders on its own.">
+        <rect x="10" y="12" width="200" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="110" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">orders (50,000 rows)</text><text x="22" y="50" font-size="7.2" class="s-ink2 mono">100001 … 2026-10-17</text><text x="22" y="64" font-size="7.2" class="s-ink2 mono">100002 … 2026-10-20</text><text x="22" y="78" font-size="7.2" class="s-ink2 mono">100003 … 2026-10-29</text><text x="22" y="92" font-size="7.2" class="s-ink2 mono">100004 … 2026-10-03</text><text x="22" y="106" font-size="7.2" class="s-ink2 mono">…</text><text x="110" y="128" text-anchor="middle" font-size="7.2" font-weight="700" class="s-acc">order_date = last SELECT column</text><path d="M216 76L262 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M255.7 79.0L262 76L255.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="268" y="52" width="96" height="48" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="316" y="72" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">one INSERT</text><text x="316" y="86" text-anchor="middle" font-size="6.6" class="s-ink2 mono">PARTITION (order_date)</text><path d="M370 76L410 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M403.7 79.0L410 76L403.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="416" y="12" width="214" height="128" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="523" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-green">30 folders, created by Hive</text><g><path d="M428 46h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="450" y="82" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-01</text></g><g><path d="M478 46h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="500" y="82" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-02</text></g><g><path d="M528 46h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="550" y="82" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-03</text></g><g><path d="M578 46h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="600" y="82" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-04</text></g><g><path d="M428 90h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="450" y="126" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-05</text></g><g><path d="M478 90h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="500" y="126" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-06</text></g><g><path d="M528 90h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="550" y="126" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-07</text></g><g><path d="M578 90h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="600" y="126" text-anchor="middle" font-size="6.6" class="s-ink2 mono">10-08</text></g><text x="523" y="134" text-anchor="middle" font-size="7.4" class="s-ink2">… up to 10-30</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">A <tspan font-weight="700" class="s-acc">dynamic partition</tspan> takes its value from the data, so one statement fills many partitions.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, do I really write 30 INSERT statements, one per date?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>No. Leave the value out: <code>PARTITION (order_date)</code>, and put <code>order_date</code> as the <b>last</b> column of the SELECT. Hive reads the date of every row and writes it to the right folder, creating folders as it goes. That is a <b>dynamic partition</b> insert.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>And the app team’s folders? Files are already there, in <code>dt=2026-10-01</code> style folders.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Then the files exist but the metastore has no partition rows, so Hive sees an empty table. <code>MSCK REPAIR TABLE</code> scans the folders and registers what is missing. Today: one-statement back-fills, the limits that protect the cluster, three traps we hit in the lab (wrong column order, NULL values, a missing folder), and what MSCK can and cannot repair. All outputs are real, from Hive 4.2.1.</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Dynamic partitions and partition repair</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>In a <b>dynamic partition insert</b> the partition clause names the partition columns without values, <code>INSERT OVERWRITE TABLE t PARTITION (col) SELECT …, col FROM src</code>, and Hive determines each row’s partition from the trailing columns of the SELECT, creating partitions as needed. It is controlled by <code>hive.exec.dynamic.partition</code>, <code>hive.exec.dynamic.partition.mode</code> (strict requires at least one static partition column) and limits on the number of partitions created. <b>MSCK REPAIR TABLE</b> compares the partition directories under a table’s location with the partitions registered in the metastore and adds (and optionally drops) metastore entries so that they match.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Dynamic partitions let Hive decide which folder each row goes to, using a column of the data, so one statement can fill a month of partitions. MSCK REPAIR does the reverse job: when folders were created outside Hive, it tells the metastore about them.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Dynamic partition</b><span><code>PARTITION (order_date)</code> with no value; the value comes from the data.</span></div>
+    <div class="term"><b>Mixed partition</b><span><code>PARTITION (order_date='2026-10-05', city)</code>: static first, then dynamic.</span></div>
+    <div class="term"><b>Strict / nonstrict</b><span>Strict mode demands at least one static partition column.</span></div>
+    <div class="term"><b>pernode limit</b><span>Max partitions one task may create (default 100).</span></div>
+    <div class="term"><b>__HIVE_DEFAULT_PARTITION__</b><span>Folder name used for NULL (or empty) partition values.</span></div>
+    <div class="term"><b>MSCK REPAIR TABLE</b><span>Registers partition folders that exist on storage but not in the metastore.</span></div>
+    <div class="term"><b>ADD / DROP / SYNC</b><span>MSCK options: add missing, drop stale, or both.</span></div>
+    <div class="term"><b>hive.msck.path.validation</b><span>What MSCK does with badly named folders: throw (default), skip, ignore.</span></div>
+  </div>
+
+  <h3>Static vs dynamic partitions</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th></th><th>Static</th><th>Dynamic</th></tr></thead>
+    <tbody><tr><td>Partition value</td><td>Written in the statement</td><td>Taken from the last SELECT columns</td></tr><tr><td>Statements for 30 days</td><td>30</td><td>1</td></tr><tr><td>Partition column in SELECT</td><td>Left out</td><td>Must be last, in order</td></tr><tr><td>Checks</td><td>None: value is trusted (5.1)</td><td>Value is real data, but a wrong column order is not detected</td></tr><tr><td>Typical use</td><td>Daily job for a known date</td><td>Back-fills, re-partitioning, splitting by city</td></tr><tr><td>Cost</td><td>Each task writes one partition</td><td>Each task may write many: memory and many files</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Dynamic partitions and MSCK at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Hive sorts the letters for you</h4>
+      <ul>
+        <li>Static partition: you put every letter into the box you choose. Dynamic partition: you hand Hive the whole pile and it reads the address on each letter, opening a new box when it needs one.</li>
+        <li>Write <code>PARTITION (order_date)</code> without a value, and put <code>order_date</code> last in the SELECT.</li>
+        <li><b>MSCK REPAIR TABLE</b> is the opposite direction: boxes already exist on the shelf, and Hive writes them into its register (the metastore).</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The settings and the rules</h4>
+      <ul>
+        <li><code>hive.exec.dynamic.partition</code> (default <b>true</b>) and <code>hive.exec.dynamic.partition.mode</code>. In our Hive 4.2.1 lab the default mode is <b>nonstrict</b>; many tutorials, written for older versions, say strict. In <b>strict</b> mode at least one partition column must be static (Error 10096).</li>
+        <li>Dynamic partition columns are matched <b>by position</b>: they must be the last SELECT columns, in the same order as in PARTITION (…). Static levels must come before dynamic ones: <code>PARTITION (order_date='…', city)</code>.</li>
+        <li>Limits: <code>hive.exec.max.dynamic.partitions</code> (1000 per statement) and <code>hive.exec.max.dynamic.partitions.pernode</code> (100 per task). They stop a bad column from creating thousands of folders.</li>
+        <li>A NULL value goes to <code>__HIVE_DEFAULT_PARTITION__</code> (<code>hive.exec.default.partition.name</code>).</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> MSCK in Hive 4.2.1: options and edges</h4>
+      <ul>
+        <li><code>MSCK REPAIR TABLE t [ADD | DROP | SYNC PARTITIONS]</code>. Plain MSCK = ADD: it registers new <code>col=value</code> folders but never removes entries whose folders are gone. DROP removes those; SYNC does both.</li>
+        <li>A folder that does not follow <code>col=value</code> made MSCK fail (“Invalid partition name”) because <code>hive.msck.path.validation=throw</code> by default; <code>skip</code> ignores such folders, <code>ignore</code> tries to use them anyway.</li>
+        <li>SYNC treated a partition we had added with a custom <code>LOCATION</code> as missing and dropped it. Keep custom locations out of tables you SYNC.</li>
+        <li>A partition whose folder was deleted made every query on the table fail (“Input path does not exist”) until it was repaired.</li>
+        <li>Hive 4’s metastore also has a background partition-management task that can discover partitions for tables with the <code>discover.partitions=true</code> property (vendor platforms such as Cloudera switch it on for external tables). Our external table in plain Apache 4.2.1 did not have the property, so we used MSCK.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “Static vs dynamic partitioning” and “What does MSCK REPAIR TABLE do?” are standard questions. For dynamic, mention the two settings, that the partition column goes last in the SELECT, and the max-partition limits. For MSCK, say it syncs folders on HDFS with partition entries in the metastore, typically after files are copied in from outside Hive.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Getting partitions into the metastore</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:720px">
+    <thead><tr><th>Situation</th><th>Use</th><th>Example</th></tr></thead>
+    <tbody><tr><td>Back-fill a month from a flat table</td><td>Dynamic INSERT</td><td><code>INSERT OVERWRITE TABLE orders_by_day PARTITION (order_date) SELECT …, order_date FROM orders</code></td></tr><tr><td>One known day, split by city</td><td>Mixed static + dynamic</td><td><code>PARTITION (order_date='2026-10-05', city)</code></td></tr><tr><td>Files land in <code>dt=…</code> folders from another tool</td><td>MSCK REPAIR TABLE</td><td><code>MSCK REPAIR TABLE app_clicks</code></td></tr><tr><td>Folders deleted outside Hive</td><td>MSCK … DROP / SYNC PARTITIONS</td><td><code>MSCK REPAIR TABLE app_clicks SYNC PARTITIONS</code></td></tr><tr><td>Folder with a different layout</td><td>ALTER TABLE … ADD PARTITION … LOCATION</td><td><code>ADD PARTITION (dt='2026-10-04') LOCATION '…/2026/10/04'</code></td></tr><tr><td>One new folder every day</td><td>ALTER TABLE … ADD IF NOT EXISTS PARTITION</td><td>Cheaper than scanning everything with MSCK</td></tr></tbody>
+  </table>
+  </div>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Setting</th><th>Default in our 4.2.1 lab</th><th>Meaning</th></tr></thead>
+    <tbody><tr><td><code>hive.exec.dynamic.partition</code></td><td>true</td><td>Dynamic partitions allowed</td></tr><tr><td><code>hive.exec.dynamic.partition.mode</code></td><td><b>nonstrict</b></td><td>strict needs one static column</td></tr><tr><td><code>hive.exec.max.dynamic.partitions</code></td><td>1000</td><td>Per statement</td></tr><tr><td><code>hive.exec.max.dynamic.partitions.pernode</code></td><td>100</td><td>Per task</td></tr><tr><td><code>hive.exec.default.partition.name</code></td><td>__HIVE_DEFAULT_PARTITION__</td><td>Where NULL values go</td></tr><tr><td><code>hive.msck.path.validation</code></td><td>throw</td><td>Badly named folder → MSCK fails</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>A dynamic insert trusts the <b>position</b> of the columns, not their names. Put the wrong column last and Hive happily creates one partition per distinct value of that column. Always run the SELECT alone first and look at the last column.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Back-fill, three traps, then repair the click table</h2>
+  <p>All outputs are real, from the Hive 4.2.1 lab (database <code>tiffingo</code>).</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Check the settings, then back-fill a month in one statement</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.exec.dynamic.partition;
+SET hive.exec.dynamic.partition.mode;
+
+INSERT OVERWRITE TABLE orders_by_day PARTITION (order_date)
+SELECT order_id, customer_id, city, order_ts, amount, payment, status,
+       order_date                       -- partition column LAST
+FROM orders;
+SHOW PARTITIONS orders_by_day;</code></pre><div class="output">+-----------------------------------+
+|                set                |
++-----------------------------------+
+| hive.exec.dynamic.partition=true  |
++-----------------------------------+
++------------------------+
+|       partition        |
++------------------------+
+| order_date=2026-10-01  |
+| order_date=2026-10-02  |
+| …                      |
+| order_date=2026-10-30  |
++------------------------+
+30 rows selected</div></div>
+      <span class="behind">Dynamic partitions are on and the mode is <b>nonstrict</b> in 4.2.1, so this works without any SET. One statement created 30 partitions. INSERT OVERWRITE replaces only the partitions that the query writes.</span></li>
+    <li><h4>Step 2 · Strict mode, the older default</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.exec.dynamic.partition.mode=strict;
+INSERT OVERWRITE TABLE orders_dyn PARTITION (order_date)
+SELECT order_id, customer_id, city, order_ts, amount, payment, status, order_date
+FROM orders;</code></pre><div class="output">Error: Error while compiling statement: FAILED: SemanticException [Error 10096]: Dynamic partition strict mode requires at least one static partition column. To turn this off set hive.exec.dynamic.partition.mode=nonstrict</div></div>
+      <span class="behind">Strict mode demands at least one static column, for example <code>PARTITION (order_date='2026-10-05', city)</code>. Many clusters (and many tutorials) still use strict, which is why you so often see <code>SET hive.exec.dynamic.partition.mode=nonstrict</code> at the top of scripts.</span></li>
+    <li><h4>Step 3 · Trap 1: the wrong column last</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE pay_by_mode (order_id INT, amount DECIMAL(10,2))
+PARTITIONED BY (payment STRING) STORED AS ORC;
+
+INSERT OVERWRITE TABLE pay_by_mode PARTITION (payment)
+SELECT order_id, payment, amount          -- oops: amount is last
+FROM orders WHERE order_date = &#x27;2026-10-05&#x27;;
+
+SELECT COUNT(*) AS partitions FROM (SELECT DISTINCT payment FROM pay_by_mode) x;
+SELECT payment, order_id, amount FROM pay_by_mode ORDER BY order_id LIMIT 3;</code></pre><div class="output">+-------------+
+| partitions  |
++-------------+
+| 69          |
++-------------+
++----------+-----------+---------+
+| payment  | order_id  | amount  |
++----------+-----------+---------+
+| 480.00   | 100005    | NULL    |
+| 170.00   | 100047    | NULL    |
+| 230.00   | 100065    | NULL    |
++----------+-----------+---------+</div></div>
+      <span class="behind">Hive matched columns by position: <code>payment</code> went into the <code>amount</code> column (and became NULL, since “UPI” is not a number), and every distinct amount became a partition: <b>69 folders</b> like <code>payment=480.00</code>. No error, no warning.</span></li>
+    <li><h4>Step 4 · Re-running correctly does not clean up</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>INSERT OVERWRITE TABLE pay_by_mode PARTITION (payment)
+SELECT order_id, amount, payment FROM orders WHERE order_date = &#x27;2026-10-05&#x27;;
+SHOW PARTITIONS pay_by_mode;      -- 73 rows: 69 bad + 4 good
+
+ALTER TABLE pay_by_mode DROP PARTITION (payment &lt; &#x27;A&#x27;);
+SHOW PARTITIONS pay_by_mode;</code></pre><div class="output">+-----------------+
+|    partition    |
++-----------------+
+| payment=100.00  |
+| …  (69 numeric) |
+| payment=Card    |
+| payment=COD     |
+| payment=UPI     |
+| payment=Wallet  |
++-----------------+
+
++-----------------+
+|    partition    |
++-----------------+
+| payment=Card    |
+| payment=COD     |
+| payment=UPI     |
+| payment=Wallet  |
++-----------------+</div></div>
+      <span class="behind">A dynamic INSERT OVERWRITE replaces only the partitions it writes; the 69 wrong ones stayed and would still show up in every <code>GROUP BY payment</code>. Digits sort before letters, so <code>payment &lt; 'A'</code> dropped exactly the numeric folders. On a real table, recreate it or drop the bad partitions explicitly.</span></li>
+    <li><h4>Step 5 · Trap 2: NULL values and the default partition</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE cust_by_ref (customer_id INT, name STRING)
+PARTITIONED BY (ref_city STRING) STORED AS ORC;
+INSERT OVERWRITE TABLE cust_by_ref PARTITION (ref_city)
+SELECT customer_id, name, IF(customer_id % 4 = 0, NULL, city)
+FROM customers WHERE customer_id &lt;= 40;
+
+SHOW PARTITIONS cust_by_ref;
+SELECT COUNT(*) AS null_rows FROM cust_by_ref WHERE ref_city IS NULL;
+SELECT COUNT(*) AS by_name FROM cust_by_ref
+WHERE ref_city = &#x27;__HIVE_DEFAULT_PARTITION__&#x27;;</code></pre><div class="output">+--------------------------------------+
+|              partition               |
++--------------------------------------+
+| ref_city=Bengaluru                   |
+| ref_city=Chennai                     |
+| ref_city=Delhi                       |
+| ref_city=__HIVE_DEFAULT_PARTITION__  |
+| ref_city=Hyderabad                   |
+| ref_city=Mumbai                      |
+| ref_city=Navi Mumbai                 |
+| ref_city=Pune                        |
+| ref_city=Thane                       |
++--------------------------------------+
++------------+
+| null_rows  |
++----------+
+| by_name  |
++----------+
+| 10       |
++----------+</div></div>
+      <span class="behind">Ten customers had no referral city. Their rows went into <code>ref_city=__HIVE_DEFAULT_PARTITION__</code>, and in our lab <code>IS NULL</code> found <b>0</b> of them while the folder name found all 10. Replace NULLs before inserting, e.g. <code>coalesce(city, 'UNKNOWN')</code>.</span></li>
+    <li><h4>Step 6 · The safety limits</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.exec.max.dynamic.partitions.pernode=10;
+INSERT OVERWRITE TABLE orders_dyn PARTITION (order_date) SELECT …, order_date FROM orders;
+
+SET hive.exec.max.dynamic.partitions=20;
+INSERT OVERWRITE TABLE orders_dyn PARTITION (order_date) SELECT …, order_date FROM orders;</code></pre><div class="output">Error: … Vertex failed … HiveFatalException: [Error 20004]: Fatal error occurred when node tried to create too many dynamic partitions. The maximum number of dynamic partitions is controlled by hive.exec.max.dynamic.partitions and hive.exec.max.dynamic.partitions.pernode. Maximum was set to 10 partitions per node, number of dynamic partitions on this node: 11
+
+Error: Error while compiling statement: FAILED: Execution Error, return code 40000 from org.apache.hadoop.hive.ql.exec.MoveTask. Number of dynamic partitions created is 30, which is more than 20. To solve this try to set hive.exec.max.dynamic.partitions to at least 30.</div></div>
+      <span class="behind">The per-task limit stops the task at the 11th partition (Error 20004); the per-statement limit is checked when files are moved into place, with the exact count it needed (30). The defaults (100 and 1000) are fine for daily data; raise them deliberately for big back-fills, never “just in case”.</span></li>
+    <li><h4>Step 7 · Files arrive outside Hive: MSCK REPAIR TABLE</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>-- the app team already wrote …/clicks/dt=2026-10-01/part-0.csv
+CREATE EXTERNAL TABLE app_clicks (event_ts STRING, ip STRING, path STRING,
+  http_code INT, bytes INT)
+PARTITIONED BY (dt STRING)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY &#x27;,&#x27;
+LOCATION &#x27;file:///data/tiffingo/clicks&#x27;;
+SELECT COUNT(*) AS n FROM app_clicks;
+
+MSCK REPAIR TABLE app_clicks;
+SELECT dt, COUNT(*) AS n FROM app_clicks GROUP BY dt;</code></pre><div class="output">+----+
+| n  |
+
++----------------+
+| dt=2026-10-01  |
++----------------+</div></div>
+      <span class="behind">The files were there, but the metastore had no partitions, so the table looked empty (0). MSCK found the <code>dt=2026-10-01</code> folder and registered it: 2,336 clicks. Files added later stay invisible until MSCK (or ALTER TABLE … ADD PARTITION) runs again.</span></li>
+    <li><h4>Step 8 · A badly named folder, a custom location and a deleted folder</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>-- new folders: dt=2026-10-02, dt=2026-10-03 and 2026/10/04 (wrong layout)
+MSCK REPAIR TABLE app_clicks;
+
+SET hive.msck.path.validation=skip;
+MSCK REPAIR TABLE app_clicks;
+ALTER TABLE app_clicks ADD PARTITION (dt=&#x27;2026-10-04&#x27;)
+  LOCATION &#x27;file:///data/tiffingo/clicks/2026/10/04&#x27;;
+
+-- later, someone deletes the dt=2026-10-01 folder
+SELECT dt, COUNT(*) FROM app_clicks GROUP BY dt;
+MSCK REPAIR TABLE app_clicks;                     -- still 4 partitions
+MSCK REPAIR TABLE app_clicks SYNC PARTITIONS;
+SHOW PARTITIONS app_clicks;</code></pre><div class="output">Error: Error while compiling statement: FAILED: Execution Error, return code 40000 from org.apache.hadoop.hive.ql.ddl.DDLTask. org.apache.hadoop.hive.metastore.api.MetastoreException: Invalid partition name file:/data/tiffingo/clicks/2026
+
++-------------+-------+
+|     dt      |   n   |
++-------------+-------+
+| 2026-10-01  | 2336  |
+| 2026-10-02  | 664   |
+| 2026-10-03  | 500   |
++-------------+-------+
+
+Error: … InvalidInputException: Input path does not exist: file:/data/tiffingo/clicks/dt=2026-10-01
+
++----------------+
+|   partition    |
++----------------+
+| dt=2026-10-02  |
+| dt=2026-10-03  |
++----------------+</div></div>
+      <span class="behind">One folder named <code>2026</code> made MSCK fail completely; with <code>skip</code> it registered 10-02 and 10-03, and ALTER … LOCATION added 10-04 (now 4 days: 2,336 + 664 + 500 + 300 rows). Deleting a folder broke every query on the table, and plain MSCK did not help, because it only adds. <b>SYNC</b> removed 10-01, but it also removed 10-04, whose folder was outside the <code>dt=…</code> layout. Prefer ADD/DROP on tables with custom locations.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Rows choosing folders, folders reaching the metastore</h2>
+  <p>Left: real Beeline output. Right: what Hive does with each row and each folder.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">How Hive picks folders, and how MSCK syncs them <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real Beeline output">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; INSERT OVERWRITE TABLE orders_by_day</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">    PARTITION (order_date)</text><text x="26" y="78" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  SELECT …, order_date FROM orders;</text><text x="26" y="92" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SHOW PARTITIONS orders_by_day;</text><text x="26" y="106" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  30 rows: 2026-10-01 … 2026-10-30</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … PARTITION (payment)</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">  SELECT order_id, payment, amount …</text><text x="26" y="78" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">| partitions |</text><text x="26" y="92" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">| 69         |</text><text x="26" y="106" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">| 480.00 | 100005 | NULL |</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … IF(customer_id % 4 = 0, NULL, city)</text><text x="26" y="64" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">| ref_city=__HIVE_DEFAULT_PARTITION__ |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … WHERE ref_city IS NULL;</text><text x="26" y="92" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">| 0  |</text><text x="26" y="106" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">&gt; … = &#x27;__HIVE_DEFAULT_PARTITION__&#x27;;  | 10 |</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; CREATE EXTERNAL TABLE app_clicks … ;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">&gt; SELECT COUNT(*) FROM app_clicks;   | 0 |</text><text x="26" y="78" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; MSCK REPAIR TABLE app_clicks;</text><text x="26" y="92" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 2026-10-01 | 2336 |</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; MSCK REPAIR TABLE app_clicks;</text><text x="26" y="64" font-size="8" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">  Invalid partition name …/clicks/2026</text><text x="26" y="78" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; SET hive.msck.path.validation=skip;</text><text x="26" y="92" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; … SYNC PARTITIONS;</text><text x="26" y="106" font-size="8" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  dt=2026-10-02, dt=2026-10-03 only</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>One dynamic INSERT creates all 30 date partitions.</li>
+          <li>With the wrong column last, every amount became a partition.</li>
+          <li>NULL values land in __HIVE_DEFAULT_PARTITION__, which IS NULL did not find.</li>
+          <li>Folders written outside Hive appear only after MSCK REPAIR.</li>
+          <li>A badly named folder breaks MSCK; SYNC also dropped a custom-location partition.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What Hive does with each row and each folder">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each row’s last column picks the folder</text><rect x="20" y="40" width="76" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="58" y="53" text-anchor="middle" font-size="7.4" class="s-ink mono">100004</text><rect x="100" y="40" width="76" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="138" y="53" text-anchor="middle" font-size="7.4" class="s-ink mono">…</text><rect x="180" y="40" width="76" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="218" y="53" text-anchor="middle" font-size="7.4" class="s-ink mono">180.00</text><rect x="260" y="40" width="76" height="18" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="298" y="53" text-anchor="middle" font-size="7.4" class="s-ink mono">10-03</text><rect x="20" y="64" width="76" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="58" y="77" text-anchor="middle" font-size="7.4" class="s-ink mono">100001</text><rect x="100" y="64" width="76" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="138" y="77" text-anchor="middle" font-size="7.4" class="s-ink mono">…</text><rect x="180" y="64" width="76" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="218" y="77" text-anchor="middle" font-size="7.4" class="s-ink mono">530.00</text><rect x="260" y="64" width="76" height="18" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="298" y="77" text-anchor="middle" font-size="7.4" class="s-ink mono">10-17</text><path d="M338 58L338 100" style="fill:none;stroke:var(--track);stroke-width:1.8"/><path d="M335.0 93.7L338 100L341.0 93.7" style="fill:none;stroke:var(--track);stroke-width:1.8"/><g><path d="M150 102h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="172" y="138" text-anchor="middle" font-size="6.6" class="s-ink2 mono">order_date=10-03</text></g><g><path d="M230 102h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="252" y="138" text-anchor="middle" font-size="6.6" class="s-ink2 mono">order_date=10-17</text></g><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">New value → new folder, created on the fly.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Columns are matched by position</text><rect x="20" y="40" width="76" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="58" y="53" text-anchor="middle" font-size="7.4" class="s-ink mono">order_id</text><rect x="100" y="40" width="76" height="18" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="138" y="53" text-anchor="middle" font-size="7.4" class="s-ink mono">payment</text><rect x="180" y="40" width="76" height="18" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="218" y="53" text-anchor="middle" font-size="7.4" class="s-ink mono">amount</text><rect x="260" y="40" width="76" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="298" y="53" text-anchor="middle" font-size="7.4" class="s-ink mono"></text><text x="58" y="76" text-anchor="middle" font-size="7.4" class="s-ink2 mono">order_id</text><text x="138" y="76" text-anchor="middle" font-size="7.4" class="s-red mono">→ amount</text><text x="218" y="76" text-anchor="middle" font-size="7.4" class="s-red mono">→ partition</text><text x="180" y="104" text-anchor="middle" font-size="8" class="s-red mono">'UPI' → DECIMAL → NULL;  480.00 → folder</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Names are ignored; order decides.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">69 bogus partitions, no error.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">NULL becomes a folder name</text><text x="180" y="52" text-anchor="middle" font-size="8" class="s-ink mono">NULL → 'ref_city=__HIVE_DEFAULT_PARTITION__'</text><g><path d="M158 70h14l4 4h26v22h-44z" class="s-soft-acc" style="stroke:#E0A100"/><text x="180" y="106" text-anchor="middle" font-size="6.6" class="s-ink2 mono">__HIVE_DEFAULT…</text></g><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">In our lab IS NULL did not match it.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Use coalesce(col, 'UNKNOWN') before inserting.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Storage and metastore out of sync</text><rect x="20" y="42" width="150" height="80" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="95" y="58" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink">storage</text><g><path d="M72 70h14l4 4h26v22h-44z" class="s-card2" style="stroke:var(--line)"/><text x="94" y="106" text-anchor="middle" font-size="6.6" class="s-ink2 mono">dt=10-01</text></g><rect x="190" y="42" width="150" height="80" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="265" y="58" text-anchor="middle" font-size="8.2" font-weight="700" class="s-ink">metastore</text><text x="265" y="88" text-anchor="middle" font-size="8" class="s-ink3">(no rows)</text><text x="265" y="106" text-anchor="middle" font-size="7.8" font-weight="700" class="s-green mono">MSCK → dt=10-01</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MSCK copies folder names into the metastore.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">What each MSCK option does</text><text x="26" y="52" font-size="8" class="s-ink mono">ADD  (default): register new col=value folders</text><text x="26" y="70" font-size="8" class="s-ink mono">DROP: remove entries whose folder is gone</text><text x="26" y="88" font-size="8" class="s-ink mono">SYNC: ADD + DROP</text><text x="26" y="106" font-size="8" class="s-ink mono">custom LOCATION ≠ col=value → seen as gone</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Pick the option, and know your layout.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Hive reads the trailing SELECT column of each row and writes the row into that partition folder.</li>
+          <li>Partition columns are taken by position, so a wrong order puts the wrong data into the folder names.</li>
+          <li>There is no folder name for NULL, so Hive uses a special default name.</li>
+          <li>MSCK lists the folders under the table location and adds the missing ones to the metastore.</li>
+          <li>ADD only adds; DROP and SYNC remove entries without a matching col=value folder.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a large back-fill, daily partition registration, and a deleted-folder incident.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-backfill">Back-filling a year into date and city partitions</h3>
+  <p class="anim-intro">A re-partitioning job meets the dynamic partition limits. Three ways through. (Typical plan; numbers from our data shape.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Large back-fill <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A year by date and city needs 2,920 partitions, more than the default limit; raise limits, split by month, or distribute by the keys">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Re-partition a year of orders by city</text><text x="180" y="56" text-anchor="middle" font-size="8.6" class="s-ink mono">PARTITION (order_date, city)</text><text x="180" y="74" text-anchor="middle" font-size="8.4" class="s-red mono">365 days × 8 cities = 2,920 partitions</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">More than the 1,000-per-statement limit.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Option 1: raise the limits</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink mono">SET hive.exec.max.dynamic.partitions=3000;</text><text x="180" y="72" text-anchor="middle" font-size="8" class="s-ink mono">SET hive.exec.max.dynamic.partitions.pernode=…;</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Works, but each task may hold many open files.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Memory pressure on big data.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Option 2: one month per run</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink mono">WHERE order_date BETWEEN '2026-01-01' AND '2026-01-31'</text><text x="180" y="74" text-anchor="middle" font-size="8.4" class="s-green mono">≈ 31 × 8 = 248 partitions per run</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Smaller, restartable chunks.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Option 3: DISTRIBUTE BY the partition keys</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">… DISTRIBUTE BY order_date, city</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each reducer writes few partitions, one file each.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Fewer small files (Lesson 5.4).</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Verify</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2 mono">COUNT(*) per month: old table = new table</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Then swap the table names.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A year by date and city needs about 2,920 partitions.</li>
+          <li>You can raise the limits, at the cost of memory and open files.</li>
+          <li>Or run one month at a time.</li>
+          <li>DISTRIBUTE BY the partition keys keeps each reducer to a few partitions.</li>
+          <li>Compare counts before switching.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-addpartition">Registering a new folder every day</h3>
+  <p class="anim-intro">Many pipelines write files with Spark, Flume or a copy job and then tell Hive. Real ALTER result below.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Daily partition registration <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Instead of scanning all folders with MSCK daily, the job adds the one new partition with ALTER TABLE ADD PARTITION">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Upstream job writes one folder a day</text><g><path d="M60 50h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="82" y="86" text-anchor="middle" font-size="6.6" class="s-ink2 mono">dt=10-02</text></g><g><path d="M130 50h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="152" y="86" text-anchor="middle" font-size="6.6" class="s-ink2 mono">dt=10-03</text></g><g><path d="M200 50h14l4 4h26v22h-44z" class="s-soft-green" style="stroke:var(--green)"/><text x="222" y="86" text-anchor="middle" font-size="6.6" class="s-ink2 mono">dt=10-04</text></g><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hive must learn about each new folder.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MSCK every day?</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">lists every folder of the table, every time</text><text x="180" y="74" text-anchor="middle" font-size="8.4" class="s-red">slow when the table has years of folders</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fine for small tables or one-off repairs.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Better: add exactly the new one</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">ALTER TABLE app_clicks ADD IF NOT EXISTS</text><text x="180" y="72" text-anchor="middle" font-size="8.2" class="s-ink mono">  PARTITION (dt='${hivevar:d}');</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Instant, and safe to re-run.</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">real output · Hive 4.2.1</text><text x="26" y="50" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">&gt; ALTER TABLE app_clicks ADD PARTITION (dt=&#x27;2026-10-04&#x27;)</text><text x="26" y="64" font-size="8" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">    LOCATION &#x27;…/clicks/2026/10/04&#x27;;</text><text x="26" y="78" font-size="8" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">| 2026-10-04 | 300 |</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Schedule</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">land files → ADD PARTITION → row-count check</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">MSCK … SYNC weekly as a safety net (no custom locations).</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Another tool writes a new date folder every day.</li>
+          <li>MSCK lists every folder each time, which grows slow.</li>
+          <li>ALTER TABLE … ADD IF NOT EXISTS PARTITION registers just the new one.</li>
+          <li>It also handles folders with a different layout, via LOCATION.</li>
+          <li>A periodic MSCK can catch anything missed.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-incident">A deleted folder takes down every dashboard</h3>
+  <p class="anim-intro">Files and the metastore must agree. These are the real behaviours we saw in Hive 4.2.1.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Partition incident <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A folder deleted outside Hive makes queries fail; plain MSCK does not help; DROP fixes it; SYNC also removed a custom-location partition">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">09:00 · every dashboard on app_clicks fails</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-red mono">Input path does not exist: …/dt=2026-10-01</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A cleanup script deleted an old folder.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">(real error from our lab)</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Plain MSCK does not fix it</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink mono">MSCK REPAIR TABLE app_clicks;  → still 4 partitions</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Default MSCK only ADDs.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-green">Targeted fix</text><text x="180" y="56" text-anchor="middle" font-size="7.8" class="s-ink mono">ALTER TABLE app_clicks DROP PARTITION (dt='2026-10-01');</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or MSCK … DROP PARTITIONS.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Careful with SYNC</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-red mono">SYNC also dropped dt=2026-10-04 (custom LOCATION)</text><rect x="10" y="150" width="340" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Now a day of data “vanished” from Hive.</text><text x="180.0" y="185.0" text-anchor="middle" font-size="8.8" class="s-ink2">Re-add it with ALTER … LOCATION.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Prevent it</text><text x="30" y="52" font-size="8.4" class="s-ink">• delete data with DROP PARTITION, not rm</text><text x="30" y="71" font-size="8.4" class="s-ink">• one layout for every folder</text><text x="30" y="90" font-size="8.4" class="s-ink">• alert on query failures</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Let Hive own its partitions.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A folder was deleted outside Hive and queries now fail.</li>
+          <li>Plain MSCK only adds partitions, so the stale entry stays.</li>
+          <li>Drop the stale partition, or use MSCK with DROP PARTITIONS.</li>
+          <li>SYNC removed a valid partition that lived outside the standard layout.</li>
+          <li>Delete through Hive, keep one folder layout, and monitor.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Dynamic partitions and MSCK at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-green">back-fill</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">one statement</text></svg></div>
+    <div><h4>1. Back-fills and migrations</h4>
+      <p>When a team moves a flat table to a partitioned one, or re-partitions by a new column, a dynamic INSERT OVERWRITE does it in one statement per chunk.</p>
+      <div class="uc-flow"><span>Old table</span><i>→</i><span class="java">dynamic INSERT</span><i>→</i><span>Partitioned table</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-blue">late data</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">right day</text></svg></div>
+    <div><h4>2. Late-arriving events</h4>
+      <p>Mobile apps upload events days late. A dynamic insert puts each event into its own event-date partition instead of the day it arrived.</p>
+      <div class="uc-flow"><span>Event batch</span><i>→</i><span class="java">PARTITION (event_date)</span><i>→</i><span>Correct days</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet mono">MSCK</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">after copy</text></svg></div>
+    <div><h4>3. Restores and cluster migrations</h4>
+      <p>After copying a warehouse folder tree to a new cluster with DistCp or restoring from backup, teams recreate the table DDL and run MSCK REPAIR to register all partitions again.</p>
+      <div class="uc-flow"><span>Copied folders</span><i>→</i><span class="java">MSCK REPAIR</span><i>→</i><span>Queryable table</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc mono">ADD PART</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">daily</text></svg></div>
+    <div><h4>4. Ingestion from other tools</h4>
+      <p>Spark jobs, Kafka connectors and copy tools write date folders; the pipeline then adds the new partition to the metastore so Hive, Trino and Spark SQL can see it.</p>
+      <div class="uc-flow"><span>Writer job</span><i>→</i><span class="java">ADD PARTITION</span><i>→</i><span>Visible to SQL</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-acc mono">DEFAULT</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">data quality</text></svg></div>
+    <div><h4>5. Data quality checks</h4>
+      <p>Teams alert when a __HIVE_DEFAULT_PARTITION__ folder appears or when a dynamic insert creates far more partitions than expected: both usually mean bad input.</p>
+      <div class="uc-flow"><span>Insert</span><i>→</i><span class="java">partition count check</span><i>→</i><span>Alert</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: rows choosing their own folders</h2>
+  <p>These programs mimic how Hive routes rows in a dynamic partition insert and how MSCK compares folders with the metastore. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># A dynamic partition insert: the LAST column of each row picks the folder
+rows = [(100004, 180, &quot;2026-10-03&quot;), (100001, 530, &quot;2026-10-17&quot;),
+        (100002, 500, &quot;2026-10-20&quot;), (100013, 340, &quot;2026-10-03&quot;)]
+
+table = {}
+for *data, part in rows:                       # SELECT ..., order_date  (last!)
+    folder = f&quot;order_date={part}&quot;
+    if folder not in table:
+        print(&quot;creating&quot;, folder)
+    table.setdefault(folder, []).append(tuple(data))
+
+print(len(table), &quot;partitions&quot;)
+for f, r in sorted(table.items()):
+    print(f, r)</code></pre><div class="output">creating order_date=2026-10-03
+creating order_date=2026-10-17
+creating order_date=2026-10-20
+3 partitions
+order_date=2026-10-03 [(100004, 180), (100013, 340)]
+order_date=2026-10-17 [(100001, 530)]
+order_date=2026-10-20 [(100002, 500)]</div></div>
+  <ul class="anno"><li><code>for *data, part in rows:                       # SELECT ..., order_date  (last!)</code><span>Hive does not look at column names here: the trailing column is the partition value.</span></li><li><code>        print(&quot;creating&quot;, folder)</code><span>A new value creates a new partition folder on the fly.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Dynamic routing",
+   "hint": "Press <b>Run<\/b>. Two orders share 10-03, so 4 rows make 3 partitions.",
+   "code": "# A dynamic partition insert: the LAST column of each row picks the folder\nrows = [(100004, 180, \"2026-10-03\"), (100001, 530, \"2026-10-17\"),\n        (100002, 500, \"2026-10-20\"), (100013, 340, \"2026-10-03\")]\n\ntable = {}\nfor *data, part in rows:                       # SELECT ..., order_date  (last!)\n    folder = f\"order_date={part}\"\n    if folder not in table:\n        print(\"creating\", folder)\n    table.setdefault(folder, []).append(tuple(data))\n\nprint(len(table), \"partitions\")\nfor f, r in sorted(table.items()):\n    print(f, r)\n"
+  },
+  {
+   "label": "2 · Predict first: wrong column last",
+   "hint": "<b>Predict first:<\/b> how many partitions if amount is last? (Real lab: 69 bogus partitions for one day.)",
+   "code": "rows = [(100004, \"UPI\", 180), (100001, \"UPI\", 530), (100002, \"Card\", 500), (100013, \"UPI\", 340)]\ntable = {}\nfor oid, payment, amount in rows:            # SELECT order_id, payment, amount\n    table.setdefault(f\"payment={amount:.2f}\", []).append((oid, payment))\nprint(len(table), sorted(table))\n"
+  },
+  {
+   "label": "3 · NULL goes to the default partition",
+   "hint": "Real lab: 10 of 40 customers ended in __HIVE_DEFAULT_PARTITION__.",
+   "code": "cities = [\"Mumbai\", None, \"Pune\", None, \"Thane\"]\nDEFAULT = \"__HIVE_DEFAULT_PARTITION__\"\nfor c in cities:\n    print(\"ref_city=\" + (c if c is not None else DEFAULT))\n"
+  },
+  {
+   "label": "4 · MSCK: compare folders with the metastore",
+   "hint": "Change <code>mode<\/code> to \"DROP\" or \"SYNC\" and run again.",
+   "code": "folders = {\"dt=2026-10-02\", \"dt=2026-10-03\", \"dt=2026-10-05\"}       # on storage\nmetastore = {\"dt=2026-10-01\", \"dt=2026-10-02\", \"dt=2026-10-03\"}     # registered\nmode = \"ADD\"\nif mode in (\"ADD\", \"SYNC\"):\n    metastore |= folders - metastore\nif mode in (\"DROP\", \"SYNC\"):\n    metastore -= metastore - folders\nprint(mode, sorted(metastore))\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "The per-task limit is 10, but the data has 30 days. Fix the job by processing the days in chunks of at most 10.",
+   "code": "days = [f\"2026-10-{d:02d}\" for d in range(1, 31)]\nPERNODE = 10\ncreated = set()\nfor d in days:                         # one task writes every day\n    created.add(d)\n    assert len(created) <= PERNODE, f\"Error 20004: {len(created)} partitions on this node, max {PERNODE}\"\nprint(len(created))\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: strict-mode-safe inserts and daily registration</h3>
+  <p>More statements to try in Beeline on the TiffinGo data. <b>Outputs are real</b>, from Hive 4.2.1.</p>
+  <div class="pcrun"><h4>1 · Static date, dynamic city: works even in strict mode</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SET hive.exec.dynamic.partition.mode=strict;
+CREATE TABLE orders_dc LIKE orders_day_city;
+INSERT OVERWRITE TABLE orders_dc PARTITION (order_date=&#x27;2026-10-06&#x27;, city)
+SELECT order_id, customer_id, amount, payment, status, city
+FROM orders WHERE order_date = &#x27;2026-10-06&#x27;;
+SELECT city, COUNT(*) AS n FROM orders_dc GROUP BY city ORDER BY n DESC LIMIT 3;</code></pre><div class="output">+------------+------+
+|    city    |  n   |
++------------+------+
+| Mumbai     | 339  |
+| Bengaluru  | 290  |
+| Pune       | 269  |
++------------+------+</div></div>
+  <p class="muted">One static column satisfies strict mode. The static level must come first; <code>PARTITION (order_date, city='Pune')</code> (dynamic before static) is not allowed.</p></div>
+  <div class="pcrun"><h4>2 · Register one new folder, twice</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>-- a new folder dt=2026-10-05 was written by the app team
+ALTER TABLE app_clicks ADD IF NOT EXISTS PARTITION (dt=&#x27;2026-10-05&#x27;);
+ALTER TABLE app_clicks ADD IF NOT EXISTS PARTITION (dt=&#x27;2026-10-05&#x27;);
+SELECT dt, COUNT(*) AS n FROM app_clicks GROUP BY dt ORDER BY dt;</code></pre><div class="output">+-------------+------+
+|     dt      |  n   |
++-------------+------+
+| 2026-10-02  | 664  |
+| 2026-10-03  | 500  |
+| 2026-10-05  | 50   |
++-------------+------+</div></div>
+  <p class="muted">IF NOT EXISTS makes the second call a no-op, so the job can be re-run safely. (10-01 is gone after the SYNC in Step 8, and 10-04 was dropped by SYNC too.)</p></div>
+  <div class="pcrun"><h4>3 · What MSCK does with a badly named folder</h4>
+  <div class="code" data-lang="bash" data-file="Beeline"><pre><code>SET hive.msck.path.validation;     -- the default
+MSCK REPAIR TABLE app_clicks;       -- with a folder named 2026/ under the table</code></pre><div class="output">+----------------------------------+
+|               set                |
+
+Error: … DDLTask. org.apache.hadoop.hive.metastore.api.MetastoreException: Invalid partition name file:/data/tiffingo/clicks/2026</div></div>
+  <p class="muted"><code>throw</code> stops the whole repair. <code>skip</code> ignores bad folders and repairs the rest; <code>ignore</code> tries to create partitions from them anyway, which is rarely what you want.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Counting partitions against the limit</h2>
+  <p>Each task tracks the partitions it has opened. Watch <code>opened</code> until it crosses the limit, as in the real Error 20004.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "limit = 3",
+  "rows = [\"10-01\", \"10-01\", \"10-02\", \"10-03\", \"10-04\"]",
+  "opened = set()",
+  "for day in rows:",
+  "    opened.add(day)",
+  "    if len(opened) > limit:",
+  "        print(\"Fatal: too many dynamic partitions:\", len(opened))",
+  "        break",
+  "print(sorted(opened))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>limit<\/code> is created: 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "limit"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>rows<\/code> is created: → list #1. A new list object (#1) is created: [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]"
+   ],
+   "newVar": "rows"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>opened<\/code> is created: → set #2. A new set object (#2) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (0)<\/b> {}"
+   ],
+   "newVar": "opened"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>day<\/code> is created: &#x27;10-01&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-01'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (0)<\/b> {}"
+   ],
+   "newVar": "day"
+  },
+  {
+   "line": 5,
+   "phase": "Open",
+   "note": "A repeated day reuses its open file; a new day opens a new one. Object #2 set now holds {&#x27;10-01&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-01'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (1)<\/b> {&#x27;10-01&#x27;}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-01'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (1)<\/b> {&#x27;10-01&#x27;}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The loop takes the next item (it has the same value as the previous one).",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-01'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (1)<\/b> {&#x27;10-01&#x27;}"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-01'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (1)<\/b> {&#x27;10-01&#x27;}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-01'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (1)<\/b> {&#x27;10-01&#x27;}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>day<\/code> changes to &#x27;10-02&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-02'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (1)<\/b> {&#x27;10-01&#x27;}"
+   ],
+   "newVar": "day"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 set now holds {&#x27;10-01&#x27;, &#x27;10-02&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-02'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (2)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-02'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (2)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>day<\/code> changes to &#x27;10-03&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-03'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (2)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;}"
+   ],
+   "newVar": "day"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 set now holds {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-03'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (3)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-03'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (3)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;}"
+   ]
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>day<\/code> changes to &#x27;10-04&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-04'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (3)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;}"
+   ],
+   "newVar": "day"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 set now holds {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-04'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-04'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Limit",
+   "note": "Hive fails the task at this point, exactly like “number of dynamic partitions on this node: 11” with a limit of 10. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-04'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ],
+   "out": "Fatal: too many dynamic partitions: 4\n"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "<code>break<\/code> leaves the loop immediately.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-04'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "limit",
+       "3"
+      ],
+      [
+       "rows",
+       "→ list #1"
+      ],
+      [
+       "opened",
+       "→ set #2"
+      ],
+      [
+       "day",
+       "'10-04'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [&#x27;10-01&#x27;, &#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;]",
+    "<b>#2 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ],
+   "out": "['10-01', '10-02', '10-03', '10-04']\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three partition-loading tasks from TiffinGo’s data team.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">ETL · dynamic insert</span></div>
+    <h4>Build the SELECT for a dynamic insert</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Given a target table’s data columns and partition columns, generate the INSERT so that the partition columns come last, in the right order.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>data: order_id, amount, payment, status · partitions: order_date, city</pre></div><div><small>Expected output</small><pre>INSERT OVERWRITE TABLE orders_day_city PARTITION (order_date, city)
+SELECT order_id, amount, payment, status, order_date, city FROM orders;</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>List the data columns in table order.</li><li>Append the partition columns in PARTITION order.</li><li>Build the statement.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Generating the column list from table metadata (DESCRIBE) instead of typing it is how many frameworks avoid the wrong-order trap.",
+   "code": "data_cols = [\"order_id\", \"amount\", \"payment\", \"status\"]\npart_cols = [\"order_date\", \"city\"]\nselect = \", \".join(data_cols + part_cols)\nprint(f\"INSERT OVERWRITE TABLE orders_day_city PARTITION ({', '.join(part_cols)})\")\nprint(f\"SELECT {select} FROM orders;\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "data_cols = [\"order_id\", \"amount\", \"payment\", \"status\"]",
+  "part_cols = [\"order_date\", \"city\"]",
+  "select = \", \".join(data_cols + part_cols)",
+  "print(f\"INSERT OVERWRITE TABLE orders_day_city PARTITION ({', '.join(part_cols)})\")",
+  "print(f\"SELECT {select} FROM orders;\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>data_cols<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data_cols",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;order_id&#x27;, &#x27;amount&#x27;, &#x27;payment&#x27;, &#x27;status&#x27;]"
+   ],
+   "newVar": "data_cols"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>part_cols<\/code> is created: → list #2. A new list object (#2) is created: [&#x27;order_date&#x27;, &#x27;city&#x27;]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data_cols",
+       "→ list #1"
+      ],
+      [
+       "part_cols",
+       "→ list #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;order_id&#x27;, &#x27;amount&#x27;, &#x27;payment&#x27;, &#x27;status&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;order_date&#x27;, &#x27;city&#x27;]"
+   ],
+   "newVar": "part_cols"
+  },
+  {
+   "line": 3,
+   "phase": "Order",
+   "note": "Partition columns last, in the same order as PARTITION (…). This prevents the 69-folder accident. <code>select<\/code> is created: &#x27;order_id, amount, payment, status, order_date, city&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data_cols",
+       "→ list #1"
+      ],
+      [
+       "part_cols",
+       "→ list #2"
+      ],
+      [
+       "select",
+       "'order_id, amount, payment, status, order_date, city'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;order_id&#x27;, &#x27;amount&#x27;, &#x27;payment&#x27;, &#x27;status&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;order_date&#x27;, &#x27;city&#x27;]"
+   ],
+   "newVar": "select"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data_cols",
+       "→ list #1"
+      ],
+      [
+       "part_cols",
+       "→ list #2"
+      ],
+      [
+       "select",
+       "'order_id, amount, payment, status, order_date, city'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;order_id&#x27;, &#x27;amount&#x27;, &#x27;payment&#x27;, &#x27;status&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;order_date&#x27;, &#x27;city&#x27;]"
+   ],
+   "out": "INSERT OVERWRITE TABLE orders_day_city PARTITION (order_date, city)\n"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "data_cols",
+       "→ list #1"
+      ],
+      [
+       "part_cols",
+       "→ list #2"
+      ],
+      [
+       "select",
+       "'order_id, amount, payment, status, order_date, city'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (4)<\/b> [&#x27;order_id&#x27;, &#x27;amount&#x27;, &#x27;payment&#x27;, &#x27;status&#x27;]",
+    "<b>#2 list (2)<\/b> [&#x27;order_date&#x27;, &#x27;city&#x27;]"
+   ],
+   "out": "SELECT order_id, amount, payment, status, order_date, city FROM orders;\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Data quality · NULL partitions</span></div>
+    <h4>Replace NULL before partitioning</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Referral city is missing for some customers. Partition by it without creating <code>__HIVE_DEFAULT_PARTITION__</code>: use <code>coalesce(ref_city, 'UNKNOWN')</code> as the last column.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>[&quot;Mumbai&quot;, None, &quot;Pune&quot;, None, &quot;Thane&quot;, &quot;Mumbai&quot;]</pre></div><div><small>Expected output</small><pre>{&#x27;Mumbai&#x27;: 2, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1, &#x27;Thane&#x27;: 1}</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Map NULL to an explicit label.</li><li>Group rows by the label.</li><li>Count rows per partition.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Real lab: without coalesce, <code>WHERE ref_city IS NULL<\/code> returned 0 rows while 10 rows sat in the default partition.",
+   "code": "refs = [\"Mumbai\", None, \"Pune\", None, \"Thane\", \"Mumbai\"]\nparts = {}\nfor r in refs:\n    key = r if r is not None else \"UNKNOWN\"      # coalesce(ref_city, 'UNKNOWN')\n    parts[key] = parts.get(key, 0) + 1\nprint(parts)\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "refs = [\"Mumbai\", None, \"Pune\", None, \"Thane\", \"Mumbai\"]",
+  "parts = {}",
+  "for r in refs:",
+  "    key = r if r is not None else \"UNKNOWN\"      # coalesce(ref_city, 'UNKNOWN')",
+  "    parts[key] = parts.get(key, 0) + 1",
+  "print(parts)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>refs<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]"
+   ],
+   "newVar": "refs"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>parts<\/code> is created: → dict #2. A new dict object (#2) is created: {}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "parts"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>r<\/code> is created: &#x27;Mumbai&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Mumbai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 4,
+   "phase": "coalesce",
+   "note": "The NULL rows now have a readable, queryable partition: ref_city = 'UNKNOWN'. <code>key<\/code> is created: &#x27;Mumbai&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Mumbai'"
+      ],
+      [
+       "key",
+       "'Mumbai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (0)<\/b> {}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;Mumbai&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Mumbai'"
+      ],
+      [
+       "key",
+       "'Mumbai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (1)<\/b> {&#x27;Mumbai&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to None.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "None"
+      ],
+      [
+       "key",
+       "'Mumbai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (1)<\/b> {&#x27;Mumbai&#x27;: 1}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;UNKNOWN&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "None"
+      ],
+      [
+       "key",
+       "'UNKNOWN'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (1)<\/b> {&#x27;Mumbai&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "None"
+      ],
+      [
+       "key",
+       "'UNKNOWN'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to &#x27;Pune&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Pune'"
+      ],
+      [
+       "key",
+       "'UNKNOWN'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 1}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;Pune&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Pune'"
+      ],
+      [
+       "key",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (2)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 1, &#x27;Pune&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Pune'"
+      ],
+      [
+       "key",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (3)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 1, &#x27;Pune&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to None.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "None"
+      ],
+      [
+       "key",
+       "'Pune'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (3)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 1, &#x27;Pune&#x27;: 1}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;UNKNOWN&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "None"
+      ],
+      [
+       "key",
+       "'UNKNOWN'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (3)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 1, &#x27;Pune&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "None"
+      ],
+      [
+       "key",
+       "'UNKNOWN'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (3)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to &#x27;Thane&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Thane'"
+      ],
+      [
+       "key",
+       "'UNKNOWN'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (3)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;Thane&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Thane'"
+      ],
+      [
+       "key",
+       "'Thane'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (3)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1, &#x27;Thane&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Thane'"
+      ],
+      [
+       "key",
+       "'Thane'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (4)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1, &#x27;Thane&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>r<\/code> changes to &#x27;Mumbai&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Mumbai'"
+      ],
+      [
+       "key",
+       "'Thane'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (4)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1, &#x27;Thane&#x27;: 1}"
+   ],
+   "newVar": "r"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>key<\/code> changes to &#x27;Mumbai&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Mumbai'"
+      ],
+      [
+       "key",
+       "'Mumbai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (4)<\/b> {&#x27;Mumbai&#x27;: 1, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1, &#x27;Thane&#x27;: 1}"
+   ],
+   "newVar": "key"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "Object #2 dict now holds {&#x27;Mumbai&#x27;: 2, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1, &#x27;Thane&#x27;: 1}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Mumbai'"
+      ],
+      [
+       "key",
+       "'Mumbai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (4)<\/b> {&#x27;Mumbai&#x27;: 2, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1, &#x27;Thane&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Mumbai'"
+      ],
+      [
+       "key",
+       "'Mumbai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (4)<\/b> {&#x27;Mumbai&#x27;: 2, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1, &#x27;Thane&#x27;: 1}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "refs",
+       "→ list #1"
+      ],
+      [
+       "parts",
+       "→ dict #2"
+      ],
+      [
+       "r",
+       "'Mumbai'"
+      ],
+      [
+       "key",
+       "'Mumbai'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (6)<\/b> [&#x27;Mumbai&#x27;, None, &#x27;Pune&#x27;, None, &#x27;Thane&#x27;, &#x27;Mumbai&#x27;]",
+    "<b>#2 dict (4)<\/b> {&#x27;Mumbai&#x27;: 2, &#x27;UNKNOWN&#x27;: 2, &#x27;Pune&#x27;: 1, &#x27;Thane&#x27;: 1}"
+   ],
+   "out": "{'Mumbai': 2, 'UNKNOWN': 2, 'Pune': 1, 'Thane': 1}\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Operations · MSCK planning</span></div>
+    <h4>Which MSCK option is safe?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>The metastore lists 10-01 … 10-04 (10-04 has a custom LOCATION). On storage, the <code>dt=</code> folders are 10-02, 10-03 and 10-05. Compute the result of ADD, DROP and SYNC, the way Hive 4.2.1 behaved in our lab.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>metastore {01, 02, 03, 04*} · folders {02, 03, 05} · * custom location</pre></div><div><small>Expected output</small><pre>ADD [&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;, &#x27;10-05&#x27;]
+DROP [&#x27;10-02&#x27;, &#x27;10-03&#x27;]
+SYNC [&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;]</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>ADD: register folders not in the metastore.</li><li>DROP: remove entries without a dt= folder; custom locations count as missing.</li><li>SYNC: both.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "None of the three options gives the correct set {02, 03, 04, 05}. Use ADD, then drop 10-01 explicitly with ALTER TABLE … DROP PARTITION.",
+   "code": "meta = {\"10-01\", \"10-02\", \"10-03\", \"10-04\"}\nfolders = {\"10-02\", \"10-03\", \"10-05\"}          # 10-04 lives in 2026/10/04, not dt=...\ndef msck(mode):\n    m = set(meta)\n    if mode in (\"ADD\", \"SYNC\"):\n        m |= folders\n    if mode in (\"DROP\", \"SYNC\"):\n        m &= folders\n    return sorted(m)\nfor mode in [\"ADD\", \"DROP\", \"SYNC\"]:\n    print(mode, msck(mode))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "meta = {\"10-01\", \"10-02\", \"10-03\", \"10-04\"}",
+  "folders = {\"10-02\", \"10-03\", \"10-05\"}          # 10-04 lives in 2026/10/04, not dt=...",
+  "def msck(mode):",
+  "    m = set(meta)",
+  "    if mode in (\"ADD\", \"SYNC\"):",
+  "        m |= folders",
+  "    if mode in (\"DROP\", \"SYNC\"):",
+  "        m &= folders",
+  "    return sorted(m)",
+  "for mode in [\"ADD\", \"DROP\", \"SYNC\"]:",
+  "    print(mode, msck(mode))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>meta<\/code> is created: → set #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ],
+   "newVar": "meta"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "<code>folders<\/code> is created: → set #2. A new set object (#2) is created: {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ],
+   "newVar": "folders"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>msck<\/code> is created: function msck().",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ],
+   "newVar": "msck"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "<code>mode<\/code> is created: &#x27;ADD&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'ADD'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "<code>msck()<\/code> is called: a new frame is pushed with <code>mode<\/code> = &#x27;ADD&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'ADD'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'ADD'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>m<\/code> is created: → set #3. A new set object (#3) is created: {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'ADD'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'ADD'"
+      ],
+      [
+       "m",
+       "→ set #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#3 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ],
+   "newVar": "m"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'ADD'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'ADD'"
+      ],
+      [
+       "m",
+       "→ set #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#3 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #3 set now holds {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;, &#x27;10-05&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'ADD'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'ADD'"
+      ],
+      [
+       "m",
+       "→ set #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#3 set (5)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;, &#x27;10-05&#x27;}"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'ADD'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'ADD'"
+      ],
+      [
+       "m",
+       "→ set #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#3 set (5)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;, &#x27;10-05&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'ADD'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'ADD'"
+      ],
+      [
+       "m",
+       "→ set #3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#3 set (5)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;, &#x27;10-05&#x27;}"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Return",
+   "note": "<code>msck()<\/code> returns <b>→ list #4<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'ADD'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ],
+   "out": "ADD ['10-01', '10-02', '10-03', '10-04', '10-05']\n"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "<code>mode<\/code> changes to &#x27;DROP&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'DROP'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "<code>msck()<\/code> is called: a new frame is pushed with <code>mode<\/code> = &#x27;DROP&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'DROP'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'DROP'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>m<\/code> is created: → set #5. A new set object (#5) is created: {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'DROP'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'DROP'"
+      ],
+      [
+       "m",
+       "→ set #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#5 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ],
+   "newVar": "m"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'DROP'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'DROP'"
+      ],
+      [
+       "m",
+       "→ set #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#5 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'DROP'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'DROP'"
+      ],
+      [
+       "m",
+       "→ set #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#5 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "DROP",
+   "note": "10-04 is dropped because its data is not in a dt= folder, even though it exists. Object #5 set now holds {&#x27;10-02&#x27;, &#x27;10-03&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'DROP'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'DROP'"
+      ],
+      [
+       "m",
+       "→ set #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#5 set (2)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'DROP'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'DROP'"
+      ],
+      [
+       "m",
+       "→ set #5"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#5 set (2)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;}"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Return",
+   "note": "<code>msck()<\/code> returns <b>→ list #6<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'DROP'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ],
+   "out": "DROP ['10-02', '10-03']\n"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "<code>mode<\/code> changes to &#x27;SYNC&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'SYNC'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 11,
+   "phase": "Python",
+   "note": "<code>msck()<\/code> is called: a new frame is pushed with <code>mode<\/code> = &#x27;SYNC&#x27;.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'SYNC'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'SYNC'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ],
+   "newVar": "mode"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>m<\/code> is created: → set #7. A new set object (#7) is created: {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'SYNC'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'SYNC'"
+      ],
+      [
+       "m",
+       "→ set #7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#7 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ],
+   "newVar": "m"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'SYNC'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'SYNC'"
+      ],
+      [
+       "m",
+       "→ set #7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#7 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "Object #7 set now holds {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;, &#x27;10-05&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'SYNC'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'SYNC'"
+      ],
+      [
+       "m",
+       "→ set #7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#7 set (5)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;, &#x27;10-05&#x27;}"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'SYNC'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'SYNC'"
+      ],
+      [
+       "m",
+       "→ set #7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#7 set (5)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;, &#x27;10-05&#x27;}"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #7 set now holds {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'SYNC'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'SYNC'"
+      ],
+      [
+       "m",
+       "→ set #7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#7 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Python",
+   "note": "The return value is worked out and handed back to the caller.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'SYNC'"
+      ]
+     ]
+    },
+    {
+     "frame": "msck()",
+     "vars": [
+      [
+       "mode",
+       "'SYNC'"
+      ],
+      [
+       "m",
+       "→ set #7"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}",
+    "<b>#7 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ]
+  },
+  {
+   "line": 11,
+   "phase": "Return",
+   "note": "<code>msck()<\/code> returns <b>→ list #8<\/b> and its frame is popped. The caller continues on this line with that value.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'SYNC'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ],
+   "out": "SYNC ['10-02', '10-03', '10-05']\n"
+  },
+  {
+   "line": 10,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "meta",
+       "→ set #1"
+      ],
+      [
+       "folders",
+       "→ set #2"
+      ],
+      [
+       "msck",
+       "function msck()"
+      ],
+      [
+       "mode",
+       "'SYNC'"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 set (4)<\/b> {&#x27;10-01&#x27;, &#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-04&#x27;}",
+    "<b>#2 set (3)<\/b> {&#x27;10-02&#x27;, &#x27;10-03&#x27;, &#x27;10-05&#x27;}"
+   ]
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: In a dynamic partition insert, where must the partition column appear in the SELECT?",
+  "options": [
+   "First",
+   "Anywhere; Hive matches by name",
+   "Last (in PARTITION order)",
+   "It must not appear"
+  ],
+  "answer": 2,
+  "why": "Partition values are taken from the trailing columns, by position."
+ },
+ {
+  "q": "Beginner: What does MSCK REPAIR TABLE do?",
+  "options": [
+   "Fixes corrupted files",
+   "Registers partition folders that exist on storage but not in the metastore",
+   "Compacts small files",
+   "Rebuilds statistics"
+  ],
+  "answer": 1,
+  "why": "It syncs the metastore with the partition folders; by default it only adds."
+ },
+ {
+  "q": "Beginner: Where do rows with a NULL partition value go?",
+  "options": [
+   "__HIVE_DEFAULT_PARTITION__",
+   "They are dropped",
+   "An error",
+   "partition=NULL"
+  ],
+  "answer": 0,
+  "why": "Set by hive.exec.default.partition.name."
+ },
+ {
+  "q": "Intermediate: What is the default hive.exec.dynamic.partition.mode in our Hive 4.2.1 lab?",
+  "options": [
+   "strict",
+   "off",
+   "auto",
+   "nonstrict"
+  ],
+  "answer": 3,
+  "why": "Older versions defaulted to strict, which is why many scripts start with SET … =nonstrict."
+ },
+ {
+  "q": "Intermediate: In strict mode, which clause is accepted?",
+  "options": [
+   "PARTITION (order_date)",
+   "PARTITION (order_date, city='Pune')",
+   "PARTITION (order_date='2026-10-06', city)",
+   "PARTITION ()"
+  ],
+  "answer": 2,
+  "why": "At least one static column, and static levels before dynamic ones."
+ },
+ {
+  "q": "Intermediate: The order_id and amount columns were swapped at the end of a dynamic insert. What happens?",
+  "options": [
+   "Hive reports a type error",
+   "Hive creates one partition per distinct value of the wrong column",
+   "Hive fixes the order by name",
+   "Nothing is written"
+  ],
+  "answer": 1,
+  "why": "Real lab: 69 bogus partitions, and re-running correctly did not remove them."
+ },
+ {
+  "q": "Advanced: A partition’s folder was deleted outside Hive. Which command removes the stale entry without touching others?",
+  "options": [
+   "ALTER TABLE t DROP PARTITION (dt='…')",
+   "MSCK REPAIR TABLE t",
+   "MSCK REPAIR TABLE t ADD PARTITIONS",
+   "ANALYZE TABLE t"
+  ],
+  "answer": 0,
+  "why": "Plain MSCK only adds. SYNC also removed a custom-location partition in our lab."
+ },
+ {
+  "q": "Advanced: MSCK fails with “Invalid partition name …/2026”. What is the quickest safe fix?",
+  "options": [
+   "Drop the table",
+   "Rename every folder",
+   "Use LOAD DATA",
+   "SET hive.msck.path.validation=skip and run MSCK again"
+  ],
+  "answer": 3,
+  "why": "skip ignores folders that are not col=value; register the odd folder with ALTER … ADD PARTITION … LOCATION."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 5.2 in one screen</h3>
+    <ul><li><b>Dynamic:</b> <code>INSERT OVERWRITE TABLE t PARTITION (col) SELECT …, col FROM src</code>. Partition columns <b>last</b>, by <b>position</b>.</li><li><b>Settings (4.2.1 defaults):</b> dynamic.partition = true · mode = <b>nonstrict</b> · max.dynamic.partitions = 1000 · pernode = 100.</li><li><b>Strict</b> needs a static column (Error 10096). Mixed: <code>PARTITION (order_date='…', city)</code>, static first.</li><li><b>Limits:</b> per task → Error 20004; per statement → “created is 30, which is more than 20”.</li><li><b>NULL</b> → <code>__HIVE_DEFAULT_PARTITION__</code>; use <code>coalesce(col, 'UNKNOWN')</code>.</li><li><b>Wrong order</b> → bogus partitions, no error; OVERWRITE does not clean other partitions.</li><li><b>MSCK REPAIR TABLE t [ADD|DROP|SYNC PARTITIONS]</b>: default ADD only; DROP removes entries without folders; SYNC both.</li><li><code>hive.msck.path.validation</code>: throw (default) · skip · ignore. Odd layouts → <code>ADD PARTITION … LOCATION</code>.</li><li>A missing partition folder makes queries fail (“Input path does not exist”). Delete data with DROP PARTITION, not rm.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Should I always use dynamic partitions?</summary><p>Use dynamic inserts for back-fills and when one batch spans several partitions. For a normal daily job that loads one known day, a static partition is clearer, cheaper (each task writes one folder) and safer, because a bad date in the data cannot create unexpected partitions.</p></details>
+    <details><summary>Why does a dynamic insert sometimes create many small files?</summary><p>Every task writes one file into every partition it touches. With 100 map tasks and 30 days you can get 3,000 files. Adding <code>DISTRIBUTE BY order_date</code> sends each day to one reducer, so each partition gets one file. Lesson 5.4 covers small files in detail.</p></details>
+    <details><summary>Is MSCK REPAIR TABLE slow?</summary><p>It lists every folder under the table location, so its cost grows with the number of partitions, and on cloud object stores listing is slow. For daily ingestion, ALTER TABLE … ADD IF NOT EXISTS PARTITION for the new day is much cheaper. Use MSCK for one-off repairs and restores.</p></details>
+    <details><summary>Does MSCK work on managed tables?</summary><p>Yes, it compares folders with the metastore for any partitioned table. In practice it is used mostly for external tables, because data for managed tables normally arrives through Hive itself, which registers partitions as it writes.</p></details>
+    <details><summary>Do Spark and Trino see partitions added by MSCK?</summary><p>Yes. They read the same metastore, so once a partition is registered every engine can prune and read it. Spark has its own <code>MSCK REPAIR TABLE</code> / <code>ALTER TABLE … RECOVER PARTITIONS</code> that writes to the same metastore.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs that simulate dynamic partitioning and MSCK, with the HiveQL in each explanation.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Count partitions a back-fill will create</h4></div>
+      <p>Count the distinct dates in a batch before running a dynamic insert.</p>
+      <div class="prob__io"><div><small>Input</small><pre>list of order dates</pre></div><div><small>Expected output</small><pre>3</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>dates = [&quot;2026-10-01&quot;, &quot;2026-10-01&quot;, &quot;2026-10-02&quot;, &quot;2026-10-30&quot;, &quot;2026-10-02&quot;]
+print(len(set(dates)))</code></pre><div class="output">3</div></div>
+        <p><b>How it works:</b> In Hive: <code>SELECT COUNT(DISTINCT order_date) FROM orders</code>. Real lab: 30. Compare with the max partition limits before running.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Folder name for NULL</h4></div>
+      <p>Print the partition folder for each value, using Hive’s default name for NULL.</p>
+      <div class="prob__io"><div><small>Input</small><pre>[&quot;Pune&quot;, None]</pre></div><div><small>Expected output</small><pre>ref_city=Pune
+ref_city=__HIVE_DEFAULT_PARTITION__</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>for v in [&quot;Pune&quot;, None]:
+    print(&quot;ref_city=&quot; + (v if v is not None else &quot;__HIVE_DEFAULT_PARTITION__&quot;))</code></pre><div class="output">ref_city=Pune
+ref_city=__HIVE_DEFAULT_PARTITION__</div></div>
+        <p><b>How it works:</b> Controlled by <code>hive.exec.default.partition.name</code>.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Is this clause strict-safe?</h4></div>
+      <p>Check whether a PARTITION clause has at least one static value.</p>
+      <div class="prob__io"><div><small>Input</small><pre>three clauses</pre></div><div><small>Expected output</small><pre>{&#x27;order_date&#x27;: None} Error 10096
+{&#x27;order_date&#x27;: &#x27;2026-10-06&#x27;, &#x27;city&#x27;: None} OK in strict
+{&#x27;order_date&#x27;: None, &#x27;city&#x27;: None} Error 10096</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>clauses = [{&quot;order_date&quot;: None}, {&quot;order_date&quot;: &quot;2026-10-06&quot;, &quot;city&quot;: None}, {&quot;order_date&quot;: None, &quot;city&quot;: None}]
+for c in clauses:
+    print(c, &quot;OK in strict&quot; if any(v is not None for v in c.values()) else &quot;Error 10096&quot;)</code></pre><div class="output">{&#x27;order_date&#x27;: None} Error 10096
+{&#x27;order_date&#x27;: &#x27;2026-10-06&#x27;, &#x27;city&#x27;: None} OK in strict
+{&#x27;order_date&#x27;: None, &#x27;city&#x27;: None} Error 10096</div></div>
+        <p><b>How it works:</b> Only the mixed clause passes in strict mode.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Chunk a back-fill</h4></div>
+      <p>Split 30 days into runs of at most 10 partitions each.</p>
+      <div class="prob__io"><div><small>Input</small><pre>days 1–30, limit 10</pre></div><div><small>Expected output</small><pre>WHERE order_date BETWEEN &#x27;2026-10-01&#x27; AND &#x27;2026-10-10&#x27;
+WHERE order_date BETWEEN &#x27;2026-10-11&#x27; AND &#x27;2026-10-20&#x27;
+WHERE order_date BETWEEN &#x27;2026-10-21&#x27; AND &#x27;2026-10-30&#x27;</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>days = [f&quot;2026-10-{d:02d}&quot; for d in range(1, 31)]
+for i in range(0, len(days), 10):
+    chunk = days[i:i + 10]
+    print(f&quot;WHERE order_date BETWEEN &#x27;{chunk[0]}&#x27; AND &#x27;{chunk[-1]}&#x27;&quot;)</code></pre><div class="output">WHERE order_date BETWEEN &#x27;2026-10-01&#x27; AND &#x27;2026-10-10&#x27;
+WHERE order_date BETWEEN &#x27;2026-10-11&#x27; AND &#x27;2026-10-20&#x27;
+WHERE order_date BETWEEN &#x27;2026-10-21&#x27; AND &#x27;2026-10-30&#x27;</div></div>
+        <p><b>How it works:</b> Three INSERT OVERWRITE runs. Each stays under the limit and can be re-run on its own.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Detect bogus partitions</h4></div>
+      <p>Find partition values that are not valid payment modes.</p>
+      <div class="prob__io"><div><small>Input</small><pre>SHOW PARTITIONS output</pre></div><div><small>Expected output</small><pre>[&#x27;payment=480.00&#x27;, &#x27;payment=170.00&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>valid = {&quot;UPI&quot;, &quot;Card&quot;, &quot;COD&quot;, &quot;Wallet&quot;}
+parts = [&quot;payment=480.00&quot;, &quot;payment=Card&quot;, &quot;payment=UPI&quot;, &quot;payment=170.00&quot;]
+print([p for p in parts if p.split(&quot;=&quot;, 1)[1] not in valid])</code></pre><div class="output">[&#x27;payment=480.00&#x27;, &#x27;payment=170.00&#x27;]</div></div>
+        <p><b>How it works:</b> Real lab: 69 bogus partitions; <code>ALTER TABLE pay_by_mode DROP PARTITION (payment &lt; 'A')</code> removed them.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>What MSCK will add</h4></div>
+      <p>List the folders that MSCK (ADD) will register.</p>
+      <div class="prob__io"><div><small>Input</small><pre>folders vs metastore</pre></div><div><small>Expected output</small><pre>[&#x27;dt=2026-10-02&#x27;, &#x27;dt=2026-10-03&#x27;]</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>folders = {&quot;dt=2026-10-01&quot;, &quot;dt=2026-10-02&quot;, &quot;dt=2026-10-03&quot;}
+meta = {&quot;dt=2026-10-01&quot;}
+print(sorted(folders - meta))</code></pre><div class="output">[&#x27;dt=2026-10-02&#x27;, &#x27;dt=2026-10-03&#x27;]</div></div>
+        <p><b>How it works:</b> The set difference: 10-02 and 10-03, exactly what our second MSCK added.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Daily registration script</h4></div>
+      <p>Generate the ALTER statements for the days that arrived since the last run.</p>
+      <div class="prob__io"><div><small>Input</small><pre>last registered 2026-10-03, today 2026-10-06</pre></div><div><small>Expected output</small><pre>ALTER TABLE app_clicks ADD IF NOT EXISTS PARTITION (dt=&#x27;2026-10-04&#x27;);
+ALTER TABLE app_clicks ADD IF NOT EXISTS PARTITION (dt=&#x27;2026-10-05&#x27;);</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>from datetime import date, timedelta
+last, today = date(2026, 10, 3), date(2026, 10, 6)
+d = last + timedelta(days=1)
+while d &lt; today:
+    print(f&quot;ALTER TABLE app_clicks ADD IF NOT EXISTS PARTITION (dt=&#x27;{d}&#x27;);&quot;)
+    d += timedelta(days=1)</code></pre><div class="output">ALTER TABLE app_clicks ADD IF NOT EXISTS PARTITION (dt=&#x27;2026-10-04&#x27;);
+ALTER TABLE app_clicks ADD IF NOT EXISTS PARTITION (dt=&#x27;2026-10-05&#x27;);</div></div>
+        <p><b>How it works:</b> Two statements (10-04 and 10-05). Cheaper than MSCK on a table with years of folders, and safe to repeat.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Estimate small files</h4></div>
+      <p>A dynamic insert runs with 50 map tasks over 30 days, and every task sees every day. How many files are written, and how many with DISTRIBUTE BY order_date?</p>
+      <div class="prob__io"><div><small>Input</small><pre>50 tasks, 30 days</pre></div><div><small>Expected output</small><pre>without DISTRIBUTE BY: 1500
+with DISTRIBUTE BY   : 30</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>tasks, days = 50, 30
+print(&quot;without DISTRIBUTE BY:&quot;, tasks * days)
+print(&quot;with DISTRIBUTE BY   :&quot;, days)</code></pre><div class="output">without DISTRIBUTE BY: 1500
+with DISTRIBUTE BY   : 30</div></div>
+        <p><b>How it works:</b> 1,500 files vs 30. Each file adds work for the NameNode and for every later query.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Dynamic partitions and MSCK appear in both fresher and data engineer interviews, usually with a “what went wrong” twist.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Hive</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“Static vs dynamic partitioning”</h4>
+      <p class="scn__situation">Explain the difference and when you would use each.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know how the value is chosen and the settings involved?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>Static: the value is written in the statement, e.g. <code>PARTITION (dt='2026-10-05')</code>; good for daily loads of a known day. Dynamic: <code>PARTITION (dt)</code> without a value, and Hive takes it from the last SELECT column, creating partitions as needed; good for back-fills. Dynamic needs <code>hive.exec.dynamic.partition=true</code>, and strict mode requires at least one static column. Limits: 1000 per statement, 100 per node by default.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Saying dynamic is “always better”.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Hundreds of strange partitions appeared</h4>
+      <p class="scn__situation">After a new back-fill job, SHOW PARTITIONS lists values like payment=480.00.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know that dynamic partitions are positional?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Check the SELECT: the partition column was not last.</li>
+          <li>Drop the bogus partitions (or recreate the table); a corrected OVERWRITE does not remove them.</li>
+          <li>Generate column lists from metadata, and alert when a load creates more partitions than expected.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> “Hive must have a bug”, without reading the SELECT.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data platform</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>The table is empty after a migration</h4>
+      <p class="scn__situation">Files were copied to the new cluster and the table was recreated with the same DDL, but SELECT COUNT(*) returns 0.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you know the metastore holds the partition list?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>The new metastore has the table but no partitions.</li>
+          <li>Run <code>MSCK REPAIR TABLE t</code> (set <code>hive.msck.path.validation=skip</code> if odd folders exist), then check counts per partition.</li>
+          <li>Re-add partitions with custom locations using ALTER … ADD PARTITION … LOCATION.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> “Reload all data”.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Analytics platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Every query on a table fails</h4>
+      <p class="scn__situation">Queries on the clicks table fail with “Input path does not exist”. A cleanup job ran last night.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you repair metastore/storage drift safely?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Identify missing folders: compare SHOW PARTITIONS with a listing of the location.</li>
+          <li>Drop exactly those partitions with ALTER TABLE … DROP PARTITION (plain MSCK only adds; SYNC may also drop custom-location partitions).</li>
+          <li>Change the cleanup job to drop partitions through Hive, so files and metadata go together.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Running MSCK … SYNC on a production table without checking which partitions it will drop.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Hive syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/hive.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

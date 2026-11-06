@@ -1,0 +1,1224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Resources and dynamic allocation | MyPhatshala</title>
+<meta name="description" content="Executor resources measured on a real Spark 4.3.0 standalone cluster: static allocation holding 4 executors, a spark.cores.max cap, dynamic allocation with shuffle tracking scaling 0 → 4 → 0 → 4 executors (with the ramp-up cost: 45.0 s vs 30.9 s), an executor larger than any worker waiting forever, and how to size executor cores, memory and counts.">
+<meta name="mp:minutes" content="28">
+<link rel="canonical" href="https://myphatshala.in/courses/spark-pyspark/08-performance-tuning/05-resources-and-dynamic-allocation/">
+<meta property="og:title" content="Resources and dynamic allocation · MyPhatshala">
+<meta property="og:description" content="Watch Spark dynamic allocation add and release executors on a real cluster, 0 → 4 → 0 → 4, and what it costs in start-up time.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Resources and dynamic allocation", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Spark and PySpark", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="08-performance-tuning/05-resources-and-dynamic-allocation" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Spark and PySpark syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Spark and PySpark</a><span>›</span><b>Lesson 8.5</b></nav>
+    <h1>Resources and dynamic allocation</h1>
+    <p class="lead">How many executors an application holds, and how big they are, decides both speed and cost. This lesson runs the same application on a real standalone cluster with static allocation, a <code>cores.max</code> cap, <b>dynamic allocation</b>, and an executor too big to fit. <b>All outputs are real</b> (Spark 4.3.0).</p>
+    <div class="lesson-meta"><span>Module 8 · Performance tuning</span><span>⏱ 28 min</span><span>Intermediate → Advanced</span><span>Spark 4.3.0 cluster</span><span>Executor timeline</span><span>Dynamic allocation</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Our cluster is full, but nothing is running”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> architecture in <a href="../../01-introduction/03-spark-architecture/">1.3</a>, the lab cluster in <a href="../../01-introduction/05-install-pyspark-and-a-spark-cluster/">1.5</a>, memory in <a href="../04-memory-spill-and-oom/">8.4</a>.</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s shared cluster kept rejecting new jobs. The UI showed every core taken, yet most applications were notebooks sitting idle for hours, each holding the executors it got at start-up.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Executors are the processes that run Spark tasks; their number, cores and memory decide how much work runs at once. On a two-worker standalone cluster we held 4 executors statically, then let dynamic allocation add and remove them, and asked for executors bigger than any worker.">
+        <text x="14" y="24" font-size="7.4" font-weight="700" class="s-ink2">executors over time (dynamic allocation)</text><rect x="24" y="34" width="340" height="70" rx="6" class="s-card2" style="stroke:var(--line)"/><rect x="39.111111111111114" y="108" width="113.33333333333333" height="8" rx="2" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="255.7037037037037" y="108" width="100.74074074074073" height="8" rx="2" class="s-soft-blue" style="stroke:var(--blue)"/><path d="M29.0,104.0 L74.4,104.0 L74.4,88.5 L79.4,88.5 L79.4,57.5 L89.5,57.5 L89.5,42.0 L187.7,42.0 L187.7,73.0 L192.7,73.0 L192.7,104.0 L278.4,104.0 L278.4,88.5 L283.4,88.5 L283.4,73.0 L288.4,73.0 L288.4,57.5 L293.5,57.5 L293.5,42.0 L356.4,42.0 L356.4,42.0" fill="none" stroke="var(--green)" stroke-width="2"/><text x="20" y="44" text-anchor="end" font-size="6.6" class="s-ink2">4</text><text x="20" y="104" text-anchor="end" font-size="6.6" class="s-ink2">0</text><text x="364" y="126" text-anchor="end" font-size="6.6" class="s-blue">blue = jobs running</text><rect x="400" y="12" width="232" height="132" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="516" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured (2-worker cluster)</text><text x="412" y="52" font-size="7.2" class="s-acc mono">static: 4 executors held</text><text x="412" y="68" font-size="7.2" class="s-acc mono">  for the whole 93 s</text><text x="412" y="84" font-size="7.2" class="s-green mono">dynamic: 0 → 4 → 0 → 4</text><text x="412" y="100" font-size="7.2" class="s-green mono">  released when idle</text><text x="412" y="116" font-size="7.2" class="s-red mono">cold start: +14 s</text><text x="412" y="132" font-size="7.2" class="s-red mono">3g executor: never starts</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Dynamic allocation gives cores back <tspan font-weight="700" class="s-acc">when you are idle</tspan>.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, an idle notebook is not running anything. Why does it keep the machines?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Because by default an application keeps the executors it asked for until it ends. <b>Dynamic allocation</b> lets Spark request executors when tasks are waiting and release them after they have been idle for a while.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>And how big should each executor be?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>That is the other half: cores, memory and how many executors. Today we run on a real standalone cluster: static vs dynamic, a <code>cores.max</code> cap, and an executor too big to fit anywhere. All outputs are real (Spark 4.3.0).</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Executor resources and dynamic allocation</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A Spark application’s capacity is the number of <b>executors</b> times their <b>cores</b> (task slots), each with a fixed heap (<code>spark.executor.memory</code>) and off-heap overhead. The cluster manager (standalone, YARN or Kubernetes) launches executors only on nodes with enough free cores and memory. With <b>static allocation</b>, the application keeps a fixed set of executors for its lifetime. With <b>dynamic allocation</b> (<code>spark.dynamicAllocation.enabled=true</code>), Spark requests more executors when tasks have been pending longer than <code>schedulerBacklogTimeout</code>, growing exponentially up to <code>maxExecutors</code>, and removes executors idle for <code>executorIdleTimeout</code>. Because removed executors may hold shuffle files, dynamic allocation needs an <b>external shuffle service</b> or <b>shuffle tracking</b>, which keeps executors with live shuffle data until <code>shuffleTracking.timeout</code>.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>An application runs tasks on executors; executors × cores is how many tasks run at once. Normally an app keeps its executors until it ends. With dynamic allocation, Spark asks for executors when work is waiting and gives them back when they sit idle, so shared clusters are used better.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Executor</b><span>JVM process that runs tasks.</span></div>
+    <div class="term"><b>Executor cores</b><span>Task slots per executor.</span></div>
+    <div class="term"><b>Cluster manager</b><span>Standalone, YARN, Kubernetes.</span></div>
+    <div class="term"><b>Static allocation</b><span>Fixed executors for the app’s life.</span></div>
+    <div class="term"><b>Dynamic allocation</b><span>Executors added/removed by load.</span></div>
+    <div class="term"><b>Backlog timeout</b><span>Pending time before asking for more.</span></div>
+    <div class="term"><b>Idle timeout</b><span>Idle time before release (60 s).</span></div>
+    <div class="term"><b>Shuffle tracking</b><span>Keep executors that hold shuffle data.</span></div>
+  </div>
+
+  <h3>Static vs dynamic</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th></th><th>Static</th><th>Dynamic</th><th>Lab</th></tr></thead>
+    <tbody><tr><td>Executors</td><td>Fixed (instances or all cores)</td><td>min … max, by backlog</td><td>4 vs 0→4→0→4</td></tr><tr><td>Idle cost</td><td>Holds resources</td><td>Releases after idle timeout</td><td>released ~15 s after job 1</td></tr><tr><td>Start-up</td><td>Ready immediately</td><td>Ramp-up delay</td><td>job 1: 30.9 s vs 45.0 s</td></tr><tr><td>Best for</td><td>Steady pipelines, SLAs</td><td>Shared clusters, notebooks, varying load</td><td></td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Resources at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Hiring delivery riders</h4>
+      <ul>
+        <li>Static: hire 50 riders for the whole day, even at 3 pm when nobody orders.</li>
+        <li>Dynamic: call riders in when orders queue up, send them home after 10 idle minutes. Cheaper, but the first orders of the dinner rush wait a bit.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The settings</h4>
+      <ul>
+        <li>Size: <code>spark.executor.cores</code>, <code>spark.executor.memory</code>, <code>spark.executor.instances</code> (static), <code>spark.cores.max</code> (standalone cap).</li>
+        <li>Dynamic: <code>spark.dynamicAllocation.enabled</code>, <code>…minExecutors</code>, <code>…maxExecutors</code>, <code>…executorIdleTimeout</code> (60 s), <code>…schedulerBacklogTimeout</code> (1 s), plus <code>…shuffleTracking.enabled</code> or an external shuffle service.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>Static: 4 one-core executors held from start to end (job 1 30.9 s, job 2 16.0 s).</li>
+        <li>Dynamic: 0 → 4 executors in 6 s once tasks queued, back to 0 after ~15 idle seconds, up again for job 2.</li>
+        <li>Asking for 3 GB executors on 2 GB workers: “Initial job has not accepted any resources”.</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “What is dynamic allocation?” Spark scales the number of executors of an application with its workload: it requests executors when tasks are backlogged (up to maxExecutors) and removes executors idle longer than executorIdleTimeout (default 60 s). It requires an external shuffle service or <code>spark.dynamicAllocation.shuffleTracking.enabled</code> so shuffle files are not lost. It improves utilisation of shared clusters at the cost of ramp-up latency.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Sizing executors</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th>Shape</th><th>Example</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody><tr><td>Tiny (1 core)</td><td>1 core, 1–2 GB</td><td>Fine-grained</td><td>No sharing of broadcasts/cache; JVM overhead per core</td></tr><tr><td>Balanced</td><td>4–5 cores, 16–32 GB</td><td>Good I/O throughput, shared broadcast</td><td>Common default</td></tr><tr><td>Fat (whole node)</td><td>32+ cores, 200 GB</td><td>Few JVMs</td><td>Long GC pauses, HDFS client contention</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p>An executor must fit on one worker: <b>cores and memory plus overhead</b>. Ask for more than any node has and Spark does not fail, it <b>waits forever</b>, logging “Initial job has not accepted any resources”. Also, cores are only as real as the hardware: our 2 workers advertise 4 cores on a host with 2 physical CPUs, which is why 4 executors were not faster than 2 in the lab.</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Executors on a real cluster</h2>
+  <p>All outputs are real: Spark 4.3.0 standalone cluster in Docker, 1 master and 2 workers with 2 cores and 2 GB each (host: 2 physical CPUs). Each run submits the same application: wait 6 s, job 1 (30M SHA hashes), idle 40 s, job 2. A thread polls <code>/api/v1/applications/…/executors</code> every 2 s.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Static allocation</h4>
+      <div class="code" data-lang="bash" data-file="submit"><pre><code>spark-submit --master spark://spark-master:7077 \
+  --conf spark.executor.cores=1 --conf spark.executor.memory=1g \
+  /jobs/l85_resources.py</code></pre><div class="output">### --conf spark.executor.cores=1 --conf spark.executor.memory=1g
+spark.executor.cores = 1
+spark.executor.memory = 1g
+spark.cores.max = (default)
+spark.dynamicAllocation.enabled = (default)
+spark.dynamicAllocation.maxExecutors = (default)
+[ 37s] job 1: 30.9 s
+[ 37s] idle 40 s ...
+[ 93s] job 2: 16.0 s
+executors over time (t s, executors, cores): [(6, 4, 4)]</div></div>
+      <span class="behind">With 1-core executors, the standalone master started <b>4 executors</b> (2 per worker) and the app kept all 4 for its whole life, including the 40 idle seconds. Job 1 (30.9 s) includes JVM warm-up; job 2 took 16.0 s.</span></li>
+    <li><h4>Step 2 · Capping with cores.max</h4>
+      <div class="code" data-lang="bash" data-file="submit"><pre><code>spark-submit … --conf spark.cores.max=2 --conf spark.executor.cores=1 /jobs/l85_resources.py</code></pre><div class="output">### --conf spark.cores.max=2 --conf spark.executor.cores=1
+spark.cores.max = 2
+[ 31s] job 1: 24.5 s
+[ 31s] idle 40 s ...
+[ 85s] job 2: 14.1 s
+executors over time (t s, executors, cores): [(2, 2, 2)]</div></div>
+      <span class="behind">On standalone, an app takes all free cores unless capped. With <code>cores.max=2</code> it got <b>2 executors</b>, leaving 2 cores for other apps, and was not slower (24.5 s / 14.1 s), because our host has only 2 physical CPUs. Advertised cores beyond the real CPUs only add contention.</span></li>
+    <li><h4>Step 3 · Dynamic allocation</h4>
+      <div class="code" data-lang="bash" data-file="submit"><pre><code>spark-submit … --conf spark.executor.cores=1 --conf spark.executor.memory=1g \
+  --conf spark.dynamicAllocation.enabled=true \
+  --conf spark.dynamicAllocation.shuffleTracking.enabled=true \
+  --conf spark.dynamicAllocation.executorIdleTimeout=10s \
+  --conf spark.dynamicAllocation.shuffleTracking.timeout=10s \
+  --conf spark.dynamicAllocation.minExecutors=0 --conf spark.dynamicAllocation.maxExecutors=4 \
+  /jobs/l85_resources.py</code></pre><div class="output">spark.executor.cores = 1
+spark.executor.memory = 1g
+spark.cores.max = (default)
+spark.dynamicAllocation.enabled = true
+spark.dynamicAllocation.maxExecutors = 4
+[ 51s] job 1: 45.0 s
+[ 51s] idle 40 s ...
+[132s] job 2: 41.3 s
+executors over time (t s, executors, cores): [(2, 0, 0), (20, 1, 1), (22, 3, 3), (26, 4, 4), (65, 2, 2), (67, 0, 0), (101, 1, 1), (103, 2, 2), (105, 3, 3), (107, 4, 4)]</div></div>
+      <span class="behind">The timeline tells the story. At 2 s: <b>0</b> executors. Job 1 queued tasks, so Spark requested 1, then 3, then 4 executors (20–26 s). After job 1 finished, idle executors were released (2 at 65 s, 0 at 67 s). Job 2 brought them back (101–107 s). The cost: every job started cold, so job 1 took 45.0 s and job 2 41.3 s instead of 30.9 s and 16.0 s. Production idle timeouts are longer (60 s default) to avoid that churn.</span></li>
+    <li><h4>Step 4 · An executor that does not fit</h4>
+      <div class="code" data-lang="bash" data-file="submit"><pre><code>spark-submit … --conf spark.executor.memory=3g /jobs/l85_resources.py   # workers have 2g</code></pre><div class="output">### --conf spark.executor.memory=3g  (workers have 2g each)
+TaskSchedulerImpl: Initial job has not accepted any resources; check your cluster UI to ensure that workers are registered and have sufficient resources</div></div>
+      <span class="behind">No error, no executors. The app waited, logging this warning every 15 s, until we killed it. In the master UI its state was <b>WAITING</b> with 0 cores. Always check executor size against node size, including memory overhead on YARN and Kubernetes.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>How many executors, when</h2>
+  <p>Left: real cluster outputs. Right: what the cluster manager does.</p>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">How many executors, when <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real cluster outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">static: executors over time</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">[(6, 4, 4)]</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">job 1 30.9 s | job 2 16.0 s</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">cores.max=2: [(2, 2, 2)]</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">job 1 24.5 s | job 2 14.1 s</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">dynamic: (2,0) (20,1) (22,3) (26,4)</text><text x="26" y="64" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">(65,2) (67,0)  released</text><text x="26" y="78" font-size="7.0" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">(101,1) ... (107,4) again</text><text x="26" y="92" font-size="7.0" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">job 1 45.0 s | job 2 41.3 s</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">executor.memory=3g</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Initial job has not accepted</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">any resources</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Static allocation.</li>
+          <li>cores.max cap.</li>
+          <li>Dynamic allocation.</li>
+          <li>Too-big executor.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What the cluster does">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Static: hold everything</text><rect x="24" y="40" width="320" height="60" rx="6" class="s-card2" style="stroke:var(--line)"/><rect x="38.22222222222222" y="104" width="73.48148148148148" height="8" rx="2" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="206.51851851851853" y="104" width="37.925925925925924" height="8" rx="2" class="s-soft-blue" style="stroke:var(--blue)"/><path d="M24.0,48.0 L344.0,48.0 L344.0,48.0" fill="none" stroke="var(--green)" stroke-width="2"/><text x="20" y="50" text-anchor="end" font-size="6.6" class="s-ink2">4</text><text x="20" y="100" text-anchor="end" font-size="6.6" class="s-ink2">0</text><text x="344" y="122" text-anchor="end" font-size="6.6" class="s-blue">blue = jobs running</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Idle cores stay reserved.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">cores.max caps the app</text><rect x="30" y="50" width="70" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="65.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">core 1</text><text x="65.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">app</text><rect x="110" y="50" width="70" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="145.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">core 2</text><text x="145.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">app</text><rect x="190" y="50" width="70" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="225.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">core 3</text><text x="225.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">free</text><rect x="270" y="50" width="70" height="30" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="305.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">core 4</text><text x="305.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">free</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Room for other apps.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Dynamic: follow the backlog</text><rect x="24" y="40" width="320" height="60" rx="6" class="s-card2" style="stroke:var(--line)"/><rect x="38.22222222222222" y="104" width="106.66666666666666" height="8" rx="2" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="242.07407407407408" y="104" width="94.81481481481481" height="8" rx="2" class="s-soft-blue" style="stroke:var(--blue)"/><path d="M28.7,100.0 L71.4,100.0 L71.4,87.0 L76.1,87.0 L76.1,61.0 L85.6,61.0 L85.6,48.0 L178.1,48.0 L178.1,74.0 L182.8,74.0 L182.8,100.0 L263.4,100.0 L263.4,87.0 L268.1,87.0 L268.1,74.0 L272.9,74.0 L272.9,61.0 L277.6,61.0 L277.6,48.0 L336.9,48.0 L336.9,48.0" fill="none" stroke="var(--green)" stroke-width="2"/><text x="20" y="50" text-anchor="end" font-size="6.6" class="s-ink2">4</text><text x="20" y="100" text-anchor="end" font-size="6.6" class="s-ink2">0</text><text x="344" y="122" text-anchor="end" font-size="6.6" class="s-blue">blue = jobs running</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Add on backlog, remove when idle.</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Must fit on one worker</text><rect x="30" y="46" width="130" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="95.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">worker</text><text x="95.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">2 cores · 2 GB</text><rect x="200" y="46" width="130" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="265.0" y="57" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">executor ask</text><text x="265.0" y="67" text-anchor="middle" font-size="6.4" class="s-ink2 mono">3 GB</text><text x="180" y="110" text-anchor="middle" font-size="7.6" class="s-red">never placed → app WAITING</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Size executors from nodes.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Fixed executors.</li>
+          <li>Sharing a standalone cluster.</li>
+          <li>Scale up and down.</li>
+          <li>Placement constraints.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: idle notebooks, an SLA job, and an executor that never fits.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-notebooks">The full but idle cluster</h3>
+  <p class="anim-intro">Dynamic allocation for notebooks. (Typical; timeline from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Dynamic allocation <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Dynamic allocation releases idle executors from interactive sessions">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">30 notebooks, all idle</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">each holding 10 executors</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cluster “full”.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Enable dynamic allocation</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">min 0, idle timeout 10 min</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Plus shuffle tracking.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Idle notebooks release</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">0 → 4 → 0 in our lab</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Cores return to the pool.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">First query waits a bit</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">executor start-up seconds</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Acceptable for notebooks.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">More users per cluster</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">same hardware</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lower cost.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Idle.</li>
+          <li>Enable.</li>
+          <li>Release.</li>
+          <li>Ramp-up.</li>
+          <li>Shared.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-sla">When dynamic is too slow</h3>
+  <p class="anim-intro">Ramp-up latency vs utilisation. (Typical; timings from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Ramp-up <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Dynamic allocation adds start-up latency; use minExecutors or static allocation for SLA jobs">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly job has an SLA</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">must finish by 6 am</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Predictability matters.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Dynamic: slow ramp-up</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">cold executors per stage gap</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">45.0 s vs 30.9 s in our lab.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Raise minExecutors</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">or initialExecutors</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Warm baseline.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or static for this job</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">spark.executor.instances=40</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Dedicated window.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Measure both</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">runtime and cluster cost</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Pick per workload.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>SLA.</li>
+          <li>Ramp-up.</li>
+          <li>Baseline.</li>
+          <li>Static.</li>
+          <li>Measure.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-fit">The job that never started</h3>
+  <p class="anim-intro">Executor sizing vs node capacity. (Typical; warning reproduced in our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Placement <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Executors bigger than any node, or full queues, leave an app waiting without an error">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Job stuck at 0 tasks</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">no errors for 20 minutes</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Logs: not accepted any resources.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check executor size</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">30g + 3g overhead per executor</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nodes have 32 GB.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or the queue is full</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">YARN queue / K8s quota</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same symptom.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Resize to fit nodes</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">5 cores, 20g + 2g overhead</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Several per node.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Executors start in seconds</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">tasks flow</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fixed.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Stuck.</li>
+          <li>Too big.</li>
+          <li>Queue.</li>
+          <li>Resize.</li>
+          <li>Running.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Resource management at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">shared</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">clusters</text></svg></div>
+    <div><h4>1. Shared analytics clusters</h4>
+      <p>Dynamic allocation with min 0 lets dozens of notebooks share one cluster.</p>
+      <div class="uc-flow"><span>Idle session</span><i>→</i><span class="java">release</span><i>→</i><span>Free cores</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-green">SLA</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">pipelines</text></svg></div>
+    <div><h4>2. SLA pipelines</h4>
+      <p>Critical nightly jobs use static executors or a high minExecutors for predictable runtimes.</p>
+      <div class="uc-flow"><span>Nightly job</span><i>→</i><span class="java">static</span><i>→</i><span>On time</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-violet">K8s</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">autoscale</text></svg></div>
+    <div><h4>3. Kubernetes autoscaling</h4>
+      <p>Dynamic allocation with shuffle tracking adds executor pods; the node autoscaler adds nodes.</p>
+      <div class="uc-flow"><span>Backlog</span><i>→</i><span class="java">more pods</span><i>→</i><span>More nodes</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">shape</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">executors</text></svg></div>
+    <div><h4>4. Executor shapes</h4>
+      <p>Platform teams publish standard small/medium/large executor shapes that fit their nodes.</p>
+      <div class="uc-flow"><span>Node size</span><i>→</i><span class="java">shape</span><i>→</i><span>Fits</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">cost</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">reports</text></svg></div>
+    <div><h4>5. Cost reports</h4>
+      <p>Executor-hours per application from the history server show which jobs hold idle resources.</p>
+      <div class="uc-flow"><span>History server</span><i>→</i><span class="java">executor-hours</span><i>→</i><span>Cost owner</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: sizing executors</h2>
+  <p>A common starting point for executor shapes. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># Sizing executors for a node (a common rule of thumb)
+node_cores, node_mem_gb = 16, 64
+reserve_cores, reserve_mem_gb = 1, 4          # OS and daemons
+cores_per_exec = 5
+
+execs = (node_cores - reserve_cores) // cores_per_exec
+mem_per_exec = (node_mem_gb - reserve_mem_gb) / execs
+overhead = max(0.384, mem_per_exec * 0.10 / 1.10)
+heap = mem_per_exec - overhead
+print(&quot;executors per node :&quot;, execs)
+print(&quot;executor.memory    :&quot;, round(heap, 1), &quot;GB&quot;)
+print(&quot;memoryOverhead     :&quot;, round(overhead, 1), &quot;GB&quot;)</code></pre><div class="output">executors per node : 3
+executor.memory    : 18.2 GB
+memoryOverhead     : 1.8 GB</div></div>
+  <ul class="anno"><li><code>cores_per_exec = 5</code><span>About 4–5 cores per executor is a widely used balance between parallelism and per-JVM overhead.</span></li><li><code>overhead = max(0.384, mem_per_exec * 0.10 / 1.10)</code><span>Container size = heap + overhead; overhead defaults to 10% of the heap, at least 384 MB.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Then try a 32-core, 256 GB node.",
+   "code": "# Sizing executors for a node (a common rule of thumb)\nnode_cores, node_mem_gb = 16, 64\nreserve_cores, reserve_mem_gb = 1, 4          # OS and daemons\ncores_per_exec = 5\n\nexecs = (node_cores - reserve_cores) // cores_per_exec\nmem_per_exec = (node_mem_gb - reserve_mem_gb) / execs\noverhead = max(0.384, mem_per_exec * 0.10 / 1.10)\nheap = mem_per_exec - overhead\nprint(\"executors per node :\", execs)\nprint(\"executor.memory    :\", round(heap, 1), \"GB\")\nprint(\"memoryOverhead     :\", round(overhead, 1), \"GB\")\n"
+  },
+  {
+   "label": "2 · Predict first: does it fit?",
+   "hint": "<b>Predict first:<\/b> 3 GB executor on 2 GB workers?",
+   "code": "worker_gb, ask_gb = 2, 3\nprint(\"placed\" if ask_gb <= worker_gb else \"WAITING: Initial job has not accepted any resources\")\n"
+  },
+  {
+   "label": "3 · Cluster capacity",
+   "hint": "Task slots in a 10-node cluster.",
+   "code": "nodes, execs_per_node, cores = 10, 3, 5\nprint(nodes * execs_per_node * cores, \"tasks at once\")\n"
+  },
+  {
+   "label": "4 · Dynamic ramp-up",
+   "hint": "Executors requested per round (doubling) until max.",
+   "code": "n, mx, rounds = 1, 20, []\nwhile sum(rounds) < mx:\n    rounds.append(min(n, mx - sum(rounds))); n *= 2\nprint(rounds)\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "Dynamic allocation without a shuffle service or tracking.",
+   "code": "conf = {\"spark.dynamicAllocation.enabled\": \"true\"}\nassert conf.get(\"spark.dynamicAllocation.shuffleTracking.enabled\") == \"true\" or conf.get(\"spark.shuffle.service.enabled\") == \"true\", \\\n    \"removing executors would lose shuffle files: enable shuffleTracking or the external shuffle service\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your cluster: executors</h3>
+  <p>On the lab cluster from Lesson 1.5. <b>Outputs are real</b> (Spark 4.3.0).</p>
+  <div class="pcrun"><h4>1 · Workers</h4>
+  <div class="code" data-lang="bash" data-file="bash"><pre><code>curl -s localhost:8090/json/ | python3 -c &quot;import json,sys;d=json.load(sys.stdin);print(d[&#x27;status&#x27;],len(d[&#x27;workers&#x27;]),d[&#x27;cores&#x27;])&quot;</code></pre><div class="output">ALIVE 2 4</div></div>
+  <p class="muted">2 workers, 4 cores.</p></div>
+  <div class="pcrun"><h4>2 · Executors of an app</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>spark.sparkContext.getConf().get(&quot;spark.dynamicAllocation.enabled&quot;, &quot;false&quot;)</code></pre><div class="output">&#x27;true&#x27;</div></div>
+  <p class="muted">Then watch the Executors tab.</p></div>
+  <div class="pcrun"><h4>3 · Too big</h4>
+  <div class="code" data-lang="bash" data-file="bash"><pre><code>spark-submit … --conf spark.executor.memory=3g job.py</code></pre><div class="output">WARN TaskSchedulerImpl: Initial job has not accepted any resources; check your cluster UI to ensure that workers are registered and have sufficient resources</div></div>
+  <p class="muted">Waits forever.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Dynamic allocation decisions</h2>
+  <p>Follow Spark adding and removing executors.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "pending, execs, idle_s = 40, 0, 0",
+  "want = min(4, pending)",
+  "execs = want",
+  "pending = 0",
+  "idle_s = 15",
+  "if idle_s > 10:",
+  "    execs = 0",
+  "print(execs)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>pending<\/code> is created: 40. <code>execs<\/code> is created: 0. <code>idle_s<\/code> is created: 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pending",
+       "40"
+      ],
+      [
+       "execs",
+       "0"
+      ],
+      [
+       "idle_s",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "idle_s"
+  },
+  {
+   "line": 2,
+   "phase": "Backlog",
+   "note": "Tasks pending → request up to max. <code>want<\/code> is created: 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pending",
+       "40"
+      ],
+      [
+       "execs",
+       "0"
+      ],
+      [
+       "idle_s",
+       "0"
+      ],
+      [
+       "want",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "want"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>execs<\/code> changes to 4.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pending",
+       "40"
+      ],
+      [
+       "execs",
+       "4"
+      ],
+      [
+       "idle_s",
+       "0"
+      ],
+      [
+       "want",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "execs"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>pending<\/code> changes to 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pending",
+       "0"
+      ],
+      [
+       "execs",
+       "4"
+      ],
+      [
+       "idle_s",
+       "0"
+      ],
+      [
+       "want",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "pending"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "<code>idle_s<\/code> changes to 15.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pending",
+       "0"
+      ],
+      [
+       "execs",
+       "4"
+      ],
+      [
+       "idle_s",
+       "15"
+      ],
+      [
+       "want",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "idle_s"
+  },
+  {
+   "line": 6,
+   "phase": "Idle",
+   "note": "After the idle timeout, release. The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pending",
+       "0"
+      ],
+      [
+       "execs",
+       "4"
+      ],
+      [
+       "idle_s",
+       "15"
+      ],
+      [
+       "want",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>execs<\/code> changes to 0.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pending",
+       "0"
+      ],
+      [
+       "execs",
+       "0"
+      ],
+      [
+       "idle_s",
+       "15"
+      ],
+      [
+       "want",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "execs"
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "pending",
+       "0"
+      ],
+      [
+       "execs",
+       "0"
+      ],
+      [
+       "idle_s",
+       "15"
+      ],
+      [
+       "want",
+       "4"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "0\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three resource decisions at TiffinGo.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Resources · capacity</span></div>
+    <h4>How many tasks run at once?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>20 executors with 4 cores each.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>20 × 4</pre></div><div><small>Expected output</small><pre>80 slots, 5.0 waves</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Task slots = executors × cores.</li><li>A stage of 400 tasks runs in waves.</li><li>Divide.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 1.",
+   "code": "slots = 20 * 4\nprint(slots, \"slots,\", 400 / slots, \"waves\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "slots = 20 * 4",
+  "print(slots, \"slots,\", 400 / slots, \"waves\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Slots",
+   "note": "spark.task.cpus = 1 by default. <code>slots<\/code> is created: 80.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "slots",
+       "80"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "slots"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "slots",
+       "80"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "80 slots, 5.0 waves\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Resources · dynamic</span></div>
+    <h4>Configure a notebook cluster</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Notebooks should release resources after 10 minutes.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>shared cluster</pre></div><div><small>Expected output</small><pre>4 settings</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Enable dynamic allocation.</li><li>Shuffle tracking.</li><li>Idle timeout 600 s, min 0.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 3.",
+   "code": "conf = {\n  \"spark.dynamicAllocation.enabled\": \"true\",\n  \"spark.dynamicAllocation.shuffleTracking.enabled\": \"true\",\n  \"spark.dynamicAllocation.executorIdleTimeout\": \"600s\",\n  \"spark.dynamicAllocation.minExecutors\": \"0\",\n}\nprint(len(conf), \"settings\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "conf = {",
+  "  \"spark.dynamicAllocation.enabled\": \"true\",",
+  "  \"spark.dynamicAllocation.shuffleTracking.enabled\": \"true\",",
+  "  \"spark.dynamicAllocation.executorIdleTimeout\": \"600s\",",
+  "  \"spark.dynamicAllocation.minExecutors\": \"0\",",
+  "}",
+  "print(len(conf), \"settings\")"
+ ],
+ "steps": [
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 3,
+   "phase": "Idle",
+   "note": "Default is 60 s.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>conf<\/code> is created: → dict #1. A new dict object (#1) is created: {&#x27;spark.dynamicAlloc…: &#x27;true&#x27;, &#x27;spark.dynamicAlloc…: &#x27;true&#x27;, &#x27;spark.dynamicAlloc…: &#x27;600s&#x27;…",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "conf",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;spark.dynamicAlloc…: &#x27;true&#x27;, &#x27;spark.dynamicAlloc…: &#x27;true&#x27;, &#x27;spark.dynamicAlloc…: &#x27;600s&#x27;…"
+   ],
+   "newVar": "conf"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "conf",
+       "→ dict #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 dict (4)<\/b> {&#x27;spark.dynamicAlloc…: &#x27;true&#x27;, &#x27;spark.dynamicAlloc…: &#x27;true&#x27;, &#x27;spark.dynamicAlloc…: &#x27;600s&#x27;…"
+   ],
+   "out": "4 settings\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Resources · sizing</span></div>
+    <h4>Why is my app waiting?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>An app shows 0 executors; nodes have 32 GB.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>executor.memory 30g</pre></div><div><small>Expected output</small><pre>never placed</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Container = heap + overhead.</li><li>30 + 3 > 32.</li><li>Shrink the executor.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 4.",
+   "code": "heap, node = 30, 32\nprint(\"fits\" if heap + max(0.384, heap * 0.1) <= node else \"never placed\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "heap, node = 30, 32",
+  "print(\"fits\" if heap + max(0.384, heap * 0.1) <= node else \"never placed\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Overhead",
+   "note": "Counts on YARN/Kubernetes. <code>heap<\/code> is created: 30. <code>node<\/code> is created: 32.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "heap",
+       "30"
+      ],
+      [
+       "node",
+       "32"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "node"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "heap",
+       "30"
+      ],
+      [
+       "node",
+       "32"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "never placed\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: Task slots of an app =",
+  "options": [
+   "executors",
+   "cores ÷ executors",
+   "executors × cores",
+   "partitions"
+  ],
+  "answer": 2,
+  "why": "One task per core."
+ },
+ {
+  "q": "Beginner: Dynamic allocation does what?",
+  "options": [
+   "Caches data",
+   "Adds/removes executors by workload",
+   "Changes partitions",
+   "Picks joins"
+  ],
+  "answer": 1,
+  "why": "Backlog and idle timeouts."
+ },
+ {
+  "q": "Beginner: Default executorIdleTimeout?",
+  "options": [
+   "60 s",
+   "1 s",
+   "10 min",
+   "Never"
+  ],
+  "answer": 0,
+  "why": "We used 10 s in the lab."
+ },
+ {
+  "q": "Intermediate: Dynamic allocation needs…",
+  "options": [
+   "Nothing",
+   "Kubernetes only",
+   "AQE off",
+   "Shuffle tracking or an external shuffle service"
+  ],
+  "answer": 3,
+  "why": "Shuffle files must survive."
+ },
+ {
+  "q": "Intermediate: Lab cost of dynamic allocation?",
+  "options": [
+   "None",
+   "Wrong results",
+   "Ramp-up: 45.0 s vs 30.9 s",
+   "More spill"
+  ],
+  "answer": 2,
+  "why": "Cold executors."
+ },
+ {
+  "q": "Intermediate: On standalone, cap an app’s cores with…",
+  "options": [
+   "spark.task.cpus",
+   "spark.cores.max",
+   "shuffle.partitions",
+   "maxResultSize"
+  ],
+  "answer": 1,
+  "why": "Otherwise it takes all free cores."
+ },
+ {
+  "q": "Advanced: 3 GB executor on 2 GB workers?",
+  "options": [
+   "Waits: has not accepted any resources",
+   "OOM",
+   "Runs with 2 GB",
+   "Uses disk"
+  ],
+  "answer": 0,
+  "why": "Never placed."
+ },
+ {
+  "q": "Advanced: Why not one 64-core executor per node?",
+  "options": [
+   "Not allowed",
+   "Faster",
+   "Less memory",
+   "Long GC pauses and contention"
+  ],
+  "answer": 3,
+  "why": "4–5 cores per executor is common."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 8.5 in one screen</h3>
+    <ul><li>Capacity = executors × cores; each executor = heap + overhead on one node.</li><li>Static: executors held for the app’s life (4 held through idle time).</li><li><code>spark.cores.max</code> caps an app on standalone.</li><li>Dynamic: add on backlog, remove after idle timeout; lab 0→4→0→4.</li><li>Needs shuffle tracking or external shuffle service.</li><li>Ramp-up cost: 45.0 s vs 30.9 s; use minExecutors/static for SLAs.</li><li>Too-big executors never start: “has not accepted any resources”.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Is dynamic allocation on by default?</summary><p>No in open-source Spark; many platforms (Databricks autoscaling, EMR, Dataproc) enable it or an equivalent by default.</p></details>
+    <details><summary>What is the external shuffle service?</summary><p>A long-running process on each node that serves shuffle files, so executors can be removed without losing them.</p></details>
+    <details><summary>Does dynamic allocation work with Structured Streaming?</summary><p>Classic dynamic allocation is not designed for streaming; streaming has its own considerations.</p></details>
+    <details><summary>How many cores per executor?</summary><p>Commonly 4–5; more can hurt I/O throughput and GC, fewer wastes memory on per-JVM overhead.</p></details>
+    <details><summary>Why were 4 executors not faster than 2 in the lab?</summary><p>The host had only 2 physical CPUs; extra advertised cores just shared them.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs about executor resources.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Slots</h4></div>
+      <p>Task slots for 12 executors of 5 cores.</p>
+      <div class="prob__io"><div><small>Input</small><pre>12, 5</pre></div><div><small>Expected output</small><pre>60</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(12 * 5)</code></pre><div class="output">60</div></div>
+        <p><b>How it works:</b> 60 tasks at once.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Waves</h4></div>
+      <p>Waves for 1,000 tasks on 60 slots.</p>
+      <div class="prob__io"><div><small>Input</small><pre>1000, 60</pre></div><div><small>Expected output</small><pre>17</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import math
+print(math.ceil(1000 / 60))</code></pre><div class="output">17</div></div>
+        <p><b>How it works:</b> 17 waves.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Overhead</h4></div>
+      <p>Overhead for a 20 GB heap.</p>
+      <div class="prob__io"><div><small>Input</small><pre>20 GB</pre></div><div><small>Expected output</small><pre>2.0 GB</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(max(0.384, 20 * 0.1), &quot;GB&quot;)</code></pre><div class="output">2.0 GB</div></div>
+        <p><b>How it works:</b> 2 GB.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Executors per node</h4></div>
+      <p>5-core executors on a 32-core node with 1 reserved.</p>
+      <div class="prob__io"><div><small>Input</small><pre>32 cores</pre></div><div><small>Expected output</small><pre>6</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print((32 - 1) // 5)</code></pre><div class="output">6</div></div>
+        <p><b>How it works:</b> 6 executors.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Fits?</h4></div>
+      <p>Does 24g heap fit a 28 GB node budget?</p>
+      <div class="prob__io"><div><small>Input</small><pre>24 + overhead</pre></div><div><small>Expected output</small><pre>True</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(24 + max(0.384, 2.4) &lt;= 28)</code></pre><div class="output">True</div></div>
+        <p><b>How it works:</b> 26.4 GB.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Ramp-up overhead</h4></div>
+      <p>Extra seconds from dynamic allocation in the lab.</p>
+      <div class="prob__io"><div><small>Input</small><pre>45.0 vs 30.9</pre></div><div><small>Expected output</small><pre>14.1</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(45.0 - 30.9, 1))</code></pre><div class="output">14.1</div></div>
+        <p><b>How it works:</b> Executors started cold.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Idle executor-hours</h4></div>
+      <p>Executor-hours wasted by 30 idle notebooks with 10 executors for 6 h.</p>
+      <div class="prob__io"><div><small>Input</small><pre>30 × 10 × 6</pre></div><div><small>Expected output</small><pre>1800</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(30 * 10 * 6)</code></pre><div class="output">1800</div></div>
+        <p><b>How it works:</b> Dynamic allocation frees them.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Cost</h4></div>
+      <p>Daily cost at ₹8 per executor-hour.</p>
+      <div class="prob__io"><div><small>Input</small><pre>1,800 executor-hours</pre></div><div><small>Expected output</small><pre>₹ 14400</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(&quot;₹&quot;, 1800 * 8)</code></pre><div class="output">₹ 14400</div></div>
+        <p><b>How it works:</b> ₹14,400 per day.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Resource sizing questions check you understand clusters, not just code.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Spark</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is an executor?”</h4>
+      <p class="scn__situation">Explain executors and cores.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> parallelism?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p>An executor is a JVM process on a worker that runs tasks and stores cached data. Each executor has a number of cores; executors × cores is how many tasks the application can run at the same time.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Saying an executor is a machine.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Idle notebooks</h4>
+      <p class="scn__situation">Users complain the shared cluster is always full.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> fix?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Enable dynamic allocation with shuffle tracking, min 0.</li>
+          <li>Reasonable idle timeout (5–10 min for notebooks).</li>
+          <li>Cap maxExecutors per user/app.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Buying more nodes first.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>App never starts</h4>
+      <p class="scn__situation">spark-submit runs but no tasks start for 20 minutes.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> diagnose?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Look for “Initial job has not accepted any resources”.</li>
+          <li>Compare executor cores/memory + overhead with node capacity.</li>
+          <li>Check queue/quota limits.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Restarting the job repeatedly.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Executor strategy</h4>
+      <p class="scn__situation">Define executor settings for batch and interactive workloads.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> design?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Standard shapes (e.g. 5 cores, 18–20 GB + overhead) that pack nodes.</li>
+          <li>Interactive: dynamic allocation; SLA batch: static or high minExecutors.</li>
+          <li>Track executor-hours and idle time per app.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> One size for every workload.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Spark and PySpark syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/spark-pyspark.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

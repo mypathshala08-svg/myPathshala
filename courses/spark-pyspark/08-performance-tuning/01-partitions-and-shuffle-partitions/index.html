@@ -1,0 +1,1701 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Partitions and shuffle partitions | MyPhatshala</title>
+<meta name="description" content="Spark partitions measured with PySpark 4.3.0 on 5M orders: how maxPartitionBytes and cores decide input partitions, 2,000 small files vs 8 files (4.06 s vs 0.20 s), a groupBy with 1 to 2,000 shuffle partitions (best 1.82 s, worst 8.13 s, AQE coalesced 200 to 8 tasks), rows per partition for repartition, repartition by column and coalesce, and the coalesce(1) trap.">
+<meta name="mp:minutes" content="30">
+<link rel="canonical" href="https://myphatshala.in/courses/spark-pyspark/08-performance-tuning/01-partitions-and-shuffle-partitions/">
+<meta property="og:title" content="Partitions and shuffle partitions · MyPhatshala">
+<meta property="og:description" content="2,000 shuffle partitions made a groupBy 4.5x slower; 2,000 small files made a read 20x slower. Partition sizing in Spark, measured.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Partitions and shuffle partitions", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Apache Spark and PySpark", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#B45309" data-lesson="08-performance-tuning/01-partitions-and-shuffle-partitions" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Apache Spark and PySpark syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-big-data">Big Data Engineering</a><span>›</span><a href="../../">Apache Spark and PySpark</a><span>›</span><b>Lesson 8.1</b></nav>
+    <h1>Partitions and shuffle partitions</h1>
+    <p class="lead">Every partition is a task. This lesson measures how Spark picks input partitions, what 2,000 small files cost, the U-shaped curve of <code>spark.sql.shuffle.partitions</code>, and how <code>repartition</code> and <code>coalesce</code> place rows. <b>All outputs are real</b> (PySpark 4.3.0).</p>
+    <div class="lesson-meta"><span>Module 8 · Performance tuning</span><span>⏱ 30 min</span><span>Intermediate → Advanced</span><span>PySpark 4.3.0</span><span>1 → 2,000 partitions</span><span>Small files measured</span><span>Runs in your browser (Python)</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“Set shuffle partitions to 2000, it’s a big job”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> partitions and the shuffle in <a href="../../02-rdds/04-narrow-vs-wide-and-the-shuffle/">2.4</a>, small files in <a href="../../05-reading-and-writing-data/03-writing-data-and-small-files/">5.3</a>, AQE in <a href="../../07-spark-sql/04-adaptive-query-execution/">7.4</a>.</p></div>
+  <div class="story">
+    <p class="narration">TiffinGo’s nightly revenue job got slower after a new engineer set <code>spark.sql.shuffle.partitions=2000</code> “for safety” and another job left 2,000 tiny Parquet files behind. Nothing failed; everything just crawled.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Partitions decide how many tasks Spark runs. We measured the same 5 million orders read from 2,000 small files versus 8 normal files, and a groupBy with 1 to 2,000 shuffle partitions.">
+        <text x="14" y="34" font-size="7.2" font-weight="700" class="s-ink2">2,000 tiny tasks</text><rect x="14" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="28" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="42" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="56" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="70" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="84" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="98" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="112" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="126" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="140" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="154" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><rect x="168" y="97" width="10" height="3" rx="2" class="s-card2" style="stroke:var(--line)"/><path d="M190 70L214 70" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M207.7 73.0L214 70L207.7 67.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><text x="224" y="34" font-size="7.2" font-weight="700" class="s-ink2">8 right-sized</text><rect x="224" y="70" width="10" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="238" y="70" width="10" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="252" y="70" width="10" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="266" y="70" width="10" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="280" y="70" width="10" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="294" y="70" width="10" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="308" y="70" width="10" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="322" y="70" width="10" height="30" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="400" y="12" width="232" height="132" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="516" y="30" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">Measured (5M orders)</text><text x="412" y="52" font-size="7.2" class="s-red mono">2000 small files: 4.06 s</text><text x="412" y="68" font-size="7.2" class="s-green mono">8 normal files : 0.20 s</text><text x="412" y="84" font-size="7.2" class="s-red mono">shuffle=2000   : 8.13 s</text><text x="412" y="100" font-size="7.2" class="s-green mono">shuffle=16     : 1.82 s</text><text x="412" y="116" font-size="7.2" class="s-green mono">shuffle=200+AQE: 8 tasks</text><text x="412" y="132" font-size="7.2" class="s-acc mono">city key: 6 of 8 used</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Too few partitions waste cores; <tspan font-weight="700" class="s-acc">too many waste time</tspan> on scheduling.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Sir, more partitions means more parallel work, so it should be faster, right?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Only up to the number of cores. Every partition is a <b>task</b>, and every task has a fixed cost: scheduling, opening files, writing shuffle blocks. Past a point you pay that cost thousands of times for nothing.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So how do we pick the number?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Today we measure it: input partitions from file sizes, the small-files problem, shuffle partitions from 1 to 2,000, and <code>repartition</code> vs <code>coalesce</code>. All outputs are real (PySpark 4.3.0).</p></div></div>
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Partitions and shuffle partitions</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A <b>partition</b> is a chunk of a DataFrame processed by one <b>task</b> on one executor core. For file sources, Spark packs files into input partitions of at most <code>spark.sql.files.maxPartitionBytes</code> (128 MB by default), counting each file as at least <code>spark.sql.files.openCostInBytes</code> (4 MB) and spreading small inputs across <code>defaultParallelism</code>. After a wide transformation (groupBy, join, orderBy, window), the data is redistributed into <code>spark.sql.shuffle.partitions</code> partitions (200 by default), which Adaptive Query Execution can coalesce at run time. <code>repartition()</code> shuffles to a new number (optionally by column hash); <code>coalesce()</code> merges partitions without a shuffle and can only reduce the count.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Spark splits data into partitions, and each partition becomes one task on one core. File reading decides the first partitions; every shuffle creates a new set (200 by default). Too few partitions leave cores idle or make tasks huge; too many add overhead for each tiny task.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Partition</b><span>One chunk of data = one task.</span></div>
+    <div class="term"><b>Task</b><span>Unit of work on one core.</span></div>
+    <div class="term"><b>defaultParallelism</b><span>Total cores (4 in our lab).</span></div>
+    <div class="term"><b>maxPartitionBytes</b><span>Max input split size (128 MB).</span></div>
+    <div class="term"><b>openCostInBytes</b><span>Fake cost per file (4 MB).</span></div>
+    <div class="term"><b>shuffle.partitions</b><span>Partitions after a shuffle (200).</span></div>
+    <div class="term"><b>repartition</b><span>Shuffle to n partitions.</span></div>
+    <div class="term"><b>coalesce</b><span>Merge partitions, no shuffle.</span></div>
+  </div>
+
+  <h3>Where partition counts come from</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:620px">
+    <thead><tr><th>Stage</th><th>Decided by</th><th>Lab result</th></tr></thead>
+    <tbody><tr><td>Reading files</td><td>maxPartitionBytes, openCostInBytes, file count, cores</td><td>34.6 MiB → 4 partitions; 4 MB → 16</td></tr><tr><td>Many small files</td><td>One task can pack several files</td><td>2,000 files → 63 partitions, 4.06 s</td></tr><tr><td>After a shuffle</td><td>spark.sql.shuffle.partitions (+ AQE)</td><td>200 → 204 tasks; with AQE → 8</td></tr><tr><td>In your code</td><td>repartition / coalesce</td><td>repartition(8) = 8 × 625,000 rows</td></tr></tbody>
+  </table>
+  </div>
+  <h3 id="levels">Partitions at three levels</h3>
+  <div class="modlab levels"><div class="modlab__bar"><b>Pick your level. New to this? Start at Beginner and climb.</b><button type="button" data-mod="b">Beginner</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Beginner</span> Cutting a big pizza</h4>
+      <ul>
+        <li>Four friends, one pizza: four slices is perfect. One slice means three friends wait; 2,000 slices means everyone spends the evening picking crumbs.</li>
+        <li>A partition is a slice of data, a task is one friend eating it, a core is one friend.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The settings</h4>
+      <ul>
+        <li>Reading files: <code>spark.sql.files.maxPartitionBytes</code> (128 MB) and <code>spark.sql.files.openCostInBytes</code> (4 MB).</li>
+        <li>After a shuffle: <code>spark.sql.shuffle.partitions</code> (200), merged by AQE (Lesson 7.4).</li>
+        <li>In code: <code>repartition(n)</code>, <code>repartition(n, col)</code>, <code>coalesce(n)</code>, <code>df.rdd.getNumPartitions()</code>.</li>
+      </ul>
+
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> What the lab showed</h4>
+      <ul>
+        <li>Same data: 2,000 small files took 4.06 s, 8 normal files 0.20 s (64 vs 5 tasks).</li>
+        <li>groupBy with AQE off: 16 partitions 1.82 s, 200 partitions 2.50 s, 2,000 partitions 8.13 s.</li>
+        <li><code>repartition(8, "city")</code> filled only 6 partitions, unevenly (0.5M to 1.5M rows).</li>
+      </ul>
+
+    </div>
+  </div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “How do you choose the number of partitions?” Aim for tasks of roughly 100–200 MB of input (or shuffle data) each and at least 2–3 tasks per core. Keep input files near 128 MB–1 GB, set <code>spark.sql.shuffle.partitions</code> high enough for the largest data and let AQE coalesce, use <code>coalesce</code> to reduce partitions before writing and <code>repartition</code> to increase them or redistribute by key.</p></div>
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>repartition vs coalesce</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:640px">
+    <thead><tr><th>Method</th><th>Shuffle?</th><th>Can increase?</th><th>Result in our lab</th></tr></thead>
+    <tbody><tr><td><code>repartition(8)</code></td><td>Yes (round-robin)</td><td>Yes</td><td>8 equal partitions of 625,000</td></tr><tr><td><code>repartition(8, "city")</code></td><td>Yes (hash of city)</td><td>Yes</td><td>only 6 used, 0.5M–1.5M rows</td></tr><tr><td><code>repartitionByRange(8, "amount")</code></td><td>Yes (sampled ranges)</td><td>Yes</td><td>sorted ranges (Lesson 8.3)</td></tr><tr><td><code>coalesce(2)</code></td><td>No</td><td>No</td><td>2 × 2,500,000</td></tr><tr><td><code>spark.sql.shuffle.partitions</code></td><td>n/a</td><td>n/a</td><td>every groupBy/join/sort</td></tr></tbody>
+  </table>
+  </div>
+  <div class="callout callout--warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/></svg><p><code>coalesce(1)</code> before a write looks harmless, but it also pulls the <b>work before it</b> into one task, because coalesce does not add a stage boundary. On a real cluster with many cores that turns a parallel job into a single-threaded one. If you need one output file after heavy work, prefer <code>repartition(1)</code> (one extra shuffle, but the heavy part stays parallel).</p></div>
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Measuring partition counts</h2>
+  <p>All outputs are real: PySpark 4.3.0, <code>local[4]</code> on a machine with 2 physical CPUs, 5,000,000 orders in 8 Parquet files (34.6 MiB). Tasks are counted from the Spark REST API; every timing is a warm run.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · Input partitions follow file size</h4>
+      <div class="code" data-lang="python" data-file="l81_partitions.py"><pre><code>print(sc.defaultParallelism, spark.conf.get(&quot;spark.sql.files.maxPartitionBytes&quot;))
+for mpb in (&quot;128MB&quot;, &quot;16MB&quot;, &quot;4MB&quot;):
+    spark.conf.set(&quot;spark.sql.files.maxPartitionBytes&quot;, mpb)
+    print(mpb, spark.read.parquet(P).rdd.getNumPartitions())</code></pre><div class="output">files: 8 | size MiB: 34.6
+defaultParallelism: 4 | maxPartitionBytes: 134217728b
+== 1) input partitions follow file size
+maxPartitionBytes 128MB: 4 partitions
+maxPartitionBytes 16MB : 4 partitions
+maxPartitionBytes 4MB  : 16 partitions</div></div>
+      <span class="behind">With 128 MB and 16 MB we still got <b>4</b> partitions: Spark also divides small inputs across the 4 cores (34.6 MiB / 4 ≈ 8.7 MB per split), so the cap did not matter. Only when the cap fell below that (4 MB) did the count rise to <b>16</b>.</span></li>
+    <li><h4>Step 2 · The small-files problem</h4>
+      <div class="code" data-lang="python" data-file="l81_partitions.py"><pre><code>spark.read.parquet(P).repartition(2000).write.parquet(small)   # 2,000 files
+d = spark.read.parquet(small)
+run(&quot;count over 2000 small files&quot;, lambda: d.agg(F.sum(&quot;amount&quot;)).collect())
+run(&quot;count over 8 normal files&quot;,   lambda: big.agg(F.sum(&quot;amount&quot;)).collect())</code></pre><div class="output">== 2) many small files
+2000 files -&gt; 63 partitions (files packed, openCostInBytes 4194304b )
+count over 2000 small files             :  4.06 s, tasks   64, spill    0.0 MiB
+count over 8 normal files               :  0.20 s, tasks    5, spill    0.0 MiB</div></div>
+      <span class="behind">Exactly the same rows. Spark packed the 2,000 files into <b>63</b> partitions (each file is charged 4 MB of “open cost”), but still had to open 2,000 files and read 2,000 footers: <b>4.06 s vs 0.20 s</b>, 20x slower. On S3 or ADLS each open is a network request, so the gap is bigger. Fix it at write time (Lesson 5.3) or compact the files.</span></li>
+    <li><h4>Step 3 · Shuffle partitions from 1 to 2,000</h4>
+      <div class="code" data-lang="python" data-file="l81_partitions.py"><pre><code>spark.conf.set(&quot;spark.sql.adaptive.enabled&quot;, &quot;false&quot;)   # see the raw effect
+q = lambda: big.groupBy(&quot;customer_id&quot;, &quot;order_date&quot;).agg(F.sum(&quot;amount&quot;)) \
+                .write.format(&quot;noop&quot;).mode(&quot;overwrite&quot;).save()
+for n in (1, 4, 16, 200, 2000):
+    spark.conf.set(&quot;spark.sql.shuffle.partitions&quot;, n); q(); run(f&quot;... {n}&quot;, q)</code></pre><div class="output">== 3) shuffle partitions (AQE off to see the raw effect)
+groupBy, shuffle.partitions=1           :  2.55 s, tasks    5, spill    0.0 MiB
+groupBy, shuffle.partitions=4           :  1.93 s, tasks    8, spill    0.0 MiB
+groupBy, shuffle.partitions=16          :  1.82 s, tasks   20, spill    0.0 MiB
+groupBy, shuffle.partitions=200         :  2.50 s, tasks  204, spill    0.0 MiB
+groupBy, shuffle.partitions=2000        :  8.13 s, tasks 2004, spill    0.0 MiB
+groupBy, 200 + AQE                      :  2.23 s, tasks    8, spill    0.0 MiB</div></div>
+      <span class="behind">A U-shaped curve. <b>1</b> partition: one core does all the reduce work (2.55 s). <b>4–16</b>: best (1.82 s). <b>200</b>: 204 tasks, mostly tiny (2.50 s). <b>2,000</b>: 2,004 tasks and 2,000 shuffle files per map task: <b>8.13 s</b>, 4.5x slower than the best. With AQE on, the 200 were coalesced to <b>8</b> tasks automatically.</span></li>
+    <li><h4>Step 4 · How rows land in partitions</h4>
+      <div class="code" data-lang="python" data-file="l81_partitions.py"><pre><code>count = lambda d: sorted(d.groupBy(F.spark_partition_id()).count().rdd.map(lambda x: x[1]).collect())
+print(count(big.repartition(8)))
+print(count(big.repartition(8, &quot;city&quot;)))
+print(count(big.coalesce(2)))</code></pre><div class="output">== 4) rows per partition
+repartition(8): [625000, 625000, 625000, 625000, 625000, 625000, 625000, 625000]
+repartition(8, city): [498646, 500086, 500552, 998365, 1000215, 1502136]
+coalesce(2): [2500000, 2500000]</div></div>
+      <span class="behind"><code>repartition(8)</code> is round-robin: perfectly even. <code>repartition(8, "city")</code> hashes 8 cities into 8 buckets, but two cities collided and two buckets stayed <b>empty</b>: 6 partitions, from 0.5M to 1.5M rows. Hash partitioning on a low-cardinality column is uneven by nature. <code>coalesce(2)</code> just glued neighbours together.</span></li>
+    <li><h4>Step 5 · coalesce(1) vs repartition(1)</h4>
+      <div class="code" data-lang="python" data-file="l81_partitions.py"><pre><code>h = lambda d: d.select(F.sha2(F.col(&quot;order_id&quot;).cast(&quot;string&quot;), 256))
+run(&quot;4 partitions&quot;,       lambda: sink(h(big)))
+run(&quot;after coalesce(1)&quot;,  lambda: sink(h(big.coalesce(1))))
+run(&quot;after repartition(1)&quot;, lambda: sink(h(big.repartition(1))))</code></pre><div class="output">== 5) coalesce(1) before a heavy step
+heavy UDF-free calc, 4 partitions       :  2.28 s, tasks    4, spill    0.0 MiB
+same after coalesce(1)                  :  2.12 s, tasks    1, spill    0.0 MiB
+same after repartition(1)               :  3.02 s, tasks    5, spill    0.0 MiB</div></div>
+      <span class="behind">Look at the <b>task counts</b>: <code>coalesce(1)</code> ran everything as <b>1 task</b>; <code>repartition(1)</code> ran 4 parallel tasks for the hashing and then 1 to gather (5 tasks). Here coalesce was not slower, because the hash is cheap and our machine has only 2 physical CPUs. With an expensive step on a 100-core cluster, that single task is the whole job. Read the task count, not one timing.</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>How many tasks, and why</h2>
+  <p>Left: real outputs. Right: what Spark does with partitions.</p>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">How many tasks, and why <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">128MB: 4 partitions</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">16MB : 4 partitions</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">4MB  : 16 partitions</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">2000 files -&gt; 63 partitions</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">small files: 4.06 s, 64 tasks</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">8 files    : 0.20 s, 5 tasks</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">shuffle=1   : 2.55 s</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">shuffle=16  : 1.82 s</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">shuffle=2000: 8.13 s</text><text x="26" y="92" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">200 + AQE   : 8 tasks</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.4" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">repartition(8): 8 x 625000</text><text x="26" y="64" font-size="7.4" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">by city: 6 used, 0.5M..1.5M</text><text x="26" y="78" font-size="7.4" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">coalesce(2): 2 x 2500000</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Input partitions.</li>
+          <li>2,000 small files.</li>
+          <li>Shuffle partitions.</li>
+          <li>Rows per partition.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="What Spark does">
+          <g data-on="1"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Files → input partitions</text><rect x="8" y="50" width="96" height="30" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="56.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">8 files</text><text x="56.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">34.6 MiB</text><rect x="120" y="50" width="96" height="30" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="168.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">split</text><text x="168.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">≈8.7 MB</text><path d="M104 65.0L120 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M113.7 68.0L120 65.0L113.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="232" y="50" width="96" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="280.0" y="61" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">4 tasks</text><text x="280.0" y="71" text-anchor="middle" font-size="6.4" class="s-ink2 mono">1 per core</text><path d="M216 65.0L232 65.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><path d="M225.7 68.0L232 65.0L225.7 62.0" style="fill:none;stroke:#8A94A0;stroke-width:1.1"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">min(128 MB, size ÷ cores) decides.</text></g><g data-on="2"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Each file has a cost</text><text x="90" y="34" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">2,000 small files</text><rect x="20" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="30" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="40" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="50" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="60" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="70" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="80" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="90" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="100" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="110" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="120" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="130" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="140" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="150" y="42" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="20" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="30" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="40" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="50" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="60" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="70" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="80" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="90" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="100" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="110" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="120" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="130" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="140" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="150" y="52" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="20" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="30" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="40" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="50" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="60" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="70" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="80" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="90" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="100" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="110" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="120" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="130" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="140" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="150" y="62" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="20" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="30" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="40" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="50" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="60" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="70" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="80" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="90" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="100" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="110" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="120" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="130" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="140" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="150" y="72" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="20" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="30" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="40" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="50" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="60" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="70" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="80" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="90" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="100" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="110" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="120" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="130" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="140" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="150" y="82" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="20" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="30" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="40" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="50" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="60" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="70" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="80" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="90" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="100" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="110" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="120" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="130" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="140" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><rect x="150" y="92" width="7" height="7" rx="1" class="s-soft-acc" style="stroke:var(--track)"/><text x="90" y="136" text-anchor="middle" font-size="7" class="s-red">2,000 opens + footers</text><text x="270" y="34" text-anchor="middle" font-size="7.4" font-weight="700" class="s-ink2">8 normal files</text><rect x="214" y="46" width="22" height="28" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="242" y="46" width="22" height="28" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="270" y="46" width="22" height="28" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="298" y="46" width="22" height="28" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="214" y="80" width="22" height="28" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="242" y="80" width="22" height="28" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="270" y="80" width="22" height="28" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="298" y="80" width="22" height="28" rx="2" class="s-soft-green" style="stroke:var(--green)"/><text x="270" y="136" text-anchor="middle" font-size="7" class="s-green">8 opens</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Opening files dominates.</text></g><g data-on="3"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The U-curve</text><text x="30" y="44" font-size="7.2" font-weight="700" class="s-ink2">1 · 4 · 16 · 200 · 2000</text><rect x="30" y="82" width="10" height="28" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="44" y="90" width="10" height="20" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="58" y="92" width="10" height="18" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="72" y="84" width="10" height="26" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="86" y="50" width="10" height="60" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><text x="240" y="90" text-anchor="middle" font-size="7.4" class="s-ink2">best near cores × 2–4</text><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Too few and too many both hurt.</text></g><g data-on="4"><text x="180" y="14" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Hash on a few values</text><text x="30" y="44" font-size="7.2" font-weight="700" class="s-ink2">repartition(8, city)</text><rect x="30" y="93" width="10" height="17" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="44" y="93" width="10" height="17" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="58" y="93" width="10" height="17" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="72" y="77" width="10" height="33" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="86" y="77" width="10" height="33" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="100" y="60" width="10" height="50" rx="2" class="s-soft-acc" style="stroke:var(--track)"/><rect x="114" y="109" width="10" height="1" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="128" y="109" width="10" height="1" rx="2" class="s-soft-green" style="stroke:var(--green)"/><rect x="10" y="144" width="340" height="30" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="162.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Collisions and empty buckets.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>How files are split.</li>
+          <li>Per-file overhead.</li>
+          <li>Overhead vs parallelism.</li>
+          <li>Hash partitioning skew.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: too many shuffle partitions, too many small files, and the coalesce(1) trap.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-shuffle">Undoing “2,000 for safety”</h3>
+  <p class="anim-intro">Right-sizing shuffle partitions. (Typical; numbers from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Shuffle partitions <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Size shuffle partitions from data volume and let AQE coalesce them">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly job: 2,000 partitions</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">set “for safety”</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">2,004 tasks per groupBy.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">UI: tasks take 20 ms each</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">scheduler busy, cores idle</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Overhead > work.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Size the shuffle</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">shuffle GB ÷ 128 MB per task</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Upper bound, not a guess.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Turn AQE coalescing on</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">200 → 8 tasks in our lab</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Small days handled.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">8.13 s → 1.82 s</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">same data, same code</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">4.5x faster.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Too many.</li>
+          <li>Overhead.</li>
+          <li>Size it.</li>
+          <li>AQE.</li>
+          <li>Faster.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-smallfiles">The 2,000-file table</h3>
+  <p class="anim-intro">Small files and compaction. (Typical; timings from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Small files <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Compact small files so each task reads a reasonable amount of data">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Streaming job writes every minute</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">1,440 files a day per partition</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Small files pile up.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Reports read 2,000 files</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">4.06 s vs 0.20 s in our lab</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">20x slower for the same rows.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly compaction job</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">read → repartition(n) → write</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Files near 128 MB–1 GB.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or a table format</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">Delta OPTIMIZE / Iceberg rewrite</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Compaction built in.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Monitor file counts</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">alert if avg file &lt; 32 MB</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Catch it early.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Many files.</li>
+          <li>Slow reads.</li>
+          <li>Compact.</li>
+          <li>Formats.</li>
+          <li>Monitor.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-coalesce1">The coalesce(1) trap</h3>
+  <p class="anim-intro">coalesce vs repartition before a write. (Typical; task counts from our lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">coalesce(1) <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="coalesce(1) runs upstream work in one task; repartition(1) keeps it parallel">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Heavy enrichment, then one file</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink mono">.coalesce(1).write.csv(...)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Partner wants a single CSV.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">UI: 1 task for the whole job</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">99 cores idle for 40 minutes</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">coalesce pulled work into 1 task.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Use repartition(1)</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">heavy part parallel, then gather</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">5 tasks vs 1 in our lab.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Or write many, merge after</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">only small final outputs in 1 file</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One file is a bottleneck.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Rule of thumb</text><text x="180" y="56" text-anchor="middle" font-size="8.4" class="s-ink2">check task counts per stage</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Not just total time.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>One file.</li>
+          <li>One task.</li>
+          <li>repartition.</li>
+          <li>Alternatives.</li>
+          <li>Check tasks.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Partition tuning at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-blue">ETL</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">nightly</text></svg></div>
+    <div><h4>1. Nightly ETL</h4>
+      <p>Shuffle partitions sized from the largest day’s shuffle data; AQE merges them on quiet days.</p>
+      <div class="uc-flow"><span>Shuffle size</span><i>→</i><span class="java">÷ 128 MB</span><i>→</i><span>Partition count</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-green">lake</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">compaction</text></svg></div>
+    <div><h4>2. Data lake compaction</h4>
+      <p>Scheduled jobs rewrite small files into large ones so every reader gets faster.</p>
+      <div class="uc-flow"><span>Small files</span><i>→</i><span class="java">repartition + write</span><i>→</i><span>Big files</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-violet">by key</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">partitionBy</text></svg></div>
+    <div><h4>3. Partitioned writes</h4>
+      <p>repartition by the partition column before partitionBy keeps one file per folder instead of one per task.</p>
+      <div class="uc-flow"><span>repartition(col)</span><i>→</i><span class="java">partitionBy(col)</span><i>→</i><span>Few files</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-acc">API</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">parallel</text></svg></div>
+    <div><h4>4. Calling slow APIs</h4>
+      <p>Increase partitions before a mapPartitions step that calls an external service, to raise concurrency.</p>
+      <div class="uc-flow"><span>Few partitions</span><i>→</i><span class="java">repartition(64)</span><i>→</i><span>More calls in flight</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">export</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">one file</text></svg></div>
+    <div><h4>5. Single-file exports</h4>
+      <p>Small final results are written with repartition(1) after the heavy work is done.</p>
+      <div class="uc-flow"><span>Heavy work</span><i>→</i><span class="java">repartition(1)</span><i>→</i><span>One CSV</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Run the code: sizing shuffle partitions</h2>
+  <p>A simple rule of thumb used by many teams. Press <b>Run</b>, then try the challenges.</p>
+  <div class="code" data-lang="python" data-file="main.py"><pre><code># How many shuffle partitions? (simplified sizing rule)
+shuffle_gb = 300            # shuffle write size seen in the Spark UI
+target_mb = 128             # aim per task
+cores = 200                 # executor cores in the cluster
+
+by_size = shuffle_gb * 1024 // target_mb
+by_cores = cores * 3        # at least 2-3 tasks per core
+print(&quot;by size :&quot;, by_size)
+print(&quot;by cores:&quot;, by_cores)
+print(&quot;use     :&quot;, max(by_size, by_cores))</code></pre><div class="output">by size : 2400
+by cores: 600
+use     : 2400</div></div>
+  <ul class="anno"><li><code>by_size = shuffle_gb * 1024 // target_mb</code><span>Enough partitions that each task handles about 128 MB.</span></li><li><code>by_cores = cores * 3        # at least 2-3 tasks per core</code><span>Small data still needs enough tasks to keep every core busy.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Then try a 2 GB shuffle: which rule wins?",
+   "code": "# How many shuffle partitions? (simplified sizing rule)\nshuffle_gb = 300            # shuffle write size seen in the Spark UI\ntarget_mb = 128             # aim per task\ncores = 200                 # executor cores in the cluster\n\nby_size = shuffle_gb * 1024 // target_mb\nby_cores = cores * 3        # at least 2-3 tasks per core\nprint(\"by size :\", by_size)\nprint(\"by cores:\", by_cores)\nprint(\"use     :\", max(by_size, by_cores))\n"
+  },
+  {
+   "label": "2 · Predict first: input splits",
+   "hint": "<b>Predict first:<\/b> 34.6 MB on 4 cores with a 128 MB cap. How many splits?",
+   "code": "import math\ntotal_mb, cores, cap_mb = 34.6, 4, 128\nsplit = min(cap_mb, max(4, total_mb / cores))\nprint(math.ceil(total_mb / split), \"partitions of\", round(split, 1), \"MB\")\n"
+  },
+  {
+   "label": "3 · Small files",
+   "hint": "2,000 files of 17 KB, each charged 4 MB open cost.",
+   "code": "files, size_mb, open_mb = 2000, 0.017, 4\nsplit_mb = 128\nper_task = split_mb // (size_mb + open_mb)\nprint(\"files per task ~\", int(per_task), \"-> tasks ~\", round(files / per_task))\n"
+  },
+  {
+   "label": "4 · Hash collisions",
+   "hint": "8 cities into 8 buckets: how many buckets are used?",
+   "code": "cities = [\"Mumbai\", \"Pune\", \"Delhi\", \"Thane\", \"Chennai\", \"Hyderabad\", \"Bengaluru\", \"Navi Mumbai\"]\nbuckets = {}\nfor c in cities:\n    buckets.setdefault(sum(map(ord, c)) % 8, []).append(c)\nprint(len(buckets), \"of 8 used:\", buckets)\n"
+  },
+  {
+   "label": "5 · Spot the error",
+   "hint": "A job sets 2,000 shuffle partitions for 200 MB of shuffle.",
+   "code": "shuffle_mb, parts = 200, 2000\nassert shuffle_mb / parts >= 32, f\"{shuffle_mb / parts:.2f} MB per task: overhead dominates (8.13 s vs 1.82 s in the lab)\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: partitions</h3>
+  <p>In the <code>pyspark</code> shell (<code>pyspark --master local[4]</code>). <b>Outputs are real</b> (PySpark 4.3.0).</p>
+  <div class="pcrun"><h4>1 · Input partitions</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>spark.read.parquet(&quot;orders_big&quot;).rdd.getNumPartitions()</code></pre><div class="output">4</div></div>
+  <p class="muted">34.6 MiB spread over 4 cores.</p></div>
+  <div class="pcrun"><h4>2 · Shuffle default</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>spark.conf.get(&quot;spark.sql.shuffle.partitions&quot;)</code></pre><div class="output">&#x27;200&#x27;</div></div>
+  <p class="muted">AQE may merge them.</p></div>
+  <div class="pcrun"><h4>3 · Rows per partition</h4>
+  <div class="code" data-lang="bash" data-file="pyspark"><pre><code>o.repartition(8, &quot;city&quot;).groupBy(F.spark_partition_id()).count().count()</code></pre><div class="output">6</div></div>
+  <p class="muted">Two buckets empty.</p></div>
+</section>
+
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>Packing files into partitions</h2>
+  <p>Follow Spark packing files into splits.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "files = [3, 3, 3, 9, 1]",
+  "cap = 10",
+  "parts, cur = [], 0",
+  "for f in files:",
+  "    if cur + f > cap:",
+  "        parts.append(cur); cur = 0",
+  "    cur += f",
+  "parts.append(cur)",
+  "print(parts)"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>files<\/code> is created: → list #1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]"
+   ],
+   "newVar": "files"
+  },
+  {
+   "line": 2,
+   "phase": "Cap",
+   "note": "maxPartitionBytes (sizes in MB). <code>cap<\/code> is created: 10.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]"
+   ],
+   "newVar": "cap"
+  },
+  {
+   "line": 3,
+   "phase": "Python",
+   "note": "<code>parts<\/code> is created: → list #2. <code>cur<\/code> is created: 0. A new list object (#2) is created: []",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "cur"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>f<\/code> is created: 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "0"
+      ],
+      [
+       "f",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "f"
+  },
+  {
+   "line": 5,
+   "phase": "Full",
+   "note": "Start a new partition. The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "0"
+      ],
+      [
+       "f",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>cur<\/code> changes to 3.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "3"
+      ],
+      [
+       "f",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "cur"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The loop takes the next item (it has the same value as the previous one).",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "3"
+      ],
+      [
+       "f",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "3"
+      ],
+      [
+       "f",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>cur<\/code> changes to 6.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "6"
+      ],
+      [
+       "f",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "cur"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "The loop takes the next item (it has the same value as the previous one).",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "6"
+      ],
+      [
+       "f",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "6"
+      ],
+      [
+       "f",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>cur<\/code> changes to 9.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "9"
+      ],
+      [
+       "f",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "cur"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>f<\/code> changes to 9.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "9"
+      ],
+      [
+       "f",
+       "9"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ],
+   "newVar": "f"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>True<\/b>, so the indented block runs.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "9"
+      ],
+      [
+       "f",
+       "9"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (0)<\/b> []"
+   ]
+  },
+  {
+   "line": 6,
+   "phase": "Python",
+   "note": "<code>cur<\/code> changes to 0. Object #2 list now holds [9]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "0"
+      ],
+      [
+       "f",
+       "9"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (1)<\/b> [9]"
+   ],
+   "newVar": "cur"
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>cur<\/code> changes to 9.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "9"
+      ],
+      [
+       "f",
+       "9"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (1)<\/b> [9]"
+   ],
+   "newVar": "cur"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "<code>f<\/code> changes to 1.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "9"
+      ],
+      [
+       "f",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (1)<\/b> [9]"
+   ],
+   "newVar": "f"
+  },
+  {
+   "line": 5,
+   "phase": "Python",
+   "note": "The condition is <b>False<\/b>, so the indented block is skipped.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "9"
+      ],
+      [
+       "f",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (1)<\/b> [9]"
+   ]
+  },
+  {
+   "line": 7,
+   "phase": "Python",
+   "note": "<code>cur<\/code> changes to 10.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "10"
+      ],
+      [
+       "f",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (1)<\/b> [9]"
+   ],
+   "newVar": "cur"
+  },
+  {
+   "line": 4,
+   "phase": "Python",
+   "note": "Nothing is left to loop over, so the loop ends and Python moves on.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "10"
+      ],
+      [
+       "f",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (1)<\/b> [9]"
+   ]
+  },
+  {
+   "line": 8,
+   "phase": "Python",
+   "note": "Object #2 list now holds [9, 10]",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "10"
+      ],
+      [
+       "f",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (2)<\/b> [9, 10]"
+   ]
+  },
+  {
+   "line": 9,
+   "phase": "Result",
+   "note": "Fewer tasks than files. The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "files",
+       "→ list #1"
+      ],
+      [
+       "cap",
+       "10"
+      ],
+      [
+       "parts",
+       "→ list #2"
+      ],
+      [
+       "cur",
+       "10"
+      ],
+      [
+       "f",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>#1 list (5)<\/b> [3, 3, 3, 9, 1]",
+    "<b>#2 list (2)<\/b> [9, 10]"
+   ],
+   "out": "[9, 10]\n"
+  }
+ ]
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three partition decisions at TiffinGo.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Partitions · basics</span></div>
+    <h4>How many tasks will this read run?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A table has 40 files of 300 MB each. Default settings.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>12 GB, 128 MB cap</pre></div><div><small>Expected output</small><pre>120 tasks</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Each file splits at 128 MB.</li><li>300 MB → 3 splits.</li><li>Multiply by files.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 1.",
+   "code": "import math\nprint(40 * math.ceil(300 / 128), \"tasks\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "import math",
+  "print(40 * math.ceil(300 / 128), \"tasks\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Splittable",
+   "note": "Parquet files split at row-group boundaries.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": []
+    }
+   ],
+   "heap": [],
+   "out": "120 tasks\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Partitions · shuffle</span></div>
+    <h4>Pick shuffle partitions</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A join shuffles 80 GB on a 100-core cluster.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>80 GB, 100 cores</pre></div><div><small>Expected output</small><pre>640</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>80 GB ÷ 128 MB.</li><li>Compare with 3 × cores.</li><li>Take the larger.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Step 3.",
+   "code": "by_size = 80 * 1024 // 128\nprint(max(by_size, 100 * 3))\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "by_size = 80 * 1024 // 128",
+  "print(max(by_size, 100 * 3))"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Size",
+   "note": "640 tasks of ~128 MB. <code>by_size<\/code> is created: 640.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "by_size",
+       "640"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "by_size"
+  },
+  {
+   "line": 2,
+   "phase": "Python",
+   "note": "The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "by_size",
+       "640"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "640\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Partitions · output</span></div>
+    <h4>One file per date folder</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Writing <code>partitionBy("order_date")</code> creates 200 files per date.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>200 tasks × 30 dates</pre></div><div><small>Expected output</small><pre>before: 6000 files | after: 30 files</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Each task writes one file per date it holds.</li><li>repartition by order_date first.</li><li>Now each date is in one task.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "python",
+ "file": "main.py",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Lesson 5.3.",
+   "code": "tasks, dates = 200, 30\nprint(\"before:\", tasks * dates, \"files | after:\", dates, \"files\")\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Python run: press <b>Next</b> to execute one line at a time. Watch variables change in each frame, and lists and dictionaries (numbered #1, #2 …) fill up as objects.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "python",
+ "code": [
+  "tasks, dates = 200, 30",
+  "print(\"before:\", tasks * dates, \"files | after:\", dates, \"files\")"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Python",
+   "note": "<code>tasks<\/code> is created: 200. <code>dates<\/code> is created: 30.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "tasks",
+       "200"
+      ],
+      [
+       "dates",
+       "30"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "dates"
+  },
+  {
+   "line": 2,
+   "phase": "Fix",
+   "note": "df.repartition(\"order_date\").write.partitionBy(\"order_date\") The text is printed to the console.",
+   "stack": [
+    {
+     "frame": "module (global)",
+     "vars": [
+      [
+       "tasks",
+       "200"
+      ],
+      [
+       "dates",
+       "30"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "before: 6000 files | after: 30 files\n"
+  }
+ ]
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Beginner: One partition is processed by…",
+  "options": [
+   "One executor",
+   "One job",
+   "One task",
+   "One stage"
+  ],
+  "answer": 2,
+  "why": "One task on one core."
+ },
+ {
+  "q": "Beginner: Default spark.sql.shuffle.partitions?",
+  "options": [
+   "8",
+   "200",
+   "64",
+   "Number of cores"
+  ],
+  "answer": 1,
+  "why": "AQE can merge them."
+ },
+ {
+  "q": "Beginner: Which one avoids a shuffle?",
+  "options": [
+   "coalesce",
+   "repartition",
+   "orderBy",
+   "groupBy"
+  ],
+  "answer": 0,
+  "why": "coalesce only merges."
+ },
+ {
+  "q": "Intermediate: 2,000 small files vs 8 files, same rows. Lab result?",
+  "options": [
+   "Same speed",
+   "Small files faster",
+   "Error",
+   "4.06 s vs 0.20 s"
+  ],
+  "answer": 3,
+  "why": "Per-file overhead."
+ },
+ {
+  "q": "Intermediate: groupBy with 2,000 shuffle partitions vs 16?",
+  "options": [
+   "Faster",
+   "Same",
+   "8.13 s vs 1.82 s",
+   "Fails"
+  ],
+  "answer": 2,
+  "why": "Overhead of 2,004 tasks."
+ },
+ {
+  "q": "Intermediate: repartition(8, \"city\") with 8 cities gave…",
+  "options": [
+   "8 equal partitions",
+   "6 used, uneven",
+   "1 partition",
+   "16"
+  ],
+  "answer": 1,
+  "why": "Hash collisions."
+ },
+ {
+  "q": "Advanced: Why can coalesce(1) be dangerous?",
+  "options": [
+   "Upstream work runs in a single task",
+   "It shuffles",
+   "It drops rows",
+   "It caches"
+  ],
+  "answer": 0,
+  "why": "No stage boundary."
+ },
+ {
+  "q": "Advanced: 34.6 MiB with a 16 MB cap on 4 cores gave 4 partitions because…",
+  "options": [
+   "A bug",
+   "Files are not splittable",
+   "Cache",
+   "Spark also spreads input over cores (≈8.7 MB each)"
+  ],
+  "answer": 3,
+  "why": "min(cap, max(openCost, size ÷ cores))."
+ }
+]</script>
+  </div>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 8.1 in one screen</h3>
+    <ul><li>Partition = task = one core at a time.</li><li>Input splits: <code>maxPartitionBytes</code> (128 MB), <code>openCostInBytes</code> (4 MB), cores.</li><li>Small files: 2,000 files 4.06 s vs 8 files 0.20 s.</li><li>Shuffle partitions: U-curve; 16 → 1.82 s, 2,000 → 8.13 s; AQE 200 → 8 tasks.</li><li>Aim for ~128 MB per task and 2–3 tasks per core.</li><li><code>repartition(n, col)</code> hashes; low cardinality = uneven or empty partitions.</li><li><code>coalesce(1)</code> pulls upstream work into one task; prefer <code>repartition(1)</code> after heavy work.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>Should I always change spark.sql.shuffle.partitions?</summary><p>Set it high enough for your biggest shuffle and let AQE coalesce it; on small data the default 200 with AQE is fine.</p></details>
+    <details><summary>What is a good task duration?</summary><p>Usually from a few seconds to a few minutes. Many tasks under 100 ms mean too many partitions; tasks of tens of minutes mean too few or skew.</p></details>
+    <details><summary>Does repartition before a write help?</summary><p>Yes, when you need fewer, bigger files or one file per output folder; it costs one shuffle.</p></details>
+    <details><summary>Why does getNumPartitions differ from the files count?</summary><p>Spark splits big files and packs small ones together into splits.</p></details>
+    <details><summary>How does this work on Databricks?</summary><p>Same settings; Databricks also offers auto-optimized shuffle and auto compaction on Delta tables.</p></details>
+    
+  </div>
+
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Programs about partition sizing.</p>
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Tasks per core</h4></div>
+      <p>Tasks per core for 200 partitions on 16 cores.</p>
+      <div class="prob__io"><div><small>Input</small><pre>200, 16</pre></div><div><small>Expected output</small><pre>12.5</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(200 / 16)</code></pre><div class="output">12.5</div></div>
+        <p><b>How it works:</b> 12.5 waves of tasks.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Small-file slowdown</h4></div>
+      <p>How many times slower?</p>
+      <div class="prob__io"><div><small>Input</small><pre>4.06 vs 0.20 s</pre></div><div><small>Expected output</small><pre>20</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(4.06 / 0.20))</code></pre><div class="output">20</div></div>
+        <p><b>How it works:</b> About 20x.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Shuffle slowdown</h4></div>
+      <p>2,000 vs 16 partitions.</p>
+      <div class="prob__io"><div><small>Input</small><pre>8.13 vs 1.82 s</pre></div><div><small>Expected output</small><pre>4.5</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(8.13 / 1.82, 1))</code></pre><div class="output">4.5</div></div>
+        <p><b>How it works:</b> 4.5x.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Partitions by size</h4></div>
+      <p>Partitions for a 50 GB shuffle at 128 MB.</p>
+      <div class="prob__io"><div><small>Input</small><pre>50 GB</pre></div><div><small>Expected output</small><pre>400</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(50 * 1024 // 128)</code></pre><div class="output">400</div></div>
+        <p><b>How it works:</b> 400 tasks.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Balance check</h4></div>
+      <p>Max/median rows per partition.</p>
+      <div class="prob__io"><div><small>Input</small><pre>repartition(8, city)</pre></div><div><small>Expected output</small><pre>2.0</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>import statistics
+p = [498646, 500086, 500552, 998365, 1000215, 1502136]
+print(round(max(p) / statistics.median(p), 2))</code></pre><div class="output">2.0</div></div>
+        <p><b>How it works:</b> Above 2 means a slow straggler.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Files written</h4></div>
+      <p>Files from 200 tasks writing 30 dates.</p>
+      <div class="prob__io"><div><small>Input</small><pre>partitionBy</pre></div><div><small>Expected output</small><pre>6000</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(200 * 30)</code></pre><div class="output">6000</div></div>
+        <p><b>How it works:</b> Repartition by the column first.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Compaction saving</h4></div>
+      <p>Seconds saved per day for 500 reads.</p>
+      <div class="prob__io"><div><small>Input</small><pre>3.86 s per read</pre></div><div><small>Expected output</small><pre>32 minutes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(round(500 * 3.86 / 60), &quot;minutes&quot;)</code></pre><div class="output">32 minutes</div></div>
+        <p><b>How it works:</b> Compaction pays for itself.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Idle cores</h4></div>
+      <p>Core-minutes wasted by coalesce(1) on 100 cores for 40 min.</p>
+      <div class="prob__io"><div><small>Input</small><pre>99 idle</pre></div><div><small>Expected output</small><pre>3960 core-minutes</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="python" data-file="main.py"><pre><code>print(99 * 40, &quot;core-minutes&quot;)</code></pre><div class="output">3960 core-minutes</div></div>
+        <p><b>How it works:</b> Use repartition(1) after the heavy step.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Partition sizing comes up in nearly every Spark performance interview.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · Spark</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“repartition vs coalesce?”</h4>
+      <p class="scn__situation">Explain the difference.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> shuffle?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <p><code>repartition(n)</code> does a full shuffle and can increase or decrease partitions, giving even partitions (or hashed by a column). <code>coalesce(n)</code> merges existing partitions without a shuffle and can only decrease them; it may leave them uneven and can pull upstream work into fewer tasks.</p>
+        <p class="scn__avoid"><b>Avoid:</b> Saying coalesce is always better because it avoids a shuffle.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Thousands of tiny tasks</h4>
+      <p class="scn__situation">A job’s stages each show 2,000 tasks of 20 ms.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> what to change?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Lower shuffle partitions to fit data size, or rely on AQE coalescing.</li>
+          <li>Check input file counts; compact small files.</li>
+          <li>In my test 2,000 → 16 partitions took 8.13 s → 1.82 s.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> Adding executors.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Data engineering</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Small files</h4>
+      <p class="scn__situation">Reads of a table are slow although it is only 30 GB.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> diagnose?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>Count files and average file size.</li>
+          <li>Compact into 128 MB–1 GB files (repartition + overwrite, or OPTIMIZE).</li>
+          <li>Fix the writer: repartition by partition columns before writing.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> Increasing maxPartitionBytes only.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Default settings</h4>
+      <p class="scn__situation">Set partition defaults for 300 batch jobs.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> strategy?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>AQE on with a 64–256 MB advisory size; shuffle partitions sized for the biggest jobs.</li>
+          <li>Writers produce right-sized files; compaction for streaming outputs.</li>
+          <li>Dashboards on task duration and file size distributions.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> One hand-tuned number per job.</p>
+      </div></details>
+    </article>
+
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Beginner → Advanced</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Apache Spark and PySpark syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/spark-pyspark.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

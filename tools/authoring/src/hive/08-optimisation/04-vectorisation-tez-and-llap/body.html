@@ -1,0 +1,361 @@
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>“The plan is right. Why is it still slow?”</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> how a query becomes a Tez job (<a href="../../01-introduction/04-how-a-hive-query-becomes-a-job/">1.4</a>), ORC (<a href="../../06-file-formats/02-orc-deep-dive/">6.2</a>) and reading plans (<a href="../01-explain-in-depth/">8.1</a>).</p></div>
+  <div class="story">
+    <p class="narration">Kabir has a good plan now: right statistics, right join. But the platform team says many queries still waste CPU, start too few or too many tasks, and wait for containers. Arjun Sir builds a 5-million-row copy of orders to measure what the execution engine itself can do.</p>
+
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="The same aggregation over 5 million rows took about 1 second vectorised and about 3 seconds in row mode. Three execution levers: vectorisation, Tez tuning and LLAP.">
+        <rect x="10" y="12" width="200" height="128" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="110" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">Same query, 5 million rows</text><rect x="26" y="48" width="46" height="14" rx="2" style="fill:var(--green)"/><text x="80" y="59" font-size="7.6" class="s-ink mono">vectorised  ≈ 1.0 s</text><rect x="26" y="72" width="140" height="14" rx="2" style="fill:var(--track)"/><text x="26" y="100" font-size="7.6" class="s-ink mono">row mode  ≈ 3.0 s</text><text x="110" y="124" text-anchor="middle" font-size="7" class="s-ink2">real lab timings</text><path d="M216 76L256 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M249.7 79.0L256 76L249.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="262" y="46" width="110" height="60" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="317" y="72" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">Execution</text><text x="317" y="88" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">engine</text><path d="M378 76L414 76" style="fill:none;stroke:var(--track);stroke-width:2.2"/><path d="M407.7 79.0L414 76L407.7 73.0" style="fill:none;stroke:var(--track);stroke-width:2.2"/><rect x="420" y="12" width="210" height="128" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="525" y="30" text-anchor="middle" font-size="8.8" font-weight="700" class="s-ink">Three levers</text><rect x="432" y="40" width="186" height="26" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="525.0" y="51" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Vectorisation</text><text x="525.0" y="61" text-anchor="middle" font-size="6.4" class="s-ink2 mono">1,024 rows per call</text><rect x="432" y="72" width="186" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="525.0" y="83" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Tez tuning</text><text x="525.0" y="93" text-anchor="middle" font-size="6.4" class="s-ink2 mono">tasks · reducers · memory</text><rect x="432" y="104" width="186" height="26" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="525.0" y="115" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">LLAP</text><text x="525.0" y="125" text-anchor="middle" font-size="6.4" class="s-ink2 mono">daemons + cache</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Same plan, same data: <tspan font-weight="700" class="s-acc">how</tspan> the operators run makes a 3× difference.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+
+R> Sir, what does “vectorized” in the plan actually change?
+A> Instead of pushing one row at a time through every operator, Hive pushes a <b>batch of 1,024 rows</b> stored column by column. Each operator runs a tight loop over arrays, which modern CPUs love. On our 5-million-row table it made the map work about <b>6×</b> faster.
+K> And Tez tuning? I see dozens of settings online.
+A> Most of them control three things: how many map tasks (split grouping), how many reducers (bytes per reducer, auto parallelism), and how much memory each container gets. We will change each and count the tasks. And <b>LLAP</b>, the long-lived daemons with a cache, we will try to switch on and see exactly what it needs. All outputs are real, from Hive 4.2.1.
+  </div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Vectorisation, Tez tuning and LLAP</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Vectorised query execution</b> processes rows in batches (<code>VectorizedRowBatch</code>, 1,024 rows by default) stored as column vectors, so operators such as scans, filters, expressions and aggregations run as loops over primitive arrays instead of per-row object calls; it is enabled with <code>hive.vectorized.execution.enabled</code> and works best with ORC and Parquet input. <b>Tez tuning</b> adjusts how the DAG is executed: input split grouping (number of map tasks), reducer parallelism, container memory and container reuse. <b>LLAP</b> (Live Long and Process) is an optional layer of persistent daemons that execute query fragments with an in-memory columnar cache and fast start-up, coordinated by Tez and discovered through ZooKeeper.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Vectorisation makes each task faster by handling 1,024 rows at a time. Tez tuning decides how many tasks run and how much memory they get. LLAP keeps worker processes running all the time, with a data cache, so interactive queries start and finish quickly.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Vectorised</b><span>Operators process batches of 1,024 rows, column by column.</span></div>
+    <div class="term"><b>Row mode</b><span>The old path: one row object at a time through each operator.</span></div>
+    <div class="term"><b>VectorUDFAdaptor</b><span>Wraps a row-mode UDF so the rest of the plan stays vectorised.</span></div>
+    <div class="term"><b>Split grouping</b><span>Tez merging input splits into tasks of a target size.</span></div>
+    <div class="term"><b>Reducer parallelism</b><span>How many tasks a Reducer vertex runs.</span></div>
+    <div class="term"><b>Container</b><span>A YARN process with fixed memory running Tez tasks.</span></div>
+    <div class="term"><b>LLAP daemon</b><span>Long-running Hive executor with cache, registered in ZooKeeper.</span></div>
+    <div class="term"><b>Fetch task</b><span>Answering a simple query without any Tez job.</span></div>
+  </div>
+
+  <h3>Lab settings (Hive 4.2.1, Tez local mode)</h3>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:680px">
+    <thead><tr><th>Setting</th><th>Value</th><th>Controls</th></tr></thead>
+    <tbody><tr><td><code>hive.vectorized.execution.enabled</code></td><td>true</td><td>Vectorised map side</td></tr><tr><td><code>hive.vectorized.adaptor.usage.mode</code></td><td>all</td><td>Wrap non-vector UDFs instead of falling back</td></tr><tr><td><code>hive.exec.reducers.bytes.per.reducer</code></td><td>256000000</td><td>Shuffle bytes per reducer</td></tr><tr><td><code>hive.exec.reducers.max</code></td><td>1009</td><td>Upper bound on reducers</td></tr><tr><td><code>hive.tez.auto.reducer.parallelism</code></td><td>false</td><td>Shrink reducers at run time</td></tr><tr><td><code>hive.tez.container.size</code></td><td>-1</td><td>Container MB (-1: use the MapReduce setting)</td></tr><tr><td><code>hive.fetch.task.conversion</code></td><td>more</td><td>Simple SELECT/filter/LIMIT without a job</td></tr><tr><td><code>hive.execution.mode</code></td><td>container</td><td><code>llap</code> needs LLAP daemons</td></tr></tbody>
+  </table>
+  </div>
+LEVELS> Execution speed at three levels
+L1> Carrying bricks
+      <ul>
+        <li>Carrying one brick at a time is slow; carrying a stack of 1,024 bricks at once is much faster. Vectorisation does that with rows.</li>
+        <li>Tez decides how many workers (tasks) to use. Too few: slow. Too many: time wasted starting them.</li>
+        <li>LLAP keeps workers always running and remembers recent data, so short queries start instantly.</li>
+      </ul>
+L2> The settings behind them
+      <ul>
+        <li><code>hive.vectorized.execution.enabled</code> (map) and <code>hive.vectorized.execution.reduce.enabled</code>: process <b>VectorizedRowBatch</b>es of 1,024 rows. Best with ORC and Parquet; check <code>EXPLAIN VECTORIZATION</code>.</li>
+        <li><b>Map tasks:</b> Tez groups input splits between <code>tez.grouping.min-size</code> and <code>tez.grouping.max-size</code>.</li>
+        <li><b>Reducers:</b> estimated shuffle bytes / <code>hive.exec.reducers.bytes.per.reducer</code> (256 MB default), capped by <code>hive.exec.reducers.max</code> (1,009); <code>hive.tez.auto.reducer.parallelism</code> lowers the count at run time; <code>mapreduce.job.reduces</code> forces it.</li>
+        <li><b>Memory:</b> <code>hive.tez.container.size</code> and <code>hive.tez.java.opts</code> (heap about 80% of the container).</li>
+      </ul>
+L3> What the lab showed
+      <ul>
+        <li>Vectorised vs row mode on 5,000,000 rows: Map 1 about 300–400 ms vs 2,250–2,400 ms; whole query about 1.0 s vs 3.0 s, three runs each.</li>
+        <li>A UDF without a vector version still ran through the <b>VectorUDFAdaptor</b> (2.1 s); forbidding the adaptor made the map side non-vectorised (3.4 s) with an explicit <code>notVectorizedReason</code>.</li>
+        <li>Split grouping changed Map 1 from 1 to 8 tasks; bytes-per-reducer changed Reducer 2 from 1 to 8, auto parallelism cut it to 2. LLAP mode failed without a ZooKeeper registry.</li>
+      </ul>
+/LEVELS
+
+EXAM> “What is vectorisation in Hive?” Processing 1,024 rows at a time as column vectors instead of row by row, which cuts per-row overhead and uses the CPU efficiently. Enable with <code>hive.vectorized.execution.enabled=true</code>, best with ORC/Parquet, verify with <code>EXPLAIN VECTORIZATION</code> (look for <code>Execution mode: vectorized</code> and <code>notVectorizedReason</code>).
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and ways to use it</span>
+  <h2>Execution modes in Hive 4</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:720px">
+    <thead><tr><th>Mode</th><th>How tasks run</th><th>Good for</th><th>In our lab</th></tr></thead>
+    <tbody><tr><td>Tez containers</td><td>YARN containers started per query (or per session, with reuse)</td><td>Batch ETL, large scans</td><td>Yes (local mode)</td></tr><tr><td>Tez + LLAP</td><td>Fragments run in long-lived LLAP daemons with cache</td><td>Interactive BI, many short queries</td><td>No: needs daemons + ZooKeeper</td></tr><tr><td>Fetch task</td><td>No job; HiveServer2 reads the files directly</td><td>SELECT … LIMIT, simple filters</td><td>Yes</td></tr><tr><td>MapReduce</td><td>Legacy engine, deprecated; Tez is the default in Hive 4</td><td>Old clusters only</td><td>Not used</td></tr></tbody>
+  </table>
+  </div>
+WARN> Timings in this lesson come from a single-node lab running Tez in local mode. More tasks made queries <b>slower</b> here (start-up cost, no extra machines), while on a real cluster they usually make big queries faster. Learn the mechanisms here; tune numbers on your cluster.
+</section>
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Measuring the execution engine</h2>
+  <p>All outputs are real, from the Hive 4.2.1 lab. Timings are HiveServer2’s “Completed executing … Time taken” and the Tez vertex summary.</p>
+  <ol class="stepper">
+    <li><h4>Step 1 · A bigger table to measure</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>CREATE TABLE orders_big STORED AS ORC AS
+SELECT o.order_id * 100 + r.n AS order_id, o.customer_id, o.city, o.amount, o.order_date, o.status
+FROM orders o CROSS JOIN
+  (SELECT pos AS n FROM (SELECT posexplode(split(space(99), &#x27; &#x27;)) AS (pos, x)) t) r;
+SELECT COUNT(*) FROM orders_big;</code></pre><div class="output">+----------+
+|   _c0    |
++----------+
+| 5000000  |
++----------+</div></div>
+      <span class="behind">50,000 orders × 100 copies = <b>5,000,000 rows</b> in one ORC file of about 10 MB (totalSize 10,195,843 bytes). <code>space(99)</code> gives 100 empty strings to explode: a handy way to generate rows in pure HiveQL.</span></li>
+    <li><h4>Step 2 · Is the query vectorised?</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>EXPLAIN VECTORIZATION SUMMARY
+SELECT city, status, COUNT(*) AS n, SUM(amount) AS rev, AVG(amount) AS avg_amt
+FROM orders_big WHERE amount &gt; 100 GROUP BY city, status;</code></pre><div class="output">  enabledConditionsMet: [hive.vectorized.execution.enabled IS true]
+        Reducer 2 &lt;- Map 1 (SIMPLE_EDGE)
+        Map 1
+            Execution mode: vectorized
+            Map Vectorization:
+                enabledConditionsMet: hive.vectorized.use.vectorized.input.format IS true
+                inputFileFormats: org.apache.hadoop.hive.ql.io.orc.OrcInputFormat
+                allNative: false
+                usesVectorUDFAdaptor: false
+                vectorized: true
+        Reducer 2
+            Execution mode: vectorized
+            Reduce Vectorization:
+                enableConditionsMet: hive.vectorized.execution.reduce.enabled IS true, hive.execution.engine tez IN [tez] IS true
+                allNative: false
+                usesVectorUDFAdaptor: false
+                vectorized: true</div></div>
+      <span class="behind">Both vertices say <code>Execution mode: vectorized</code>. The map side reads through the ORC vectorised input format. <code>allNative: false</code> means some operator uses a generic (non-native) vector implementation, still vectorised; <code>usesVectorUDFAdaptor: false</code> means no row-mode UDF had to be wrapped.</span></li>
+    <li><h4>Step 3 · Vectorised vs row mode, three runs each</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.vectorized.execution.enabled=true;    -- then false
+SET hive.tez.exec.print.summary=true;
+SELECT city, status, COUNT(*) AS n, SUM(amount) AS rev, AVG(amount) AS avg_amt
+FROM orders_big WHERE amount &gt; 100 GROUP BY city, status;</code></pre><div class="output">run 1  vectorized=true  query 0.973 seconds  Map 1 302.00 ms
+run 1  vectorized=false  query 3.035 seconds  Map 1 2360.00 ms
+run 2  vectorized=true  query 1.081 seconds  Map 1 404.00 ms
+run 2  vectorized=false  query 3.101 seconds  Map 1 2400.00 ms
+run 3  vectorized=true  query 1.01 seconds  Map 1 344.00 ms
+run 3  vectorized=false  query 2.938 seconds  Map 1 2254.00 ms</div></div>
+      <span class="behind">Map 1 (scan, filter, partial aggregation of 5,000,000 rows) took <b>302–404 ms</b> vectorised and <b>2,254–2,400 ms</b> in row mode: about <b>6–7×</b>. The whole query went from about 3.0 s to 1.0 s; the rest is fixed overhead (planning, starting tasks). Same result, 24 groups, in every run.</span></li>
+    <li><h4>Step 4 · A UDF without a vector version</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.vectorized.adaptor.usage.mode;          -- all
+EXPLAIN VECTORIZATION EXPRESSION SELECT md5(city) AS x, COUNT(*) FROM orders_big GROUP BY md5(city);
+
+SET hive.vectorized.adaptor.usage.mode=none;
+EXPLAIN VECTORIZATION ONLY SUMMARY SELECT md5(city) AS x, COUNT(*) FROM orders_big GROUP BY md5(city);
+-- and timing both</code></pre><div class="output">hive.vectorized.adaptor.usage.mode=all
+                        selectExpressions: VectorUDFAdaptor(md5(city)) -&gt; 8:string
+                usesVectorUDFAdaptor: true
+                usesVectorUDFAdaptor: false
+
+-- adaptor.usage.mode=none
+                notVectorizedReason: Select expression for SELECT operator: UDF GenericUDFBridge ==&gt; md5 (Column[city]) not supported
+                vectorized: false
+                vectorized: true
+
+run 1  adaptor.usage.mode=all  2.081 seconds
+run 1  adaptor.usage.mode=none  3.47 seconds
+run 2  adaptor.usage.mode=all  2.21 seconds
+run 2  adaptor.usage.mode=none  3.424 seconds</div></div>
+      <span class="behind"><code>md5</code> has no vector implementation, so Hive wrapped it: <code>VectorUDFAdaptor(md5(city))</code> converts each batch to rows for that one expression and keeps everything else vectorised (about <b>2.1 s</b>). With the adaptor forbidden, EXPLAIN says exactly why the map side fell back: <code>notVectorizedReason: … UDF GenericUDFBridge ==> md5 … not supported</code>, and the query took about <b>3.4 s</b>. Custom Java UDFs are the most common reason for row mode in real plans.</span></li>
+    <li><h4>Step 5 · The Tez knobs and their defaults</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.tez.container.size; SET hive.exec.reducers.bytes.per.reducer; SET hive.exec.reducers.max;
+SET hive.tez.auto.reducer.parallelism; SET mapreduce.job.reduces; SET hive.execution.mode;
+SET hive.llap.execution.mode; SET hive.fetch.task.conversion; SET hive.fetch.task.conversion.threshold;
+SET hive.server2.tez.initialize.default.sessions;</code></pre><div class="output">hive.tez.container.size=-1
+hive.exec.reducers.bytes.per.reducer=256000000
+hive.exec.reducers.max=1009
+hive.tez.auto.reducer.parallelism=false
+mapreduce.job.reduces=-1
+hive.execution.mode=container
+hive.llap.execution.mode=all
+hive.fetch.task.conversion=more
+hive.fetch.task.conversion.threshold=209715200
+hive.server2.tez.initialize.default.sessions=false</div></div>
+      <span class="behind">Container size -1 means Hive takes the MapReduce map memory setting. One reducer per 256 MB of estimated shuffle data, at most 1,009. Auto reducer parallelism is off. Execution mode is <code>container</code>, not <code>llap</code>. Simple queries up to 200 MB of input can run as a fetch task.</span></li>
+    <li><h4>Step 6 · Changing the number of tasks</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>-- orders_big_txt: the same 5,000,000 rows as one 246 MB text file
+SELECT customer_id, COUNT(*) AS n, SUM(amount) FROM orders_big_txt GROUP BY customer_id;
+-- run once per setting below, with hive.tez.exec.print.summary=true</code></pre><div class="output">-- defaults
+   Map 1 tasks: 1   Reducer 2 tasks: 1   query time: 3.394 seconds
+SET tez.grouping.max-size=16777216; SET tez.grouping.min-size=8388608;
+   Map 1 tasks: 8   Reducer 2 tasks: 1   query time: 4.824 seconds
+SET hive.exec.reducers.bytes.per.reducer=100000;
+   Map 1 tasks: 1   Reducer 2 tasks: 8   query time: 4.82 seconds
+SET hive.exec.reducers.bytes.per.reducer=100000; SET hive.tez.auto.reducer.parallelism=true;
+   Map 1 tasks: 1   Reducer 2 tasks: 2   query time: 3.714 seconds
+SET mapreduce.job.reduces=6;
+   Map 1 tasks: 1   Reducer 2 tasks: 6   query time: 4.483 seconds</div></div>
+      <span class="behind">The 246 MB file has 8 input splits of up to 32 MB. By default Tez <b>grouped</b> them into 1 map task; with <code>tez.grouping.max-size</code> at 16 MB no two splits could be grouped, so <b>8</b> map tasks ran (grouping merges splits, it never cuts them). <b>Bytes per reducer</b> at 100,000 gave <b>8</b> reducers (the estimated shuffle is about 765 KB: 6,171 rows × 124 bytes). With <b>auto reducer parallelism</b> on as well, Tez lowered the reducer count at run time after seeing the real data, ending with <b>2</b>. <code>mapreduce.job.reduces=6</code> forced 6. On one machine every extra task cost time; on a cluster it buys parallelism.</span></li>
+    <li><h4>Step 7 · No job at all: fetch tasks</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>EXPLAIN SELECT order_id, city, amount FROM orders_big WHERE city = &#x27;Pune&#x27; LIMIT 5;
+SET hive.fetch.task.conversion=none;
+EXPLAIN SELECT order_id, city, amount FROM orders_big WHERE city = &#x27;Pune&#x27; LIMIT 5;</code></pre><div class="output">Plan optimized by CBO.
+
+Stage-0
+  Fetch Operator
+    limit:5
+    Select Operator [SEL_2]
+      Output:[&quot;_col0&quot;,&quot;_col1&quot;,&quot;_col2&quot;]
+      Limit [LIM_3]
+        Number of rows:5
+        Filter Operator [FIL_5]
+          predicate:(city = &#x27;Pune&#x27;)
+          TableScan [TS_0]
+            Output:[&quot;order_id&quot;,&quot;city&quot;,&quot;amount&quot;]
+
+-- with conversion=none
+Stage-0
+  Fetch Operator
+    Stage-1
+      Map 1 vectorized</div></div>
+      <span class="behind">With <code>hive.fetch.task.conversion=more</code> the whole query is a <b>Fetch Operator</b>: HiveServer2 reads the file itself and stops after 5 rows, with no Tez DAG. With <code>none</code> the same query gets Stage-1 and a vectorised Map 1. This is why <code>SELECT … LIMIT 10</code> feels instant even on large tables; aggregations always need a job.</span></li>
+    <li><h4>Step 8 · Trying LLAP</h4>
+      <div class="code" data-lang="sql" data-file="Beeline"><pre><code>SET hive.execution.mode=llap;
+SELECT COUNT(*) FROM orders_big WHERE amount &gt; 100;</code></pre><div class="output">Error: Error while compiling statement: FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.tez.TezTask. java.io.IOException: org.apache.tez.dag.api.TezUncheckedException: java.lang.reflect.InvocationTargetException
+Caused by: java.lang.NullPointerException: Cannot invoke &quot;String.split(String)&quot; because the return value of &quot;org.apache.hadoop.hive.common.ZooKeeperHiveHelper$ZooKeeperHiveHelperBuilder.getQuorum()&quot; is null</div></div>
+      <span class="behind">LLAP mode failed: to find LLAP daemons Hive looks them up in a <b>ZooKeeper</b> registry (<code>hive.llap.daemon.service.hosts</code>, ZooKeeper quorum), and our lab has neither daemons nor ZooKeeper. A real LLAP setup runs daemons on YARN or Kubernetes with a large heap and off-heap cache. We did not measure LLAP speed-ups; see the FAQ for what it changes. The next statement in container mode worked normally (4,319,400 rows).</span></li>
+  </ol>
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Inside the execution engine</h2>
+  <p>Left: real lab outputs. Right: what happens inside.</p>
+  <div class="anim" data-frames="5">
+    <div class="anim__title">How tasks run <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Real lab outputs">
+          <g data-on="1"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">Map 1</text><text x="26" y="64" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  Execution mode: vectorized</text><text x="26" y="78" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  inputFileFormats: …OrcInputFormat</text><text x="26" y="92" font-size="7.6" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">Reducer 2</text><text x="26" y="106" font-size="7.6" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">  Execution mode: vectorized</text></g><g data-on="2"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">vectorized=true   query 0.973 s  Map 1 302 ms</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">vectorized=false  query 3.035 s  Map 1 2360 ms</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">vectorized=true   query 1.081 s  Map 1 404 ms</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">vectorized=false  query 3.101 s  Map 1 2400 ms</text></g><g data-on="3"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">VectorUDFAdaptor(md5(city))</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">usesVectorUDFAdaptor: true</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">adaptor none:</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">notVectorizedReason: … md5 … not supported</text></g><g data-on="4"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">defaults           Map 1: 1  Reducer 2: 1</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">grouping 8–16 MB   Map 1: 8</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">bytes/reducer 1e5  Reducer 2: 8</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">+ auto parallelism Reducer 2: 2</text><text x="26" y="106" font-size="7.2" class="mono" style="fill:#9FD3B8;white-space:pre" xml:space="preserve">job.reduces=6      Reducer 2: 6</text></g><g data-on="5"><rect x="14" y="14" width="332" height="196" rx="8" class="s-board"/><text x="26" y="30" font-size="9" class="mono" style="fill:#7F8C86">terminal · real output</text><text x="26" y="50" font-size="7.2" class="mono" style="fill:#EDEBE3;white-space:pre" xml:space="preserve">SET hive.execution.mode=llap;</text><text x="26" y="64" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">FAILED: … TezTask</text><text x="26" y="78" font-size="7.2" class="mono" style="fill:#FF8A80;white-space:pre" xml:space="preserve">Caused by: NullPointerException</text><text x="26" y="92" font-size="7.2" class="mono" style="fill:#F5C77E;white-space:pre" xml:space="preserve">  … ZooKeeperHiveHelper … getQuorum() is null</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>EXPLAIN VECTORIZATION: both vertices run vectorised.</li>
+          <li>Vectorised map work took 300–400 ms instead of about 2,300 ms.</li>
+          <li>md5 had no vector form: the adaptor wrapped it, or the map fell back.</li>
+          <li>Grouping and reducer settings changed the task counts.</li>
+          <li>LLAP mode failed: no ZooKeeper registry in the lab.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Inside the engine">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Row mode vs vectorised</text><rect x="30" y="44" width="90" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="75" y="56" text-anchor="middle" font-size="7" class="s-ink2 mono">row 1</text><path d="M122 53L196 85" style="fill:none;stroke:#D64545;stroke-width:1"/><path d="M189.0 85.3L196 85L191.4 79.7" style="fill:none;stroke:#D64545;stroke-width:1"/><rect x="30" y="66" width="90" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="75" y="78" text-anchor="middle" font-size="7" class="s-ink2 mono">row 2</text><path d="M122 75L196 85" style="fill:none;stroke:#D64545;stroke-width:1"/><path d="M189.3 87.2L196 85L190.2 81.1" style="fill:none;stroke:#D64545;stroke-width:1"/><rect x="30" y="88" width="90" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="75" y="100" text-anchor="middle" font-size="7" class="s-ink2 mono">row 3</text><path d="M122 97L196 85" style="fill:none;stroke:#D64545;stroke-width:1"/><path d="M190.3 89.0L196 85L189.3 83.0" style="fill:none;stroke:#D64545;stroke-width:1"/><rect x="30" y="110" width="90" height="18" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="75" y="122" text-anchor="middle" font-size="7" class="s-ink2 mono">row 4</text><path d="M122 119L196 85" style="fill:none;stroke:#D64545;stroke-width:1"/><path d="M191.5 90.4L196 85L189.0 84.9" style="fill:none;stroke:#D64545;stroke-width:1"/><rect x="200" y="72" width="130" height="26" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="265.0" y="83" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Filter</text><text x="265.0" y="93" text-anchor="middle" font-size="6.4" class="s-ink2 mono">one call per row</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Row mode: per-row calls and objects.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Vectorised: column arrays</text><rect x="20" y="44" width="120" height="82" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="80" y="60" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">batch of 1,024</text><rect x="30" y="70" width="32" height="48" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="46" y="98" text-anchor="middle" font-size="6.4" class="s-ink2 mono">city</text><rect x="66" y="70" width="32" height="48" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="82" y="98" text-anchor="middle" font-size="6.4" class="s-ink2 mono">amou</text><rect x="102" y="70" width="32" height="48" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="118" y="98" text-anchor="middle" font-size="6.4" class="s-ink2 mono">stat</text><path d="M144 85L196 85" style="fill:none;stroke:var(--green);stroke-width:2"/><path d="M189.7 88.0L196 85L189.7 82.0" style="fill:none;stroke:var(--green);stroke-width:2"/><rect x="200" y="72" width="130" height="26" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="265.0" y="83" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Filter</text><text x="265.0" y="93" text-anchor="middle" font-size="6.4" class="s-ink2 mono">loop over array</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">One call per 1,024 rows: 6–7× faster map in our lab.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A row-only UDF inside a vector plan</text><rect x="20" y="60" width="96" height="26" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="68.0" y="76" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Scan (vector)</text><path d="M118 73L130 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M123.7 76.0L130 73L123.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="132" y="60" width="110" height="26" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="187.0" y="71" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">md5 via adaptor</text><text x="187.0" y="81" text-anchor="middle" font-size="6.4" class="s-ink2 mono">batch → rows → batch</text><path d="M244 73L256 73" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M249.7 76.0L256 73L249.7 70.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="258" y="60" width="90" height="26" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="303.0" y="76" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">Group By (vector)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Only one expression pays the row cost.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Tasks per vertex</text><rect x="20" y="50" width="34" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="60" y="50" width="34" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="100" y="50" width="34" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="140" y="50" width="34" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="180" y="50" width="34" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="220" y="50" width="34" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="260" y="50" width="34" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><rect x="300" y="50" width="34" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180" y="90" text-anchor="middle" font-size="8" class="s-ink2 mono">Map 1: input splits merged by grouping</text><rect x="110" y="100" width="34" height="20" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><rect x="150" y="100" width="34" height="20" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="180" y="134" text-anchor="middle" font-size="7.6" class="s-ink2 mono">Reducers: shuffle bytes / bytes-per-reducer</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Auto parallelism trims reducers at run time.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">LLAP: daemons found through ZooKeeper</text><rect x="20" y="56" width="100" height="26" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="70.0" y="67" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">HiveServer2</text><text x="70.0" y="77" text-anchor="middle" font-size="6.4" class="s-ink2 mono">Tez AM</text><path d="M122 69L146 69" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M139.7 72.0L146 69L139.7 66.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="148" y="56" width="90" height="26" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="193.0" y="67" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">ZooKeeper</text><text x="193.0" y="77" text-anchor="middle" font-size="6.4" class="s-ink2 mono">registry</text><path d="M240 69L264 69" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M257.7 72.0L264 69L257.7 66.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="266" y="56" width="80" height="26" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="306.0" y="67" text-anchor="middle" font-size="7.2" font-weight="700" class="s-ink">LLAP daemons</text><text x="306.0" y="77" text-anchor="middle" font-size="6.4" class="s-ink2 mono">cache + executors</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">No registry, no daemons: the query fails.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Row mode calls every operator once per row.</li>
+          <li>Vectorised operators loop over column arrays of 1,024 values.</li>
+          <li>The adaptor turns one batch into rows for a single expression.</li>
+          <li>Map tasks come from grouped input splits; reducers from estimated shuffle bytes.</li>
+          <li>LLAP fragments run in daemons the Tez AM discovers via ZooKeeper.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <p>Three live scenarios follow: a UDF that breaks vectorisation, reducer counts, and interactive BI with LLAP.</p>
+
+  <span class="live">Real-time scenario 1</span>
+  <h3 id="scenario-udf">One UDF, three times slower</h3>
+  <p class="anim-intro">A typical regression; timings in the captions are from our lab’s md5 test.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">UDF and vectorisation <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="A custom UDF made the map side fall back to row mode; the adaptor or built-in functions restore vectorised execution">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A pipeline got 3× slower after a release</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2 mono">new custom UDF mask_phone() in the SELECT</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Same data, same plan shape.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">EXPLAIN VECTORIZATION</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-red mono">notVectorizedReason: … UDF … not supported</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Map side fell back to row mode.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Check the adaptor setting</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">hive.vectorized.adaptor.usage.mode = all</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lab: 2.1 s with adaptor vs 3.4 s without.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Better: built-in functions</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink2 mono">regexp_replace / concat / substr instead of a UDF</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Many built-ins have native vector versions.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Guard it</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">CI check: no notVectorizedReason in key jobs</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Catches the next regression early.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A release added a custom UDF.</li>
+          <li>EXPLAIN VECTORIZATION gives the reason.</li>
+          <li>The adaptor keeps the rest vectorised.</li>
+          <li>Built-in functions are often native.</li>
+          <li>Check vectorisation in CI.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 2</span>
+  <h3 id="scenario-reducers">Reducer counts that are badly wrong</h3>
+  <p class="anim-intro">Reducer parallelism comes from estimates. Sizes are illustrative; the 8 → 2 adjustment is from our lab.</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">Reducer tuning <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Fix statistics so estimated shuffle bytes are right, enable auto reducer parallelism, and force counts only for exceptions">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Nightly aggregation: 1 reducer, 3 hours</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-red mono">estimated shuffle tiny, real shuffle 400 GB</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Bad estimate → one reducer.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fix the estimate first</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">ANALYZE TABLE … FOR COLUMNS (Lesson 8.2)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Reducer count follows estimated bytes.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Opposite problem: 1,009 tiny reducers</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">thousands of small output files</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Over-estimate wastes containers.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Let Tez adjust</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink mono">hive.tez.auto.reducer.parallelism=true</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Lab: 8 planned → 2 at run time.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Force only as a last resort</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">mapreduce.job.reduces=N for one query</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Fixed numbers age badly as data grows.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Too few reducers: one task does all the work.</li>
+          <li>Better statistics give a better reducer count.</li>
+          <li>Too many reducers waste containers and create small files.</li>
+          <li>Auto parallelism trims at run time.</li>
+          <li>Hard-coded counts are a last resort.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Real-time scenario 3 · advanced</span>
+  <h3 id="scenario-llap">Interactive BI on Hive</h3>
+  <p class="anim-intro">How platform teams make Hive interactive. (Typical architectures; we could not run LLAP in the lab.)</p>
+  <div class="anim anim--one" data-frames="5" data-delay="5000">
+    <div class="anim__title">LLAP and interactive SQL <span>5 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="For many short dashboard queries, pre-warmed sessions or LLAP remove start-up cost; LLAP needs ZooKeeper and daemons">
+          <g data-on="1"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">200 analysts, dashboards with 3-second goals</text><text x="180" y="56" text-anchor="middle" font-size="8" class="s-ink2">each query small, container start-up dominates</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Batch-style execution feels slow.</text></g><g data-on="2"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Options</text><text x="180" y="52" text-anchor="middle" font-size="8" class="s-ink mono">pre-warmed Tez sessions + container reuse</text><text x="180" y="70" text-anchor="middle" font-size="8" class="s-ink mono">LLAP daemons with cache</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Remove start-up time.</text></g><g data-on="3"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">LLAP needs infrastructure</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">ZooKeeper registry, daemons, big memory</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Our lab failed exactly at the registry.</text></g><g data-on="4"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Workload management</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">resource plans: BI pool vs ETL pool</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">ETL does not starve dashboards.</text></g><g data-on="5"><text x="180" y="22" text-anchor="middle" font-size="9.4" font-weight="700" class="s-acc">Or another engine</text><text x="180" y="56" text-anchor="middle" font-size="8.2" class="s-ink2">Trino / Impala on the same tables</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Common split: Hive for ETL, MPP for BI.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Short queries are dominated by start-up.</li>
+          <li>Pre-warm sessions or use LLAP.</li>
+          <li>LLAP needs a registry and daemons.</li>
+          <li>Separate BI and ETL resources.</li>
+          <li>Some teams use an MPP engine for BI.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Execution tuning at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60" y="42" text-anchor="middle" font-size="10" font-weight="700" class="s-green mono">vectorized</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">every job</text></svg></div>
+    <div><h4>1. CPU savings on ETL</h4>
+      <p>Keeping heavy ETL on ORC/Parquet with vectorisation cuts CPU hours, which on cloud clusters is directly money.</p>
+      <div class="uc-flow"><span>ORC + vector</span><i>→</i><span class="java">fewer CPU s</span><i>→</i><span>Lower bill</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-blue">reducers</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">right-sized</text></svg></div>
+    <div><h4>2. Right-sized parallelism</h4>
+      <p>Auto reducer parallelism and split grouping keep tasks large enough to be efficient and many enough to finish on time.</p>
+      <div class="uc-flow"><span>Estimates</span><i>→</i><span class="java">task counts</span><i>→</i><span>On-time SLAs</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60" y="42" text-anchor="middle" font-size="12" font-weight="700" class="s-violet mono">LLAP</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">interactive</text></svg></div>
+    <div><h4>3. Interactive analytics</h4>
+      <p>Distributions such as Cloudera Data Warehouse offer LLAP-based virtual warehouses for BI tools.</p>
+      <div class="uc-flow"><span>BI tool</span><i>→</i><span class="java">LLAP</span><i>→</i><span>Seconds</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-soft-acc" style="stroke:var(--track)"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc">memory</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">containers</text></svg></div>
+    <div><h4>4. Fixing container failures</h4>
+      <p>Tasks killed for exceeding memory are fixed with container size and heap settings, or by reducing map-join sizes.</p>
+      <div class="uc-flow"><span>Killed task</span><i>→</i><span class="java">memory tuning</span><i>→</i><span>Stable job</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="16" y="22" width="88" height="46" rx="6" class="s-card2"/><text x="60" y="42" text-anchor="middle" font-size="11" font-weight="700" class="s-acc mono">fetch</text><text x="60" y="58" text-anchor="middle" font-size="7.4" class="s-ink2">no job</text></svg></div>
+    <div><h4>5. Fast data previews</h4>
+      <p>Fetch-task conversion lets analysts preview tables with SELECT … LIMIT instantly, without using cluster resources.</p>
+      <div class="uc-flow"><span>Preview</span><i>→</i><span class="java">fetch task</span><i>→</i><span>Instant</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified.</p>
+</section>
