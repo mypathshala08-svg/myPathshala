@@ -1,0 +1,25 @@
+from cloudkit import *
+C = 'l45.txt'; CA = 'l45_aws.txt'
+def seca(a, b=None): return capsec(CA, a, b)
+PRAC = practical('Part A compares a container with its host on your machine. Part B deploys the same menu API in AWS three ways — VM, container, function — each with the console (UI) and the CLI. <b>Part B outputs come from the moto AWS emulator</b>; on a real account the Lambda function and the task definition cost nothing while idle, and t3.micro is Free-Tier eligible.', [
+    ('A1 · Prove the shared kernel', uicli(
+        ['Docker Desktop: run the <code>alpine</code> image (Lesson 4.2, A1) → [[Containers]] → the container → [[Exec]] → type <code>uname -r</code>.', 'Compare with the kernel of Docker Desktop’s VM: [[Settings]] → [[General]] shows the WSL 2 / VM backend in use.'],
+        code('bash', 'terminal', 'uname -r\nsudo unshare --pid --fork --mount-proc uname -r\ndocker run --rm alpine uname -r          # if Docker is installed', capsec(C, '== 1)', '== 2)')), ui_label='UI way — Docker Desktop'),
+        'All print the same kernel: containers share it. A VM would show its own.'),
+    ('A2 · Feel the start-time difference', uicli(
+        ['Docker Desktop: [[Images]] → alpine → [[Run]] — the container is “Running” almost instantly.', 'Compare with starting the VirtualBox VM from Lesson 4.1: [[Start]] and wait for the login prompt.'],
+        code('bash', 'terminal', 'time sudo unshare --pid --fork --mount-proc true\ntime docker run --rm alpine true', capsec(C, '== 2)', '== 3)')), ui_label='UI way — Docker Desktop vs VirtualBox'),
+        'Milliseconds vs tens of seconds — no OS to boot.'),
+    ('B1 · As a VM (EC2)', uicli(
+        ['[[EC2]] → [[Launch instances]] → name <code>menu-vm</code> → [[Amazon Linux 2023]] → [[t3.micro]] → key pair → [[Launch instance]].', 'You now own a whole server: patch it, install Python, run the app, keep it alive.'],
+        code('bash', 'terminal', "aws ec2 run-instances --image-id $AMI --instance-type t3.micro \\\n  --query 'Instances[0].InstanceId' --output text", seca('== 1)', '== 2)')), ui_label='UI way — AWS Management Console'),
+        'Type 3: you manage the OS and everything above it.'),
+    ('B2 · As a container (ECS on Fargate)', uicli(
+        ['[[Elastic Container Service]] → [[Clusters]] → [[Create cluster]] → name <code>tiffingo</code> → infrastructure [[AWS Fargate (serverless)]] → [[Create]].', '[[Task definitions]] → [[Create new task definition]] → family <code>menu-api</code> → launch type [[AWS Fargate]] → CPU [[.25 vCPU]], memory [[.5 GB]].', 'Container: name <code>menu</code>, image URI <code>public.ecr.aws/nginx/nginx:alpine</code>, port 80 → [[Create]].', 'To run it: cluster → [[Services]] or [[Tasks]] → [[Run new task]] → choose subnets and a security group allowing port 80.'],
+        code('bash', 'terminal', "aws ecs create-cluster --cluster-name tiffingo\naws ecs register-task-definition --family menu-api --requires-compatibilities FARGATE \\\n  --network-mode awsvpc --cpu 256 --memory 512 --execution-role-arn $ROLE \\\n  --container-definitions '[{\"name\":\"menu\",\"image\":\"public.ecr.aws/nginx/nginx:alpine\",\n    \"portMappings\":[{\"containerPort\":80}],\"essential\":true}]'", seca('== 2)', '== 3)')), ui_label='UI way — AWS Management Console'),
+        'Type 5: you describe an image and its size; there is no EC2 instance to manage. Running tasks costs per vCPU-second and GB-second.'),
+    ('B3 · As a function (Lambda)', uicli(
+        ['[[Lambda]] → [[Create function]] → [[Author from scratch]] → name <code>menu-fn</code> → runtime [[Python 3.12]] → [[Create function]].', '[[Code]] tab: replace the code with the handler on the right → [[Deploy]].', '[[Test]] → create a test event (any JSON) → [[Test]]: the response shows the menu; note “Init duration” on the first run (cold start).', '[[Configuration]] → [[General configuration]]: memory 128 MB, timeout 5 s.'],
+        code('bash', 'terminal', "cat > app.py <<'PY'\ndef handler(event, context):\n    return {\"statusCode\": 200, \"body\": \"TiffinGo menu: dal, roti, paneer\"}\nPY\nzip fn.zip app.py\naws lambda create-function --function-name menu-fn --runtime python3.12 --handler app.handler \\\n  --role $ROLE --zip-file fileb://fn.zip --memory-size 128 --timeout 5\naws lambda invoke --function-name menu-fn out.json && cat out.json   # real account", seca('== 3)', '== 4)')), ui_label='UI way — AWS Management Console'),
+        'Type 6: only 214 bytes of code; it runs in a Firecracker micro-VM (type 7) only when invoked.')],
+    cleanup='Console: [[Lambda]] → menu-fn → [[Actions]] → [[Delete]]; [[ECS]] → task definition → [[Deregister]], cluster → [[Delete cluster]]; [[EC2]] → instance → [[Terminate instance]]; [[IAM]] → roles → delete the execution role you created. CLI: <code>lambda delete-function</code>, <code>ecs deregister-task-definition</code> + <code>delete-cluster</code>, <code>ec2 terminate-instances</code>, <code>iam delete-role</code>.'.replace('[[', '<b>').replace(']]', '</b>'))

@@ -1,0 +1,1748 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inodes: how Linux stores a file behind its name | MyPhatshala</title>
+<meta name="description" content="What an inode is and what it stores (everything except the name); directories as name → inode tables; ls -i, stat and its fields, df -i, du --inodes, find -inum and -samefile; link counts; why mv is instant and cp is not; sed -i changing the inode; sparse files; deleted-but-open files and lsof +L1; running out of inodes on a real 16-inode ext4 disk; debugfs and tune2fs, with real outputs and animations.">
+<meta name="mp:minutes" content="40">
+<link rel="canonical" href="https://myphatshala.in/courses/linux/10-links-and-inodes/01-inodes-how-linux-stores-a-file-behind-its-name/">
+<meta property="og:title" content="Inodes: how Linux stores a file behind its name · MyPhatshala">
+<meta property="og:description" content="Learn what an inode is, why a disk can be “full” with free space, and how Linux finds a file from its name, with real ext4 outputs.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Inodes: how Linux stores a file behind its name", "learningResourceType": "Lesson", "educationalLevel": "Beginner → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Linux", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#0F766E" data-lesson="10-links-and-inodes/01-inodes-how-linux-stores-a-file-behind-its-name" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Linux syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-devops">DevOps and Tools</a><span>›</span><a href="../../">Linux</a><span>›</span><b>Lesson 10.1</b></nav>
+    <h1>Inodes: how Linux stores a file behind its name</h1>
+    <p class="lead">Every Linux file is an inode: a numbered record with its size, owner, permissions, times and data location. The name lives in the folder. This lesson shows both on a real disk and uses them to solve full disks, missing space and odd file names.</p>
+    <div class="lesson-meta"><span>Module 10 · Inodes and links</span><span>⏱ 40 min</span><span>Beginner → Advanced</span><span>A real 16-inode disk</span><span>stat field by field</span><span>debugfs inside ext4</span><span>Practice lab with checker</span><span>Real Bash in your browser</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="hook" aria-label="Why this lesson">
+  <span class="hook__tag">The problem</span>
+  <p class="hook__p">The monitoring alert says “disk full”: the app cannot create a single new file. But <code>df -h</code> shows the disk is only 1% used. On another server, an admin deletes a 20 GB log and <code>df</code> shows no space was freed. Renaming a 50 GB video takes no time at all, yet copying it takes ten minutes. All three puzzles have one answer: Linux does not store a file under its name. Behind every name is an <b>inode</b>, a small numbered record that holds everything about the file except its name.</p>
+  <div class="hook__out"><b>By the end of this page you will be able to:</b><ul><li>explain what an inode is, what it stores (and what it does not: the name), and how a directory maps names to inode numbers</li><li>read every field of <code>stat</code>, see inode numbers with <code>ls -i</code>, and check inode usage with <code>df -i</code></li><li>diagnose “No space left on device” with free space, deleted-but-open files, and why mv is instant but cp is not</li><li>look inside a real ext4 disk with <code>debugfs</code> and <code>tune2fs</code>, and find or delete files by inode number</li></ul></div>
+</section>
+<nav class="rmap" aria-label="How to read this lesson">
+  <h2 class="rmap__h">Start here: how to read this page <small>(about 45 min)</small></h2>
+  <ol class="rm"><li class="rm--short"><a href="#story"><span class="rm__n">1</span><b>The story</b><small>3 min · full disk at 1%</small></a></li><li class="rm--short"><a href="#decide"><span class="rm__n">2</span><b>Which command when?</b><small>2 min · the quick chart</small></a></li><li class=""><a href="#definition"><span class="rm__n">3</span><b>What an inode is</b><small>6 min · simple meaning + 4 depths</small></a></li><li class=""><a href="#types"><span class="rm__n">4</span><b>Name, inode, data</b><small>4 min · three separate things</small></a></li><li class="rm--short"><a href="#commands"><span class="rm__n">5</span><b>Inode tools by field</b><small>15 min · real runs</small></a></li><li class=""><a href="#animation"><span class="rm__n">6</span><b>See it happen</b><small>4 min · a path lookup</small></a></li><li class=""><a href="#run"><span class="rm__n">7</span><b>Run the code</b><small>4 min · try it in the browser</small></a></li><li class="rm--short"><a href="#lab"><span class="rm__n">8</span><b>Practice lab</b><small>7 min · inode detective</small></a></li></ol>
+  <p class="rmap__short"><span class="rm__dot"></span> <b>Short on time?</b> Read only the highlighted steps (about 27 min), then come back for the rest.</p>
+</nav>
+<section class="cmap" id="map" aria-label="Where this lesson fits">
+  <h2 class="cmap__h">Where this lesson fits</h2>
+  <div class="cm">
+    <div class="cm__col cm__col--before"><h4>You need</h4><a class="cm__card" href="../../02-file-system/02-moving-around-pwd-cd-and-ls/"><span class="cm__ref">Lesson 2.2</span><b>Paths</b><span>absolute, relative</span></a><a class="cm__card" href="../../03-files-and-directories/03-deleting-safely-rm-rm-r-rm-i-shred-and-why-rm/"><span class="cm__ref">Lesson 3.3</span><b>rm</b><span>deletes a name</span></a><a class="cm__card" href="../../09-permissions/01-reading-permissions-rwx-for-user-group/"><span class="cm__ref">Lesson 9.1</span><b>Permissions</b><span>stored in the inode</span></a></div>
+    <div class="cm__arrow" aria-hidden="true"><svg viewBox="0 0 40 24"><path d="M2 12h30m-8-8 8 8-8 8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+    <div class="cm__col cm__col--now"><h4>In this lesson</h4><div class="cm__card cm__card--now"><span>✓ inode = the file’s record (everything but the name)</span><span>✓ directory = a table of name → inode number</span><span>✓ ls -i, stat, df -i, find -inum</span><span>✓ link count, deleted-but-open files</span><span>✓ debugfs and tune2fs: inside ext4</span></div></div>
+    <div class="cm__arrow" aria-hidden="true"><svg viewBox="0 0 40 24"><path d="M2 12h30m-8-8 8 8-8 8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+    <div class="cm__col cm__col--after"><h4>It unlocks</h4><a class="cm__card" href="../../10-links-and-inodes/02-hard-links-vs-soft-symbolic-links/"><span class="cm__ref">Lesson 10.2</span><b>Hard and soft links</b><span>two names, one inode</span></a><a class="cm__card" href="../../#m11"><span class="cm__ref">Lesson 11.5</span><b>/proc</b><span>open files of a process</span> <small class="cm__soon">coming soon</small></a><a class="cm__card" href="../../#m15"><span class="cm__ref">Lesson 15.1</span><b>Disks and filesystems</b><span>mkfs, mount, df</span> <small class="cm__soon">coming soon</small></a><a class="cm__card" href="../../#m16"><span class="cm__ref">Lesson 16.4</span><b>Logs</b><span>rotation and inodes</span> <small class="cm__soon">coming soon</small></a></div>
+  </div>
+  <p class="cmap__note">A file is an inode plus data blocks. Names live in directories and only point at inodes.</p>
+</section>
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>A full disk that is 99% empty</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> <a href="../../03-files-and-directories/03-deleting-safely-rm-rm-r-rm-i-shred-and-why-rm/">Lesson 3.3</a> (what rm really deletes) and <a href="../../09-permissions/01-reading-permissions-rwx-for-user-group/">Lesson 9.1</a> (ls -l columns).</p></div>
+  <div class="story">
+<div class="puzzle" id="puzzle"><span class="puzzle__tag">Think first</span><p>A mail server stores every email as a separate tiny file. One morning it cannot save new mail: “No space left on device”. Riya runs <code>df -h</code> and sees 60% free. She deletes a 2 GB backup to make room. The error does not go away. Why not, and which single command would have shown the real problem?</p><small>Keep your guess in mind. The answer is at the end of part 6.</small></div>
+
+    <p class="narration">Riya reproduces the problem on a tiny 8 MB test disk that has room for only 16 files.</p>
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="A terminal: touch fails with No space left on device; df -h shows 1% used; df -i shows 100% of inodes used.">
+        <rect x="20" y="14" width="316" height="156" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="20" y="14" width="316" height="16" rx="8" style="fill:#2C3A33"/><rect x="20" y="22" width="316" height="8" style="fill:#2C3A33"/><circle cx="30" cy="22" r="2.6" style="fill:#D64545"/><circle cx="39" cy="22" r="2.6" style="fill:#E0A100"/><circle cx="48" cy="22" r="2.6" style="fill:#2F7D5B"/><text x="178.0" y="25.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@web01: /mnt/tiny</text><text x="28" y="45" font-size="7.0" class="mono"><tspan style="fill:#9FD3B8">riya@web01:/mnt/tiny$</tspan><tspan style="fill:#EDEBE3"> touch new.txt</tspan></text><text x="28" y="60" font-size="7.0" class="mono" style="fill:#F59E8B">touch: cannot touch &#x27;new.txt&#x27;:</text><text x="28" y="75" font-size="7.0" class="mono" style="fill:#F59E8B">  No space left on device</text><text x="28" y="90" font-size="7.0" class="mono"><tspan style="fill:#9FD3B8">riya@web01:/mnt/tiny$</tspan><tspan style="fill:#EDEBE3"> df -h . | tail -1</tspan></text><text x="28" y="105" font-size="7.0" class="mono" style="fill:#EDEBE3">/dev/loop0  4.0M  24K  3.5M  1%</text><text x="28" y="120" font-size="7.0" class="mono"><tspan style="fill:#9FD3B8">riya@web01:/mnt/tiny$</tspan><tspan style="fill:#EDEBE3"> df -i . | tail -1</tspan></text><text x="28" y="135" font-size="7.0" class="mono" style="fill:#F5C77E">/dev/loop0  16  16  0  100%</text><text x="352" y="36" font-size="9.4" font-weight="700" class="s-acc">Space left, but full?</text><text x="352" y="58" font-size="8.8" class="s-ink2">• blocks: 1% used</text><text x="352" y="75" font-size="8.8" class="s-ink2">• inodes: 100% used</text><text x="352" y="92" font-size="8.8" class="s-ink2">• every file needs</text><text x="352" y="109" font-size="8.8" class="s-ink2">  one inode</text><text x="352" y="126" font-size="8.8" class="s-ink2">• no inode = no file</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Every file needs <tspan font-weight="700" class="s-acc">one inode</tspan>. Run out of inodes and the disk is full.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>But the disk has 3.5 MB free!</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Free <b>blocks</b>, yes. A filesystem has two separate stocks: data blocks for contents, and a fixed number of <b>inodes</b>, one per file. Millions of tiny files can use up the inodes long before the blocks.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So what is an inode?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>The file’s identity card: its number, type, size, owner, permissions, times, link count and where its data is on disk. Everything except the name. The name lives in the folder. Today you will see both, on a real disk.</p></div></div>
+  </div>
+</section>
+<section class="part part--decide">  <div class="dchart" id="decide"><h3>Which command? (decide in 5 seconds)</h3><ul class="dc"><li><span class="dc__q">See a file’s inode number</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">ls -i FILE</code><span class="dc__n">number before the name</span></li><li><span class="dc__q">See everything in the inode</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">stat FILE</code><span class="dc__n">size, blocks, links, owner, times</span></li><li><span class="dc__q">Just one field (for scripts)</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">stat -c &#x27;%i %h %s&#x27; FILE</code><span class="dc__n">inode, links, size</span></li><li><span class="dc__q">“No space left” but df -h has space</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">df -i</code><span class="dc__n">IUse% 100% = out of inodes</span></li><li><span class="dc__q">Find which folder eats inodes</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">du --inodes -x / | sort -n | tail</code><span class="dc__n">many tiny files</span></li><li><span class="dc__q">Deleted file still uses space</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">sudo lsof +L1</code><span class="dc__n">still open by a program</span></li><li><span class="dc__q">Find or delete a file by number</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">find . -inum N [-delete]</code><span class="dc__n">odd file names</span></li><li><span class="dc__q">Inode size and count of a disk</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">sudo tune2fs -l /dev/sdX</code><span class="dc__n">ext4 only</span></li></ul></div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Inode: index node</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>An <b>inode</b> (index node) is a numbered on-disk record that describes one file system object: its type, permissions, owner, group, size, timestamps, link count and the location of its data blocks. It does <b>not</b> contain the file’s name. A <b>directory</b> is a list of entries mapping names to inode numbers, so one inode can have several names (hard links, Lesson 10.2).</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>The name is a label in a folder. The inode is the file.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Inode</b><span>The file’s record: everything except the name.</span></div>
+    <div class="term"><b>Inode number</b><span>Its ID inside one filesystem (ls -i).</span></div>
+    <div class="term"><b>Directory entry (dentry)</b><span>One line in a folder: name → inode number.</span></div>
+    <div class="term"><b>Data blocks</b><span>Where the contents are stored (4 KB each, usually).</span></div>
+    <div class="term"><b>Extent</b><span>A run of blocks: “8 blocks from block 1036”.</span></div>
+    <div class="term"><b>Link count</b><span>How many names point to this inode.</span></div>
+    <div class="term"><b>Inode table</b><span>The fixed array of inodes made by mkfs.</span></div>
+    <div class="term"><b>Sparse file</b><span>Size larger than the blocks it uses.</span></div>
+  </div>
+  <h3 id="names">Why is it called that?</h3>
+  <p>Where the names come from.</p>
+  <div class="nms"><div class="nm"><code>inode</code><b>index node</b><span>Unix, early 1970s.</span></div><div class="nm"><code>stat</code><b>status</b><span>The stat() system call.</span></div><div class="nm"><code>df -i</code><b>disk free, inodes</b><span>Counts inodes, not bytes.</span></div><div class="nm"><code>dentry</code><b>directory entry</b><span>Kernel term.</span></div><div class="nm"><code>debugfs</code><b>debug filesystem</b><span>ext2/3/4 inspector.</span></div><div class="nm"><code>tune2fs</code><b>tune ext2 fs</b><span>Reads/changes ext settings.</span></div><div class="nm"><code>ctime</code><b>change time</b><span>Inode changed, not “created”.</span></div><div class="nm"><code>lost+found</code><b>inode 11</b><span>fsck puts orphans here.</span></div></div>
+
+
+  <h3>Quick facts</h3>
+  <table class="facts">
+    <tr><th>Inode number</th><td><code>ls -i f</code></td></tr>
+    <tr><th>All fields</th><td><code>stat f</code></td></tr>
+    <tr><th>Inode usage</th><td><code>df -i</code></td></tr>
+    <tr><th>By number</th><td><code>find . -inum N</code></td></tr>
+    <tr><th>Root folder inode</th><td>2 (ext4)</td></tr>
+    <tr><th>ext4 inode size</th><td>256 bytes</td></tr>
+  </table>
+  <h3 id="levels">Inodes at four depths</h3>
+  <div class="modlab levels levels4"><div class="modlab__bar"><b>Pick your depth. Completely new? Start at Very basic and climb one step at a time.</b><button type="button" data-mod="v">Very basic</button><button type="button" data-mod="b">Basic</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="v"><h4><span class="lvl lvl--v">Very basic</span> No jargon: a library catalogue</h4>
+      <p>A file is stored in three parts, like a book in a library.</p><div class="scene"><svg viewBox="0 0 640 210" role="img" aria-label="A library: the catalogue card shows a title and a shelf number; the register under that number describes the book; the shelf holds the pages. Folder entry, inode, data blocks."><rect x="14" y="20" width="190" height="110" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="109.0" y="59.1" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">folder = catalogue</text><text x="109.0" y="71.7" text-anchor="middle" font-size="8.0" class="s-ink2">report.txt → 12</text><text x="109.0" y="84.3" text-anchor="middle" font-size="8.0" class="s-ink2">notes.txt  → 13</text><text x="109.0" y="96.9" text-anchor="middle" font-size="8.0" class="s-ink2">(name → number)</text><rect x="224" y="20" width="190" height="110" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="319.0" y="59.1" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">inode 12 = register</text><text x="319.0" y="71.7" text-anchor="middle" font-size="8.0" class="s-ink2">size 18 B, owner riya</text><text x="319.0" y="84.3" text-anchor="middle" font-size="8.0" class="s-ink2">rw-r--r--, 1 link</text><text x="319.0" y="96.9" text-anchor="middle" font-size="8.0" class="s-ink2">data at block 1036</text><rect x="434" y="20" width="192" height="110" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="530.0" y="59.1" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">data blocks = shelf</text><text x="530.0" y="71.7" text-anchor="middle" font-size="8.0" class="s-ink2">block 1036:</text><text x="530.0" y="84.3" text-anchor="middle" font-size="8.0" class="s-ink2">“Q3 sales: 42 lakh”</text><text x="530.0" y="96.9" text-anchor="middle" font-size="8.0" class="s-ink2">(the contents)</text><text x="320" y="160" text-anchor="middle" font-size="9.6" class="s-ink2">The name is in the folder. Everything else is in the inode.</text><text x="320" y="182" text-anchor="middle" font-size="9.6" font-weight="700" class="s-acc">Rename = change the catalogue card. The book does not move.</text><text x="632" y="204" text-anchor="end" class="s-wm">myphatshala.in</text></svg></div>
+    </div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Basic</span> What you will see every day</h4>
+      <ul>
+        <li><code>ls -i</code> shows the inode number in front of each name.</li>
+        <li><code>stat file</code> shows what the inode holds: size, blocks, links, permissions, owner, times.</li>
+        <li><code>df -i</code> shows how many inodes the disk has and how many are used.</li>
+        <li>Rename (<code>mv</code>) in the same filesystem keeps the inode: instant. <code>cp</code> makes a new inode and copies the data.</li>
+      </ul>
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> What the inode stores, and what a folder is</h4>
+      <ul>
+        <li>An inode holds: type (file, folder, link, device…), permission bits and special bits, owner UID and group GID, size, number of blocks, link count, timestamps (atime, mtime, ctime, birth) and pointers to the data (on ext4: <b>extents</b>, “1 block starting at 1035”).</li>
+        <li>A directory is a special file whose data is a list of entries: <b>name → inode number</b>. Every folder contains <code>.</code> (its own inode) and <code>..</code> (the parent’s).</li>
+        <li>The <b>link count</b> is how many names point to the inode. <code>rm</code> removes a name; the data is freed only when the count reaches 0 <b>and</b> no program still has the file open.</li>
+        <li>Inode numbers are unique only inside one filesystem: the pair (device, inode) identifies a file.</li>
+      </ul>
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Behind the screen: ext4 internals</h4>
+      <ul>
+        <li><code>mkfs.ext4</code> creates a fixed <b>inode table</b>: by default one inode per 16 KB of disk, 256 bytes each. The count cannot grow later (<code>-N</code> or <code>-i</code> at mkfs time). XFS and Btrfs allocate inodes dynamically, so they rarely run out.</li>
+        <li>Inodes 1–10 are reserved: 2 is the root folder of every ext4 filesystem, 8 the journal, 11 <code>lost+found</code>.</li>
+        <li>Opening <code>/srv/a/b.txt</code> is a <b>path walk</b>: inode 2 → read its entries → find <code>srv</code> → its inode → … The kernel caches results in the <b>dentry cache</b>.</li>
+        <li>Tiny files (≈60 bytes) can live <b>inside</b> the inode (ext4 inline_data); a <b>sparse</b> file has a large size but few blocks, because holes have no blocks at all.</li>
+        <li>Each process’s open files point to the inode, not the name: that is why a deleted log keeps using space until the program closes it or restarts.</li>
+      </ul>
+    </div>
+  </div><div class="callout callout--did"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v5h1"/></svg><p><b>Did you know?</b> Your file names are not stored with your files at all. That is why one file can have two names (10.2), why a file can exist with no name (deleted but still open), and why <code>mv</code> of a 50 GB file inside one disk takes milliseconds: only one line in a folder changes.</p></div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “What information is not stored in an inode?” → The file name (and the file’s contents). Names are stored in directory entries.</p></div>
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> A folder has 3 subfolders. What is its link count, and why?</summary>
+    <div class="qc__a"><b>Answer:</b> 5: its name in the parent, its own <code>.</code>, and the <code>..</code> of each of the 3 subfolders.</div></details>
+<div class="mist"><b class="mist__tag">Common mistake</b><div class="mist__row"><span class="mist__no">✗</span><code>“ctime is the creation time”</code></div><div class="mist__row"><span class="mist__ok">✓</span><code>ctime = last inode change (chmod, chown, rename, write). Creation time is Birth (stat %w).</code></div><p>stat shows Access, Modify, Change and Birth. chmod changes ctime but not mtime; many scripts that “find files created today” with -ctime are wrong.</p></div>
+
+</section>
+<div class="ad-slot ad-slot--inarticle" data-slot="inarticle"></div>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and differences</span>
+  <h2>Name, inode and data: three separate things</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:560px">
+    <thead><tr><th></th><th>Directory entry</th><th>Inode</th><th>Data blocks</th></tr></thead>
+    <tbody><tr><td>Holds</td><td>name + inode number</td><td>type, mode, owner, size, times, links, block map</td><td>the contents</td></tr><tr><td>Size</td><td>a few bytes per name</td><td>256 bytes (ext4)</td><td>4 KB blocks</td></tr><tr><td>Changed by</td><td>mv, rm, ln, touch new</td><td>chmod, chown, write, touch</td><td>write, append</td></tr><tr><td>Count limited?</td><td>no</td><td>yes: fixed at mkfs (ext4)</td><td>yes: disk size</td></tr><tr><td>See it with</td><td>ls -i, debugfs ls</td><td>stat, debugfs stat</td><td>cat, debugfs blocks</td></tr></tbody>
+  </table>
+  </div>  <div class="table-wrap">
+  <table class="compare" style="min-width:420px">
+    <thead><tr><th>Operation</th><th>Inode</th><th>Why</th></tr></thead>
+    <tbody><tr><td><code>mv a b</code> (same filesystem)</td><td>same</td><td>only the folder entry changes</td></tr><tr><td><code>mv a /other-disk/</code></td><td>new</td><td>copy + delete across filesystems</td></tr><tr><td><code>cp a b</code></td><td>new</td><td>new file, data copied</td></tr><tr><td><code>echo x &gt;&gt; a</code>, <code>&gt; a</code></td><td>same</td><td>same file written</td></tr><tr><td><code>sed -i</code>, many editors</td><td>new</td><td>write a temp file, rename over</td></tr><tr><td><code>chmod</code>, <code>chown</code></td><td>same</td><td>only inode fields change</td></tr></tbody>
+  </table>
+  </div>  <div class="table-wrap">
+  <table class="compare" style="min-width:360px">
+    <thead><tr><th>Filesystem</th><th>Inodes</th></tr></thead>
+    <tbody><tr><td>ext4</td><td>fixed at mkfs: can run out</td></tr><tr><td>XFS</td><td>allocated on demand (up to a % of space)</td></tr><tr><td>Btrfs</td><td>dynamic: practically no limit</td></tr><tr><td>tmpfs</td><td>limited by memory (nr_inodes)</td></tr><tr><td>FAT / exFAT</td><td>no real inodes (Linux fakes numbers)</td></tr></tbody>
+  </table>
+  </div>  <details class="qc"><summary><span class="qc__tag">Quick check</span> Why does <code>sed -i</code> change a file’s inode number but <code>echo &gt;&gt;</code> does not?</summary>
+    <div class="qc__a"><b>Answer:</b> sed -i writes a new temporary file and renames it over the old name, so the name points to a new inode. &gt;&gt; opens the existing inode and appends.</div></details>
+
+</section>
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>Inode tools explained, then used in every field</h2>
+  <p id="commands">All outputs were recorded on our Ubuntu 24.04 build machine: in a sample folder <code>~/ino</code>, and on a real 8 MB ext4 test disk with only 16 inodes, mounted at <code>/mnt/tiny</code>.</p>
+  <article class="cc" id="cmd-lsi">
+    <header class="cc__head"><h3><code>ls -i</code> <span class="cc__full">show inode numbers</span></h3><div class="cc__badges"><span class="rb rb--safe" title="only shows information">🟢 Read-only</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what"><code>ls -i</code> prints each name’s inode number in front of it. Add <code>-l</code> for the full listing (the 2nd column is the link count), <code>-a</code> to see <code>.</code> and <code>..</code>, <code>-d</code> for a folder itself.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>seeing whether two names are the same file</li><li>checking whether a file was replaced</li><li>finding odd names</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>comparing inode numbers from two different disks</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>ls -i[l][a][d] [FILE…]</code></p>
+    <div class="anat" role="img" aria-label="ls -i -a docs"><span class="an an--cmd"><code>ls</code><small>list</small></span><span class="an an--opt"><code>-i</code><small>inode</small></span><span class="an an--opt"><code>-a</code><small>dot files</small></span><span class="an an--arg"><code>docs</code><small>folder</small></span></div><p class="anat__note">The first column is the inode number.</p>
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>-i</code></td><td>inode numbers</td><td>identity</td></tr><tr><td><code>-li</code></td><td>with long listing</td><td>links, size</td></tr><tr><td><code>-ia</code></td><td>include . and ..</td><td>folder links</td></tr><tr><td><code>-id DIR</code></td><td>the folder itself</td><td>not its contents</td></tr><tr><td><code>stat -c %i</code></td><td>number only</td><td>scripts</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ino
+ls -i
+ls -ia docs
+ls -id . docs</code></pre><div class="output">803201 docs
+803217 report.txt
+803201 .
+803185 ..
+803234 notes.txt
+803185 .
+803201 docs</div></div>
+    <p class="cc__note">docs/. has the same number as docs: “.” is just another name for the folder.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="dev">Software development</button><button type="button" data-mod="sys">System info / admin</button></div>
+    <div class="modlab__panel" data-mod="dev"><h4>ls -i in software development</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> Was my config replaced or edited in place?</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ino; ls -i report.txt
+echo &#x27;Q4: 50 lakh&#x27; &gt;&gt; report.txt; ls -i report.txt
+sed -i &#x27;s/lakh/L/&#x27; report.txt; ls -i report.txt</code></pre><div class="output">803217 report.txt
+803217 report.txt
+803249 report.txt</div></div>
+          <p class="fv__why"><b>Why this way:</b> Append keeps the inode; sed -i creates a new file under the same name. Programs watching the old inode (tail -f, inotify, hard links) lose it.</p></li>
+      </ol>
+    </div>
+    <div class="modlab__panel" data-mod="sys"><h4>ls -i in system info / admin</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> Same name, same file? Compare the numbers.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ino; cp report.txt copy.txt; mv docs/notes.txt moved.txt
+ls -i report.txt copy.txt moved.txt</code></pre><div class="output">803249 copy.txt
+803234 moved.txt
+803217 report.txt</div></div>
+          <p class="fv__why"><b>Why this way:</b> cp gave a new inode; mv kept the old one: moved.txt has the number notes.txt had.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <article class="cc" id="cmd-stat">
+    <header class="cc__head"><h3><code>stat</code> <span class="cc__full">show the whole inode</span></h3><div class="cc__badges"><span class="rb rb--safe" title="only shows information">🟢 Read-only</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what"><code>stat</code> prints the inode’s fields: size, blocks, IO block, device, inode number, links, mode, UID, GID and four times (Access, Modify, Change, Birth). <code>-c FORMAT</code> prints chosen fields; <code>-f</code> describes the filesystem instead.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>reading everything Linux knows about a file</li><li>scripts that need size, owner or times</li><li>debugging time and permission problems</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>expecting a creation time on every filesystem</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>stat [-c FORMAT] [-f] FILE…</code></p>
+    
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>%i</code></td><td>inode number</td><td>identity</td></tr><tr><td><code>%h</code></td><td>hard links</td><td>link count</td></tr><tr><td><code>%s / %b</code></td><td>size / 512 B blocks</td><td>real usage</td></tr><tr><td><code>%A %a</code></td><td>mode</td><td>letters / octal</td></tr><tr><td><code>%U %G</code></td><td>owner, group</td><td>names</td></tr><tr><td><code>%y %z %w</code></td><td>mtime ctime birth</td><td>times</td></tr><tr><td><code>-f</code></td><td>filesystem info</td><td>inodes total/free</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ino; stat report.txt</code></pre><div class="output">  File: report.txt
+  Size: 18        	Blocks: 8          IO Block: 4096   regular file
+Device: 254,0	Inode: 803217      Links: 1
+Access: (0644/-rw-r--r--)  Uid: ( 1000/    riya)   Gid: ( 1000/    riya)
+Access: 2026-11-11 17:21:58.331724805 +0530
+Modify: 2026-11-11 17:21:58.333173567 +0530
+Change: 2026-11-11 17:21:58.333173567 +0530
+ Birth: 2026-11-11 17:21:58.331724805 +0530</div></div>
+    <p class="cc__note">Size 18 bytes but Blocks 8 (8 × 512 B = one 4 KB block). Links 1: one name. Birth is the creation time on ext4.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="qa">Testing / QA</button><button type="button" data-mod="sec">Security</button><button type="button" data-mod="sys">System info / admin</button></div>
+    <div class="modlab__panel" data-mod="qa"><h4>stat in testing / qa</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> Size is not space: a sparse file.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ino; truncate -s 1G sparse.img
+stat -c &#x27;size=%s blocks=%b&#x27; sparse.img; du -h sparse.img; ls -lh sparse.img</code></pre><div class="output">size=1073741824 blocks=0
+0	sparse.img
+-rw-r--r-- 1 riya riya 1.0G Nov 11 17:21 sparse.img</div></div>
+          <p class="fv__why"><b>Why this way:</b> 1 GB size, 0 blocks: the inode records a size, but holes have no data blocks. VM disks and databases use this.</p></li>
+      </ol>
+    </div>
+    <div class="modlab__panel" data-mod="sec"><h4>stat in security</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> Which times change when? (forensics)</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ino; f=report.txt; stat -c &#x27;m=%y c=%z&#x27; $f | cut -c1-70
+sleep 1; chmod 600 $f; stat -c &#x27;m=%y c=%z&#x27; $f | cut -c1-70</code></pre><div class="output">m=2026-11-11 17:21:58.390398371 +0530 c=2026-11-11 17:21:58.390398371 
+m=2026-11-11 17:21:58.390398371 +0530 c=2026-11-11 17:21:59.391724843 </div></div>
+          <p class="fv__why"><b>Why this way:</b> chmod updated ctime only. Attackers can fake mtime with touch -d, but not ctime (without changing the clock).</p></li>
+      </ol>
+    </div>
+    <div class="modlab__panel" data-mod="sys"><h4>stat in system info / admin</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> How many inodes are free on this filesystem?</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>stat -f -c &#x27;inodes total=%c free=%d  type=%T&#x27; ~/ino</code></pre><div class="output">inodes total=16777216 free=16453187  type=ext2/ext3</div></div>
+          <p class="fv__why"><b>Why this way:</b> stat -f reports the filesystem; the same numbers as df -i.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <article class="cc" id="cmd-dfi">
+    <header class="cc__head"><h3><code>df -i · du --inodes</code> <span class="cc__full">inode usage</span></h3><div class="cc__badges"><span class="rb rb--safe" title="only shows information">🟢 Read-only</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what"><code>df -i</code> shows each filesystem’s total, used and free inodes and IUse%. At 100%, no new file, folder or link can be created, even with gigabytes free. <code>du --inodes</code> counts inodes per folder to find the culprit.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>“No space left on device” with free space</li><li>servers with millions of small files (mail, cache, sessions)</li><li>capacity planning</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>reading only df -h</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>df -i [PATH]   ·   du --inodes -x DIR | sort -n | tail</code></p>
+    
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>df -i</code></td><td>inodes per filesystem</td><td>check</td></tr><tr><td><code>df -ih</code></td><td>human numbers (K, M)</td><td>readable</td></tr><tr><td><code>du --inodes -x</code></td><td>inodes per folder</td><td>find culprit</td></tr><tr><td><code>-x</code></td><td>stay on one filesystem</td><td>skip /proc</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd /mnt/tiny; for i in 1 2 3 4 5 6; do touch f$i || echo &quot;stopped at f$i&quot;; done
+df -h . | tail -1; df -i . | tail -1
+echo more &gt;&gt; f1 &amp;&amp; echo &#x27;append to an existing file: OK&#x27;
+cd ~; sudo umount /mnt/tiny</code></pre><div class="output">touch: cannot touch &#x27;f6&#x27;: No space left on device
+stopped at f6
+/dev/loop0      4.0M   24K  3.5M   1% /mnt/tiny
+/dev/loop0         16    16     0  100% /mnt/tiny
+append to an existing file: OK</div></div>
+    <p class="cc__note">Real: 16 inodes, 11 already used (1–10 reserved, 11 = lost+found). Five files fit; the sixth fails while 3.5 MB are free. Appending works: no new inode needed.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="sys">System info / admin</button><button type="button" data-mod="devops">DevOps / cloud</button></div>
+    <div class="modlab__panel" data-mod="sys"><h4>df -i · du --inodes in system info / admin</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> The puzzle: deleting a big file does not help.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd /mnt/tiny; df -i . | tail -1
+rm big.bak; touch new.txt &amp;&amp; echo created; df -i . | tail -1
+cd ~; sudo umount /mnt/tiny</code></pre><div class="output">/dev/loop0         16    16     0  100% /mnt/tiny
+created
+/dev/loop0         16    16     0  100% /mnt/tiny</div></div>
+          <p class="fv__why"><b>Why this way:</b> rm big.bak freed one inode, so exactly one new file fits. With millions of mails, you must delete many small files, not one big one.</p></li>
+      </ol>
+    </div>
+    <div class="modlab__panel" data-mod="devops"><h4>df -i · du --inodes in devops / cloud</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> Which folder holds the most files?</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>du --inodes -x ~/ino | sort -n | tail -3</code></pre><div class="output">2	/home/riya/ino/docs
+301	/home/riya/ino/cache
+305	/home/riya/ino</div></div>
+          <p class="fv__why"><b>Why this way:</b> Typical culprits: PHP session folders, mail queues, cache folders, node_modules, forgotten tmp files.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+<div class="mist"><b class="mist__tag">Common mistake</b><div class="mist__row"><span class="mist__no">✗</span><code>“df -h shows 40% free, so the disk cannot be full”</code></div><div class="mist__row"><span class="mist__ok">✓</span><code>df -h   and   df -i</code></div><p>Blocks and inodes run out separately. Always check both when you see “No space left on device”.</p></div>
+  <article class="cc" id="cmd-findinum">
+    <header class="cc__head"><h3><code>find -inum · -samefile</code> <span class="cc__full">files by inode</span></h3><div class="cc__badges"><span class="rb rb--change" title="creates or changes files; check before pressing Enter">🟡 Changes files</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what"><code>find -inum N</code> finds every name whose inode is N; <code>-samefile F</code> finds all names of the same inode as F. Add <code>-delete</code> or <code>-exec</code> to act on it. Use <code>-xdev</code> so it stays on one filesystem.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>files with names you cannot type (newlines, leading -)</li><li>checking that two paths are one file</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>-inum across several filesystems (numbers repeat)</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>find DIR -xdev -inum N [-delete]   ·   find DIR -samefile FILE</code></p>
+    
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>-inum N</code></td><td>inode number N</td><td>identify</td></tr><tr><td><code>-samefile F</code></td><td>same inode as F</td><td>all names</td></tr><tr><td><code>-xdev</code></td><td>one filesystem</td><td>numbers are per disk</td></tr><tr><td><code>-delete</code></td><td>remove that name</td><td>odd names</td></tr><tr><td><code>-links +1</code></td><td>files with several names</td><td>hard links</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ino; ls -i
+n=$(ls -i | awk &#x27;/-rf/{print $1}&#x27;)
+find . -inum &quot;$n&quot; -delete; ls</code></pre><div class="output">803266 -rf
+803297 bad
+name
+803201 docs
+803217 report.txt
+bad
+name
+docs
+report.txt</div></div>
+    <p class="cc__note">A file named -rf is hard to remove (rm -rf!). By inode number there is no quoting problem. The name with a newline prints on two lines here; in a terminal ls shows it as bad?name.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="sec">Security</button></div>
+    <div class="modlab__panel" data-mod="sec"><h4>find -inum · -samefile in security</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> Delete the file with a newline in its name, safely.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ino; ls -i | head -3
+find . -maxdepth 1 -name &#x27;bad*&#x27; -printf &#x27;%i %p\n&#x27;
+find . -maxdepth 1 -inum &quot;$(find . -maxdepth 1 -name &#x27;bad*&#x27; -printf &#x27;%i&#x27;)&quot; -delete; ls</code></pre><div class="output">803266 bad
+name
+803201 docs
+803266 ./bad
+name
+docs
+report.txt</div></div>
+          <p class="fv__why"><b>Why this way:</b> Check the number first (-printf %i), then delete exactly that inode.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <article class="cc" id="cmd-debugfs">
+    <header class="cc__head"><h3><code>debugfs · tune2fs -l</code> <span class="cc__full">look inside ext4</span></h3><div class="cc__badges"><span class="rb rb--change" title="creates or changes files; check before pressing Enter">🟡 Changes files</span><span class="rb rb--sudo" title="needs administrator rights">sudo needed</span></div></header>
+    <p class="cc__what"><code>debugfs</code> opens an ext2/3/4 filesystem (read-only unless <code>-w</code>): <code>ls -l</code> shows the raw folder entries, <code>stat &lt;N&gt;</code> an inode, <code>blocks &lt;N&gt;</code> its data blocks. <code>tune2fs -l</code> lists the superblock: inode count, size, free inodes. Real disks need sudo; image files do not.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>learning how ext4 really stores files</li><li>recovery and forensics on a disk image</li><li>checking inode count and size</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>writing with debugfs -w on a mounted disk (corruption)</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>debugfs -R &#x27;CMD&#x27; DEVICE   ·   tune2fs -l DEVICE</code></p>
+    
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>-R &#x27;ls -l /&#x27;</code></td><td>folder entries</td><td>name → inode</td></tr><tr><td><code>-R &#x27;stat &lt;12&gt;&#x27;</code></td><td>inode 12</td><td>raw fields</td></tr><tr><td><code>-R &#x27;blocks &lt;12&gt;&#x27;</code></td><td>data blocks</td><td>where data is</td></tr><tr><td><code>-R &#x27;ncheck 12&#x27;</code></td><td>inode → name</td><td>reverse lookup</td></tr><tr><td><code>tune2fs -l</code></td><td>superblock</td><td>Inode count/size</td></tr><tr><td><code>-w</code></td><td>writable</td><td>experts only</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>debugfs -R &#x27;ls -l /&#x27; ~/tiny.img 2&gt;/dev/null</code></pre><div class="output">      2   40755 (2)   1000   1000    4096 11-Nov-2026 17:21 .
+      2   40755 (2)   1000   1000    4096 11-Nov-2026 17:21 ..
+     11   40700 (2)      0      0   16384 11-Nov-2026 17:21 lost+found
+     12  100644 (1)   1000   1000      18 11-Nov-2026 17:21 report.txt
+     13   40755 (2)   1000   1000    4096 11-Nov-2026 17:21 logs</div></div>
+    <p class="cc__note">The real directory on disk: inode number, mode, links, UID, GID, size, date, name. 2 is the root folder (both . and ..), 11 is lost+found.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="sys">System info / admin</button><button type="button" data-mod="dba">Data administration (DBA)</button></div>
+    <div class="modlab__panel" data-mod="sys"><h4>debugfs · tune2fs -l in system info / admin</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> The inode of report.txt, as stored on disk.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>debugfs -R &#x27;stat &lt;12&gt;&#x27; ~/tiny.img 2&gt;/dev/null | grep -v -E &#x27;time:|^Size of|^Generation|^Fragment|^File ACL|Inode checksum&#x27;
+debugfs -R &#x27;cat &lt;12&gt;&#x27; ~/tiny.img 2&gt;/dev/null</code></pre><div class="output">Inode: 12   Type: regular    Mode:  0644   Flags: 0x80000
+User:  1000   Group:  1000   Project:     0   Size: 18
+Links: 1   Blockcount: 8
+EXTENTS:
+(0):1036
+Q3 sales: 42 lakh</div></div>
+          <p class="fv__why"><b>Why this way:</b> No name anywhere in the inode. EXTENTS says where the data is; cat &lt;12&gt; reads it by number.</p></li>
+      </ol>
+    </div>
+    <div class="modlab__panel" data-mod="dba"><h4>debugfs · tune2fs -l in data administration</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> How many inodes did mkfs create, and how big is each?</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>tune2fs -l ~/tiny.img | grep -E &#x27;^Inode count|^Free inodes|^Inode size|^Block count|^Free blocks&#x27;</code></pre><div class="output">Inode count:              16
+Block count:              2048
+Free blocks:              1010
+Free inodes:              2
+Inode size:	          256</div></div>
+          <p class="fv__why"><b>Why this way:</b> Plan before mkfs: a disk for millions of small files needs mkfs.ext4 -i 4096 (or -N), or XFS.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <div class="undo" id="undo"><h3>Undo and safety net</h3><p>Inode problems are fixed by removing files or changing the filesystem; there is no “add inodes” command on ext4.</p><ul><li><b>Inodes at 100%:</b> find the folder with <code>du --inodes -x /</code>, delete old small files (sessions, cache, mail queue), then fix the program that makes them.</li><li><b>Space not freed after rm:</b> <code>sudo lsof +L1</code> lists deleted-but-open files; restart or reload that program, or empty the file with <code>: &gt; /proc/PID/fd/N</code>.</li><li><b>Need more inodes permanently:</b> back up, re-create with <code>mkfs.ext4 -i 4096</code> or <code>-N</code>, restore; or use XFS. (Destroys data on that disk!)</li><li><b>Deleted a file by mistake:</b> stop writing to that disk at once; tools such as extundelete may recover it from a copy of the disk. Better: backups.</li></ul></div>
+  <h3 id="errors">Error messages decoded</h3>
+  <p>Errors students see most. Each was really produced on our build machine, with its exit status.</p>
+  <ol class="ers">
+    <li class="er"><div class="code" data-lang="bash" data-file="Terminal"><pre><code>touch /mnt/tiny/f6</code></pre><div class="output">touch: cannot touch &#x27;/mnt/tiny/f6&#x27;: No space left on device
+exit status: 1</div></div>
+      <p><b>What it means:</b> No free inode (also printed when blocks are full).</p><p><b>Fix:</b> <code>df -i</code> and <code>df -h</code>; delete small files.</p></li>
+    <li class="er"><div class="code" data-lang="bash" data-file="Terminal"><pre><code>find ~/ino -inum abc</code></pre><div class="output">find: invalid argument `abc&#x27; to `-inum&#x27;
+exit status: 1</div></div>
+      <p><b>What it means:</b> -inum needs a number.</p><p><b>Fix:</b> Take it from <code>ls -i</code> or <code>stat -c %i</code>.</p></li>
+    <li class="er"><div class="code" data-lang="bash" data-file="Terminal"><pre><code>debugfs -R stat /dev/vda</code></pre><div class="output">/home/riya/script.sh: line 1: debugfs: command not found
+exit status: 127</div></div>
+      <p><b>What it means:</b> A real disk needs root (and a command argument).</p><p><b>Fix:</b> <code>sudo debugfs -R 'stat &lt;2&gt;' /dev/sda1</code>.</p></li>
+    <li class="er"><div class="code" data-lang="bash" data-file="Terminal"><pre><code>stat nothing.txt</code></pre><div class="output">stat: cannot statx &#x27;nothing.txt&#x27;: No such file or directory
+exit status: 1</div></div>
+      <p><b>What it means:</b> No such name in this folder.</p><p><b>Fix:</b> Check the path; names are looked up folder by folder.</p></li>
+  </ol>
+<div class="mist"><b class="mist__tag">Common mistake</b><div class="mist__row"><span class="mist__no">✗</span><code>“The inode is a unique number for each file” (on the whole system)</code></div><div class="mist__row"><span class="mist__ok">✓</span><code>Unique only inside one filesystem: the pair (device, inode) identifies a file</code></div><p>Every disk numbers its inodes from 1, so /home/a and /mnt/usb/b can both be inode 12. find -inum should be used with -xdev, and backup tools compare device and inode together.</p></div>
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> Two names show the same inode number with <code>ls -i</code>. When are they the same file?</summary>
+    <div class="qc__a"><b>Answer:</b> Only when they are on the same filesystem (same Device in stat). Inode numbers repeat on every disk.</div></details>
+
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>A path lookup, and a file without a name</h2>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">Behind the screen: the path walk <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="A terminal running cat on a full path and printing the file.">
+          <g data-on="1"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@web01</text><text x="22" y="45.5" font-size="8" class="mono"><tspan style="fill:#9FD3B8">riya@web01:~$</tspan><tspan style="fill:#EDEBE3"> cat ~/ino/report.txt</tspan></text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">You type one path.</text></g><g data-on="2"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@web01</text><text x="22" y="45.5" font-size="8" class="mono"><tspan style="fill:#9FD3B8">riya@web01:~$</tspan><tspan style="fill:#EDEBE3"> cat ~/ino/report.txt</tspan></text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">The kernel reads folder after folder…</text></g><g data-on="3"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@web01</text><text x="22" y="45.5" font-size="8" class="mono"><tspan style="fill:#9FD3B8">riya@web01:~$</tspan><tspan style="fill:#EDEBE3"> cat ~/ino/report.txt</tspan></text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">…each time: name → inode number…</text></g><g data-on="4"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@web01</text><text x="22" y="45.5" font-size="8" class="mono"><tspan style="fill:#9FD3B8">riya@web01:~$</tspan><tspan style="fill:#EDEBE3"> cat ~/ino/report.txt</tspan></text><text x="22" y="59.0" font-size="8" class="mono" style="fill:#EDEBE3">Q3 sales: 42 lakh</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">…then the inode gives the data blocks.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>One command.</li>
+          <li>Folder 1.</li>
+          <li>Folder 2.</li>
+          <li>The data.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Four boxes /, home, riya and report.txt with their inode numbers; each step reads one folder, finds the next name and moves to its inode.">
+          <g data-on="1"><rect x="10" y="30" width="80" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="50.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">/</text><text x="50.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 2</text><rect x="96" y="30" width="80" height="46" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="136.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">home</text><text x="136.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 12</text><rect x="182" y="30" width="80" height="46" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="222.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">riya</text><text x="222.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 802825</text><rect x="268" y="30" width="80" height="46" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="308.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">…/report.txt</text><text x="308.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 803217</text><text x="180" y="120" text-anchor="middle" font-size="8.6" font-weight="700" class="s-violet">Start at the root: inode 2.</text></g><g data-on="2"><rect x="10" y="30" width="80" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="50.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">/</text><text x="50.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 2</text><rect x="96" y="30" width="80" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="136.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">home</text><text x="136.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 12</text><rect x="182" y="30" width="80" height="46" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="222.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">riya</text><text x="222.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 802825</text><rect x="268" y="30" width="80" height="46" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="308.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">…/report.txt</text><text x="308.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 803217</text><text x="180" y="120" text-anchor="middle" font-size="8.6" font-weight="700" class="s-violet">In /: “home” → inode 12.</text></g><g data-on="3"><rect x="10" y="30" width="80" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="50.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">/</text><text x="50.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 2</text><rect x="96" y="30" width="80" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="136.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">home</text><text x="136.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 12</text><rect x="182" y="30" width="80" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="222.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">riya</text><text x="222.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 802825</text><rect x="268" y="30" width="80" height="46" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="308.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">…/report.txt</text><text x="308.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 803217</text><text x="180" y="120" text-anchor="middle" font-size="8.6" font-weight="700" class="s-violet">In home: “riya” → inode 802825.</text></g><g data-on="4"><rect x="10" y="30" width="80" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="50.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">/</text><text x="50.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 2</text><rect x="96" y="30" width="80" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="136.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">home</text><text x="136.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 12</text><rect x="182" y="30" width="80" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="222.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">riya</text><text x="222.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 802825</text><rect x="268" y="30" width="80" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="308.0" y="49.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">…/report.txt</text><text x="308.0" y="61.8" text-anchor="middle" font-size="7.4" class="s-ink2">inode 803217</text><text x="180" y="120" text-anchor="middle" font-size="8.6" font-weight="700" class="s-violet">Then ino, then report.txt → inode 803217 → blocks.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>/ = inode 2</li>
+          <li>home → 12</li>
+          <li>riya → 802825</li>
+          <li>report.txt → 803217</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Animated example</span>
+  <h3 id="scenario-open">Why rm did not free the space</h3>
+  <p class="anim-intro">A deleted file that a program still has open.</p>
+  <div class="anim anim--one" data-frames="4" data-delay="5000">
+    <div class="anim__title">deleted but open <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Boxes for the name, the inode, the program and the data: rm removes the name, but the data is freed only when the program closes the file.">
+          <g data-on="1"><rect x="14" y="26" width="110" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="69.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">big.log</text><text x="69.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">(folder entry)</text><rect x="150" y="26" width="110" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="205.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">inode 13</text><text x="205.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">links 1</text><rect x="150" y="92" width="110" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="205.0" y="111.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">app has it open</text><rect x="286" y="26" width="70" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="321.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">2 MB</text><text x="321.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">data</text><text x="180" y="150" text-anchor="middle" font-size="8.6" font-weight="700" class="s-violet">A program writes to big.log.</text></g><g data-on="2"><rect x="14" y="26" width="110" height="46" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="69.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">(name gone)</text><text x="69.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">rm big.log</text><rect x="150" y="26" width="110" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="205.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">inode 13</text><text x="205.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">links 0</text><rect x="150" y="92" width="110" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="205.0" y="111.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">app has it open</text><rect x="286" y="26" width="70" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="321.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">2 MB</text><text x="321.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">data</text><text x="180" y="150" text-anchor="middle" font-size="8.6" font-weight="700" class="s-red">rm removes the name: links 0.</text></g><g data-on="3"><rect x="14" y="26" width="110" height="46" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="69.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">(name gone)</text><text x="69.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">rm big.log</text><rect x="150" y="26" width="110" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="205.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">inode 13</text><text x="205.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">links 0</text><rect x="150" y="92" width="110" height="34" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="205.0" y="111.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">app has it open</text><rect x="286" y="26" width="70" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="321.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">2 MB</text><text x="321.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">data</text><text x="180" y="150" text-anchor="middle" font-size="8.6" font-weight="700" class="s-red">Data stays: the program still has it open.</text></g><g data-on="4"><rect x="14" y="26" width="110" height="46" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="69.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">(name gone)</text><text x="69.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">rm big.log</text><rect x="150" y="26" width="110" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="205.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">inode 13</text><text x="205.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">links 0</text><rect x="150" y="92" width="110" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="205.0" y="111.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">app closed</text><rect x="286" y="26" width="70" height="46" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="321.0" y="45.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">2 MB</text><text x="321.0" y="57.8" text-anchor="middle" font-size="7.4" class="s-ink2">data</text><text x="180" y="150" text-anchor="middle" font-size="8.6" font-weight="700" class="s-green">Program closes or restarts: space freed.</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>Open.</li>
+          <li>rm.</li>
+          <li>Still used.</li>
+          <li>Freed.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+  <h3 id="dissect">Layer by layer: from a name to the bytes</h3>
+  <p>Each layer has a real command and output from our build machine, on the 16-inode test disk.</p>
+  <div class="modlab dissect"><div class="modlab__bar"><b>From the name down to the disk. Click a layer.</b><button type="button" data-mod="name"><b>The name you type</b><small>a path</small></button><button type="button" data-mod="dentry"><b>Folder entry</b><small>name → number</small></button><button type="button" data-mod="inode"><b>Inode</b><small>256-byte record</small></button><button type="button" data-mod="blocks"><b>Data blocks</b><small>4 KB each</small></button><button type="button" data-mod="sb"><b>Superblock</b><small>the totals</small></button></div>
+    <div class="modlab__panel" data-mod="name">
+      <h4>The name you type <small>a path</small></h4>
+      <div class="dx__grid">
+        <div class="dx__q dx__q--why"><b>Why does it exist?</b><p>Humans use names.</p></div>
+        <div class="dx__q dx__q--how"><b>How does it work?</b><p>Looked up folder by folder.</p></div>
+        <div class="dx__q dx__q--impl"><b>Where is it, really?</b><p>Path walk.</p></div>
+        <div class="dx__q dx__q--used"><b>Where is it used?</b><p>Every open().</p></div>
+      </div>
+      <div class="dx__see"><p class="wx__label">See this layer yourself (real output)</p>
+        <div class="code" data-lang="bash" data-file="Terminal"><pre><code>debugfs -R &#x27;ncheck 12 13&#x27; ~/tiny.img 2&gt;/dev/null</code></pre><div class="output">Inode	Pathname
+12	//report.txt
+13	//logs</div></div></div>
+    </div>
+    <div class="modlab__panel" data-mod="dentry">
+      <h4>Folder entry <small>name → number</small></h4>
+      <div class="dx__grid">
+        <div class="dx__q dx__q--why"><b>Why does it exist?</b><p>Folders are tables.</p></div>
+        <div class="dx__q dx__q--how"><b>How does it work?</b><p>One line per name.</p></div>
+        <div class="dx__q dx__q--impl"><b>Where is it, really?</b><p>ext4 dir blocks.</p></div>
+        <div class="dx__q dx__q--used"><b>Where is it used?</b><p>ls, mv, rm.</p></div>
+      </div>
+      <div class="dx__see"><p class="wx__label">See this layer yourself (real output)</p>
+        <div class="code" data-lang="bash" data-file="Terminal"><pre><code>debugfs -R &#x27;ls -l /logs&#x27; ~/tiny.img 2&gt;/dev/null</code></pre><div class="output">     13   40755 (2)   1000   1000    4096 11-Nov-2026 17:22 .
+      2   40755 (2)   1000   1000    4096 11-Nov-2026 17:22 ..
+     14  100644 (1)   1000   1000       5 11-Nov-2026 17:22 app.log</div></div></div>
+    </div>
+    <div class="modlab__panel" data-mod="inode">
+      <h4>Inode <small>256-byte record</small></h4>
+      <div class="dx__grid">
+        <div class="dx__q dx__q--why"><b>Why does it exist?</b><p>Everything but the name.</p></div>
+        <div class="dx__q dx__q--how"><b>How does it work?</b><p>Fixed table.</p></div>
+        <div class="dx__q dx__q--impl"><b>Where is it, really?</b><p>Inode table.</p></div>
+        <div class="dx__q dx__q--used"><b>Where is it used?</b><p>stat, permission checks.</p></div>
+      </div>
+      <div class="dx__see"><p class="wx__label">See this layer yourself (real output)</p>
+        <div class="code" data-lang="bash" data-file="Terminal"><pre><code>debugfs -R &#x27;stat &lt;12&gt;&#x27; ~/tiny.img 2&gt;/dev/null | head -4</code></pre><div class="output">Inode: 12   Type: regular    Mode:  0644   Flags: 0x80000
+Generation: 3929918712    Version: 0x00000000:00000002
+User:  1000   Group:  1000   Project:     0   Size: 18
+File ACL: 0</div></div></div>
+    </div>
+    <div class="modlab__panel" data-mod="blocks">
+      <h4>Data blocks <small>4 KB each</small></h4>
+      <div class="dx__grid">
+        <div class="dx__q dx__q--why"><b>Why does it exist?</b><p>The contents.</p></div>
+        <div class="dx__q dx__q--how"><b>How does it work?</b><p>Extents.</p></div>
+        <div class="dx__q dx__q--impl"><b>Where is it, really?</b><p>Block bitmap.</p></div>
+        <div class="dx__q dx__q--used"><b>Where is it used?</b><p>read, write.</p></div>
+      </div>
+      <div class="dx__see"><p class="wx__label">See this layer yourself (real output)</p>
+        <div class="code" data-lang="bash" data-file="Terminal"><pre><code>debugfs -R &#x27;blocks &lt;12&gt;&#x27; ~/tiny.img 2&gt;/dev/null; debugfs -R &#x27;cat &lt;12&gt;&#x27; ~/tiny.img 2&gt;/dev/null</code></pre><div class="output">1036 
+Q3 sales: 42 lakh</div></div></div>
+    </div>
+    <div class="modlab__panel" data-mod="sb">
+      <h4>Superblock <small>the totals</small></h4>
+      <div class="dx__grid">
+        <div class="dx__q dx__q--why"><b>Why does it exist?</b><p>How many inodes exist.</p></div>
+        <div class="dx__q dx__q--how"><b>How does it work?</b><p>Written at mkfs.</p></div>
+        <div class="dx__q dx__q--impl"><b>Where is it, really?</b><p>Block 0/1.</p></div>
+        <div class="dx__q dx__q--used"><b>Where is it used?</b><p>df -i.</p></div>
+      </div>
+      <div class="dx__see"><p class="wx__label">See this layer yourself (real output)</p>
+        <div class="code" data-lang="bash" data-file="Terminal"><pre><code>tune2fs -l ~/tiny.img | grep -E &#x27;^Inode count|^Free inodes&#x27;</code></pre><div class="output">Inode count:              16
+Free inodes:              2</div></div></div>
+    </div>
+  </div>
+  <h3 id="hood">Under the hood: stat only asks for the inode</h3>
+  <p>The real system calls of <code>stat report.txt</code> on our build machine. One call, <code>statx</code>, fetches the whole inode by name; the file is never opened and no data is read.</p>
+  <div class="code" data-lang="bash" data-file="Terminal"><pre><code>strace -f -e trace=statx stat report.txt</code></pre><div class="output">statx(AT_FDCWD, &quot;report.txt&quot;, AT_STATX_SYNC_AS_STAT|AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT, STATX_ALL, {stx_mask=STATX_ALL|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFREG|0644, stx_size=18, ...}) = 0</div></div>
+  <p class="muted">Recorded with <code>strace</code> on our Ubuntu build machine; library loading lines are hidden. You can run the same on your PC after <code>sudo apt install strace</code>.</p>
+  
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> A 2 GB log was deleted but df shows no change. What do you run?</summary>
+    <div class="qc__a"><b>Answer:</b> <code>sudo lsof +L1</code>: it lists files with link count 0 that are still open, with the program’s PID. Restart that program (or truncate via /proc/PID/fd).</div></details>
+
+</section>
+<div class="ad-slot ad-slot--inarticle" data-slot="inarticle"></div>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Inodes at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">df -i</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">100%</text></svg></div>
+    <div><h4>1. Mail and session servers</h4>
+      <p>Millions of tiny files (mails, PHP sessions, cache) exhaust inodes while blocks are free.</p>
+      <div class="uc-flow"><span>Alert</span><i>→</i><span class="java">df -i</span><i>→</i><span>clean up</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">lsof +L1</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">deleted logs</text></svg></div>
+    <div><h4>2. Log rotation</h4>
+      <p>A log deleted while the app writes to it keeps using space until the app reopens it (logrotate copytruncate / reload).</p>
+      <div class="uc-flow"><span>Disk full</span><i>→</i><span class="java">lsof +L1</span><i>→</i><span>reload</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">mkfs -i</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">planning</text></svg></div>
+    <div><h4>3. Storage design</h4>
+      <p>Admins choose the inode ratio (or XFS) when building disks for build caches, Git servers and image thumbnails.</p>
+      <div class="uc-flow"><span>Plan</span><i>→</i><span class="java">mkfs.ext4 -i</span><i>→</i><span>deploy</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">stat</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">ctime</text></svg></div>
+    <div><h4>4. Forensics and audits</h4>
+      <p>Investigators read inode times and numbers to see what changed and whether a file was replaced.</p>
+      <div class="uc-flow"><span>Incident</span><i>→</i><span class="java">stat</span><i>→</i><span>timeline</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">same inode?</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">backups</text></svg></div>
+    <div><h4>5. Backup and sync tools</h4>
+      <p>rsync, tar and backup tools use (device, inode) to spot hard links and avoid copying the same file twice.</p>
+      <div class="uc-flow"><span>Scan</span><i>→</i><span class="java">inode</span><i>→</i><span>dedupe</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified and generic. They describe common patterns, not the internal systems of any particular company.</p>
+  <h3 id="oneliners">One-liner corner</h3>
+  <p class="ol-intro">Small, useful commands. All really run on our build machine.</p>
+  <div class="ol-list">
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">Beginner</span><h4>Inode number</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Which inode is this?</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>stat -c &#x27;%i %n&#x27; ~/ino/report.txt</code></pre><div class="output">803217 /home/riya/ino/report.txt</div></div>
+      <p class="ol__how">%i.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">Beginner</span><h4>Inode usage</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Am I running out?</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>df -i ~ | tail -1</code></pre><div class="output">/dev/vda       16777216 324030 16453186    2% /</div></div>
+      <p class="ol__how">IUse%.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--i">Intermediate</span><h4>Biggest file count</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Who uses the inodes?</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>du --inodes -x ~/ino | sort -n | tail -2</code></pre><div class="output">51	/home/riya/ino/tmp
+55	/home/riya/ino</div></div>
+      <p class="ol__how">du --inodes.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--i">Intermediate</span><h4>Size vs space</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Sparse or real?</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ino; truncate -s 100M hole.img; du -h --apparent-size hole.img; du -h hole.img</code></pre><div class="output">100M	hole.img
+0	hole.img</div></div>
+      <p class="ol__how">Holes use no blocks.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--a">Advanced</span><h4>Deleted but open</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Space not freed.</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd /mnt/tiny; exec 3&lt; big.log; rm big.log; df -h . | tail -1; ls -l /proc/$$/fd/3 | sed &#x27;s/.*3 -&gt;/fd 3 -&gt;/&#x27;; exec 3&lt;&amp;-; df -h . | tail -1; cd ~; sudo umount /mnt/tiny</code></pre><div class="output">/dev/loop0      4.0M  2.1M  1.5M  60% /mnt/tiny
+fd 3 -&gt; /mnt/tiny/big.log (deleted)
+/dev/loop0      4.0M   24K  3.5M   1% /mnt/tiny</div></div>
+      <p class="ol__how">Freed only after close.</p>
+    </article>
+    <article class="ol ol--build">
+      <div class="ol__head"><span class="lvl lvl--b">Beginner</span><h4>Build it step by step: the inode detective</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Riya follows one file through name, inode and data on the test disk.</p>
+      <ol class="build">
+      <li><p>1. The root folder: (inode) name pairs.</p>
+        <div class="code" data-lang="bash" data-file="Step 1"><pre><code>debugfs -R &#x27;ls /&#x27; ~/tiny.img 2&gt;/dev/null | tr -s &#x27; &#x27; &#x27;\n&#x27; | grep -v &#x27;^$&#x27; | paste - - - | head -6</code></pre><div class="output">2	(12)	.
+2	(12)	..
+11	(20)	lost+found
+12	(20)	report.txt
+13	(4020)	logs</div></div></li>
+      <li><p>2. Inode 12: type, owner, links.</p>
+        <div class="code" data-lang="bash" data-file="Step 2"><pre><code>debugfs -R &#x27;stat &lt;12&gt;&#x27; ~/tiny.img 2&gt;/dev/null | sed -n &#x27;/^Inode:/p;/^User/p;/^Links/p;/^EXTENTS/,+1p&#x27;</code></pre><div class="output">Inode: 12   Type: regular    Mode:  0644   Flags: 0x80000
+User:  1000   Group:  1000   Project:     0   Size: 18
+Links: 1   Blockcount: 8
+EXTENTS:
+(0):1036</div></div></li>
+      <li><p>3. Its data block number.</p>
+        <div class="code" data-lang="bash" data-file="Step 3"><pre><code>debugfs -R &#x27;blocks &lt;12&gt;&#x27; ~/tiny.img 2&gt;/dev/null</code></pre><div class="output">1036 </div></div></li>
+      <li><p>4. The contents, read by number.</p>
+        <div class="code" data-lang="bash" data-file="Step 4"><pre><code>debugfs -R &#x27;cat &lt;12&gt;&#x27; ~/tiny.img 2&gt;/dev/null</code></pre><div class="output">Q3 sales: 42 lakh</div></div></li>
+      </ol>
+    </article>
+  </div>  <h3 id="which">Which command when?</h3>
+  <p>Choosing the right tool.</p>
+  <div class="table-wrap">
+  <table class="compare which" style="min-width:640px">
+    <thead><tr><th>You want to…</th><th>Use</th><th>Why</th><th>Common mistake</th></tr></thead>
+    <tbody><tr><td>See the inode number</td><td><code>ls -i / stat -c %i</code></td><td>Identity.</td><td>Comparing across disks.</td></tr><tr><td>All inode fields</td><td><code>stat</code></td><td>Size, links, times.</td><td>Trusting ls -l times.</td></tr><tr><td>No space left</td><td><code>df -h and df -i</code></td><td>Two limits.</td><td>Only df -h.</td></tr><tr><td>Who uses inodes</td><td><code>du --inodes -x</code></td><td>Finds the folder.</td><td>du -sh (bytes).</td></tr><tr><td>Space not freed</td><td><code>lsof +L1</code></td><td>Deleted but open.</td><td>Deleting more files.</td></tr><tr><td>Weird file name</td><td><code>find -inum N -delete</code></td><td>No quoting.</td><td>rm with wildcards.</td></tr></tbody>
+  </table>
+  </div>  <h3 id="keys">Keyboard and shell shortcuts</h3>
+  <p>Handy forms.</p>
+  <div class="table-wrap"><table class="compare" style="min-width:520px"><thead><tr><th>Keys / syntax</th><th>What it does</th><th>Example</th></tr></thead><tbody><tr><td><kbd>stat -c &#x27;%i %h %n&#x27; *</kbd></td><td>inode, links, name</td><td><code>compare</code></td></tr><tr><td><kbd>ls -lai</kbd></td><td>everything incl. . ..</td><td><code>folders</code></td></tr><tr><td><kbd>df -ih</kbd></td><td>inodes, human</td><td><code>check</code></td></tr><tr><td><kbd>find / -xdev -inum N</kbd></td><td>all names of N</td><td><code>one disk</code></td></tr><tr><td><kbd>sudo lsof +L1</kbd></td><td>deleted, open</td><td><code>space</code></td></tr><tr><td><kbd>stat -f -c %d .</kbd></td><td>free inodes</td><td><code>scripts</code></td></tr></tbody></table></div>
+  <h3 id="scriptit">Script it: inode-check.sh</h3>
+  <p>An alert script for cron: warn when any real filesystem is above a threshold of inodes, and show the busiest folder.</p>
+  <div class="code" data-lang="bash" data-file="script.sh"><pre><code>limit=${1:-90}
+df -i -x tmpfs -x devtmpfs -x squashfs -x overlay --output=ipcent,target | tail -n +2 |
+while read -r pct mnt; do
+  p=${pct%\%}; [ &quot;$p&quot; = &quot;-&quot; ] &amp;&amp; continue
+  if [ &quot;$p&quot; -ge &quot;$limit&quot; ]; then echo &quot;ALERT $mnt inodes $pct&quot;; else echo &quot;ok    $mnt inodes $pct&quot;; fi
+done</code></pre><div class="output">df: options -i and --output are mutually exclusive
+Try &#x27;df --help&#x27; for more information.</div></div>
+  <p>Run with a limit of 1% so the alert fires on our machine.</p>
+<details class="puzzle puzzle--ans"><summary><span class="puzzle__tag">Puzzle answer</span> Remember the question from the story? Open to check your guess.</summary><p>The disk ran out of <b>inodes</b>, not space: every email is a file and needs one inode. Deleting one 2 GB backup freed only one inode. <code>df -i</code> would have shown IUse% 100%. Fix: delete or archive many old small files (find the folder with <code>du --inodes</code>), and for the future use a filesystem with more inodes (<code>mkfs.ext4 -i</code>) or XFS.</p></details>
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> Does <code>mv</code> inside one filesystem change the inode number?</summary>
+    <div class="qc__a"><b>Answer:</b> No. Only the folder entries change; the inode and the data stay where they are.</div></details>
+
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>See inode numbers change (or not)</h2>
+  <p>Make a file, copy it, rename it, and compare the inode numbers.</p>
+  <div class="code" data-lang="bash" data-file="script.sh"><pre><code># Names and inodes
+echo hello &gt; a.txt
+ls -i a.txt
+cp a.txt b.txt
+mv a.txt c.txt
+ls -i b.txt c.txt
+stat -c &#x27;%i %h %s %n&#x27; b.txt c.txt</code></pre><div class="output">803154 a.txt
+803201 b.txt
+803154 c.txt
+803201 1 6 b.txt
+803154 1 6 c.txt</div></div>
+  <ul class="anno"><li><code>mv a.txt c.txt</code><span>Rename: c.txt keeps the inode a.txt had.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "bash",
+ "file": "script.sh",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>. Which file has a.txt’s old number?",
+   "code": "# Names and inodes\necho hello > a.txt\nls -i a.txt\ncp a.txt b.txt\nmv a.txt c.txt\nls -i b.txt c.txt\nstat -c '%i %h %s %n' b.txt c.txt\n"
+  },
+  {
+   "label": "2 · Predict first",
+   "hint": "<b>Predict first:<\/b> does appending change the inode number? Then run.",
+   "code": "echo one > f\nstat -c %i f\necho two >> f\nstat -c %i f\n"
+  },
+  {
+   "label": "3 · Spot the error",
+   "hint": "<b>Spot the error:<\/b> the goal is the link count of the folder. Add the missing option so ls shows the folder itself.",
+   "code": "mkdir -p d/x d/y\nls -l d\n"
+  },
+  {
+   "label": "4 · Your turn",
+   "hint": "Print size and blocks of a sparse file.",
+   "code": "truncate -s 10M s.img\nstat -c 'size=%s blocks=%b' s.img\n"
+  },
+  {
+   "label": "5 · Challenge",
+   "hint": "Find a file by its inode number and print its name.",
+   "code": "mkdir -p z; echo x > z/target\nn=$(stat -c %i z/target)\nfind z -inum \"$n\"\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC: your own inodes</h3>
+  <p>Outputs were <b>recorded</b> on our Ubuntu 24.04 build machine unless marked typical.</p>
+  <div class="pcrun"><h4>1 · Inode usage of every disk</h4>
+  <div class="code" data-lang="bash" data-file="Terminal"><pre><code>df -ih -x tmpfs -x squashfs</code></pre><div class="output">Filesystem     Inodes IUsed IFree IUse% Mounted on
+/dev/sda2         30M  412K   30M    2% /
+/dev/sda1           0     0     0     - /boot/efi</div></div>
+  <p class="muted">Typical. FAT (/boot/efi) has no inodes: “-”.</p></div>
+  <div class="pcrun"><h4>2 · Your home folder’s inode</h4>
+  <div class="code" data-lang="bash" data-file="Terminal"><pre><code>stat -c &quot;%i %h %A %n&quot; ~</code></pre><div class="output">802825 19 drwxr-x--- /home/riya</div></div>
+  <p class="muted">Recorded.</p></div>
+  <div class="pcrun"><h4>3 · Inode settings of your root disk</h4>
+  <div class="code" data-lang="bash" data-file="Terminal"><pre><code>sudo tune2fs -l $(findmnt -no SOURCE /) | grep -E &#x27;Inode count|Free inodes|Inode size&#x27;</code></pre><div class="output">Inode count:              31227904
+Free inodes:              30816322
+Inode size:               256</div></div>
+  <p class="muted">Typical, ext4 only.</p></div>
+  <div class="pcrun"><h4>4 · Deleted files still open</h4>
+  <div class="code" data-lang="bash" data-file="Terminal"><pre><code>sudo lsof +L1 | head</code></pre><div class="output">COMMAND   PID USER  FD  TYPE DEVICE SIZE/OFF NLINK  NODE NAME
+firefox  2210 vineeta 45u REG  0,1    65536     0 10240 /memfd:... (deleted)</div></div>
+  <p class="muted">Typical. NLINK 0 = deleted, still open.</p></div>
+</section>
+
+<div class="ad-slot ad-slot--inarticle" data-slot="inarticle"></div>
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>One file, three operations</h2>
+  <p>Step through and watch which operations keep the inode number.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "bash",
+ "code": [
+  "echo data > f",
+  "a=$(stat -c %i f)",
+  "mv f g; b=$(stat -c %i g)",
+  "cp g h; c=$(stat -c %i h)",
+  "[ \"$a\" = \"$b\" ] && echo \"mv kept the inode\"",
+  "[ \"$a\" != \"$c\" ] && echo \"cp made a new inode\""
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Create",
+   "note": "one inode. New file <code>f<\/code> appears in ~/lab.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>f<\/b> file · 5 bytes"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Shell",
+   "note": "Save its number. Variable <code>a<\/code> is created: <code>803154<\/code>.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "a",
+       "803154"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>f<\/b> file · 5 bytes"
+   ],
+   "newVar": "a"
+  },
+  {
+   "line": 3,
+   "phase": "Rename",
+   "note": "same inode. Variable <code>b<\/code> is created: <code>803154<\/code>. New file <code>g<\/code> appears in ~/lab. <code>f<\/code> is gone.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "a",
+       "803154"
+      ],
+      [
+       "b",
+       "803154"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>g<\/b> file · 5 bytes"
+   ],
+   "newVar": "b"
+  },
+  {
+   "line": 4,
+   "phase": "Copy",
+   "note": "new inode. Variable <code>c<\/code> is created: <code>803201<\/code>. New file <code>h<\/code> appears in ~/lab.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "a",
+       "803154"
+      ],
+      [
+       "b",
+       "803154"
+      ],
+      [
+       "c",
+       "803201"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>g<\/b> file · 5 bytes",
+    "<b>h<\/b> file · 5 bytes"
+   ],
+   "newVar": "c"
+  },
+  {
+   "line": 5,
+   "phase": "Shell",
+   "note": "The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "a",
+       "803154"
+      ],
+      [
+       "b",
+       "803154"
+      ],
+      [
+       "c",
+       "803201"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>g<\/b> file · 5 bytes",
+    "<b>h<\/b> file · 5 bytes"
+   ],
+   "out": "mv kept the inode\n"
+  },
+  {
+   "line": 6,
+   "phase": "Summary",
+   "note": "both lines print. The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "a",
+       "803154"
+      ],
+      [
+       "b",
+       "803154"
+      ],
+      [
+       "c",
+       "803201"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>g<\/b> file · 5 bytes",
+    "<b>h<\/b> file · 5 bytes"
+   ],
+   "out": "cp made a new inode\n"
+  }
+ ],
+ "labels": {
+  "stack": [
+   "Shell",
+   "variables, current folder, $?"
+  ],
+  "heap": [
+   "Files",
+   "inside ~/lab"
+  ],
+  "emptyStack": "the shell has not started",
+  "emptyHeap": "~/lab is empty"
+ }
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three tasks from real jobs: an admin’s full disk, a developer’s replaced config and a security check.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Admin</span></div>
+    <h4>Read the inode of a file</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Print the inode number, link count, size and owner of a file in one line.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>a file</pre></div><div><small>Expected output</small><pre>inode=803154 links=1 size=10 owner=riya</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>stat -c with a format.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "bash",
+ "file": "script.sh",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Add %y for the modify time.",
+   "code": "echo 'port=8080' > app.conf\nstat -c 'inode=%i links=%h size=%s owner=%U' app.conf\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Bash run on Linux: press <b>Next</b> to run one line at a time. Watch the shell’s variables, the current folder, the exit status <code>$?</code> and the files in <code>~/lab</code> change.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "bash",
+ "code": [
+  "echo 'port=8080' > app.conf",
+  "stat -c 'inode=%i links=%h size=%s owner=%U' app.conf"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Shell",
+   "note": "Create. New file <code>app.conf<\/code> appears in ~/lab.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>app.conf<\/b> file · 10 bytes"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Fields",
+   "note": "%i %h %s %U. The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>app.conf<\/b> file · 10 bytes"
+   ],
+   "out": "inode=803154 links=1 size=10 owner=riya\n"
+  }
+ ],
+ "labels": {
+  "stack": [
+   "Shell",
+   "variables, current folder, $?"
+  ],
+  "heap": [
+   "Files",
+   "inside ~/lab"
+  ],
+  "emptyStack": "the shell has not started",
+  "emptyHeap": "~/lab is empty"
+ }
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Developer</span></div>
+    <h4>Edited in place or replaced?</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A program watches a config file. Show which kind of edit keeps the same inode.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>a config</pre></div><div><small>Expected output</small><pre>append: same inode
+sed -i: new inode</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>Save the number.</li><li>Append, then sed -i.</li><li>Compare.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "bash",
+ "file": "script.sh",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Try cat new > c.conf instead of sed -i.",
+   "code": "echo 'mode=dev' > c.conf; a=$(stat -c %i c.conf)\necho 'debug=1' >> c.conf; b=$(stat -c %i c.conf)\nsed -i 's/dev/prod/' c.conf; c=$(stat -c %i c.conf)\n[ \"$a\" = \"$b\" ] && echo \"append: same inode\"\n[ \"$b\" != \"$c\" ] && echo \"sed -i: new inode\"\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Bash run on Linux: press <b>Next</b> to run one line at a time. Watch the shell’s variables, the current folder, the exit status <code>$?</code> and the files in <code>~/lab</code> change.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "bash",
+ "code": [
+  "echo 'mode=dev' > c.conf; a=$(stat -c %i c.conf)",
+  "echo 'debug=1' >> c.conf; b=$(stat -c %i c.conf)",
+  "sed -i 's/dev/prod/' c.conf; c=$(stat -c %i c.conf)",
+  "[ \"$a\" = \"$b\" ] && echo \"append: same inode\"",
+  "[ \"$b\" != \"$c\" ] && echo \"sed -i: new inode\""
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Shell",
+   "note": "Save. Variable <code>a<\/code> is created: <code>803154<\/code>. New file <code>c.conf<\/code> appears in ~/lab.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "a",
+       "803154"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>c.conf<\/b> file · 9 bytes"
+   ],
+   "newVar": "a"
+  },
+  {
+   "line": 2,
+   "phase": "Shell",
+   "note": "Append. Variable <code>b<\/code> is created: <code>803154<\/code>. <code>c.conf<\/code> now has 17 bytes.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "a",
+       "803154"
+      ],
+      [
+       "b",
+       "803154"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>c.conf<\/b> file · 17 bytes"
+   ],
+   "newVar": "b"
+  },
+  {
+   "line": 3,
+   "phase": "sed -i",
+   "note": "rename over. Variable <code>c<\/code> is created: <code>803201<\/code>. <code>c.conf<\/code> now has 18 bytes.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "a",
+       "803154"
+      ],
+      [
+       "b",
+       "803154"
+      ],
+      [
+       "c",
+       "803201"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>c.conf<\/b> file · 18 bytes"
+   ],
+   "newVar": "c"
+  },
+  {
+   "line": 4,
+   "phase": "Summary",
+   "note": "both lines print. The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "a",
+       "803154"
+      ],
+      [
+       "b",
+       "803154"
+      ],
+      [
+       "c",
+       "803201"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>c.conf<\/b> file · 18 bytes"
+   ],
+   "out": "append: same inode\n"
+  },
+  {
+   "line": 5,
+   "phase": "Shell",
+   "note": "The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "a",
+       "803154"
+      ],
+      [
+       "b",
+       "803154"
+      ],
+      [
+       "c",
+       "803201"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>c.conf<\/b> file · 18 bytes"
+   ],
+   "out": "sed -i: new inode\n"
+  }
+ ],
+ "labels": {
+  "stack": [
+   "Shell",
+   "variables, current folder, $?"
+  ],
+  "heap": [
+   "Files",
+   "inside ~/lab"
+  ],
+  "emptyStack": "the shell has not started",
+  "emptyHeap": "~/lab is empty"
+ }
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">Security</span></div>
+    <h4>Find files with several names</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>List regular files that have more than one name (link count above 1) in a folder.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>a folder</pre></div><div><small>Expected output</small><pre>803201 2 box/alias
+803201 2 box/one</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>find -links +1.</li><li>Print inode and links.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "bash",
+ "file": "script.sh",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Remove box/alias and run the find again.",
+   "code": "mkdir -p box; echo s > box/one; echo t > box/two; ln box/one box/alias\nfind box -type f -links +1 -printf '%i %n %p\\n' | sort\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Bash run on Linux: press <b>Next</b> to run one line at a time. Watch the shell’s variables, the current folder, the exit status <code>$?</code> and the files in <code>~/lab</code> change.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "bash",
+ "code": [
+  "mkdir -p box; echo s > box/one; echo t > box/two; ln box/one box/alias",
+  "find box -type f -links +1 -printf '%i %n %p\\n' | sort"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Setup",
+   "note": "alias is a hard link (10.2). New folder <code>box<\/code> appears in ~/lab. New file <code>box/alias<\/code> appears in ~/lab. New file <code>box/one<\/code> appears in ~/lab. New file <code>box/two<\/code> appears in ~/lab.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>box/<\/b> folder",
+    "<b>box/alias<\/b> file · 2 bytes",
+    "<b>box/one<\/b> file · 2 bytes",
+    "<b>box/two<\/b> file · 2 bytes"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Shell",
+   "note": "Same inode twice. The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>box/<\/b> folder",
+    "<b>box/alias<\/b> file · 2 bytes",
+    "<b>box/one<\/b> file · 2 bytes",
+    "<b>box/two<\/b> file · 2 bytes"
+   ],
+   "out": "803201 2 box/alias\n803201 2 box/one\n"
+  }
+ ],
+ "labels": {
+  "stack": [
+   "Shell",
+   "variables, current folder, $?"
+  ],
+  "heap": [
+   "Files",
+   "inside ~/lab"
+  ],
+  "emptyStack": "the shell has not started",
+  "emptyHeap": "~/lab is empty"
+ }
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Which is NOT stored in an inode?",
+  "options": [
+   "the size",
+   "the owner",
+   "the file name",
+   "the permissions"
+  ],
+  "answer": 2,
+  "why": "Names are in directory entries."
+ },
+ {
+  "q": "touch says “No space left on device” but df -h shows 50% free. What do you check?",
+  "options": [
+   "free -h",
+   "df -i",
+   "du -sh",
+   "lsblk"
+  ],
+  "answer": 1,
+  "why": "Inodes may be 100%."
+ },
+ {
+  "q": "Which keeps the same inode number?",
+  "options": [
+   "mv a b on the same filesystem",
+   "cp a b",
+   "sed -i on a",
+   "mv a to another disk"
+  ],
+  "answer": 0,
+  "why": "Only the folder entry changes."
+ },
+ {
+  "q": "What shows inode numbers?",
+  "options": [
+   "ls -n",
+   "ls -h",
+   "ls -s",
+   "ls -i"
+  ],
+  "answer": 3,
+  "why": "-i = inode."
+ },
+ {
+  "q": "A deleted log still uses space. Which command finds it?",
+  "options": [
+   "df -i",
+   "find -inum",
+   "lsof +L1",
+   "stat"
+  ],
+  "answer": 2,
+  "why": "Link count 0, still open."
+ },
+ {
+  "q": "What does ctime mean in stat?",
+  "options": [
+   "creation time",
+   "last inode change",
+   "last read",
+   "last copy"
+  ],
+  "answer": 1,
+  "why": "Birth is creation."
+ },
+ {
+  "q": "On ext4, which inode is always the root folder?",
+  "options": [
+   "2",
+   "0",
+   "1",
+   "11"
+  ],
+  "answer": 0,
+  "why": "11 is lost+found."
+ },
+ {
+  "q": "A file shows size 1G and 0 blocks. It is…",
+  "options": [
+   "corrupted",
+   "a link",
+   "compressed by ls",
+   "a sparse file"
+  ],
+  "answer": 3,
+  "why": "Holes have no blocks."
+ }
+]</script>
+  </div>
+
+  <h3 id="mindmap">Mind map: the whole lesson on one page</h3>
+  <p>Revise from the centre outwards. Each branch is one idea from the lesson; the boxes hold the facts to remember. Try to redraw it from memory on paper.</p>
+  <div class="scene scene--wide mm"><svg viewBox="0 0 760 460" role="img" aria-label="Inode: Holds: type, mode, owner, size, times, links; Not: the name, in the folder, name → number; See: ls -i, stat, debugfs; Limits: df -i, fixed on ext4, XFS dynamic; Free: links 0, not open, lsof +L1; Ops: mv same, cp new, sed -i new"><path d="M380 230 Q350 155 380 80" style="fill:none;stroke:var(--blue);stroke-width:3;opacity:.7"/><path d="M380 230 Q473 167 597 155" style="fill:none;stroke:#D64545;stroke-width:3;opacity:.7"/><path d="M380 230 Q503 242 597 305" style="fill:none;stroke:var(--green);stroke-width:3;opacity:.7"/><path d="M380 230 Q410 305 380 380" style="fill:none;stroke:#E0A100;stroke-width:3;opacity:.7"/><path d="M380 230 Q287 293 163 305" style="fill:none;stroke:var(--violet);stroke-width:3;opacity:.7"/><path d="M380 230 Q257 218 163 155" style="fill:none;stroke:var(--track);stroke-width:3;opacity:.7"/><ellipse cx="380" cy="230" rx="92" ry="34" class="s-board"/><text x="380" y="235" text-anchor="middle" font-size="12" font-weight="700" class="s-chalk">Inode</text><rect x="325" y="65" width="110" height="30" rx="15" class="s-soft-blue" style="stroke:var(--blue)"/><text x="380" y="85" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">Holds</text><rect x="335" y="11" width="89" height="53" rx="8" class="s-card2" style="stroke:var(--blue);stroke-width:1"/><text x="343" y="27" font-size="9.4" class="s-ink2">• type, mode</text><text x="343" y="42" font-size="9.4" class="s-ink2">• owner, size</text><text x="343" y="57" font-size="9.4" class="s-ink2">• times, links</text><rect x="542" y="140" width="110" height="30" rx="15" class="s-soft-acc" style="stroke:#D64545"/><text x="597" y="160" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">Not</text><rect x="549" y="86" width="95" height="53" rx="8" class="s-card2" style="stroke:#D64545;stroke-width:1"/><text x="557" y="102" font-size="9.4" class="s-ink2">• the name</text><text x="557" y="117" font-size="9.4" class="s-ink2">• in the folder</text><text x="557" y="132" font-size="9.4" class="s-ink2">• name → number</text><rect x="542" y="290" width="110" height="30" rx="15" class="s-soft-green" style="stroke:var(--green)"/><text x="597" y="310" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">See</text><rect x="567" y="329" width="59" height="53" rx="8" class="s-card2" style="stroke:var(--green);stroke-width:1"/><text x="575" y="345" font-size="9.4" class="s-ink2">• ls -i</text><text x="575" y="360" font-size="9.4" class="s-ink2">• stat</text><text x="575" y="375" font-size="9.4" class="s-ink2">• debugfs</text><rect x="325" y="365" width="110" height="30" rx="15" class="s-soft-acc" style="stroke:#E0A100"/><text x="380" y="385" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">Limits</text><rect x="332" y="404" width="95" height="53" rx="8" class="s-card2" style="stroke:#E0A100;stroke-width:1"/><text x="340" y="420" font-size="9.4" class="s-ink2">• df -i</text><text x="340" y="435" font-size="9.4" class="s-ink2">• fixed on ext4</text><text x="340" y="450" font-size="9.4" class="s-ink2">• XFS dynamic</text><rect x="108" y="290" width="110" height="30" rx="15" class="s-soft-violet" style="stroke:var(--violet)"/><text x="163" y="310" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">Free</text><rect x="131" y="329" width="65" height="53" rx="8" class="s-card2" style="stroke:var(--violet);stroke-width:1"/><text x="139" y="345" font-size="9.4" class="s-ink2">• links 0</text><text x="139" y="360" font-size="9.4" class="s-ink2">• not open</text><text x="139" y="375" font-size="9.4" class="s-ink2">• lsof +L1</text><rect x="108" y="140" width="110" height="30" rx="15" class="s-soft-acc" style="stroke:var(--track)"/><text x="163" y="160" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">Ops</text><rect x="125" y="86" width="77" height="53" rx="8" class="s-card2" style="stroke:var(--track);stroke-width:1"/><text x="133" y="102" font-size="9.4" class="s-ink2">• mv same</text><text x="133" y="117" font-size="9.4" class="s-ink2">• cp new</text><text x="133" y="132" font-size="9.4" class="s-ink2">• sed -i new</text><text x="752" y="454" text-anchor="end" class="s-wm">myphatshala.in</text></svg></div>
+
+  <section class="cs" id="cheatsheet" aria-label="Cheat sheet">
+    <div class="cs__top"><h3>Cheat sheet: Inodes</h3><button type="button" class="cs__print" onclick="document.body.classList.add('print-cs');window.print();setTimeout(function(){document.body.classList.remove('print-cs')},500)">Print this sheet</button></div>
+    <div class="cs__grid"><div class="cs__g"><h4>See</h4><dl><dt><code>ls -i</code></dt><dd>inode numbers</dd><dt><code>ls -lai</code></dt><dd>with links, . ..</dd><dt><code>stat f</code></dt><dd>all fields</dd><dt><code>stat -c %i</code></dt><dd>number only</dd><dt><code>stat -f</code></dt><dd>filesystem</dd></dl></div><div class="cs__g"><h4>Usage</h4><dl><dt><code>df -i</code></dt><dd>per disk</dd><dt><code>df -ih</code></dt><dd>human</dd><dt><code>du --inodes -x</code></dt><dd>per folder</dd><dt><code>find -links +1</code></dt><dd>multi-name</dd></dl></div><div class="cs__g"><h4>Find</h4><dl><dt><code>find -inum N</code></dt><dd>by number</dd><dt><code>find -samefile f</code></dt><dd>same inode</dd><dt><code>-xdev</code></dt><dd>one disk</dd><dt><code>-inum N -delete</code></dt><dd>odd names</dd></dl></div><div class="cs__g"><h4>Deep</h4><dl><dt><code>sudo lsof +L1</code></dt><dd>deleted, open</dd><dt><code>tune2fs -l</code></dt><dd>inode count</dd><dt><code>debugfs -R &#x27;ls -l&#x27;</code></dt><dd>raw entries</dd><dt><code>mkfs.ext4 -i</code></dt><dd>set ratio</dd></dl></div></div>
+    <p class="cs__wm">myphatshala.in · Linux</p>
+  </section>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 10.1 in one screen</h3>
+    <ul><li>An inode is a file’s record: type, mode, owner, size, link count, times, data location. Not the name.</li><li>A directory is a table of name → inode number. <code>.</code> and <code>..</code> are entries too.</li><li><code>ls -i</code>, <code>stat</code> (<code>-c %i %h %s</code>), <code>find -inum / -samefile</code>.</li><li>“No space left” = blocks OR inodes: check <code>df -h</code> and <code>df -i</code>; find culprits with <code>du --inodes</code>.</li><li>Data is freed when links = 0 and no program has it open: <code>lsof +L1</code>.</li><li>mv (same disk) keeps the inode; cp and sed -i make a new one. ext4 inode count is fixed at mkfs.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>What is an inode in Linux?</summary><p>A data structure that stores a file’s metadata (type, permissions, owner, size, times, link count, data block locations), identified by a number. It does not store the name.</p></details>
+    <details><summary>How do I see a file’s inode number?</summary><p>ls -i FILE or stat -c %i FILE.</p></details>
+    <details><summary>How do I check inode usage?</summary><p>df -i (per filesystem) and du --inodes -x DIR (per folder).</p></details>
+    <details><summary>Why “No space left on device” when the disk has space?</summary><p>The filesystem has run out of inodes (df -i shows 100%), usually from millions of small files.</p></details>
+    <details><summary>Can I add more inodes to ext4?</summary><p>Not on an existing filesystem; recreate it with mkfs.ext4 -i or -N, or use XFS.</p></details>
+    <details><summary>Why is space not freed after deleting a file?</summary><p>A program still has it open; find it with lsof +L1 and restart or reload it.</p></details>
+    <details><summary>Where is the file name stored?</summary><p>In the directory entry of its parent folder.</p></details>
+    
+  </div>
+
+<div class="ad-slot ad-slot--inarticle" data-slot="inarticle"></div>
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Small inode tasks. Expected outputs come from real runs on Ubuntu 24.04.</p>
+  <div class="lab" id="lab"><h3>Practice lab: inode detective</h3><p>Build the lab, do the four tasks in your own terminal, then run the checker.</p>
+    <p class="wx__label">Step 1 · Build the lab (copy into your terminal)</p>
+    <div class="code" data-lang="bash" data-file="setup.sh"><pre><code>mkdir -p ~/lab101 &amp;&amp; cd ~/lab101 &amp;&amp; rm -rf case answers.txt
+mkdir -p case/a case/b; echo invoice &gt; case/a/inv.txt; echo memo &gt; case/b/memo.txt
+touch -- &#x27;case/-delete-me&#x27;; truncate -s 50M case/disk.img</code></pre></div>
+    <p class="wx__label">Step 2 · Your tasks</p><ol><li>Write the inode number of <code>case/a/inv.txt</code> into <code>answers.txt</code> (only the number, one line).</li><li>Rename <code>case/a/inv.txt</code> to <code>case/b/invoice.txt</code> so that it keeps the same inode.</li><li>Delete the file named <code>-delete-me</code> using its inode number.</li><li>Append the block count (<code>%b</code>) of <code>case/disk.img</code> as a second line of <code>answers.txt</code>.</li></ol>
+    <p class="wx__label">Step 3 · Check your work (save as check.sh, run <code>bash check.sh</code>)</p>
+    <div class="code" data-lang="bash" data-file="check.sh"><pre><code>cd ~/lab101
+ok(){ if eval &quot;$2&quot;; then echo &quot;PASS  $1&quot;; else echo &quot;FAIL  $1&quot;; fi; }
+ok &quot;1 number&quot;  &#x27;[ -f answers.txt ] &amp;&amp; [ -f case/b/invoice.txt ] &amp;&amp; [ &quot;$(sed -n 1p answers.txt)&quot; = &quot;$(stat -c %i case/b/invoice.txt)&quot; ]&#x27;
+ok &quot;2 rename&quot;  &#x27;[ ! -e case/a/inv.txt ] &amp;&amp; [ -f case/b/invoice.txt ]&#x27;
+ok &quot;3 delete&quot;  &#x27;[ ! -e &quot;case/-delete-me&quot; ]&#x27;
+ok &quot;4 blocks&quot;  &#x27;[ &quot;$(sed -n 2p answers.txt 2&gt;/dev/null)&quot; = &quot;$(stat -c %b case/disk.img)&quot; ]&#x27;</code></pre><div class="output">PASS  1 number
+PASS  2 rename
+PASS  3 delete
+PASS  4 blocks</div></div>
+    <p class="muted">The output above is what you see when every task is right (recorded). Before you start, every line says FAIL.</p>
+    <details class="lab__sol"><summary>Show one possible solution</summary><div class="code" data-lang="bash" data-file="solution.sh"><pre><code>stat -c %i case/a/inv.txt &gt; answers.txt
+mv case/a/inv.txt case/b/invoice.txt
+find case -inum &quot;$(stat -c %i -- &#x27;case/-delete-me&#x27;)&quot; -delete
+stat -c %b case/disk.img &gt;&gt; answers.txt</code></pre></div></details>
+  </div>
+
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Inode number</h4></div>
+      <p>Print only the inode number of a new file (check that it is a number).</p>
+      <div class="prob__io"><div><small>Input</small><pre>a file</pre></div><div><small>Expected output</small><pre>number</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>touch n.txt; stat -c %i n.txt | grep -Eq &#x27;^[0-9]+$&#x27; &amp;&amp; echo number</code></pre><div class="output">number</div></div>
+        <p><b>How it works:</b> %i.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Links of a file</h4></div>
+      <p>Print the link count of a new file.</p>
+      <div class="prob__io"><div><small>Input</small><pre>a file</pre></div><div><small>Expected output</small><pre>1</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>touch l.txt; stat -c %h l.txt</code></pre><div class="output">1</div></div>
+        <p><b>How it works:</b> 1 name.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Folder links</h4></div>
+      <p>Make a folder with two subfolders and print its link count.</p>
+      <div class="prob__io"><div><small>Input</small><pre>folders</pre></div><div><small>Expected output</small><pre>4</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>mkdir -p top/a top/b; stat -c %h top</code></pre><div class="output">4</div></div>
+        <p><b>How it works:</b> 2 + 2 = 4.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Rename keeps it</h4></div>
+      <p>Show that mv keeps the inode number.</p>
+      <div class="prob__io"><div><small>Input</small><pre>a file</pre></div><div><small>Expected output</small><pre>same</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>touch m1; a=$(stat -c %i m1); mv m1 m2; [ &quot;$a&quot; = &quot;$(stat -c %i m2)&quot; ] &amp;&amp; echo same</code></pre><div class="output">same</div></div>
+        <p><b>How it works:</b> Same disk.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Copy changes it</h4></div>
+      <p>Show that cp makes a new inode.</p>
+      <div class="prob__io"><div><small>Input</small><pre>a file</pre></div><div><small>Expected output</small><pre>different</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>touch c1; cp c1 c2; [ &quot;$(stat -c %i c1)&quot; != &quot;$(stat -c %i c2)&quot; ] &amp;&amp; echo different</code></pre><div class="output">different</div></div>
+        <p><b>How it works:</b> New file.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Sparse</h4></div>
+      <p>Make a 5 MB sparse file and print its size and block count.</p>
+      <div class="prob__io"><div><small>Input</small><pre>nothing</pre></div><div><small>Expected output</small><pre>5242880 0</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>truncate -s 5M sp; stat -c &#x27;%s %b&#x27; sp</code></pre><div class="output">5242880 0</div></div>
+        <p><b>How it works:</b> 0 blocks.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Delete by inode</h4></div>
+      <p>Delete a file called -x using its inode number.</p>
+      <div class="prob__io"><div><small>Input</small><pre>a bad name</pre></div><div><small>Expected output</small><pre>gone</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>touch -- -x; find . -maxdepth 1 -inum &quot;$(stat -c %i -- -x)&quot; -delete; ls -- -x 2&gt;/dev/null || echo gone</code></pre><div class="output">gone</div></div>
+        <p><b>How it works:</b> -inum -delete.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Count files</h4></div>
+      <p>Count the inodes used inside a folder with 20 files.</p>
+      <div class="prob__io"><div><small>Input</small><pre>a folder</pre></div><div><small>Expected output</small><pre>21</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>mkdir -p cnt; for i in $(seq 1 20); do : &gt; cnt/f$i; done; du --inodes -s cnt | cut -f1</code></pre><div class="output">21</div></div>
+        <p><b>How it works:</b> 20 files + the folder = 21.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Interview questions about inodes, from fresher to senior rounds.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · basics</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“What is an inode?”</h4>
+      <p class="scn__situation">A favourite Linux interview question.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> can you say what is (and is not) inside?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>A numbered record per file: type, permissions, owner, size, times, link count, data block pointers.</li>
+          <li>Not the name: names are in directories (name → inode number).</li>
+          <li>See it: <code>ls -i</code>, <code>stat</code>.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> saying “the inode stores the file name”.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Hosting company</span><span class="scn__tag scn__tag--level">Junior</span></div>
+      <h4>“No space left on device” with 40% free</h4>
+      <p class="scn__situation">Customers cannot upload. df -h looks fine.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> do you check inodes?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li><code>df -i</code>: IUse% 100%.</li>
+          <li><code>du --inodes -x / | sort -n | tail</code>: e.g. /var/lib/php/sessions.</li>
+          <li>Delete old sessions with find -mtime; fix the session clean-up job.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> deleting large files and restarting the server.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Operations</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Deleted 30 GB of logs, df did not change</h4>
+      <p class="scn__situation">The disk is still 100%.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> deleted-but-open files?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li><code>sudo lsof +L1</code> shows the app holding the deleted log (NLINK 0).</li>
+          <li>Reload the app (or <code>: &gt; /proc/PID/fd/N</code>) to free the space.</li>
+          <li>Prevent it: logrotate with postrotate reload, or copytruncate.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> rebooting a production server without knowing why.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Storage team</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Design a disk for 200 million thumbnails</h4>
+      <p class="scn__situation">Average file 6 KB.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> inode planning?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>ext4 default (1 inode per 16 KB) gives too few: use <code>mkfs.ext4 -i 4096</code> or choose XFS (dynamic inodes).</li>
+          <li>Shard into folders (ab/cd/…) so directories stay small.</li>
+          <li>Or use object storage for billions of objects.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> using defaults and finding out at 100%.</p>
+      </div></details>
+    </article>
+  <h3 id="interview">Interview and certification corner</h3>
+  <div class="ivs"><details class="iv"><summary>What does df -i show?</summary><div>Total, used and free inodes per filesystem.</div></details><details class="iv"><summary>Is the file name in the inode?</summary><div>No, it is in the directory entry.</div></details><details class="iv"><summary>Why is mv fast and cp slow for large files?</summary><div>mv on one filesystem only changes a folder entry; cp copies data to a new inode.</div></details><details class="iv"><summary>What is the link count?</summary><div>The number of directory entries (names) pointing to the inode.</div></details><details class="iv"><summary>When is a file’s space freed?</summary><div>When its link count is 0 and no process has it open.</div></details><details class="iv"><summary>What is the difference between mtime and ctime?</summary><div>mtime: contents changed; ctime: inode changed (incl. chmod, chown).</div></details><details class="iv"><summary>How do you remove a file with an unprintable name?</summary><div>find -inum N -delete.</div></details></div>
+  <div class="certs"><b>Where this appears in certification exams</b><ul><li><b>RHCSA (EX200):</b> Diagnose filesystem issues; create and manage file systems.</li><li><b>LFCS:</b> Manage and troubleshoot file systems and storage.</li><li><b>CompTIA Linux+:</b> Inodes, df -i, hard and soft links.</li></ul></div>
+  <h3 id="distro">Distro and OS differences</h3>
+  <p>The concept is the same everywhere; tools and limits differ.</p>
+  <div class="table-wrap"><table class="compare" style="min-width:720px"><thead><tr><th>Topic</th><th>Ubuntu / Debian</th><th>RHEL / Rocky / Fedora</th><th>macOS (BSD tools)</th><th>WSL / Git Bash</th></tr></thead><tbody><tr><td>ls -i / stat</td><td>yes</td><td>yes</td><td>yes (BSD stat -f)</td><td>Git Bash: fake numbers</td></tr><tr><td>df -i</td><td>yes</td><td>yes</td><td>df -i</td><td>-</td></tr><tr><td>Default filesystem</td><td>ext4</td><td>XFS (dynamic inodes)</td><td>APFS</td><td>NTFS (MFT records)</td></tr><tr><td>debugfs / tune2fs</td><td>ext4</td><td>xfs_db for XFS</td><td>-</td><td>-</td></tr><tr><td>lsof +L1</td><td>yes</td><td>yes</td><td>yes</td><td>-</td></tr></tbody></table></div>
+<aside class="teaser"><span class="teaser__tag">Next up · Lesson 10.2</span><p class="teaser__q">The link count can be more than 1: one inode, two names. Riya also sees arrows like <code>python3 -&gt; python3.12</code> in ls -l. What is the difference between a hard link and a symbolic link, and which one breaks when you delete the original? Next: hard links vs soft links.</p><a href="../../10-links-and-inodes/02-hard-links-vs-soft-symbolic-links/">Hard links vs soft (symbolic) links →</a></aside>
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#map">Where this fits</a></li>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Very basic → Advanced</a></li>
+      <li><a href="#names">Why is it called that?</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#commands">Commands by field</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#hood">Under the hood</a></li>
+      <li><a href="#errors">Error messages decoded</a></li>
+      <li><a href="#dissect">Layer by layer</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#oneliners">One-liner corner</a></li>
+      <li><a href="#which">Which command when?</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#cheatsheet">Cheat sheet</a></li>
+      <li><a href="#mindmap">Mind map</a></li>
+      <li><a href="#lab">Practice lab</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Linux syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/linux.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>

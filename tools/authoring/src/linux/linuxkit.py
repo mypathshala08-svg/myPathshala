@@ -19,7 +19,7 @@ def gl(term_id, text=None):
         _GL = set(re.findall(r'<article class="gt" id="([^"]+)"', open(p, encoding='utf-8').read()))
     if term_id not in _GL:
         raise SystemExit(f'glossary id not found: {term_id}')
-    return f'<a class="gl-term" href="../../glossary/#{term_id}" title="Open in the Linux glossary">{text or term_id}</a>'
+    return f'<a class="gl-term" href="{"../../" if CUR == "linux" else "../../../linux/"}glossary/#{term_id}" title="Open in the Linux glossary">{text or term_id}</a>'
 
 
 # ---------------------------------------------------------------- terminal drawing (SVG)
@@ -128,12 +128,14 @@ def before(text):
 
 # ================================================================ new format blocks (5 Nov 2026)
 import json as _json
-_COURSE = None
-def _course():
-    global _COURSE
-    if _COURSE is None:
-        _COURSE = _json.load(open(os.path.join(SITE, 'courses', 'linux', 'course.json'), encoding='utf-8'))
-    return _COURSE
+# The course being built: lessons under src/shell-scripting/ use this kit too.
+CUR = 'shell-scripting' if any('/src/shell-scripting/' in os.path.abspath(a) + '/' for a in sys.argv) else 'linux'
+_COURSES = {}
+def _course(cid=None):
+    cid = cid or CUR
+    if cid not in _COURSES:
+        _COURSES[cid] = _json.load(open(os.path.join(SITE, 'courses', cid, 'course.json'), encoding='utf-8'))
+    return _COURSES[cid]
 
 
 def lesson_link(ref):
@@ -141,11 +143,15 @@ def lesson_link(ref):
     if ref.startswith('course:'):
         cid = ref.split(':', 1)[1]
         return f'../../../{cid}/', None, True
+    cid = CUR
+    if ref.startswith('L:'):            # a Linux lesson, from any course
+        cid, ref = 'linux', ref[2:]
     m, l = (int(x) for x in ref.split('.'))
-    mo = _course()['modules'][m - 1]; le = mo['lessons'][l - 1]
+    mo = _course(cid)['modules'][m - 1]; le = mo['lessons'][l - 1]
     path = f"{mo['slug']}/{le['slug']}/"
-    live = os.path.exists(os.path.join(SITE, 'courses', 'linux', path, 'index.html'))
-    return ('../../' + path if live else f'../../#m{m}'), le['title'], live
+    live = os.path.exists(os.path.join(SITE, 'courses', cid, path, 'index.html'))
+    base = '../../' if cid == CUR else f'../../../{cid}/'
+    return (base + path if live else f'{base}#m{m}'), le['title'], live
 
 
 def concept_map(before, now, after, note=''):
@@ -154,7 +160,7 @@ def concept_map(before, now, after, note=''):
     def card(ref, label, why):
         if ref:
             href, title, live = lesson_link(ref)
-            tag = f'<span class="cm__ref">Lesson {ref}</span>' if not ref.startswith('course:') else '<span class="cm__ref">Course</span>'
+            tag = ('<span class="cm__ref">Course</span>' if ref.startswith('course:') else f'<span class="cm__ref">Linux {ref[2:]}</span>' if ref.startswith('L:') else f'<span class="cm__ref">Lesson {ref}</span>')
             soon = '' if live else ' <small class="cm__soon">coming soon</small>'
             return f'<a class="cm__card" href="{href}">{tag}<b>{label}</b><span>{why}</span>{soon}</a>'
         return f'<div class="cm__card"><span class="cm__ref">Basics</span><b>{label}</b><span>{why}</span></div>'
@@ -253,14 +259,17 @@ def teaser(ref, question):
     return f'''<aside class="teaser"><span class="teaser__tag">Next up · Lesson {ref}</span><p class="teaser__q">{question}</p><a href="{href}">{title} →</a></aside>'''
 
 
-def build_up(title, scenario, setup, steps, level='b', expect=None):
+def build_up(title, scenario, setup, steps, level='b', expect=None, cumulative=False):
     """Build a pipeline one stage at a time. steps: [(cmd, note)]; each is really run after the hidden setup."""
     if setup and shlesson.run_sh(setup, 'any').strip():
         raise SystemExit('build_up setup must print nothing: ' + title)
     k, name = LV[level]
     items = []
+    done = []
     for i, (cmd, note) in enumerate(steps, 1):
-        res = shlesson.run_sh((setup + '\n' if setup else '') + cmd, expect).rstrip('\n')
+        prior = ''.join('{ ' + c + '\n} > /dev/null 2>&1\n' for c in done) if cumulative else ''
+        res = shlesson.run_sh((setup + '\n' if setup else '') + prior + cmd, expect).rstrip('\n')
+        done.append(cmd)
         items.append(f'''      <li><p>{note}</p>
         <div class="code" data-lang="bash" data-file="Step {i}"><pre><code>{E(cmd)}</code></pre>{f'<div class="output">{E(res)}</div>' if res else ''}</div></li>''')
     return f'''    <article class="ol ol--build">
@@ -598,3 +607,28 @@ def screens_block(title, intro, setup, cmd, steps, w=72, h=12, after=None, hid=N
   <ol class="fvs">{''.join(items)}</ol>
   {aft}
 '''
+
+
+# ================================================================ more examples and variations (11 Nov 2026, Vineeta: "add more sample
+# snippet or shell code to justify the example and variations")
+def variations(intro, groups, hid='variations'):
+    """groups: [(group title, [dict(title, cmd, setup='', why, expect=None, file='script.sh')])].
+    Every snippet is really run after its hidden setup; the recorded output is shown under it."""
+    out = [f'  <h3 id="{hid}">More examples and variations</h3>', f'  <p class="ol-intro">{intro}</p>']
+    n = 0
+    for gtitle, items in groups:
+        out.append(f'  <h4 class="var__group">{gtitle}</h4>\n  <div class="ol-list">')
+        for it in items:
+            n += 1
+            if it.get('setup') and shlesson.run_sh(it['setup'], 'any').strip():
+                raise SystemExit('variation setup must print nothing: ' + it['title'])
+            script = (it.get('setup', '').rstrip('\n') + '\n' if it.get('setup') else '') + it['cmd']
+            res = shlesson.run_sh(script, it.get('expect')).rstrip('\n')
+            o = f'<div class="output">{E(res)}</div>' if res else ''
+            out.append(f'''    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V{n}</span><h4>{it['title']}</h4></div>
+      <div class="code" data-lang="bash" data-file="{it.get('file', 'script.sh')}"><pre><code>{E(it['cmd'])}</code></pre>{o}</div>
+      <p class="ol__how">{it['why']}</p>
+    </article>''')
+        out.append('  </div>')
+    return '\n'.join(out) + '\n'

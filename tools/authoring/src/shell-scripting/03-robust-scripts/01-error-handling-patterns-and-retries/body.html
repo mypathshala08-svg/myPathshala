@@ -1,0 +1,662 @@
+<section class="hook" aria-label="Why this lesson">
+  <span class="hook__tag">The problem</span>
+  <p class="hook__p">Riya’s nightly sync calls a partner API, copies files and loads a database. Some failures are permanent (a wrong password, a missing file) and the job should stop at once with a clear error. Others are temporary (the API answers “service unavailable”, the network blinks) and the right reaction is to wait and try again. In Lesson 1.1 she learned <code>set -euo pipefail</code>; this lesson shows where it silently does <i>not</i> stop a script, how an <b>ERR trap</b> reports exactly which line failed, and how a small <b>retry</b> function with back-off turns a flaky step into a reliable one.</p>
+  <div class="hook__out"><b>By the end of this page you will be able to:</b><ul><li>know exactly when set -e stops a script and the cases where it does not (if, &&, ||, !, local x=$(…), subshells)</li><li>report failures with an ERR trap: line number, command and exit code, with set -E for functions</li><li>handle errors explicitly with || die, if ! cmd, and fallbacks with ||</li><li>write a retry function with a limit and exponential back-off, retrying only temporary errors</li></ul></div>
+</section>
+<nav class="rmap" aria-label="How to read this lesson">
+  <h2 class="rmap__h">Start here: how to read this page <small>(about 44 min)</small></h2>
+  <ol class="rm"><li class="rm--short"><a href="#story"><span class="rm__n">1</span><b>The story</b><small>3 min · stop or try again?</small></a></li><li class="rm--short"><a href="#decide"><span class="rm__n">2</span><b>Which pattern?</b><small>2 min · the quick chart</small></a></li><li class=""><a href="#definition"><span class="rm__n">3</span><b>Error handling</b><small>5 min · simple meaning + 4 depths</small></a></li><li class=""><a href="#types"><span class="rm__n">4</span><b>Kinds of failure</b><small>4 min · permanent vs temporary</small></a></li><li class="rm--short"><a href="#commands"><span class="rm__n">5</span><b>Step by step</b><small>15 min · set -e traps, ERR, retry</small></a></li><li class=""><a href="#animation"><span class="rm__n">6</span><b>See it happen</b><small>4 min · retry with back-off</small></a></li><li class=""><a href="#run"><span class="rm__n">7</span><b>Run on your PC</b><small>3 min · a real flaky URL</small></a></li><li class="rm--short"><a href="#lab"><span class="rm__n">8</span><b>Practice lab</b><small>8 min · a reliable sync step</small></a></li></ol>
+  <p class="rmap__short"><span class="rm__dot"></span> <b>Short on time?</b> Read only the highlighted steps (about 28 min), then come back for the rest.</p>
+</nav>
+<section class="cmap" id="map" aria-label="Where this lesson fits">
+  <h2 class="cmap__h">Where this lesson fits</h2>
+  <div class="cm">
+    <div class="cm__col cm__col--before"><h4>You need</h4><a class="cm__card" href="../../01-script-craft/01-anatomy-of-a-real-script/"><span class="cm__ref">Lesson 1.1</span><b>Safe mode</b><span>set -euo pipefail</span></a><a class="cm__card" href="../../01-script-craft/03-exit-codes-logging-and-stderr/"><span class="cm__ref">Lesson 1.3</span><b>Exit codes</b><span>contract</span></a><a class="cm__card" href="../../02-working-with-data/03-temporary-files-trap-and-clean-up/"><span class="cm__ref">Lesson 2.3</span><b>trap</b><span>EXIT, INT, TERM</span></a></div>
+    <div class="cm__arrow" aria-hidden="true"><svg viewBox="0 0 40 24"><path d="M2 12h30m-8-8 8 8-8 8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+    <div class="cm__col cm__col--now"><h4>In this lesson</h4><div class="cm__card cm__card--now"><span>✓ where set -e does not stop</span><span>✓ local x=$(cmd) hides failures</span><span>✓ ERR trap with $LINENO and $BASH_COMMAND</span><span>✓ set -E (errtrace)</span><span>✓ || die, || fallback, || true</span><span>✓ retry with back-off and jitter</span><span>✓ which errors to retry</span></div></div>
+    <div class="cm__arrow" aria-hidden="true"><svg viewBox="0 0 40 24"><path d="M2 12h30m-8-8 8 8-8 8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+    <div class="cm__col cm__col--after"><h4>It unlocks</h4><a class="cm__card" href="../../#m3"><span class="cm__ref">Lesson 3.2</span><b>Locks and timeouts</b><span>stuck steps</span> <small class="cm__soon">coming soon</small></a><a class="cm__card" href="../../#m3"><span class="cm__ref">Lesson 3.3</span><b>Testing scripts</b><span>prove the error paths</span> <small class="cm__soon">coming soon</small></a><a class="cm__card" href="../../#m4"><span class="cm__ref">Lesson 4.1</span><b>Backup tool</b><span>retries</span> <small class="cm__soon">coming soon</small></a><a class="cm__card" href="../../#m4"><span class="cm__ref">Lesson 4.2</span><b>Log monitor</b><span>alerts</span> <small class="cm__soon">coming soon</small></a></div>
+  </div>
+  <p class="cmap__note">Stop loudly on permanent errors, retry temporary ones, and always know which line failed.</p>
+</section>
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Stop, or try again?</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> <a href="../../01-script-craft/01-anatomy-of-a-real-script/">Lesson 1.1</a> (set -euo pipefail) and <a href="../../02-working-with-data/03-temporary-files-trap-and-clean-up/">Lesson 2.3</a> (trap).</p></div>
+  <div class="story">
+<div class="puzzle" id="puzzle"><span class="puzzle__tag">Think first</span><p>Riya’s script has <code>set -euo pipefail</code> at the top. Yet <code>local total=$(compute_total)</code> fails and the script happily continues with an empty total. A failing <code>grep</code> inside <code>if grep … ; then</code> does not stop it either (that one is fine). And the nightly API call fails roughly one night in ten with “503 service unavailable”, waking her up for nothing because it would have worked a minute later. How can a script stop on real errors, keep going on harmless ones, and retry the flaky ones?</p><small>Keep your guess in mind. The answer is at the end of part 6.</small></div>
+
+    <p class="narration">In <code>~/ops</code> (every run in this lesson is real). <code>bin/flaky NAME N</code> is a stand-in for a flaky API: it fails the first N calls with exit 75 (“try again later”), then succeeds.</p>
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="A terminal: sync.sh calls a flaky API; the first two attempts fail with 75 and the retry function waits 1 s then 2 s; the third attempt succeeds.">
+        <rect x="20" y="14" width="316" height="156" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="20" y="14" width="316" height="16" rx="8" style="fill:#2C3A33"/><rect x="20" y="22" width="316" height="8" style="fill:#2C3A33"/><circle cx="30" cy="22" r="2.6" style="fill:#D64545"/><circle cx="39" cy="22" r="2.6" style="fill:#E0A100"/><circle cx="48" cy="22" r="2.6" style="fill:#2F7D5B"/><text x="178.0" y="25.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@server: ~/ops</text><text x="28" y="48" font-size="6.4" class="mono"><tspan style="fill:#9FD3B8">$</tspan><tspan style="fill:#EDEBE3"> ./sync.sh</tspan></text><text x="28" y="66" font-size="6.4" class="mono" style="fill:#F59E8B">flaky: api attempt 1: service unavailable</text><text x="28" y="84" font-size="6.4" class="mono" style="fill:#EDEBE3">retry: attempt 1 failed (75), waiting 1s</text><text x="28" y="102" font-size="6.4" class="mono" style="fill:#F59E8B">flaky: api attempt 2: service unavailable</text><text x="28" y="120" font-size="6.4" class="mono" style="fill:#EDEBE3">retry: attempt 2 failed (75), waiting 2s</text><text x="28" y="138" font-size="6.4" class="mono" style="fill:#F5C77E">flaky: api attempt 3: ok</text><text x="352" y="36" font-size="9.4" font-weight="700" class="s-acc">Two kinds of failure:</text><text x="352" y="58" font-size="8.8" class="s-ink2">permanent → stop</text><text x="352" y="75" font-size="8.8" class="s-ink2">  || die</text><text x="352" y="92" font-size="8.8" class="s-ink2">temporary → retry</text><text x="352" y="109" font-size="8.8" class="s-ink2">  with back-off</text><text x="352" y="126" font-size="8.8" class="s-ink2">always: which line?</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2">Retry the <tspan font-weight="700" class="s-acc">temporary</tspan>, stop on the permanent.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+K> Isn’t set -e enough?
+A> It is a safety net with holes. Bash deliberately ignores failures in places where a failure is part of the logic: the test of an <code>if</code> or <code>while</code>, the left side of <code>&amp;&amp;</code>/<code>||</code>, after <code>!</code>. And <code>local x=$(cmd)</code> reports the status of <code>local</code>, which is always 0. Knowing the holes is half of robust scripting.
+R> And retries?
+A> A retry loop with a limit and growing pauses (1 s, 2 s, 4 s…). It must only retry errors that can go away; retrying a wrong password five times just locks the account.
+  </div>
+</section>
+<section class="part part--decide">  <div class="dchart" id="decide"><h3>When a step fails… → do</h3><ul class="dc"><li><span class="dc__q">it must never fail (config missing)</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">cmd || die &quot;message&quot;</code><span class="dc__n">stop, exit 1</span></li><li><span class="dc__q">it may fail, there is a fallback</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">cmd || fallback</code><span class="dc__n">continue</span></li><li><span class="dc__q">it may fail, it does not matter</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">cmd || true</code><span class="dc__n">documented</span></li><li><span class="dc__q">it fails sometimes (network)</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">retry 5 cmd</code><span class="dc__n">back-off</span></li><li><span class="dc__q">you want to know where it failed</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">trap &#x27;on_err $LINENO&#x27; ERR</code><span class="dc__n">line + command</span></li><li><span class="dc__q">a whole block needs one check</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">if ! { a &amp;&amp; b; }; then</code><span class="dc__n">group</span></li></ul></div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Error handling in Bash</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p><b>Error handling</b> is deciding, for every command that can fail, what the script does next: stop with a message, use a fallback, ignore it on purpose, or try again. Bash offers <b>set -e</b> (exit on unhandled failures), explicit checks (<code>if</code>, <code>||</code>), the <b>ERR trap</b> (run code whenever a command fails) and loops for <b>retries</b>.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>Every failure gets a decision: stop, fall back, ignore on purpose, or retry.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>errexit</b><span>set -e.</span></div>
+    <div class="term"><b>ERR trap</b><span>Runs on a failing command.</span></div>
+    <div class="term"><b>errtrace</b><span>set -E: ERR inside functions.</span></div>
+    <div class="term"><b>$LINENO</b><span>Current line number.</span></div>
+    <div class="term"><b>$BASH_COMMAND</b><span>The command that was running.</span></div>
+    <div class="term"><b>Retry</b><span>Try again after a failure.</span></div>
+    <div class="term"><b>Back-off</b><span>Wait longer each time.</span></div>
+    <div class="term"><b>Jitter</b><span>A little random extra wait.</span></div>
+  </div>
+  <h3 id="names">Why is it called that?</h3>
+  <p>Where the names come from.</p>
+  <div class="nms"><div class="nm"><code>errexit</code><b>error → exit</b><span>set -o errexit = set -e.</span></div><div class="nm"><code>errtrace</code><b>trace errors into functions</b><span>set -E.</span></div><div class="nm"><code>pipefail</code><b>pipeline fails</b><span>Bash 3.</span></div><div class="nm"><code>die</code><b>stop with a message</b><span>From Perl.</span></div><div class="nm"><code>back-off</code><b>step back</b><span>Ethernet, 1970s.</span></div><div class="nm"><code>jitter</code><b>small random shake</b><span>Networking.</span></div><div class="nm"><code>EX_TEMPFAIL</code><b>temporary failure (75)</b><span>sysexits.h.</span></div><div class="nm"><code>idempotent</code><b>same result if repeated</b><span>Maths.</span></div></div>
+
+
+  <h3>Quick facts</h3>
+  <table class="facts">
+    <tr><th>Stop with message</th><td><code>cmd || die "…"</code></td></tr>
+    <tr><th>Allowed failure</th><td><code>cmd || true</code></td></tr>
+    <tr><th>Where did it fail</th><td><code>trap '…$LINENO…' ERR</code></td></tr>
+    <tr><th>In functions too</th><td><code>set -E</code></td></tr>
+    <tr><th>Keep $( ) status</th><td><code>local x; x=$(…)</code></td></tr>
+    <tr><th>Retry</th><td><code>retry 5 cmd args</code></td></tr>
+  </table>
+  <h3 id="levels">Error handling at four depths</h3>
+  <div class="modlab levels levels4"><div class="modlab__bar"><b>Pick your depth. Completely new? Start at Very basic and climb one step at a time.</b><button type="button" data-mod="v">Very basic</button><button type="button" data-mod="b">Basic</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="v"><h4><span class="lvl lvl--v">Very basic</span> No jargon: a delivery driver</h4>
+      <p>Wrong address: stop and report. Customer not home: come back later, a few times. Doorbell broken: knock instead. Three different reactions to “it did not work”.</p><div class="scene"><svg viewBox="0 0 640 210" role="img" aria-label="A failing command goes one of three ways: a permanent error stops the script with a message; a temporary error goes into a retry loop with growing waits; an expected failure continues with a fallback."><rect x="250" y="14" width="140" height="40" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="320.0" y="37.1" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">a command fails</text><path d="M320 56L84 98" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M89.7 93.9L84 98L90.7 99.9" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="14" y="100" width="140" height="56" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="84.0" y="124.7" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">permanent</text><text x="84.0" y="137.1" text-anchor="middle" font-size="7.800000000000001" class="s-ink2">|| die → exit 1</text><path d="M320 56L320 98" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M317.0 91.7L320 98L323.0 91.7" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="250" y="100" width="140" height="56" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="320.0" y="124.7" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">temporary</text><text x="320.0" y="137.1" text-anchor="middle" font-size="7.800000000000001" class="s-ink2">retry 1s,2s,4s…</text><path d="M320 56L556 98" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M549.3 99.9L556 98L550.3 93.9" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="486" y="100" width="140" height="56" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="556.0" y="124.7" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">expected</text><text x="556.0" y="137.1" text-anchor="middle" font-size="7.800000000000001" class="s-ink2">|| fallback</text><text x="320" y="190" text-anchor="middle" font-size="9" font-weight="700" class="s-acc">ERR trap: report the line and command in every case</text><text x="632" y="204" text-anchor="end" class="s-wm">myphatshala.in</text></svg></div>
+    </div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Basic</span> What you will type</h4>
+      <ul>
+        <li><code>cp config.yml /etc/app/ || die "cannot install config"</code></li>
+        <li><code>curl -fsS "$url" -o out.json || retry 5 curl -fsS "$url" -o out.json</code></li>
+        <li><code>trap 'echo "line $LINENO: $BASH_COMMAND failed" &gt;&amp;2' ERR</code></li>
+        <li><code>local x; x=$(cmd)</code> (two lines, never <code>local x=$(cmd)</code>)</li>
+      </ul>
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The differences that matter</h4>
+      <ul>
+        <li>set -e ignores failures in <code>if</code>/<code>while</code>/<code>until</code> tests, in <code>a &amp;&amp; b</code> except the last command, after <code>!</code>, and inside functions called from those places.</li>
+        <li>The ERR trap fires on the same failures set -e would act on; <code>set -E</code> makes it work inside functions and subshells too.</li>
+        <li>Retry with a <b>limit</b>, <b>growing waits</b> (exponential back-off) and a little <b>jitter</b> so 100 servers do not retry at the same second.</li>
+        <li>Decide by exit code what is temporary: curl 6/7/28 (DNS, connect, timeout), HTTP 429/503, sysexits 75 (EX_TEMPFAIL).</li>
+      </ul>
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Behind the screen: errexit’s rules</h4>
+      <ul>
+        <li>POSIX defines errexit as “exit if a simple command fails, unless it is part of a condition”; the condition context is <i>inherited</i> by everything called from it, so <code>if myfunc; then</code> disables set -e for the whole body of myfunc.</li>
+        <li><code>local</code>, <code>export</code>, <code>declare</code> and <code>readonly</code> are commands with their own status (0 when the assignment works): the <code>$( )</code> status is lost. ShellCheck flags it as SC2155.</li>
+        <li>Command substitution runs in a subshell that inherits set -e only with <code>shopt -s inherit_errexit</code> (Bash 4.4+).</li>
+        <li><code>$LINENO</code> in an ERR trap is the line of the failing command; <code>${BASH_SOURCE[1]}</code>, <code>${FUNCNAME[1]}</code> and <code>caller</code> give a small stack trace.</li>
+      </ul>
+    </div>
+  </div><div class="callout callout--did"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v5h1"/></svg><p><b>Did you know?</b> The Bash manual itself warns that set -e’s rules are complicated, and many experienced scripters use it only together with explicit checks. The pattern in this lesson (set -euo pipefail + ERR trap + explicit <code>|| die</code> on important steps) gives you both: a safety net and clear intent.</p></div>
+
+EXAM> “Why didn’t set -e stop my script when local x=$(false) failed?” → local is a separate command whose own status (0) replaces the substitution’s status; declare first, then assign: local x; x=$(cmd).
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> Inside if myfunc; then …, does set -e work in myfunc?</summary>
+    <div class="qc__a"><b>Answer:</b> No: the condition context is inherited by the whole function body.</div></details>
+<div class="mist"><b class="mist__tag">Common mistake</b><div class="mist__row"><span class="mist__no">✗</span><code>local result=$(compute)</code></div><div class="mist__row"><span class="mist__ok">✓</span><code>local result; result=$(compute)</code></div><p>The failure of compute is hidden by local’s own exit status 0.</p></div>
+<div class="mist"><b class="mist__tag">Common mistake</b><div class="mist__row"><span class="mist__no">✗</span><code>for i in 1 2 3 4 5; do curl … &amp;&amp; break; done   (retry with no pause)</code></div><div class="mist__row"><span class="mist__ok">✓</span><code>retry 5 curl …   (limit, back-off, only for temporary errors)</code></div><p>Five instant retries hit an overloaded server five times in a second and still fail.</p></div>
+
+</section>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and differences</span>
+  <h2>Kinds of failure, and where set -e stops</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:520px">
+    <thead><tr><th>Failure</th><th>Examples</th><th>Reaction</th></tr></thead>
+    <tbody><tr><td>Permanent</td><td>missing file, wrong password, bad argument, disk full</td><td>stop: <code>|| die</code>, exit non-zero</td></tr><tr><td>Temporary</td><td>timeout, 503, 429 rate limit, DNS blip, lock busy</td><td>retry with back-off</td></tr><tr><td>Expected</td><td>grep finds nothing, optional file absent</td><td>handle: <code>if</code>, <code>|| fallback</code></td></tr><tr><td>Harmless</td><td>cleanup of a file that may not exist</td><td><code>|| true</code> (or <code>rm -f</code>)</td></tr></tbody>
+  </table>
+  </div>  <div class="table-wrap">
+  <table class="compare" style="min-width:420px">
+    <thead><tr><th>Situation</th><th>set -e stops?</th></tr></thead>
+    <tbody><tr><td><code>false</code> on its own line</td><td>yes</td></tr><tr><td><code>if false; then</code> / <code>while false</code></td><td>no (condition)</td></tr><tr><td><code>false &amp;&amp; echo x</code></td><td>no (not the last in the list)</td></tr><tr><td><code>echo x &amp;&amp; false</code></td><td>yes (last command)</td></tr><tr><td><code>false || true</code></td><td>no</td></tr><tr><td><code>! false</code></td><td>no</td></tr><tr><td><code>x=$(false)</code></td><td>yes</td></tr><tr><td><code>local x=$(false)</code></td><td><b>no</b> (local’s status)</td></tr><tr><td><code>false | true</code> without pipefail</td><td>no</td></tr><tr><td>a function called from <code>if f; then</code></td><td>no, for its whole body</td></tr></tbody>
+  </table>
+  </div>  <details class="qc"><summary><span class="qc__tag">Quick check</span> Which line stops a set -e script: false && echo hi, or echo hi && false?</summary>
+    <div class="qc__a"><b>Answer:</b> echo hi && false (false is the last command of the list).</div></details>
+
+</section>
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>set -e’s holes, ERR traps, explicit checks and retries</h2>
+  <p id="commands">Every card runs on our build machine in <code>~/ops</code>. <code>bin/flaky NAME N</code> fails its first N calls with exit 75 and then succeeds (its counter lives in <code>state/</code>). In the retry cards <code>RETRY_SLEEP_SCALE=0.1</code> shortens the waits ten times so the page builds fast; the messages still show the real schedule.</p>
+  <article class="cc" id="cmd-holes">
+    <header class="cc__head"><h3><code>set -e: where it does not stop</code> <span class="cc__full">the holes in set -e</span></h3><div class="cc__badges"><span class="rb rb--safe" title="only shows information">🟢 Read-only</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what">set -e ignores a failure when it is part of a condition (if, while, &amp;&amp;, ||, !) and when <code>local</code>/<code>export</code>/<code>declare</code> wraps a <code>$( )</code>. These are the places to check explicitly.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>every script with set -e</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>trusting set -e blindly</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>local x; x=$(cmd)   ·   cmd || die &quot;…&quot;</code></p>
+    <div class="anat" role="img" aria-label="local t; t=$(cmd)"><span class="an an--cmd"><code>local t;</code><small>declare</small></span><span class="an an--arg"><code>t=$(cmd)</code><small>assign: status kept</small></span></div><p class="anat__note">Two statements, so set -e sees the failure.</p>
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>local x=$(cmd)</code></td><td>status lost</td><td>split it</td></tr><tr><td><code>if cmd; then</code></td><td>no stop</td><td>by design</td></tr><tr><td><code>a &amp;&amp; b</code></td><td>only b stops</td><td>lists</td></tr><tr><td><code>f called in if</code></td><td>no stop inside f</td><td>inherited</td></tr><tr><td><code>inherit_errexit</code></td><td>set -e in $( )</td><td>Bash 4.4+</td></tr><tr><td><code>cmd || true</code></td><td>deliberate</td><td>document it</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>compute() { echo &#x27;computing&#x27;; false; }
+bash -c &#x27;set -e; f(){ local t=$(false); echo &quot;after local: continued, t=[$t]&quot;; }; f&#x27;
+bash -c &#x27;set -e; f(){ local t; t=$(false); echo &quot;never printed&quot;; }; f&#x27;; echo &quot;split version stopped: exit $?&quot;
+bash -c &#x27;set -e; g(){ false; echo &quot;inside g: still running&quot;; }; if g; then echo &quot;g returned success&quot;; fi&#x27;</code></pre><div class="output">after local: continued, t=[]
+split version stopped: exit 1
+inside g: still running
+g returned success</div></div>
+    <p class="cc__note">The first form continues with an empty value; splitting it stops at once. The third shows the if-context: false inside g is ignored.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="dev">Software development</button></div>
+    <div class="modlab__panel" data-mod="dev"><h4>set -e: where it does not stop in software development</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> && lists.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>bash -c &#x27;set -e; false &amp;&amp; echo x; echo &quot;after false &amp;&amp; …: still running&quot;; echo y &amp;&amp; false; echo never&#x27;; echo &quot;exit $?&quot;</code></pre><div class="output">after false &amp;&amp; …: still running
+y
+exit 1</div></div>
+          <p class="fv__why"><b>Why this way:</b> Only the last command of a list counts.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <article class="cc" id="cmd-errtrap">
+    <header class="cc__head"><h3><code>trap &#x27;on_err $LINENO&#x27; ERR · set -E · $BASH_COMMAND</code> <span class="cc__full">report where it failed</span></h3><div class="cc__badges"><span class="rb rb--safe" title="only shows information">🟢 Read-only</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what">An ERR trap runs whenever a command fails (where set -e would act). Print the line (<code>$LINENO</code> passed in), the command (<code>$BASH_COMMAND</code>) and the status. <code>set -E</code> makes the trap work inside functions and subshells.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>any non-trivial script</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>silent deaths in cron</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>on_err(){ echo &quot;ERROR line $1: &#x27;$2&#x27; exited $3&quot; &gt;&amp;2; }; trap &#x27;on_err $LINENO &quot;$BASH_COMMAND&quot; $?&#x27; ERR</code></p>
+    
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>$LINENO</code></td><td>line number</td><td>pass at trap time</td></tr><tr><td><code>$BASH_COMMAND</code></td><td>failing command</td><td>text</td></tr><tr><td><code>$?</code></td><td>its status</td><td>first thing</td></tr><tr><td><code>set -E</code></td><td>errtrace</td><td>functions</td></tr><tr><td><code>${FUNCNAME[1]}</code></td><td>which function</td><td>stack</td></tr><tr><td><code>caller</code></td><td>line + file</td><td>stack</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops
+cat &gt; bin/load.sh &lt;&lt;&#x27;EOF&#x27;
+#!/usr/bin/env bash
+set -eEuo pipefail
+on_err() { echo &quot;ERROR in ${3:-main} line $1: &#x27;$2&#x27; exited $4&quot; &gt;&amp;2; }
+trap &#x27;on_err $LINENO &quot;$BASH_COMMAND&quot; &quot;${FUNCNAME[0]:-}&quot; $?&#x27; ERR
+check() { grep -q &#x27;,&#x27; &quot;$1&quot;; }
+load() { check data/orders.csv; cp data/orders.csv /nonexistent/dir/ 2&gt;/dev/null; }
+load
+echo &#x27;never reached&#x27;
+EOF
+chmod +x bin/load.sh; bin/load.sh; echo &quot;exit $?&quot;</code></pre><div class="output">ERROR in load line 6: &#x27;cp data/orders.csv /nonexistent/dir/ 2&gt; /dev/null&#x27; exited 1
+exit 1</div></div>
+    <p class="cc__note">The trap names the function, the line and the exact command, which is gold in a 2 a.m. cron mail.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="sys">System info / admin</button></div>
+    <div class="modlab__panel" data-mod="sys"><h4>trap 'on_err $LINENO' ERR · set -E · $BASH_COMMAND in system info / admin</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> Without set -E the trap is silent inside functions.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>bash -c &#x27;set -e; trap &quot;echo ERR trap: line \$LINENO&quot; ERR; f(){ false; }; f&#x27;; echo &quot;exit $?&quot;
+bash -c &#x27;set -eE; trap &quot;echo ERR trap: line \$LINENO&quot; ERR; f(){ false; }; f&#x27;; echo &quot;exit $?&quot;</code></pre><div class="output">exit 1
+ERR trap: line 1
+exit 1</div></div>
+          <p class="fv__why"><b>Why this way:</b> Only the -E version reports.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <article class="cc" id="cmd-explicit">
+    <header class="cc__head"><h3><code>|| die · if ! cmd · || fallback · || true</code> <span class="cc__full">explicit checks</span></h3><div class="cc__badges"><span class="rb rb--safe" title="only shows information">🟢 Read-only</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what">For steps that matter, say what should happen: <code>|| die "message"</code> stops with a reason, <code>if ! cmd; then</code> handles the failure in a block, <code>|| fallback</code> continues another way, <code>|| true</code> marks a failure as harmless (with a comment).</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>important steps</li><li>clear messages</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>relying on set -e for messages</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>cp &quot;$cfg&quot; /etc/app/ || die &quot;cannot install $cfg&quot;</code></p>
+    
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>|| die &quot;…&quot;</code></td><td>stop + reason</td><td>must work</td></tr><tr><td><code>if ! cmd; then</code></td><td>handle block</td><td>several steps</td></tr><tr><td><code>|| fallback</code></td><td>another way</td><td>optional source</td></tr><tr><td><code>|| true</code></td><td>harmless</td><td>comment why</td></tr><tr><td><code>${PIPESTATUS[@]}</code></td><td>pipe statuses</td><td>details</td></tr><tr><td><code>rc=$?</code></td><td>save first</td><td>branches</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops
+die() { echo &quot;sync: error: $*&quot; &gt;&amp;2; exit 1; }
+primary=data/orders-today.csv; backup=data/orders.csv
+src=$primary; [[ -r $src ]] || { echo &quot;sync: $primary missing, using $backup&quot;; src=$backup; }
+lines=$(wc -l &lt; &quot;$src&quot;) || die &quot;cannot count $src&quot;
+echo &quot;loading $((lines - 1)) orders from $src&quot;
+rm -f state/old.lock || true   # may not exist: harmless
+( [[ -r data/password.txt ]] || die &#x27;data/password.txt missing: refusing to continue&#x27; ); echo &quot;exit $?&quot;</code></pre><div class="output">sync: data/orders-today.csv missing, using data/orders.csv
+loading 2 orders from data/orders.csv
+sync: error: data/password.txt missing: refusing to continue
+exit 1</div></div>
+    <p class="cc__note">Fallback, a checked step, a harmless failure, and a permanent error that stops with a clear reason.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="devops">DevOps / cloud</button></div>
+    <div class="modlab__panel" data-mod="devops"><h4>|| die · if ! cmd · || fallback · || true in devops / cloud</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> if ! with a cleanup branch.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; if ! tar -czf /nonexistent/backup.tgz data 2&gt;/dev/null; then echo &#x27;backup failed: removing partial file, alerting&#x27;; rm -f /nonexistent/backup.tgz; fi</code></pre><div class="output">backup failed: removing partial file, alerting</div></div>
+          <p class="fv__why"><b>Why this way:</b> Several reactions in one place.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <article class="cc" id="cmd-retry">
+    <header class="cc__head"><h3><code>retry MAX cmd args · back-off · RETRY_ON</code> <span class="cc__full">retry with back-off</span></h3><div class="cc__badges"><span class="rb rb--safe" title="only shows information">🟢 Read-only</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what">The <code>retry</code> function runs the command; on success it returns 0. On a <b>temporary</b> exit code (listed in <code>RETRY_ON</code>, default 75, 6, 7, 28) it waits 1 s, 2 s, 4 s… and tries again, up to MAX attempts. Any other code is permanent: it gives up at once and passes the code on.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>network calls</li><li>APIs</li><li>locks</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>permanent errors</li><li>non-idempotent steps</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>retry 5 curl -fsS &quot;$url&quot; -o data.json</code></p>
+    
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>MAX</code></td><td>attempt limit</td><td>always</td></tr><tr><td><code>2 ** (n-1)</code></td><td>1,2,4,8 s</td><td>back-off</td></tr><tr><td><code>RETRY_ON</code></td><td>temporary codes</td><td>only these</td></tr><tr><td><code>+ jitter</code></td><td>$((RANDOM % 1000)) ms</td><td>many clients</td></tr><tr><td><code>return rc</code></td><td>last status</td><td>caller decides</td></tr><tr><td><code>idempotent</code></td><td>safe to repeat</td><td>required</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; source bin/retry.sh
+retry 5 bin/flaky api 2; echo &quot;exit $?&quot;
+echo &#x27;--- a service that never recovers:&#x27;
+retry 3 bin/flaky down 99; echo &quot;exit $?&quot;</code></pre><div class="output">flaky: api attempt 1: service unavailable
+retry: attempt 1 failed (75), waiting 1s
+flaky: api attempt 2: service unavailable
+retry: attempt 2 failed (75), waiting 2s
+flaky: api attempt 3: ok
+exit 0
+--- a service that never recovers:
+flaky: down attempt 1: service unavailable
+retry: attempt 1 failed (75), waiting 1s
+flaky: down attempt 2: service unavailable
+retry: attempt 2 failed (75), waiting 2s
+flaky: down attempt 3: service unavailable
+retry: giving up after 3 attempts
+exit 75</div></div>
+    <p class="cc__note">Two failures, waits of 1 s and 2 s (scaled), then success. The second gives up after 3 attempts with the last code.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="sec">Security</button></div>
+    <div class="modlab__panel" data-mod="sec"><h4>retry MAX cmd args · back-off · RETRY_ON in security</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> Permanent errors are not retried.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; source bin/retry.sh; retry 5 bash -c &#x27;echo &quot;auth: invalid password&quot; &gt;&amp;2; exit 77&#x27;; echo &quot;exit $?&quot;</code></pre><div class="output">auth: invalid password
+retry: permanent error (77), not retrying
+exit 77</div></div>
+          <p class="fv__why"><b>Why this way:</b> Retrying a wrong password would only lock the account.</p></li>
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> Read the function.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; cat bin/retry.sh</code></pre><div class="output">retry() {   # retry MAX CMD ARGS...  (exponential back-off; retries only exit codes listed in RETRY_ON)
+  local max=$1 n=1 rc wait; shift
+  while true; do
+    &quot;$@&quot; &amp;&amp; return 0
+    rc=$?
+    if [[ &quot; ${RETRY_ON:-75 6 7 28} &quot; != *&quot; $rc &quot;* ]]; then echo &quot;retry: permanent error ($rc), not retrying&quot; &gt;&amp;2; return &quot;$rc&quot;; fi
+    (( n &gt;= max )) &amp;&amp; { echo &quot;retry: giving up after $n attempts&quot; &gt;&amp;2; return &quot;$rc&quot;; }
+    wait=$(( 2 ** (n - 1) ))
+    echo &quot;retry: attempt $n failed ($rc), waiting ${wait}s&quot; &gt;&amp;2
+    sleep &quot;$(awk -v w=&quot;$wait&quot; -v s=&quot;${RETRY_SLEEP_SCALE:-1}&quot; &#x27;BEGIN{print w*s}&#x27;)&quot;
+    (( n++ ))
+  done
+}</div></div>
+          <p class="fv__why"><b>Why this way:</b> 15 lines you can paste into the template.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <div class="undo" id="undo"><h3>Undo and safety net</h3><p>Error handling is about recovery; plan the undo for each step:</p><ul><li><b>Half-done job:</b> make steps idempotent (safe to run again) and write results atomically (Lesson 2.3).</li><li><b>Retried a step that should not repeat (a payment, an email):</b> only retry idempotent steps, or check “already done?” first.</li><li><b>Script stopped too early (|| true missing):</b> decide per step; never sprinkle set +e.</li><li><b>Silent failure found later:</b> add the ERR trap and the split <code>local x; x=$(…)</code>, then rerun.</li></ul></div>
+  <h3 id="errors">Error messages decoded</h3>
+  <p>Errors students see most (really run on our build machine).</p>
+  <ol class="ers">
+    <li class="er"><div class="code" data-lang="bash" data-file="Terminal"><pre><code>bash -c &#x27;set -e; f(){ local x=$(false); echo &quot;got [$x], status hidden&quot;; }; f&#x27;</code></pre><div class="output">got [], status hidden
+exit status: 0</div></div>
+      <p><b>What it means:</b> local hid the failure of the substitution.</p><p><b>Fix:</b> local x; x=$(false)</p></li>
+    <li class="er"><div class="code" data-lang="bash" data-file="Terminal"><pre><code>bash -c &#x27;set -e; trap &quot;echo line $LINENO&quot; ERR; false&#x27;</code></pre><div class="output">line 1
+exit status: 1</div></div>
+      <p><b>What it means:</b> Double quotes expanded $LINENO when the trap was set (line 1), not when it ran.</p><p><b>Fix:</b> Single quotes: trap 'echo line $LINENO' ERR</p></li>
+    <li class="er"><div class="code" data-lang="bash" data-file="Terminal"><pre><code>for i in 1 2 3; do curl -fsS http://127.0.0.1:9 -o /dev/null 2&gt;/dev/null &amp;&amp; break; echo &quot;try $i failed&quot;; done</code></pre><div class="output">try 1 failed
+try 2 failed
+try 3 failed
+exit status: 0</div></div>
+      <p><b>What it means:</b> Retries with no pause and no limit check: all three fail within milliseconds.</p><p><b>Fix:</b> retry with back-off; check the final status.</p></li>
+  </ol>
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> Which exit codes should a retry function retry?</summary>
+    <div class="qc__a"><b>Answer:</b> Only temporary ones (timeouts, connection refused, 429/503, EX_TEMPFAIL 75), never permanent ones such as bad credentials or missing files.</div></details>
+
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>Retry with back-off, and the local trap</h2>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">Behind the screen: waits double <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="A terminal: two 503 answers, waits of 1 and 2 seconds, then success.">
+          <g data-on="1"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@server: ~/ops</text><text x="22" y="45.5" font-size="7.2" class="mono" style="fill:#EDEBE3">call_api</text><text x="22" y="59.0" font-size="7.2" class="mono" style="fill:#F59E8B">503 service unavailable</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Try 1.</text></g><g data-on="2"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@server: ~/ops</text><text x="22" y="45.5" font-size="7.2" class="mono" style="fill:#EDEBE3">sleep 1; call_api</text><text x="22" y="59.0" font-size="7.2" class="mono" style="fill:#F59E8B">503 service unavailable</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Try 2.</text></g><g data-on="3"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@server: ~/ops</text><text x="22" y="45.5" font-size="7.2" class="mono" style="fill:#EDEBE3">sleep 2; call_api</text><text x="22" y="59.0" font-size="7.2" class="mono" style="fill:#EDEBE3">ok</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Try 3.</text></g><g data-on="4"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@server: ~/ops</text><text x="22" y="45.5" font-size="7.2" class="mono"><tspan style="fill:#9FD3B8">$</tspan><tspan style="fill:#EDEBE3"> echo $?</tspan></text><text x="22" y="59.0" font-size="7.2" class="mono" style="fill:#F5C77E">0</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">Done.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>try 1.</li>
+          <li>try 2.</li>
+          <li>try 3.</li>
+          <li>done.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Rows show each attempt and the next wait.">
+          <g data-on="1"><text x="180" y="18" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink2">retry 5 call_api</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">attempt 1: exit 75 → wait 1 s</text></g><g data-on="2"><text x="180" y="18" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink2">retry 5 call_api</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">attempt 1: exit 75 → wait 1 s</text><rect x="14" y="60" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="74.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">attempt 2: exit 75 → wait 2 s</text></g><g data-on="3"><text x="180" y="18" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink2">retry 5 call_api</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">attempt 1: exit 75 → wait 1 s</text><rect x="14" y="60" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="74.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">attempt 2: exit 75 → wait 2 s</text><rect x="14" y="88" width="330" height="24" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="179.0" y="102.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">attempt 3: exit 0 → return 0</text></g><g data-on="4"><text x="180" y="18" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink2">retry 5 call_api</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">attempt 1: exit 75 → wait 1 s</text><rect x="14" y="60" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="74.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">attempt 2: exit 75 → wait 2 s</text><rect x="14" y="88" width="330" height="24" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="179.0" y="102.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">attempt 3: exit 0 → return 0</text><rect x="14" y="116" width="330" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="179.0" y="130.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">total: 3 calls, 3 s waited, job continues</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>1</li>
+          <li>2</li>
+          <li>3</li>
+          <li>ok</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Animated example</span>
+  <h3 id="scenario-local">Why local hides failures</h3>
+  <p class="anim-intro">Two commands, one status.</p>
+  <div class="anim anim--one" data-frames="4" data-delay="5000">
+    <div class="anim__title">local + $( ) <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Two boxes: the substitution fails, local succeeds.">
+          <g data-on="1"><text x="180" y="18" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink2">set -e and local x=$(false)</text><rect x="14" y="36" width="160" height="50" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="94.0" y="57.7" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">$(false)</text><text x="94.0" y="70.1" text-anchor="middle" font-size="7.800000000000001" class="s-ink2">status 1</text><rect x="186" y="36" width="160" height="50" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="266.0" y="57.7" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">local x=…</text><text x="266.0" y="70.1" text-anchor="middle" font-size="7.800000000000001" class="s-ink2">?</text><text x="180" y="112" text-anchor="middle" font-size="9.2" font-weight="700" class="s-violet">two commands on one line</text></g><g data-on="2"><text x="180" y="18" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink2">set -e and local x=$(false)</text><rect x="14" y="36" width="160" height="50" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="94.0" y="57.7" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">$(false)</text><text x="94.0" y="70.1" text-anchor="middle" font-size="7.800000000000001" class="s-ink2">status 1</text><rect x="186" y="36" width="160" height="50" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="266.0" y="57.7" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">local x=…</text><text x="266.0" y="70.1" text-anchor="middle" font-size="7.800000000000001" class="s-ink2">status 0</text><text x="180" y="112" text-anchor="middle" font-size="9.2" font-weight="700" class="s-violet">local succeeds: assignment worked</text></g><g data-on="3"><text x="180" y="18" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink2">set -e and local x=$(false)</text><rect x="14" y="36" width="160" height="50" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="94.0" y="57.7" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">$(false)</text><text x="94.0" y="70.1" text-anchor="middle" font-size="7.800000000000001" class="s-ink2">status 1</text><rect x="186" y="36" width="160" height="50" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="266.0" y="57.7" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">local x=…</text><text x="266.0" y="70.1" text-anchor="middle" font-size="7.800000000000001" class="s-ink2">status 0</text><text x="180" y="112" text-anchor="middle" font-size="9.2" font-weight="700" class="s-violet">$? = 0: set -e sees nothing</text></g><g data-on="4"><text x="180" y="18" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink2">set -e and local x=$(false)</text><rect x="14" y="36" width="160" height="50" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="94.0" y="57.7" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">$(false)</text><text x="94.0" y="70.1" text-anchor="middle" font-size="7.800000000000001" class="s-ink2">status 1</text><rect x="186" y="36" width="160" height="50" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="266.0" y="57.7" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">local x=…</text><text x="266.0" y="70.1" text-anchor="middle" font-size="7.800000000000001" class="s-ink2">status 0</text><text x="180" y="112" text-anchor="middle" font-size="9.2" font-weight="700" class="s-violet">fix: local x; x=$(false)</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>line.</li>
+          <li>local.</li>
+          <li>status.</li>
+          <li>fix.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+  <h3 id="dissect">Layer by layer: from failure to decision</h3>
+  <p>Each layer has a real command from our build machine.</p>
+  <div class="modlab dissect"><div class="modlab__bar"><b>Status → class → report. Click a layer.</b><button type="button" data-mod="status"><b>Exit status</b><small>0 or not</small></button><button type="button" data-mod="classify"><b>Classify</b><small>temporary?</small></button><button type="button" data-mod="report"><b>Report</b><small>ERR trap</small></button></div>
+    <div class="modlab__panel" data-mod="status">
+      <h4>Exit status <small>0 or not</small></h4>
+      <div class="dx__grid">
+        <div class="dx__q dx__q--why"><b>Why does it exist?</b><p>The signal.</p></div>
+        <div class="dx__q dx__q--how"><b>How does it work?</b><p>$?.</p></div>
+        <div class="dx__q dx__q--impl"><b>Where is it, really?</b><p>wait().</p></div>
+        <div class="dx__q dx__q--used"><b>Where is it used?</b><p>Everything.</p></div>
+      </div>
+      <div class="dx__see"><p class="wx__label">See this layer yourself (real output)</p>
+        <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; bin/flaky x 1; echo &quot;status $?&quot;; bin/flaky x 1; echo &quot;status $?&quot;</code></pre><div class="output">flaky: x attempt 1: service unavailable
+status 75
+flaky: x attempt 2: ok
+status 0</div></div></div>
+    </div>
+    <div class="modlab__panel" data-mod="classify">
+      <h4>Classify <small>temporary?</small></h4>
+      <div class="dx__grid">
+        <div class="dx__q dx__q--why"><b>Why does it exist?</b><p>Retry or stop.</p></div>
+        <div class="dx__q dx__q--how"><b>How does it work?</b><p>case on code.</p></div>
+        <div class="dx__q dx__q--impl"><b>Where is it, really?</b><p>RETRY_ON.</p></div>
+        <div class="dx__q dx__q--used"><b>Where is it used?</b><p>retry().</p></div>
+      </div>
+      <div class="dx__see"><p class="wx__label">See this layer yourself (real output)</p>
+        <div class="code" data-lang="bash" data-file="Terminal"><pre><code>for rc in 0 2 7 28 75 77; do case $rc in 0) k=ok;; 6|7|28|75) k=temporary;; *) k=permanent;; esac; echo &quot;$rc -&gt; $k&quot;; done</code></pre><div class="output">0 -&gt; ok
+2 -&gt; permanent
+7 -&gt; temporary
+28 -&gt; temporary
+75 -&gt; temporary
+77 -&gt; permanent</div></div></div>
+    </div>
+    <div class="modlab__panel" data-mod="report">
+      <h4>Report <small>ERR trap</small></h4>
+      <div class="dx__grid">
+        <div class="dx__q dx__q--why"><b>Why does it exist?</b><p>Find it fast.</p></div>
+        <div class="dx__q dx__q--how"><b>How does it work?</b><p>$LINENO, $BASH_COMMAND.</p></div>
+        <div class="dx__q dx__q--impl"><b>Where is it, really?</b><p>trap.</p></div>
+        <div class="dx__q dx__q--used"><b>Where is it used?</b><p>cron mail.</p></div>
+      </div>
+      <div class="dx__see"><p class="wx__label">See this layer yourself (real output)</p>
+        <div class="code" data-lang="bash" data-file="Terminal"><pre><code>bash -c &#x27;set -eE; trap &#x27;&quot;&#x27;&quot;&#x27;echo &quot;failed at line $LINENO: $BASH_COMMAND&quot; &gt;&amp;2&#x27;&quot;&#x27;&quot;&#x27; ERR
+echo step1
+ls /nonexistent-dir
+echo never&#x27; 2&gt;&amp;1 | sed &#x27;s/^ls: .*/(ls error message)/&#x27;</code></pre><div class="output">step1
+(ls error message)
+failed at line 3: ls /nonexistent-dir</div></div></div>
+    </div>
+  </div>
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> With waits 1, 2, 4, 8 s, how long do 5 failed attempts take?</summary>
+    <div class="qc__a"><b>Answer:</b> 15 s of waiting (1+2+4+8) before the 5th attempt fails and retry gives up.</div></details>
+
+</section>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Error handling at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">APIs</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">retries</text></svg></div>
+    <div><h4>1. Partner APIs</h4>
+      <p>Nightly jobs retry 503/429 with back-off before paging anyone; most “incidents” disappear.</p>
+      <div class="uc-flow"><span>503</span><i>→</i><span class="java">retry</span><i>→</i><span>success</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">CI</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">deploy</text></svg></div>
+    <div><h4>2. Deploy pipelines</h4>
+      <p>set -euo pipefail plus an ERR trap that prints the step and line makes failed deploys readable in CI logs.</p>
+      <div class="uc-flow"><span>step fails</span><i>→</i><span class="java">ERR trap</span><i>→</i><span>clear log</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">cloud</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">eventual</text></svg></div>
+    <div><h4>3. Cloud provisioning</h4>
+      <p>A new VM or DNS record is not ready instantly; scripts poll with a deadline instead of failing at once.</p>
+      <div class="uc-flow"><span>create</span><i>→</i><span class="java">poll</span><i>→</i><span>ready</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">data</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">ETL</text></svg></div>
+    <div><h4>4. Data loads</h4>
+      <p>Missing source files are permanent errors (stop, alert); a busy database lock is temporary (retry).</p>
+      <div class="uc-flow"><span>classify</span><i>→</i><span class="java">stop / retry</span><i>→</i><span>load</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">K8s</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">jobs</text></svg></div>
+    <div><h4>5. Containers and jobs</h4>
+      <p>Kubernetes restarts failed pods with back-off too; exit codes decide whether a Job is retried.</p>
+      <div class="uc-flow"><span>exit code</span><i>→</i><span class="java">backoffLimit</span><i>→</i><span>retry</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified and generic. They describe common patterns, not the internal systems of any particular company.</p>
+  <h3 id="oneliners">One-liner corner</h3>
+  <p class="ol-intro">Small, useful patterns. All really run on our build machine.</p>
+  <div class="ol-list">
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">Beginner</span><h4>Stop with a reason</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Config missing.</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>( [[ -r /nonexistent/app.conf ]] || { echo &#x27;error: app.conf missing&#x27; &gt;&amp;2; exit 1; } ); echo &quot;exit $?&quot;</code></pre><div class="output">error: app.conf missing
+exit 1</div></div>
+      <p class="ol__how">|| { …; exit 1; }</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">Beginner</span><h4>Harmless failure</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Cleanup.</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>rm /nonexistent/old.tmp 2&gt;/dev/null || true; echo &#x27;continued&#x27;</code></pre><div class="output">continued</div></div>
+      <p class="ol__how">|| true.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--i">Intermediate</span><h4>Keep a $( ) failure visible</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Functions.</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>f(){ local v; v=$(false) || { echo &quot;caught: $?&quot;; return 1; }; }; f; echo &quot;f returned $?&quot;</code></pre><div class="output">caught: 1
+f returned 1</div></div>
+      <p class="ol__how">Split local.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--i">Intermediate</span><h4>Line of the failure</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Debug.</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>bash -c &#x27;set -eE; trap &#x27;&quot;&#x27;&quot;&#x27;echo &quot;line $LINENO&quot; &gt;&amp;2&#x27;&quot;&#x27;&quot;&#x27; ERR
+true
+false&#x27; 2&gt;&amp;1; true</code></pre><div class="output">line 3</div></div>
+      <p class="ol__how">ERR + $LINENO.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--a">Advanced</span><h4>Retry a flaky call</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Night job.</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; source bin/retry.sh; retry 4 bin/flaky night 1 2&gt;&amp;1</code></pre><div class="output">flaky: night attempt 1: service unavailable
+retry: attempt 1 failed (75), waiting 1s
+flaky: night attempt 2: ok</div></div>
+      <p class="ol__how">One failure, one wait, success.</p>
+    </article>
+    <article class="ol ol--build">
+      <div class="ol__head"><span class="lvl lvl--b">Beginner</span><h4>Build it step by step: a reliable sync step</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Riya hardens the API step of her nightly job.</p>
+      <ol class="build">
+      <li><p>1. Plain call: fails tonight.</p>
+        <div class="code" data-lang="bash" data-file="Step 1"><pre><code>cd ~/ops; bin/flaky api1 2; echo &quot;plain call: exit $?&quot;</code></pre><div class="output">flaky: api1 attempt 1: service unavailable
+plain call: exit 75</div></div></li>
+      <li><p>2. With retry: succeeds after two waits.</p>
+        <div class="code" data-lang="bash" data-file="Step 2"><pre><code>cd ~/ops; source bin/retry.sh; retry 5 bin/flaky api2 2 2&gt;&amp;1 | sed &#x27;s/^/  /&#x27;</code></pre><div class="output">  flaky: api2 attempt 1: service unavailable
+  retry: attempt 1 failed (75), waiting 1s
+  flaky: api2 attempt 2: service unavailable
+  retry: attempt 2 failed (75), waiting 2s
+  flaky: api2 attempt 3: ok</div></div></li>
+      <li><p>3. Permanent errors stop at once.</p>
+        <div class="code" data-lang="bash" data-file="Step 3"><pre><code>cd ~/ops; source bin/retry.sh; retry 5 bash -c &#x27;echo &quot;401 unauthorized&quot; &gt;&amp;2; exit 77&#x27; 2&gt;&amp;1; echo &quot;exit $?: no retry for a permanent error&quot;</code></pre><div class="output">401 unauthorized
+retry: permanent error (77), not retrying
+exit 77: no retry for a permanent error</div></div></li>
+      <li><p>4. Still down: give up with a clear message and exit 1.</p>
+        <div class="code" data-lang="bash" data-file="Step 4"><pre><code>cd ~/ops; bash -c &#x27;set -eE; trap &#x27;&quot;&#x27;&quot;&#x27;echo &quot;sync failed at line $LINENO: $BASH_COMMAND&quot; &gt;&amp;2&#x27;&quot;&#x27;&quot;&#x27; ERR; source bin/retry.sh; retry 2 bin/flaky api3 9 || { echo &quot;sync: error: partner API still down after retries&quot; &gt;&amp;2; exit 1; }&#x27; 2&gt;&amp;1 | tail -2; echo &quot;exit ${PIPESTATUS[0]}&quot;</code></pre><div class="output">retry: giving up after 2 attempts
+sync: error: partner API still down after retries
+exit 1</div></div></li>
+      </ol>
+    </article>
+  </div>  <h3 id="variations">More examples and variations</h3>
+  <p class="ol-intro">Sixteen more error-handling patterns. All were really run on our build machine.</p>
+  <h4 class="var__group">set -e cases</h4>
+  <div class="ol-list">
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V1</span><h4>Pipeline without pipefail</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>bash -c &#x27;set -e; false | true; echo &quot;continued: pipefail missing&quot;&#x27;</code></pre><div class="output">continued: pipefail missing</div></div>
+      <p class="ol__how">Add -o pipefail.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V2</span><h4>inherit_errexit</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>bash -c &#x27;set -e; shopt -s inherit_errexit; x=$(false; echo after); echo &quot;x=[$x]&quot;&#x27;; echo &quot;exit $?&quot;</code></pre><div class="output">exit 1</div></div>
+      <p class="ol__how">set -e inside $( ) too.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V3</span><h4>! does not stop</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>bash -c &#x27;set -e; ! true; echo &quot;after ! true: still running&quot;&#x27;</code></pre><div class="output">after ! true: still running</div></div>
+      <p class="ol__how">Negation counts as a condition.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V4</span><h4>Arithmetic zero is a failure</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>bash -c &#x27;set -e; n=0; ((n++)); echo never&#x27;; echo &quot;exit $?: ((n++)) returned 1 because the old value was 0&quot;</code></pre><div class="output">exit 1: ((n++)) returned 1 because the old value was 0</div></div>
+      <p class="ol__how">Use ((++n)) or n=$((n+1)).</p>
+    </article>
+  </div>
+  <h4 class="var__group">Reporting</h4>
+  <div class="ol-list">
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V5</span><h4>A tiny stack trace</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>bash -c &#x27;set -eE; trace(){ local i; for ((i=1;i&lt;${#FUNCNAME[@]};i++)); do echo &quot;  at ${FUNCNAME[i]} (line ${BASH_LINENO[i-1]})&quot; &gt;&amp;2; done; }; trap &quot;echo ERROR: \$BASH_COMMAND &gt;&amp;2; trace&quot; ERR; a(){ b; }; b(){ false; }; a&#x27; 2&gt;&amp;1</code></pre><div class="output">ERROR: false
+  at b (line 1)
+  at a (line 1)</div></div>
+      <p class="ol__how">FUNCNAME and BASH_LINENO.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V6</span><h4>Exit code in the message</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>bash -c &#x27;trap &quot;rc=\$?; echo \&quot;failed with \$rc\&quot; &gt;&amp;2&quot; ERR; set -e; ls /nonexistent 2&gt;/dev/null&#x27; 2&gt;&amp;1; true</code></pre><div class="output">failed with 2</div></div>
+      <p class="ol__how">Save $? first in the trap.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V7</span><h4>Different message per step</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>step=&#x27;download&#x27;; bash -c &quot;set -e; trap &#x27;echo \&quot;step [$step] failed\&quot; &gt;&amp;2&#x27; ERR; false&quot; 2&gt;&amp;1; true</code></pre><div class="output">step [download] failed</div></div>
+      <p class="ol__how">Track the current step in a variable.</p>
+    </article>
+  </div>
+  <h4 class="var__group">Explicit handling</h4>
+  <div class="ol-list">
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V8</span><h4>Default when a command fails</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>ver=$(cat /nonexistent/VERSION 2&gt;/dev/null || echo 0.0.0); echo &quot;version $ver&quot;</code></pre><div class="output">version 0.0.0</div></div>
+      <p class="ol__how">|| inside $( ).</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V9</span><h4>Try several sources</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>for src in /nonexistent/a.conf /etc/hostname; do [[ -r $src ]] &amp;&amp; { echo &quot;using $src&quot;; break; }; done</code></pre><div class="output">using /etc/hostname</div></div>
+      <p class="ol__how">First that works.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V10</span><h4>Check every pipe stage</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>printf &#x27;a\n&#x27; | grep -q zzz | cat; s=(&quot;${PIPESTATUS[@]}&quot;); echo &quot;stages: ${s[*]}&quot;; (( s[1] == 1 )) &amp;&amp; echo &#x27;grep found nothing (expected)&#x27;</code></pre><div class="output">stages: 0 1 0
+grep found nothing (expected)</div></div>
+      <p class="ol__how">Decide per stage.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V11</span><h4>Collect errors, fail at the end</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>errs=0; for f in /etc/hostname /nonexistent /etc/passwd; do [[ -r $f ]] || { echo &quot;missing $f&quot;; ((++errs)); }; done; echo &quot;$errs problem(s)&quot;; (( errs == 0 ))</code></pre><div class="output">missing /nonexistent
+1 problem(s)</div></div>
+      <p class="ol__how">Report all problems, not just the first.</p>
+    </article>
+  </div>
+  <h4 class="var__group">Retries</h4>
+  <div class="ol-list">
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V12</span><h4>Succeeds first time: no waiting</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>cd ~/ops; source bin/retry.sh; retry 5 bin/flaky fast 0</code></pre><div class="output">flaky: fast attempt 1: ok</div></div>
+      <p class="ol__how">Zero overhead on success.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V13</span><h4>Custom temporary codes</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>cd ~/ops; source bin/retry.sh; RETRY_ON=&#x27;75 3&#x27; retry 3 bash -c &#x27;exit 3&#x27;; echo &quot;exit $?&quot;</code></pre><div class="output">retry: attempt 1 failed (3), waiting 1s
+retry: attempt 2 failed (3), waiting 2s
+retry: giving up after 3 attempts
+exit 3</div></div>
+      <p class="ol__how">Choose per command.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V14</span><h4>Jitter</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>for i in 1 2 3; do echo &quot;wait $(( 2 ** i ))s + $(( RANDOM % 1000 ))ms&quot;; done | sed -E &#x27;s/[0-9]+ms/NNNms/&#x27;</code></pre><div class="output">wait 2s + NNNms
+wait 4s + NNNms
+wait 8s + NNNms</div></div>
+      <p class="ol__how">Random part avoids thundering herds.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V15</span><h4>Retry until a file appears</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>( sleep 0.3; touch ready.flag ) &amp; n=0; until [[ -e ready.flag ]]; do ((++n)); sleep 0.1; done; echo &quot;ready after $n checks&quot; | sed -E &#x27;s/[0-9]+ checks/N checks/&#x27;</code></pre><div class="output">ready after N checks</div></div>
+      <p class="ol__how">Polling with a pause.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V16</span><h4>Overall deadline</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>deadline=$(( SECONDS + 1 )); n=0; until (( SECONDS &gt;= deadline )); do ((++n)); sleep 0.2; done; echo &quot;gave up at the deadline after some tries&quot;</code></pre><div class="output">gave up at the deadline after some tries</div></div>
+      <p class="ol__how">Limit total time, not just attempts.</p>
+    </article>
+  </div>
+  <h3 id="which">Which command when?</h3>
+  <p>Choosing the right reaction.</p>
+  <div class="table-wrap">
+  <table class="compare which" style="min-width:640px">
+    <thead><tr><th>You want to…</th><th>Use</th><th>Why</th><th>Common mistake</th></tr></thead>
+    <tbody><tr><td>Must work</td><td><code>|| die &quot;reason&quot;</code></td><td>Stops, explains.</td><td>Hoping set -e catches it.</td></tr><tr><td>Optional step</td><td><code>|| fallback</code></td><td>Continues.</td><td>Ignoring silently.</td></tr><tr><td>Harmless</td><td><code>|| true (+ comment)</code></td><td>Explicit.</td><td>set +e.</td></tr><tr><td>Flaky</td><td><code>retry with back-off</code></td><td>Recovers.</td><td>Instant loops.</td></tr><tr><td>Where?</td><td><code>ERR trap + set -E</code></td><td>Line, command.</td><td>echo after each line.</td></tr><tr><td>$( ) in a function</td><td><code>local x; x=$(…)</code></td><td>Status kept.</td><td>local x=$(…).</td></tr></tbody>
+  </table>
+  </div>  <h3 id="keys">Keyboard and shell shortcuts</h3>
+  <p>Handy forms.</p>
+  <div class="table-wrap"><table class="compare" style="min-width:520px"><thead><tr><th>Keys / syntax</th><th>What it does</th><th>Example</th></tr></thead><tbody><tr><td><kbd>set -eEuo pipefail</kbd></td><td>safe mode + errtrace</td><td><code>top</code></td></tr><tr><td><kbd>trap &#x27;on_err $LINENO &quot;$BASH_COMMAND&quot; $?&#x27; ERR</kbd></td><td>report</td><td><code>top</code></td></tr><tr><td><kbd>cmd || die &quot;…&quot;</kbd></td><td>must work</td><td><code>steps</code></td></tr><tr><td><kbd>local x; x=$(cmd)</kbd></td><td>keep status</td><td><code>functions</code></td></tr><tr><td><kbd>retry 5 cmd args</kbd></td><td>temporary errors</td><td><code>network</code></td></tr><tr><td><kbd>RETRY_ON=&quot;75 6 7 28&quot;</kbd></td><td>which codes</td><td><code>per call</code></td></tr></tbody></table></div>
+  <h3 id="scriptit">Script it: sync.sh</h3>
+  <p>A nightly sync step with every pattern: safe mode with errtrace, an ERR trap that names the line, a fallback, a harmless step, a permanent check and a retried flaky call.</p>
+  <div class="code" data-lang="bash" data-file="script.sh"><pre><code>#!/usr/bin/env bash
+set -eEuo pipefail
+cd ~/ops
+die() { echo &quot;sync: error: $*&quot; &gt;&amp;2; exit 1; }
+trap &#x27;echo &quot;sync: failed at line $LINENO: $BASH_COMMAND&quot; &gt;&amp;2&#x27; ERR
+source bin/retry.sh
+export RETRY_SLEEP_SCALE=0.1
+
+[[ -r data/orders.csv ]] || die &quot;orders.csv missing&quot;           # permanent: stop
+extra=$(cat data/extra.csv 2&gt;/dev/null || echo &quot;&quot;)               # optional: fallback
+rm -f state/sync.lock || true                                     # harmless
+retry 5 bin/flaky partner 2                                       # temporary: retry
+echo &quot;sync: done, $(( $(wc -l &lt; data/orders.csv) - 1 )) orders, extra rows: ${#extra}&quot;</code></pre><div class="output">flaky: partner attempt 1: service unavailable
+retry: attempt 1 failed (75), waiting 1s
+flaky: partner attempt 2: service unavailable
+retry: attempt 2 failed (75), waiting 2s
+flaky: partner attempt 3: ok
+sync: done, 2 orders, extra rows: 0</div></div>
+  <p>Run it twice: the second time the partner call succeeds at once (the counter remembers).</p>
+<details class="puzzle puzzle--ans"><summary><span class="puzzle__tag">Puzzle answer</span> Remember the question from the story? Open to check your guess.</summary><p><b>1.</b> <code>local total=$(compute_total)</code> is one <code>local</code> command whose status (0, the assignment worked) replaces the status of <code>$(compute_total)</code>, so set -e sees success. Write <code>local total; total=$(compute_total)</code>. <b>2.</b> A failing command inside an <code>if</code> test is supposed not to stop the script: that failure is the “false” branch. set -e only acts on failures that are not part of a condition. <b>3.</b> Wrap the API call in a <code>retry</code> with a limit and back-off that retries only temporary exit codes (503 → curl exit 22 with -f, timeouts, exit 75); permanent errors still stop at once with <code>|| die</code>, and an ERR trap tells her the exact line.</p></details>
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> Which option makes an ERR trap fire inside functions?</summary>
+    <div class="qc__a"><b>Answer:</b> set -E (errtrace).</div></details>
+
+</section>

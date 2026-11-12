@@ -1,0 +1,2004 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Locks, timeouts and running only once | MyPhatshala</title>
+<meta name="description" content="Stop overlapping runs and hangs in Bash: a real race condition with lost updates, flock -n / -w / -s / -u and the exec 9&gt;file pattern, mkdir locks with stale-lock checks, noclobber, timeout with -k and exit code 124, whole-script deadlines, and idempotent steps for safe reruns, with every run real.">
+<meta name="mp:minutes" content="35">
+<link rel="canonical" href="https://myphatshala.in/courses/shell-scripting/03-robust-scripts/02-locks-timeouts-and-running-only-once/">
+<meta property="og:title" content="Locks, timeouts and running only once · MyPhatshala">
+<meta property="og:description" content="flock, mkdir locks, timeout and idempotent steps for Bash and cron jobs, shown with a real race condition.">
+<link rel="icon" href="../../../../assets/img/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/css/style.css">
+<link rel="stylesheet" href="../../../../assets/css/lesson.css">
+<script src="../../../../assets/js/config.js"></script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5906362345660187" crossorigin="anonymous"></script>
+<script>try { const t = localStorage.getItem("mp-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "LearningResource", "name": "Locks, timeouts and running only once", "learningResourceType": "Lesson", "educationalLevel": "Intermediate → Advanced", "isAccessibleForFree": true, "inLanguage": "en", "isPartOf": {"@type": "Course", "name": "Shell Scripting (Bash)", "provider": {"@type": "Organization", "name": "MyPhatshala"}}}</script>
+</head>
+<body style="--track:#0F766E" data-lesson="03-robust-scripts/02-locks-timeouts-and-running-only-once" data-course-root="../../">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../../../" aria-label="MyPhatshala home"><img src="../../../../assets/img/logo.svg" width="34" height="34" alt=""><span>My<b>Phatshala</b></span></a>
+    <nav class="nav" aria-label="Main">
+      <a href="../../../../#tracks">All courses</a>
+      <a href="../../">Shell Scripting (Bash) syllabus</a>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="lesson-hero">
+  <div class="wrap">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="../../../../">Home</a><span>›</span><a href="../../../../#track-devops">DevOps and Tools</a><span>›</span><a href="../../">Shell Scripting (Bash)</a><span>›</span><b>Lesson 3.2</b></nav>
+    <h1>Locks, timeouts and running only once</h1>
+    <p class="lead">One copy at a time, nothing runs forever, and any rerun is safe.</p>
+    <div class="lesson-meta"><span>Module 3 · Robust scripts</span><span>⏱ 35 min</span><span>Intermediate → Advanced</span><span>A real race condition</span><span>flock released after kill -9</span><span>timeout and 124</span><span>Practice lab with checker</span><span>Real Bash in your browser</span><span>8 practice problems</span></div>
+  </div>
+</section>
+
+<div class="wrap"><div class="ad-slot" data-slot="top"></div></div>
+
+<div class="wrap lesson-layout">
+<article class="lesson-main">
+<section class="hook" aria-label="Why this lesson">
+  <span class="hook__tag">The problem</span>
+  <p class="hook__p">Riya’s report job runs every 5 minutes from cron. One day the database is slow, a run takes 7 minutes, the next run starts while the first is still working, and both write the same file: the report ends up with half of each. Another night a network copy simply hangs, and the job never finishes. Two failures that <code>set -e</code> and retries cannot fix: <b>two copies at once</b> and <b>steps that never end</b>. This lesson adds a <b>lock</b> with <code>flock</code> so only one copy runs, <code>timeout</code> so nothing runs forever, and the patterns behind them: lock files, PID files, stale locks and idempotent steps.</p>
+  <div class="hook__out"><b>By the end of this page you will be able to:</b><ul><li>show how two copies of a job corrupt shared data (a race condition) and prevent it with flock</li><li>use flock -n (skip), flock -w (wait with a limit) and the exec 9>file pattern, and know why mkdir also works as a lock</li><li>limit any command’s run time with timeout, -k and exit code 124, and set a deadline for a whole script</li><li>avoid stale-lock and PID-file traps, and make steps idempotent so a rerun is always safe</li></ul></div>
+</section>
+<nav class="rmap" aria-label="How to read this lesson">
+  <h2 class="rmap__h">Start here: how to read this page <small>(about 44 min)</small></h2>
+  <ol class="rm"><li class="rm--short"><a href="#story"><span class="rm__n">1</span><b>The story</b><small>3 min · two copies, one file</small></a></li><li class="rm--short"><a href="#decide"><span class="rm__n">2</span><b>Which tool?</b><small>2 min · the quick chart</small></a></li><li class=""><a href="#definition"><span class="rm__n">3</span><b>Locks and timeouts</b><small>5 min · simple meaning + 4 depths</small></a></li><li class=""><a href="#types"><span class="rm__n">4</span><b>Lock types compared</b><small>4 min · flock, mkdir, PID file</small></a></li><li class="rm--short"><a href="#commands"><span class="rm__n">5</span><b>Step by step</b><small>15 min · race, flock, timeout</small></a></li><li class=""><a href="#animation"><span class="rm__n">6</span><b>See it happen</b><small>4 min · the race, then the lock</small></a></li><li class=""><a href="#run"><span class="rm__n">7</span><b>Run on your PC</b><small>3 min · cron + flock</small></a></li><li class="rm--short"><a href="#lab"><span class="rm__n">8</span><b>Practice lab</b><small>8 min · one copy, limited time</small></a></li></ol>
+  <p class="rmap__short"><span class="rm__dot"></span> <b>Short on time?</b> Read only the highlighted steps (about 28 min), then come back for the rest.</p>
+</nav>
+<section class="cmap" id="map" aria-label="Where this lesson fits">
+  <h2 class="cmap__h">Where this lesson fits</h2>
+  <div class="cm">
+    <div class="cm__col cm__col--before"><h4>You need</h4><a class="cm__card" href="../../03-robust-scripts/01-error-handling-patterns-and-retries/"><span class="cm__ref">Lesson 3.1</span><b>Error handling</b><span>retries</span></a><a class="cm__card" href="../../02-working-with-data/03-temporary-files-trap-and-clean-up/"><span class="cm__ref">Lesson 2.3</span><b>trap</b><span>clean-up</span></a><a class="cm__card" href="../../../linux/11-processes/03-signals-kill-pkill-killall-sigterm-vs-sigkill/"><span class="cm__ref">Linux 11.3</span><b>Signals</b><span>TERM, KILL</span></a></div>
+    <div class="cm__arrow" aria-hidden="true"><svg viewBox="0 0 40 24"><path d="M2 12h30m-8-8 8 8-8 8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+    <div class="cm__col cm__col--now"><h4>In this lesson</h4><div class="cm__card cm__card--now"><span>✓ race conditions</span><span>✓ flock -n / -w / -x / -s</span><span>✓ exec 9>file locks</span><span>✓ mkdir as an atomic lock</span><span>✓ stale locks and PID files</span><span>✓ timeout, -k, exit 124</span><span>✓ idempotent steps</span></div></div>
+    <div class="cm__arrow" aria-hidden="true"><svg viewBox="0 0 40 24"><path d="M2 12h30m-8-8 8 8-8 8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+    <div class="cm__col cm__col--after"><h4>It unlocks</h4><a class="cm__card" href="../../#m3"><span class="cm__ref">Lesson 3.3</span><b>Testing scripts</b><span>test concurrency</span> <small class="cm__soon">coming soon</small></a><a class="cm__card" href="../../#m4"><span class="cm__ref">Lesson 4.1</span><b>Backup tool</b><span>one at a time</span> <small class="cm__soon">coming soon</small></a><a class="cm__card" href="../../#m4"><span class="cm__ref">Lesson 4.4</span><b>cron and timers</b><span>schedules</span> <small class="cm__soon">coming soon</small></a><a class="cm__card" href="../../../linux/#m17"><span class="cm__ref">Linux 17.3</span><b>systemd service</b><span>built-in limits</span> <small class="cm__soon">coming soon</small></a></div>
+  </div>
+  <p class="cmap__note">One copy at a time, nothing runs forever, and any rerun is safe.</p>
+</section>
+<section class="part" id="story">
+  <span class="part-label"><b>1</b> The story</span>
+  <h2>Two copies, one file</h2>
+<div class="callout callout--tip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg><p><b>Before you start:</b> <a href="../01-error-handling-patterns-and-retries/">Lesson 3.1</a> (retries) and <a href="../../02-working-with-data/03-temporary-files-trap-and-clean-up/">Lesson 2.3</a> (trap, atomic writes).</p></div>
+  <div class="story">
+<div class="puzzle" id="puzzle"><span class="puzzle__tag">Think first</span><p>Five copies of <code>append.sh</code> each read a counter, add 1 and write it back. Run one after another, the counter ends at 5. Started at the same moment, it ends at 1. Riya first “fixes” it with <code>[[ -e job.lock ]] &amp;&amp; exit; touch job.lock; …; rm job.lock</code>: it still breaks sometimes, and after one crash the job never runs again. Why does the check-then-create lock fail, and why does a crash leave the job stuck?</p><small>Keep your guess in mind. The answer is at the end of part 6.</small></div>
+
+    <p class="narration">In <code>~/ops</code> (every run in this lesson is real). <code>bin/append.sh</code> reads <code>out/counter</code>, waits 0.2 s (the “work”), and writes counter+1. <code>bin/job.sh</code> is the same job protected by flock.</p>
+    <div class="scene">
+      <svg viewBox="0 0 640 170" role="img" aria-label="A terminal: two copies of job.sh start; B finds the lock taken and skips, A writes 1; timeout stops a 10-second command after 2 seconds with exit 124.">
+        <rect x="20" y="14" width="316" height="156" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="20" y="14" width="316" height="16" rx="8" style="fill:#2C3A33"/><rect x="20" y="22" width="316" height="8" style="fill:#2C3A33"/><circle cx="30" cy="22" r="2.6" style="fill:#D64545"/><circle cx="39" cy="22" r="2.6" style="fill:#E0A100"/><circle cx="48" cy="22" r="2.6" style="fill:#2F7D5B"/><text x="178.0" y="25.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@server: ~/ops</text><text x="28" y="50" font-size="6.8" class="mono"><tspan style="fill:#9FD3B8">$</tspan><tspan style="fill:#EDEBE3"> bin/job.sh A &amp; bin/job.sh B</tspan></text><text x="28" y="70" font-size="6.8" class="mono" style="fill:#F59E8B">B: another copy is running, skipping</text><text x="28" y="90" font-size="6.8" class="mono" style="fill:#EDEBE3">A wrote 1</text><text x="28" y="110" font-size="6.8" class="mono"><tspan style="fill:#9FD3B8">$</tspan><tspan style="fill:#EDEBE3"> timeout 2 bash -c &quot;sleep 10&quot;; echo $?</tspan></text><text x="28" y="130" font-size="6.8" class="mono" style="fill:#F5C77E">124</text><text x="352" y="36" font-size="9.4" font-weight="700" class="s-acc">Two new guards:</text><text x="352" y="58" font-size="8.8" class="s-ink2">flock: one copy</text><text x="352" y="75" font-size="8.8" class="s-ink2">timeout: a limit</text><text x="352" y="92" font-size="8.8" class="s-ink2">exit 124 = timed out</text><text x="352" y="109" font-size="8.8" class="s-ink2">idempotent steps</text><text x="352" y="126" font-size="8.8" class="s-ink2">= safe reruns</text>
+        <text x="320" y="158" text-anchor="middle" font-size="10.5" class="s-ink2"><tspan font-weight="700" class="s-acc">flock</tspan> lets one copy in; <tspan font-weight="700" class="s-acc">timeout</tspan> ends hangs.</text>
+        <text x="632" y="168" text-anchor="end" class="s-wm">myphatshala.in</text>
+      </svg>
+    </div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#E1E9F7"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#B45309"/><circle cx="32" cy="29" r="12" fill="#A9714A"/><path d="M19 27c0-9 6-14 13-14s13 5 13 14c-2-4-5-6-8-6-3 3-9 4-13 3-2 1-4 2-5 3z" fill="#1E1A17"/><circle cx="27.5" cy="30" r="1.5" fill="#1E1A17"/><circle cx="36.5" cy="30" r="1.5" fill="#1E1A17"/><path d="M27 35.5q5 3.5 10 0" stroke="#1E1A17" stroke-width="1.6" fill="none" stroke-linecap="round"/><rect x="41" y="40" width="10" height="7" rx="1.5" fill="#2E5AAC"/></svg></div><div class="bubble"><b class="who">Kabir</b><p>Why does the counter end at 1?</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>All five read 0 before any of them wrote. Each writes 0+1. This is a <b>race condition</b>: the result depends on timing. The check-then-create lock has the same race: two copies can both see “no lock” before either creates it.</p></div></div>
+    <div class="panel"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#FCE6D6"/><path d="M14 64c2-12 9-18 18-18s16 6 18 18z" fill="#2E5AAC"/><circle cx="32" cy="29" r="12" fill="#C68B5E"/><path d="M19 29c0-10 6-15 13-15s13 5 13 15c-3-5-7-8-13-8s-10 3-13 8z" fill="#2A1B14"/><path d="M43 27c3 6 3 14 0 20" stroke="#2A1B14" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="27.5" cy="30" r="1.5" fill="#2A1B14"/><circle cx="36.5" cy="30" r="1.5" fill="#2A1B14"/><path d="M28 35q4 3 8 0" stroke="#2A1B14" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="24" r="1.2" fill="#D64545"/></svg></div><div class="bubble"><b class="who">Riya</b><p>So a lock must be checked and taken in one step.</p></div></div>
+    <div class="panel panel--right"><div class="avatar" aria-hidden="true"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#DDEFE6"/><path d="M12 64c2-12 10-18 20-18s18 6 20 18z" fill="#F4F1EA"/><path d="M28 46l4 8 4-8" fill="#2F7D5B"/><circle cx="32" cy="28" r="12" fill="#B57A50"/><path d="M20 26c0-8 5-13 12-13s12 5 12 13c-2-3-6-5-12-5s-10 2-12 5z" fill="#5A5A5A"/><path d="M22 32c1 8 5 11 10 11s9-3 10-11c-2 3-6 4-10 4s-8-1-10-4z" fill="#5A5A5A"/><circle cx="27" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><circle cx="37" cy="29" r="3.4" fill="none" stroke="#1B2433" stroke-width="1.4"/><path d="M30.4 29h3.2" stroke="#1B2433" stroke-width="1.4"/><circle cx="27" cy="29" r="1.1" fill="#1B2433"/><circle cx="37" cy="29" r="1.1" fill="#1B2433"/></svg></div><div class="bubble"><b class="who">Arjun Sir</b><p>Exactly. The kernel’s <code>flock</code> does that atomically, and it releases the lock automatically when the process ends, even after a crash or kill -9. No stale lock files.</p></div></div>
+  </div>
+</section>
+<section class="part part--decide">  <div class="dchart" id="decide"><h3>I need… → use</h3><ul class="dc"><li><span class="dc__q">only one copy, skip if busy</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">flock -n LOCKFILE CMD</code><span class="dc__n">cron jobs</span></li><li><span class="dc__q">only one copy, wait my turn</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">flock -w 60 LOCKFILE CMD</code><span class="dc__n">queues</span></li><li><span class="dc__q">lock inside the script</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">exec 9&gt;f; flock -n 9 || exit</code><span class="dc__n">whole script</span></li><li><span class="dc__q">a step must not hang</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">timeout 30 CMD</code><span class="dc__n">exit 124 on timeout</span></li><li><span class="dc__q">it ignores TERM</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">timeout -k 5 30 CMD</code><span class="dc__n">KILL after 5 s more</span></li><li><span class="dc__q">safe to run again</span><span class="dc__arrow" aria-hidden="true">→</span><code class="dc__a">idempotent steps</code><span class="dc__n">check before doing</span></li></ul></div>
+</section>
+<section class="part" id="definition">
+  <span class="part-label"><b>2</b> Definition</span>
+  <h2>Locks, timeouts and idempotence</h2>
+  <div class="def">
+    <div class="def__formal"><small>Formal definition (write this in exams)</small>
+      <p>A <b>lock</b> makes sure only one process at a time runs a critical section; <b>flock</b> takes a kernel-managed lock on a file atomically and releases it automatically when the process exits. A <b>timeout</b> limits how long a command may run; the <code>timeout</code> command stops it with a signal and exits 124. A step is <b>idempotent</b> when running it again produces the same result, so reruns and retries are safe.</p></div>
+    <div class="def__simple"><small>In simple words</small>
+      <p>One copy at a time, nothing runs forever, reruns change nothing extra.</p></div>
+  </div>
+
+  <h3>Words you’ll meet in this lesson</h3>
+  <div class="terms">
+    <div class="term"><b>Race condition</b><span>Result depends on timing.</span></div>
+    <div class="term"><b>Critical section</b><span>Code only one copy may run.</span></div>
+    <div class="term"><b>flock</b><span>Kernel file lock.</span></div>
+    <div class="term"><b>Exclusive / shared</b><span>One writer / many readers.</span></div>
+    <div class="term"><b>Stale lock</b><span>Left behind by a dead process.</span></div>
+    <div class="term"><b>timeout</b><span>Limit run time; exit 124.</span></div>
+    <div class="term"><b>Idempotent</b><span>Same result when repeated.</span></div>
+    <div class="term"><b>fd 9</b><span>A file descriptor kept for the lock.</span></div>
+  </div>
+  <h3 id="names">Why is it called that?</h3>
+  <p>Where the names come from.</p>
+  <div class="nms"><div class="nm"><code>flock</code><b>file lock</b><span>BSD 4.2, 1983.</span></div><div class="nm"><code>race</code><b>processes racing</b><span>Who gets there first.</span></div><div class="nm"><code>mutex</code><b>mutual exclusion</b><span>Dijkstra, 1965.</span></div><div class="nm"><code>PID file</code><b>process ID in a file</b><span>/run/*.pid.</span></div><div class="nm"><code>124</code><b>timeout’s exit code</b><span>GNU coreutils.</span></div><div class="nm"><code>/run/lock</code><b>lock folder (tmpfs)</b><span>Cleared at boot.</span></div><div class="nm"><code>idempotent</code><b>idem = same</b><span>Maths, 1870.</span></div><div class="nm"><code>advisory</code><b>only if everyone asks</b><span>Not enforced.</span></div></div>
+
+
+  <h3>Quick facts</h3>
+  <table class="facts">
+    <tr><th>Skip if running</th><td><code>flock -n f cmd</code></td></tr>
+    <tr><th>Wait 60 s max</th><td><code>flock -w 60 f cmd</code></td></tr>
+    <tr><th>Whole script</th><td><code>exec 9&gt;f; flock -n 9</code></td></tr>
+    <tr><th>Time limit</th><td><code>timeout 30 cmd</code></td></tr>
+    <tr><th>Timed out</th><td>exit <b>124</b></td></tr>
+    <tr><th>Force kill</th><td><code>timeout -k 5 30 cmd</code></td></tr>
+  </table>
+  <h3 id="levels">Locks and timeouts at four depths</h3>
+  <div class="modlab levels levels4"><div class="modlab__bar"><b>Pick your depth. Completely new? Start at Very basic and climb one step at a time.</b><button type="button" data-mod="v">Very basic</button><button type="button" data-mod="b">Basic</button><button type="button" data-mod="i">Intermediate</button><button type="button" data-mod="a">Advanced</button></div>
+    <div class="modlab__panel" data-mod="v"><h4><span class="lvl lvl--v">Very basic</span> No jargon: a single-person changing room</h4>
+      <p>The door locks from inside. The next person either waits or comes back later. When you leave, the door unlocks by itself, even if you ran out in a hurry.</p><div class="scene"><svg viewBox="0 0 640 210" role="img" aria-label="Two jobs A and B reach a lock: A takes it and works; B finds it taken and either skips (flock -n) or waits (flock -w); when A ends, the kernel releases the lock automatically."><rect x="14" y="40" width="120" height="40" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="74.0" y="63.1" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">job A</text><rect x="14" y="120" width="120" height="40" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="74.0" y="143.2" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">job B</text><path d="M136 60L250 90" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M243.1 91.3L250 90L244.7 85.5" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M136 140L250 110" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M244.7 114.5L250 110L243.1 108.7" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="256" y="76" width="130" height="48" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="321.0" y="96.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">flock job.lock</text><text x="321.0" y="109.3" text-anchor="middle" font-size="8.0" class="s-ink2">kernel lock</text><path d="M388 90L470 60" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M465.1 65.0L470 60L463.0 59.3" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="476" y="40" width="150" height="40" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="551.0" y="63.1" text-anchor="middle" font-size="9" font-weight="700" class="s-ink">A works</text><path d="M388 110L470 140" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><path d="M463.0 140.7L470 140L465.1 135.0" style="fill:none;stroke:#8A94A0;stroke-width:1.8"/><rect x="476" y="120" width="150" height="40" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="551.0" y="142.9" text-anchor="middle" font-size="8.4" font-weight="700" class="s-ink">B: skip (-n) / wait (-w)</text><text x="320" y="192" text-anchor="middle" font-size="9" font-weight="700" class="s-acc">lock released automatically when A exits (even kill -9)</text><text x="632" y="204" text-anchor="end" class="s-wm">myphatshala.in</text></svg></div>
+    </div>
+    <div class="modlab__panel" data-mod="b"><h4><span class="lvl lvl--b">Basic</span> What you will type</h4>
+      <ul>
+        <li><code>flock -n /run/lock/report.lock ./report.sh</code> in cron</li>
+        <li>inside a script: <code>exec 9&gt;/run/lock/report.lock; flock -n 9 || exit 0</code></li>
+        <li><code>timeout 300 rsync -a src/ dst/</code></li>
+        <li><code>timeout -k 10 300 ./step.sh</code></li>
+      </ul>
+    </div>
+    <div class="modlab__panel" data-mod="i"><h4><span class="lvl lvl--i">Intermediate</span> The differences that matter</h4>
+      <ul>
+        <li><code>-n</code> fails at once if locked (skip this run); <code>-w N</code> waits up to N seconds; no option waits forever.</li>
+        <li>flock locks belong to the <b>open file</b>: they disappear when the process (and its children holding fd 9) exit. A lock <i>file</i> left on disk is harmless; only a held lock blocks.</li>
+        <li><code>timeout</code> sends TERM (exit 124 if it fired); <code>-k 5</code> sends KILL 5 s later if the command ignores TERM; <code>-s INT</code> chooses another signal.</li>
+        <li>An idempotent step gives the same result if run twice: <code>mkdir -p</code>, <code>ln -sfn</code>, “create user if missing”.</li>
+      </ul>
+    </div>
+    <div class="modlab__panel" data-mod="a"><h4><span class="lvl lvl--a">Advanced</span> Behind the screen: flock(2) and atomic operations</h4>
+      <ul>
+        <li><code>flock(2)</code> is an advisory lock on an open file description, kept by the kernel: only programs that also call flock respect it. Exclusive (<code>-x</code>, default) vs shared (<code>-s</code>) locks allow one writer or many readers.</li>
+        <li><code>mkdir</code> is atomic (create-or-fail in one system call), so <code>mkdir lockdir</code> is a portable lock, but it is not released on crash: you need a trap and stale-lock handling.</li>
+        <li>PID files can lie: after a crash and reboot the PID may belong to another process (PID reuse). Check <code>/proc/PID/cmdline</code> or prefer flock.</li>
+        <li>flock does not work reliably on some network file systems (older NFS); keep lock files on local disk, e.g. <code>/run/lock</code> or <code>/var/lock</code>.</li>
+      </ul>
+    </div>
+  </div><div class="callout callout--did"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v5h1"/></svg><p><b>Did you know?</b> The flock man page has a ready-made line for the top of any script: <code>[ "${FLOCKER}" != "$0" ] &amp;&amp; exec env FLOCKER="$0" flock -en "$0" "$0" "$@" || :</code>. It re-runs the script under a lock on the script file itself, so no separate lock file is needed.</p></div>
+
+  <div class="callout callout--exam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2zm0 0a2 2 0 0 1 2-2h12"/></svg><p><b>Exam tip:</b> “How do you make sure a cron job never runs twice at the same time?” → Run it under flock: flock -n /var/lock/job.lock /path/job.sh (or take the lock inside the script with exec 9>file; flock -n 9 || exit). The kernel releases it automatically when the job ends.</p></div>
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> Why does [[ -e lock ]] || touch lock not work as a lock?</summary>
+    <div class="qc__a"><b>Answer:</b> Check and create are two steps: two copies can both pass the check before either creates the file.</div></details>
+<div class="mist"><b class="mist__tag">Common mistake</b><div class="mist__row"><span class="mist__no">✗</span><code>[[ -e /tmp/job.lock ]] &amp;&amp; exit; touch /tmp/job.lock; …; rm /tmp/job.lock</code></div><div class="mist__row"><span class="mist__ok">✓</span><code>exec 9&gt;/run/lock/job.lock; flock -n 9 || exit 0</code></div><p>The check-then-create has a race, and a crash leaves the file forever: the job never runs again.</p></div>
+<div class="mist"><b class="mist__tag">Common mistake</b><div class="mist__row"><span class="mist__no">✗</span><code>rsync -a big/ remote:/backup/   with no limit in a nightly job</code></div><div class="mist__row"><span class="mist__ok">✓</span><code>timeout -k 60 3600 rsync -a big/ remote:/backup/</code></div><p>A hung network copy blocks the job, and with a lock, every later run too.</p></div>
+
+</section>
+<div class="ad-slot ad-slot--inarticle" data-slot="inarticle"></div>
+<section class="part" id="types">
+  <span class="part-label"><b>3</b> Types and differences</span>
+  <h2>Ways to lock, compared</h2>
+  <div class="table-wrap">
+  <table class="compare" style="min-width:560px">
+    <thead><tr><th>Method</th><th>Atomic?</th><th>Released on crash?</th><th>Notes</th></tr></thead>
+    <tbody><tr><td><code>[[ -e f ]] || touch f</code></td><td>no (race)</td><td>no</td><td>never use</td></tr><tr><td><code>mkdir lockdir</code></td><td>yes</td><td>no (needs trap + stale check)</td><td>portable, works on NFS</td></tr><tr><td>PID file</td><td>no</td><td>no (PID reuse)</td><td>for daemons, with checks</td></tr><tr><td><code>flock</code></td><td>yes</td><td><b>yes</b>, by the kernel</td><td>best on Linux, local disk</td></tr><tr><td><code>set -o noclobber; &gt; f</code></td><td>yes</td><td>no</td><td>creates only if missing</td></tr><tr><td>systemd unit</td><td>yes</td><td>yes</td><td>a service runs once by design</td></tr></tbody>
+  </table>
+  </div>  <div class="table-wrap">
+  <table class="compare" style="min-width:420px">
+    <thead><tr><th>flock option</th><th>Meaning</th></tr></thead>
+    <tbody><tr><td><code>-n</code></td><td>non-blocking: fail (exit 1) if locked</td></tr><tr><td><code>-w N</code></td><td>wait at most N seconds</td></tr><tr><td><code>-x</code> / <code>-s</code></td><td>exclusive (default) / shared</td></tr><tr><td><code>-u</code></td><td>unlock an fd early</td></tr><tr><td><code>-E N</code></td><td>exit code to use when locked (instead of 1)</td></tr><tr><td><code>-o</code></td><td>do not pass the lock to the command’s children</td></tr></tbody>
+  </table>
+  </div>  <details class="qc"><summary><span class="qc__tag">Quick check</span> Which lock survives a kill -9 of its owner?</summary>
+    <div class="qc__a"><b>Answer:</b> mkdir and PID files do (stale); a flock lock is released by the kernel.</div></details>
+
+</section>
+<section class="part" id="steps">
+  <span class="part-label"><b>4</b> Step by step</span>
+  <h2>The race, flock, mkdir locks, timeouts and safe reruns</h2>
+  <p id="commands">Every card runs on our build machine in <code>~/ops</code>: <code>bin/append.sh</code> (an unprotected read-modify-write of <code>out/counter</code>) and <code>bin/job.sh</code> (the same work under flock). Locks live in <code>~/ops/run</code>.</p>
+  <article class="cc" id="cmd-race">
+    <header class="cc__head"><h3><code>two copies at once</code> <span class="cc__full">the race condition</span></h3><div class="cc__badges"><span class="rb rb--change" title="creates or changes files; check before pressing Enter">🟡 Changes files</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what">Run the read-modify-write five times in a row and the counter is 5. Start the five at the same moment with <code>&amp;</code> and <code>wait</code>, and they all read the old value before anyone writes. That lost update is a race condition.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>understanding why locks exist</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>assuming jobs never overlap</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>for i in 1 2 3 4 5; do bin/append.sh $i &amp; done; wait</code></p>
+    <div class="anat" role="img" aria-label="n=$(cat f) … work … echo $((n+1)) &gt; f"><span class="an an--cmd"><code>n=$(cat f)</code><small>read</small></span><span class="an an--opt"><code>… work …</code><small>meanwhile others read too</small></span><span class="an an--arg"><code>echo $((n+1)) &gt; f</code><small>write: overwrites theirs</small></span></div><p class="anat__note">Any gap between read and write is a race window.</p>
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>&amp;</code></td><td>run in background</td><td>parallel</td></tr><tr><td><code>wait</code></td><td>wait for all</td><td>collect</td></tr><tr><td><code>read-modify-write</code></td><td>unsafe</td><td>counters, files</td></tr><tr><td><code>lost update</code></td><td>symptom</td><td>wrong totals</td></tr><tr><td><code>timing-dependent</code></td><td>flaky</td><td>hard to test</td></tr><tr><td><code>fix</code></td><td>a lock</td><td>next card</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops
+for i in 1 2 3 4 5; do bin/append.sh $i &gt; /dev/null; done; echo &quot;one after another: counter=$(cat out/counter)&quot;
+echo 0 &gt; out/counter
+for i in 1 2 3 4 5; do bin/append.sh $i &gt; /dev/null &amp; done; wait; echo &quot;all at once:        counter=$(cat out/counter)&quot;</code></pre><div class="output">one after another: counter=5
+all at once:        counter=1</div></div>
+    <p class="cc__note">Five updates, one survives: four were lost.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="dev">Software development</button></div>
+    <div class="modlab__panel" data-mod="dev"><h4>two copies at once in software development</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> The check-then-create lock still races.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; echo 0 &gt; out/counter
+bad(){ [[ -e run/bad.lock ]] &amp;&amp; return; touch run/bad.lock; bin/append.sh &quot;$1&quot; &gt; /dev/null; rm -f run/bad.lock; }
+for i in 1 2 3; do bad $i &amp; done; wait; echo &quot;counter=$(cat out/counter) (3 copies got past the check)&quot;</code></pre><div class="output">counter=1 (3 copies got past the check)</div></div>
+          <p class="fv__why"><b>Why this way:</b> Check and create are two steps.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <article class="cc" id="cmd-flock">
+    <header class="cc__head"><h3><code>flock -n FILE CMD · exec 9&gt;FILE; flock -n 9</code> <span class="cc__full">one copy with flock</span></h3><div class="cc__badges"><span class="rb rb--change" title="creates or changes files; check before pressing Enter">🟡 Changes files</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what">flock takes the lock and runs the command in one atomic step. <code>-n</code> means “if busy, give up now” (exit 1); in a script, open the lock file on fd 9 with <code>exec 9&gt;file</code> and lock that fd, so the whole script is protected and the lock ends with the process.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>cron jobs</li><li>any shared file or resource</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>network file systems (old NFS)</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>exec 9&gt; ~/ops/run/job.lock; flock -n 9 || { echo &quot;already running&quot;; exit 0; }</code></p>
+    
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>flock -n f cmd</code></td><td>wrap a command</td><td>cron line</td></tr><tr><td><code>exec 9&gt;f</code></td><td>open fd 9</td><td>whole script</td></tr><tr><td><code>flock -n 9</code></td><td>try to lock fd 9</td><td>skip if busy</td></tr><tr><td><code>flock -w 30 9</code></td><td>wait ≤ 30 s</td><td>take turns</td></tr><tr><td><code>exit 0 when busy</code></td><td>not an error</td><td>cron stays quiet</td></tr><tr><td><code>lock file stays</code></td><td>harmless</td><td>only held locks block</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops
+for i in A B C D E; do bin/job.sh $i &amp; done 2&gt;&amp;1; wait
+echo &quot;counter=$(cat out/counter): one copy ran, four skipped&quot;
+echo &#x27;--- taking turns with -w (wait up to 5 s):&#x27;
+echo 0 &gt; out/counter
+for i in A B C; do flock -w 5 run/turns.lock bin/append.sh $i &amp; done; wait
+echo &quot;counter=$(cat out/counter): all three ran, one at a time&quot;</code></pre><div class="output">C: another copy is running, skipping
+D: another copy is running, skipping
+A: another copy is running, skipping
+E: another copy is running, skipping
+B wrote 1
+counter=1: one copy ran, four skipped
+--- taking turns with -w (wait up to 5 s):
+A wrote 1
+B wrote 2
+C wrote 3
+counter=3: all three ran, one at a time</div></div>
+    <p class="cc__note">-n: only one copy works, the rest skip. -w: they queue and every update survives.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="sys">System info / admin</button></div>
+    <div class="modlab__panel" data-mod="sys"><h4>flock -n FILE CMD · exec 9>FILE; flock -n 9 in system info / admin</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> The kernel releases the lock after kill -9.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; ( exec 9&gt; run/k.lock; flock 9; sleep 30 ) &amp; p=$!; sleep 0.3
+flock -n run/k.lock true || echo &#x27;locked while the holder runs&#x27;
+kill -9 $p; wait $p 2&gt;/dev/null; pkill -f &#x27;sleep 30&#x27; 2&gt;/dev/null
+flock -n run/k.lock true &amp;&amp; echo &#x27;free immediately after kill -9: no stale lock&#x27;</code></pre><div class="output">locked while the holder runs
+free immediately after kill -9: no stale lock</div></div>
+          <p class="fv__why"><b>Why this way:</b> No clean-up code needed.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <article class="cc" id="cmd-mkdir">
+    <header class="cc__head"><h3><code>mkdir LOCKDIR · trap rmdir · stale check</code> <span class="cc__full">mkdir as a portable lock</span></h3><div class="cc__badges"><span class="rb rb--change" title="creates or changes files; check before pressing Enter">🟡 Changes files</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what"><code>mkdir</code> creates a folder or fails if it exists, in one atomic system call, on every Unix and on NFS. Remove it with a trap on EXIT. Because a crash leaves it behind, store the owner’s PID inside and treat the lock as <b>stale</b> if that process no longer exists.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>NFS, portability</li><li>when flock is missing</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>forgetting the trap</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>mkdir run/job.lockdir 2&gt;/dev/null || { echo busy; exit 0; }; trap &#x27;rm -rf run/job.lockdir&#x27; EXIT</code></p>
+    
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>mkdir d</code></td><td>atomic create</td><td>or fail</td></tr><tr><td><code>trap rm EXIT</code></td><td>release</td><td>normal exits</td></tr><tr><td><code>echo $$ &gt; d/pid</code></td><td>owner</td><td>stale check</td></tr><tr><td><code>kill -0 PID</code></td><td>still alive?</td><td>no signal sent</td></tr><tr><td><code>remove stale</code></td><td>then retry</td><td>carefully</td></tr><tr><td><code>noclobber</code></td><td>set -C; > f</td><td>file variant</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops
+take() { mkdir run/job.lockdir 2&gt;/dev/null &amp;&amp; echo $$ &gt; run/job.lockdir/pid; }
+take &amp;&amp; echo &#x27;first: got the lock&#x27;
+take || echo &#x27;second: busy&#x27;
+echo 99999 &gt; run/job.lockdir/pid      # pretend the owner died
+owner=$(cat run/job.lockdir/pid); kill -0 &quot;$owner&quot; 2&gt;/dev/null || { echo &quot;owner $owner is gone: stale lock, removing&quot;; rm -rf run/job.lockdir; }
+take &amp;&amp; echo &#x27;third: got the lock after stale clean-up&#x27;</code></pre><div class="output">first: got the lock
+second: busy
+owner 99999 is gone: stale lock, removing
+third: got the lock after stale clean-up</div></div>
+    <p class="cc__note">kill -0 only checks whether a process exists.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="sec">Security</button></div>
+    <div class="modlab__panel" data-mod="sec"><h4>mkdir LOCKDIR · trap rmdir · stale check in security</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> noclobber as a file lock.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; ( set -C; echo $$ &gt; run/noclob.lock ) 2&gt;/dev/null &amp;&amp; echo &#x27;created: lock taken&#x27;; ( set -C; echo $$ &gt; run/noclob.lock ) 2&gt;/dev/null || echo &#x27;exists: busy&#x27;</code></pre><div class="output">created: lock taken
+exists: busy</div></div>
+          <p class="fv__why"><b>Why this way:</b> > refuses to overwrite with set -C.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <article class="cc" id="cmd-timeout">
+    <header class="cc__head"><h3><code>timeout N cmd · -k · -s · exit 124</code> <span class="cc__full">limit run time</span></h3><div class="cc__badges"><span class="rb rb--safe" title="only shows information">🟢 Read-only</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what"><code>timeout 30 cmd</code> runs cmd and sends TERM after 30 s; the exit code is then <b>124</b> (otherwise the command’s own code). <code>-k 5</code> sends KILL 5 s later for programs that ignore TERM. Units: <code>30</code>, <code>2m</code>, <code>1h</code>, decimals allowed.</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>network calls</li><li>anything that can hang</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>jobs without any time limit</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>timeout -k 10 300 rsync -a src/ dst/</code></p>
+    
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>timeout 30 cmd</code></td><td>TERM after 30 s</td><td>basic</td></tr><tr><td><code>124</code></td><td>timed out</td><td>check it</td></tr><tr><td><code>-k 5</code></td><td>then KILL</td><td>stubborn</td></tr><tr><td><code>-s INT</code></td><td>other signal</td><td>graceful apps</td></tr><tr><td><code>2m · 1.5</code></td><td>units</td><td>m h d</td></tr><tr><td><code>--preserve-status</code></td><td>cmd’s own code</td><td>rare</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops
+timeout 1 sleep 5; echo &quot;sleep 5 with timeout 1: exit $?&quot;
+timeout 5 sleep 0.2; echo &quot;sleep 0.2 with timeout 5: exit $?&quot;
+timeout 0.5 bash -c &#x27;trap &quot;&quot; TERM; sleep 3&#x27;; echo &quot;ignores TERM, no -k: exit $? (ran the full 3 s)&quot;
+timeout -k 0.5 0.5 bash -c &#x27;trap &quot;&quot; TERM; sleep 3&#x27;; echo &quot;ignores TERM, -k 0.5: exit $? (128+9 = killed)&quot;</code></pre><div class="output">sleep 5 with timeout 1: exit 124
+sleep 0.2 with timeout 5: exit 0
+ignores TERM, no -k: exit 124 (ran the full 3 s)
+/home/riya/script.sh: line 24:  3162 Killed                  timeout -k 0.5 0.5 bash -c &#x27;trap &quot;&quot; TERM; sleep 3&#x27;
+ignores TERM, -k 0.5: exit 137 (128+9 = killed)</div></div>
+    <p class="cc__note">124 = our timeout fired; 137 = it had to use KILL.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="devops">DevOps / cloud</button></div>
+    <div class="modlab__panel" data-mod="devops"><h4>timeout N cmd · -k · -s · exit 124 in devops / cloud</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> Treat a timeout differently from a failure.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>timeout 0.3 sleep 2; rc=$?
+case $rc in 0) echo ok;; 124) echo &#x27;step timed out: retry later&#x27;;; *) echo &quot;step failed ($rc)&quot;;; esac</code></pre><div class="output">step timed out: retry later</div></div>
+          <p class="fv__why"><b>Why this way:</b> 124 is a temporary error for retry() (Lesson 3.1).</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <article class="cc" id="cmd-idem">
+    <header class="cc__head"><h3><code>mkdir -p · ln -sfn · grep -q || append · check first</code> <span class="cc__full">idempotent steps</span></h3><div class="cc__badges"><span class="rb rb--change" title="creates or changes files; check before pressing Enter">🟡 Changes files</span><span class="rb rb--nosudo" title="a normal user can run it">no sudo</span></div></header>
+    <p class="cc__what">With locks and retries, steps will be run again. Make each one safe to repeat: create only if missing, replace instead of append, skip work already done (a marker file or a check).</p>
+    <div class="uw"><div class="uw__yes"><b>✓ Use it when</b><ul><li>reruns after failures</li><li>retries</li></ul></div><div class="uw__no"><b>✗ Don’t use it when</b><ul><li>steps that double the work</li></ul></div></div>
+    <p class="cc__syn"><b>Syntax:</b> <code>grep -qxF &quot;$line&quot; file || echo &quot;$line&quot; &gt;&gt; file</code></p>
+    
+    <div class="table-wrap"><table class="compare cc__opts" style="min-width:560px"><thead><tr><th>Option</th><th>What it does</th><th>When to use it</th></tr></thead><tbody><tr><td><code>mkdir -p</code></td><td>no error if exists</td><td>folders</td></tr><tr><td><code>ln -sfn</code></td><td>replace link</td><td>releases</td></tr><tr><td><code>grep -q || &gt;&gt;</code></td><td>add once</td><td>config lines</td></tr><tr><td><code>[[ -e done.flag ]]</code></td><td>skip done work</td><td>markers</td></tr><tr><td><code>id user || useradd</code></td><td>create once</td><td>users</td></tr><tr><td><code>cp -n</code></td><td>no overwrite</td><td>seed files</td></tr></tbody></table></div>
+    <p class="wx__label">First run (real output)</p>
+    <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops
+setup() {
+  mkdir -p out/reports
+  grep -qxF &#x27;retention=30&#x27; out/settings 2&gt;/dev/null || echo &#x27;retention=30&#x27; &gt;&gt; out/settings
+  ln -sfn reports out/latest
+  [[ -e out/.migrated ]] || { echo &#x27;  migrating (once)&#x27;; touch out/.migrated; }
+}
+for run in 1 2 3; do echo &quot;run $run&quot;; setup; done
+echo &quot;settings lines: $(wc -l &lt; out/settings); link: $(readlink out/latest)&quot;</code></pre><div class="output">run 1
+  migrating (once)
+run 2
+run 3
+settings lines: 1; link: reports</div></div>
+    <p class="cc__note">Three runs, one result: one settings line, one link, one migration.</p>
+    
+    <p class="cc__fieldh"><b>Now the variations, by field.</b> Pick the field you work in (or want to work in).</p>
+    <div class="modlab fields"><div class="modlab__bar"><b>Same command, different jobs. Click a field.</b><button type="button" data-mod="sys">System info / admin</button></div>
+    <div class="modlab__panel" data-mod="sys"><h4>mkdir -p · ln -sfn · grep -q || append · check first in system info / admin</h4>
+      <ol class="fvs">
+        <li class="fv"><p class="fv__sit"><b>Situation:</b> Not idempotent: append twice, get duplicates.</p>
+          <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; for i in 1 2; do echo &#x27;retention=30&#x27; &gt;&gt; out/bad-settings; done; wc -l &lt; out/bad-settings</code></pre><div class="output">2</div></div>
+          <p class="fv__why"><b>Why this way:</b> Every rerun adds another line.</p></li>
+      </ol>
+    </div>
+    </div>
+  </article>
+  <div class="undo" id="undo"><h3>Undo and safety net</h3><p>Concurrency bugs corrupt data quietly; recover and prevent:</p><ul><li><b>Corrupted shared file:</b> restore from backup or rebuild from source data; add flock before the next run.</li><li><b>Job never runs (stale lock):</b> with flock this cannot happen; with mkdir/PID locks check the owner (<code>kill -0</code>) and remove the stale lock.</li><li><b>Killed by timeout mid-write:</b> write to a temp file and mv (Lesson 2.3) so a stop never leaves half a file.</li><li><b>Duplicates after a rerun:</b> deduplicate, then make the step idempotent.</li></ul></div>
+  <h3 id="errors">Error messages decoded</h3>
+  <p>Errors students see most (really run on our build machine).</p>
+  <ol class="ers">
+    <li class="er"><div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops &amp;&amp; exec 9&gt; run/held.lock &amp;&amp; flock -n 9 &amp;&amp; echo &#x27;got it&#x27; &amp;&amp; flock -n run/held.lock true; echo &quot;second flock: exit $?&quot;</code></pre><div class="output">got it
+second flock: exit 1
+exit status: 0</div></div>
+      <p><b>What it means:</b> The same lock file is already held (by fd 9 of this shell): -n fails with 1.</p><p><b>Fix:</b> Wait (-w), skip, or find the holder: fuser run/held.lock.</p></li>
+    <li class="er"><div class="code" data-lang="bash" data-file="Terminal"><pre><code>timeout 1 sleep 3; echo &quot;exit $?&quot;</code></pre><div class="output">exit 124
+exit status: 0</div></div>
+      <p><b>What it means:</b> 124 is not an error of sleep: it means timeout stopped it.</p><p><b>Fix:</b> Check for 124 separately.</p></li>
+    <li class="er"><div class="code" data-lang="bash" data-file="Terminal"><pre><code>flock -n /nonexistent/dir/x.lock true</code></pre><div class="output">flock: cannot open lock file /nonexistent/dir/x.lock: No such file or directory
+exit status: 66</div></div>
+      <p><b>What it means:</b> The lock file’s folder does not exist.</p><p><b>Fix:</b> mkdir -p the folder (e.g. /run/lock/myapp) first.</p></li>
+  </ol>
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> timeout returns 124. What happened?</summary>
+    <div class="qc__a"><b>Answer:</b> The time limit was reached and timeout stopped the command.</div></details>
+
+</section>
+<section class="part" id="animation">
+  <span class="part-label"><b>5</b> See it happen</span>
+  <h2>A race and its fix, and timeout</h2>
+  <div class="anim" data-frames="4">
+    <div class="anim__title">Behind the screen: and with a lock <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--see">
+        <span class="view__tag">What you see</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="Two copies read the same value; one update is lost.">
+          <g data-on="1"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@server: ~/ops</text><text x="22" y="45.5" font-size="7.2" class="mono" style="fill:#EDEBE3">A: n=$(cat counter)</text><text x="22" y="59.0" font-size="7.2" class="mono" style="fill:#EDEBE3">0</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A reads.</text></g><g data-on="2"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@server: ~/ops</text><text x="22" y="45.5" font-size="7.2" class="mono" style="fill:#EDEBE3">B: n=$(cat counter)</text><text x="22" y="59.0" font-size="7.2" class="mono" style="fill:#EDEBE3">0</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">B reads.</text></g><g data-on="3"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@server: ~/ops</text><text x="22" y="45.5" font-size="7.2" class="mono" style="fill:#EDEBE3">A: echo 1 &gt; counter</text><text x="22" y="59.0" font-size="7.2" class="mono" style="fill:#EDEBE3"></text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">A writes.</text></g><g data-on="4"><rect x="14" y="16" width="332" height="116" rx="8" style="fill:#1F2B26;stroke:#2C3A33"/><rect x="14" y="16" width="332" height="16" rx="8" style="fill:#2C3A33"/><rect x="14" y="24" width="332" height="8" style="fill:#2C3A33"/><circle cx="24" cy="24" r="2.6" style="fill:#D64545"/><circle cx="33" cy="24" r="2.6" style="fill:#E0A100"/><circle cx="42" cy="24" r="2.6" style="fill:#2F7D5B"/><text x="180.0" y="27.5" text-anchor="middle" font-size="7.4" style="fill:#B7BFCC">riya@server: ~/ops</text><text x="22" y="45.5" font-size="7.2" class="mono" style="fill:#EDEBE3">B: echo 1 &gt; counter</text><text x="22" y="59.0" font-size="7.2" class="mono" style="fill:#F59E8B">counter = 1 (should be 2)</text><rect x="10" y="150" width="340" height="34" rx="6" class="s-card2" style="stroke:var(--line)"/><text x="180.0" y="170.0" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink">B writes.</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>A reads.</li>
+          <li>B reads.</li>
+          <li>A writes.</li>
+          <li>B writes.</li>
+        </ol>
+      </div>
+      <div class="view view--behind">
+        <span class="view__tag">Behind the screen</span>
+        <svg viewBox="0 0 360 250" role="img" aria-label="With flock the second copy waits, and both updates survive.">
+          <g data-on="1"><text x="180" y="18" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink2">with flock</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">A locks: reads 0</text></g><g data-on="2"><text x="180" y="18" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink2">with flock</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">A locks: reads 0</text><rect x="14" y="60" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="74.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B tries: busy → waits (-w) or skips (-n)</text></g><g data-on="3"><text x="180" y="18" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink2">with flock</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">A locks: reads 0</text><rect x="14" y="60" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="74.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B tries: busy → waits (-w) or skips (-n)</text><rect x="14" y="88" width="330" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="179.0" y="102.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">A writes: 1, unlocks</text></g><g data-on="4"><text x="180" y="18" text-anchor="middle" font-size="9.6" font-weight="700" class="s-ink2">with flock</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">A locks: reads 0</text><rect x="14" y="60" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="74.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B tries: busy → waits (-w) or skips (-n)</text><rect x="14" y="88" width="330" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="179.0" y="102.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">A writes: 1, unlocks</text><rect x="14" y="116" width="330" height="24" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="179.0" y="130.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">B locks: reads 1, writes 2</text></g>
+          <text x="352" y="244" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>1</li>
+          <li>2</li>
+          <li>3</li>
+          <li>4</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <span class="live">Animated example</span>
+  <h3 id="scenario-timeout">How timeout ends a hang</h3>
+  <p class="anim-intro">TERM first, KILL if needed.</p>
+  <div class="anim anim--one" data-frames="4" data-delay="5000">
+    <div class="anim__title">timeout -k <span>4 steps</span></div>
+    <div class="anim__views">
+      <div class="view view--story">
+        <span class="view__tag">Animated example</span>
+        <svg viewBox="0 0 360 226" role="img" aria-label="Rows: start, TERM at the limit, KILL after the grace period, exit code.">
+          <g data-on="1"><text x="180" y="18" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink2">timeout -k 5 30 ./step.sh</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">0 s: step starts</text></g><g data-on="2"><text x="180" y="18" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink2">timeout -k 5 30 ./step.sh</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">0 s: step starts</text><rect x="14" y="60" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="74.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">30 s: still running → TERM</text></g><g data-on="3"><text x="180" y="18" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink2">timeout -k 5 30 ./step.sh</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">0 s: step starts</text><rect x="14" y="60" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="74.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">30 s: still running → TERM</text><rect x="14" y="88" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="179.0" y="102.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">35 s: ignored TERM → KILL</text></g><g data-on="4"><text x="180" y="18" text-anchor="middle" font-size="9.4" font-weight="700" class="s-ink2">timeout -k 5 30 ./step.sh</text><rect x="14" y="32" width="330" height="24" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="179.0" y="46.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">0 s: step starts</text><rect x="14" y="60" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="179.0" y="74.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">30 s: still running → TERM</text><rect x="14" y="88" width="330" height="24" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="179.0" y="102.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">35 s: ignored TERM → KILL</text><rect x="14" y="116" width="330" height="24" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="179.0" y="130.8" text-anchor="middle" font-size="8" font-weight="700" class="s-ink">result: exit 124 (or 137 after KILL)</text></g>
+          <text x="354" y="221" text-anchor="end" class="s-wm">myphatshala.in</text>
+        </svg>
+        <ol class="caps" hidden>
+          <li>start.</li>
+          <li>TERM.</li>
+          <li>KILL.</li>
+          <li>code.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+  <h3 id="dissect">Layer by layer: what a flock really is</h3>
+  <p>Each layer has a real command from our build machine.</p>
+  <div class="modlab dissect"><div class="modlab__bar"><b>File → open file → kernel. Click a layer.</b><button type="button" data-mod="file"><b>Lock file</b><small>just a file</small></button><button type="button" data-mod="fd"><b>Open file</b><small>fd 9</small></button><button type="button" data-mod="kernel"><b>Kernel lock</b><small>flock(2)</small></button></div>
+    <div class="modlab__panel" data-mod="file">
+      <h4>Lock file <small>just a file</small></h4>
+      <div class="dx__grid">
+        <div class="dx__q dx__q--why"><b>Why does it exist?</b><p>A name to agree on.</p></div>
+        <div class="dx__q dx__q--how"><b>How does it work?</b><p>Any path.</p></div>
+        <div class="dx__q dx__q--impl"><b>Where is it, really?</b><p>Local disk.</p></div>
+        <div class="dx__q dx__q--used"><b>Where is it used?</b><p>/run/lock.</p></div>
+      </div>
+      <div class="dx__see"><p class="wx__label">See this layer yourself (real output)</p>
+        <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; bin/job.sh X &gt; /dev/null 2&gt;&amp;1; ls -l run/job.lock | awk &#x27;{print $1, $5, $9}&#x27;</code></pre><div class="output">-rw-r--r-- 0 run/job.lock</div></div></div>
+    </div>
+    <div class="modlab__panel" data-mod="fd">
+      <h4>Open file <small>fd 9</small></h4>
+      <div class="dx__grid">
+        <div class="dx__q dx__q--why"><b>Why does it exist?</b><p>Lock is on the open file.</p></div>
+        <div class="dx__q dx__q--how"><b>How does it work?</b><p>exec 9>f.</p></div>
+        <div class="dx__q dx__q--impl"><b>Where is it, really?</b><p>/proc/$$/fd.</p></div>
+        <div class="dx__q dx__q--used"><b>Where is it used?</b><p>Whole script.</p></div>
+      </div>
+      <div class="dx__see"><p class="wx__label">See this layer yourself (real output)</p>
+        <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; exec 9&gt; run/demo.lock; ls -l /proc/$$/fd/9 | sed &quot;s|.*-&gt; ||; s|$HOME|~|&quot;</code></pre><div class="output">~/ops/run/demo.lock</div></div></div>
+    </div>
+    <div class="modlab__panel" data-mod="kernel">
+      <h4>Kernel lock <small>flock(2)</small></h4>
+      <div class="dx__grid">
+        <div class="dx__q dx__q--why"><b>Why does it exist?</b><p>Atomic, auto-release.</p></div>
+        <div class="dx__q dx__q--how"><b>How does it work?</b><p>One system call.</p></div>
+        <div class="dx__q dx__q--impl"><b>Where is it, really?</b><p>/proc/locks.</p></div>
+        <div class="dx__q dx__q--used"><b>Where is it used?</b><p>Everyone who asks.</p></div>
+      </div>
+      <div class="dx__see"><p class="wx__label">See this layer yourself (real output)</p>
+        <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; exec 9&gt; run/demo2.lock; flock 9; grep -c FLOCK /proc/locks | sed &#x27;s/^/FLOCK entries in \/proc\/locks: /&#x27;</code></pre><div class="output">FLOCK entries in /proc/locks: 2</div></div></div>
+    </div>
+  </div>
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> Two copies run without a lock and both add 1 to a counter of 0. What can the result be?</summary>
+    <div class="qc__a"><b>Answer:</b> 1 or 2, depending on timing: that is the race.</div></details>
+
+</section>
+<div class="ad-slot ad-slot--inarticle" data-slot="inarticle"></div>
+<section class="part" id="real-world">
+  <span class="part-label"><b>6</b> Real-world use</span>
+  <h2>Locks and timeouts at work</h2>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-blue" style="stroke:var(--blue)"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">cron</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">flock</text></svg></div>
+    <div><h4>1. Overlapping cron jobs</h4>
+      <p>Every */5 cron job that can run longer than 5 minutes is wrapped in flock -n; slow nights skip a run instead of piling up.</p>
+      <div class="uc-flow"><span class="java">/5</span><i>→</i><span class="java">flock -n</span><i>→</i><span>one copy</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-green" style="stroke:var(--green)"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">deploy</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">lock</text></svg></div>
+    <div><h4>2. Deploys</h4>
+      <p>Two engineers deploying at once is a classic outage; deploy scripts hold a lock for the whole release.</p>
+      <div class="uc-flow"><span>deploy</span><i>→</i><span class="java">lock</span><i>→</i><span>serial</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-acc" style="stroke:#E0A100"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">backup</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">timeout</text></svg></div>
+    <div><h4>3. Backups over the network</h4>
+      <p>rsync/scp steps run under timeout -k so a dead link does not block the next night.</p>
+      <div class="uc-flow"><span>rsync</span><i>→</i><span class="java">timeout</span><i>→</i><span>next night ok</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-violet" style="stroke:var(--violet)"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">apt</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">dpkg</text></svg></div>
+    <div><h4>4. Package managers</h4>
+      <p>apt and dpkg take locks (/var/lib/dpkg/lock-frontend): the “could not get lock” message you meet in Linux 14.2.</p>
+      <div class="uc-flow"><span>apt</span><i>→</i><span class="java">lock</span><i>→</i><span>one at a time</span></div></div>
+  </div>
+  <div class="usecase">
+    <div class="uc-art"><svg viewBox="0 0 120 90"><rect x="14" y="22" width="92" height="46" rx="6" class="s-soft-acc" style="stroke:#D64545"/><text x="60.0" y="41.7" text-anchor="middle" font-size="8.6" font-weight="700" class="s-ink">idempotent</text><text x="60.0" y="54.3" text-anchor="middle" font-size="8.0" class="s-ink2">IaC</text></svg></div>
+    <div><h4>5. Infrastructure as code</h4>
+      <p>Ansible, Terraform and Puppet are built on idempotence: run them again and only differences change.</p>
+      <div class="uc-flow"><span>rerun</span><i>→</i><span class="java">no change</span><i>→</i><span>safe</span></div></div>
+  </div>
+  <p class="muted">Examples are simplified and generic. They describe common patterns, not the internal systems of any particular company.</p>
+  <h3 id="oneliners">One-liner corner</h3>
+  <p class="ol-intro">Small, useful forms. All really run on our build machine.</p>
+  <div class="ol-list">
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">Beginner</span><h4>Run only one copy</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Cron.</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; flock -n run/one.lock bin/append.sh cron</code></pre><div class="output">cron wrote 1</div></div>
+      <p class="ol__how">flock -n.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">Beginner</span><h4>Time limit</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Hang protection.</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>timeout 0.5 sleep 2; echo &quot;exit $?&quot;</code></pre><div class="output">exit 124</div></div>
+      <p class="ol__how">124.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--i">Intermediate</span><h4>Lock the whole script</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Inside a script.</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; bash -c &#x27;exec 9&gt; run/s.lock; flock -n 9 || exit 0; echo &quot;working with the lock&quot;&#x27;</code></pre><div class="output">working with the lock</div></div>
+      <p class="ol__how">exec 9>; flock -n 9.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--i">Intermediate</span><h4>Is the lock busy?</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Monitoring.</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; flock -n run/check.lock true &amp;&amp; echo free || echo busy</code></pre><div class="output">free</div></div>
+      <p class="ol__how">Probe with true.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--a">Advanced</span><h4>Queue three jobs</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Serial work.</p>
+      
+      <div class="code" data-lang="bash" data-file="Terminal"><pre><code>cd ~/ops; for j in 1 2 3; do flock -w 5 run/q.lock bin/append.sh job$j &amp; done; wait; cat out/counter</code></pre><div class="output">job1 wrote 1
+job2 wrote 2
+job3 wrote 3
+3</div></div>
+      <p class="ol__how">-w: all run, in turn.</p>
+    </article>
+    <article class="ol ol--build">
+      <div class="ol__head"><span class="lvl lvl--b">Beginner</span><h4>Build it step by step: a safe cron job</h4></div>
+      <p class="ol__scn"><b>Scenario:</b> Riya makes her 5-minute job safe against overlaps and hangs.</p>
+      <ol class="build">
+      <li><p>1. Unprotected: lost updates.</p>
+        <div class="code" data-lang="bash" data-file="Step 1"><pre><code>cd ~/ops; for i in 1 2 3; do bin/append.sh $i &gt; /dev/null &amp; done; wait; echo &quot;unprotected: counter=$(cat out/counter)&quot;</code></pre><div class="output">unprotected: counter=1</div></div></li>
+      <li><p>2. flock -n: overlaps skip.</p>
+        <div class="code" data-lang="bash" data-file="Step 2"><pre><code>cd ~/ops; echo 0 &gt; out/counter; for i in 1 2 3; do bin/job.sh $i 2&gt;/dev/null &amp; done; wait; echo &quot;flock -n: counter=$(cat out/counter) (overlaps skipped)&quot;</code></pre><div class="output">1 wrote 1
+flock -n: counter=1 (overlaps skipped)</div></div></li>
+      <li><p>3. timeout: a hang ends.</p>
+        <div class="code" data-lang="bash" data-file="Step 3"><pre><code>cd ~/ops; timeout 0.5 bash -c &#x27;sleep 3&#x27;; echo &quot;hung step stopped: exit $?&quot;</code></pre><div class="output">hung step stopped: exit 124</div></div></li>
+      <li><p>4. The final crontab line.</p>
+        <div class="code" data-lang="bash" data-file="Step 4"><pre><code>cd ~/ops; echo &#x27;*/5 * * * * flock -n /run/lock/report.lock timeout -k 30 270 /home/riya/ops/bin/report.sh &gt;&gt; /home/riya/ops/out/cron.log 2&gt;&amp;1&#x27;</code></pre><div class="output">*/5 * * * * flock -n /run/lock/report.lock timeout -k 30 270 /home/riya/ops/bin/report.sh &gt;&gt; /home/riya/ops/out/cron.log 2&gt;&amp;1</div></div></li>
+      </ol>
+    </article>
+  </div>  <h3 id="variations">More examples and variations</h3>
+  <p class="ol-intro">Fifteen more lock, timeout and idempotence patterns. All were really run on our build machine.</p>
+  <h4 class="var__group">flock</h4>
+  <div class="ol-list">
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V1</span><h4>Custom exit code when busy</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>cd ~/ops; exec 9&gt; run/e.lock; flock 9; flock -n -E 3 run/e.lock true; echo &quot;exit $?&quot;</code></pre><div class="output">exit 3</div></div>
+      <p class="ol__how">-E distinguishes “busy” from a failure.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V2</span><h4>Wait with a limit</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>cd ~/ops; ( flock run/w.lock sleep 1 ) &amp; sleep 0.2; flock -w 0.3 run/w.lock true; echo &quot;waited 0.3 s: exit $?&quot;; wait</code></pre><div class="output">waited 0.3 s: exit 1</div></div>
+      <p class="ol__how">Gives up after 0.3 s.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V3</span><h4>Shared locks for readers</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>cd ~/ops; ( flock -s run/s.lock sleep 0.5 ) &amp; sleep 0.1; flock -s -n run/s.lock true &amp;&amp; echo &#x27;second reader allowed&#x27;; flock -x -n run/s.lock true || echo &#x27;writer must wait&#x27;; wait</code></pre><div class="output">second reader allowed
+writer must wait</div></div>
+      <p class="ol__how">Many readers or one writer.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V4</span><h4>Release early</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>cd ~/ops; exec 8&gt; run/u.lock; flock 8; echo &#x27;critical part done&#x27;; flock -u 8; flock -n run/u.lock true &amp;&amp; echo &#x27;others may start now&#x27;</code></pre><div class="output">critical part done
+others may start now</div></div>
+      <p class="ol__how">-u before slow non-critical work.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V5</span><h4>Who holds a lock?</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>cd ~/ops; ( exec 9&gt; run/who.lock; flock 9; sleep 2 ) &amp; sleep 0.2; awk &#x27;$2==&quot;FLOCK&quot;&#x27; /proc/locks | wc -l | sed &#x27;s/^/flock entries: /&#x27;; wait</code></pre><div class="output">flock entries: 2</div></div>
+      <p class="ol__how">/proc/locks lists all locks (fuser/lsof name the PID).</p>
+    </article>
+  </div>
+  <h4 class="var__group">timeout</h4>
+  <div class="ol-list">
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V6</span><h4>Minutes and decimals</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>timeout 0.2 sleep 1; echo &quot;exit $?&quot;; timeout 1m true; echo &quot;exit $?&quot;</code></pre><div class="output">exit 124
+exit 0</div></div>
+      <p class="ol__how">Units s m h d.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V7</span><h4>Graceful signal first</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>timeout -s INT 0.3 bash -c &#x27;trap &quot;echo got INT, saving work; exit 0&quot; INT; sleep 2 &amp; wait&#x27;; echo &quot;exit $?&quot;</code></pre><div class="output">got INT, saving work
+exit 124</div></div>
+      <p class="ol__how">Let the program clean up.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V8</span><h4>Whole-script deadline</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>SECONDS=0; deadline=1; for step in a b c d e; do (( SECONDS &gt;= deadline )) &amp;&amp; { echo &quot;deadline reached before step $step&quot;; break; }; sleep 0.3; echo &quot;step $step done&quot;; done</code></pre><div class="output">step a done
+deadline reached before step b</div></div>
+      <p class="ol__how">Bash SECONDS counts up.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V9</span><h4>timeout inside retry</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>for try in 1 2; do timeout 0.2 sleep 1 &amp;&amp; break; echo &quot;try $try timed out ($?)&quot;; done</code></pre><div class="output">try 1 timed out (124)
+try 2 timed out (124)</div></div>
+      <p class="ol__how">124 as a temporary error.</p>
+    </article>
+  </div>
+  <h4 class="var__group">Idempotence</h4>
+  <div class="ol-list">
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V10</span><h4>Create a user only if missing (dry run)</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>u=riya; id &quot;$u&quot; &gt;/dev/null 2&gt;&amp;1 &amp;&amp; echo &quot;$u exists: nothing to do&quot; || echo &quot;would run: useradd $u&quot;</code></pre><div class="output">riya exists: nothing to do</div></div>
+      <p class="ol__how">Check first.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V11</span><h4>Download only if newer (pattern)</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>touch -d &#x27;2 days ago&#x27; old.csv; [[ old.csv -nt marker ]] || echo &#x27;source not newer than last run: skip&#x27;</code></pre></div>
+      <p class="ol__how">-nt compares times.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V12</span><h4>Done-markers per item</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>mkdir -p done; for f in a b c; do [[ -e done/$f ]] &amp;&amp; continue; echo &quot;processing $f&quot;; touch done/$f; done; echo &#x27;second run:&#x27;; for f in a b c; do [[ -e done/$f ]] &amp;&amp; continue; echo &quot;processing $f&quot;; done; echo &#x27;(nothing)&#x27;</code></pre><div class="output">processing a
+processing b
+processing c
+second run:
+(nothing)</div></div>
+      <p class="ol__how">Restart where it stopped.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V13</span><h4>Replace, never append</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>for i in 1 2 3; do printf &#x27;port=9090\n&#x27; &gt; app.port; done; wc -l &lt; app.port</code></pre><div class="output">1</div></div>
+      <p class="ol__how">> instead of >>.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V14</span><h4>Symlink switch is repeatable</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>mkdir -p r1 r2; for i in 1 2; do ln -sfn r2 current; done; readlink current</code></pre><div class="output">r2</div></div>
+      <p class="ol__how">-n replaces the link itself.</p>
+    </article>
+    <article class="ol">
+      <div class="ol__head"><span class="lvl lvl--b">V15</span><h4>set -C (noclobber) as a guard</h4></div>
+      <div class="code" data-lang="bash" data-file="script.sh"><pre><code>set -C; echo first &gt; once.txt; echo second &gt; once.txt 2&gt;/dev/null || echo &#x27;refused to overwrite&#x27;; set +C; cat once.txt</code></pre><div class="output">/home/riya/script.sh: line 1: once.txt: cannot overwrite existing file
+refused to overwrite
+first</div></div>
+      <p class="ol__how">Protects existing files.</p>
+    </article>
+  </div>
+  <h3 id="which">Which command when?</h3>
+  <p>Choosing the right guard.</p>
+  <div class="table-wrap">
+  <table class="compare which" style="min-width:640px">
+    <thead><tr><th>You want to…</th><th>Use</th><th>Why</th><th>Common mistake</th></tr></thead>
+    <tbody><tr><td>One copy (cron)</td><td><code>flock -n</code></td><td>Atomic, auto-release.</td><td>touch lock files.</td></tr><tr><td>Take turns</td><td><code>flock -w N</code></td><td>Queue with a limit.</td><td>Waiting forever.</td></tr><tr><td>NFS / no flock</td><td><code>mkdir + trap + stale check</code></td><td>Portable.</td><td>PID file alone.</td></tr><tr><td>Hangs</td><td><code>timeout -k</code></td><td>Always ends.</td><td>No limit.</td></tr><tr><td>Reruns</td><td><code>idempotent steps</code></td><td>Safe.</td><td>Blind appends.</td></tr><tr><td>Daemons</td><td><code>systemd unit</code></td><td>Built-in.</td><td>Hand-made PID logic.</td></tr></tbody>
+  </table>
+  </div>  <h3 id="keys">Keyboard and shell shortcuts</h3>
+  <p>Handy forms.</p>
+  <div class="table-wrap"><table class="compare" style="min-width:520px"><thead><tr><th>Keys / syntax</th><th>What it does</th><th>Example</th></tr></thead><tbody><tr><td><kbd>flock -n /run/lock/x.lock cmd</kbd></td><td>skip if busy</td><td><code>cron</code></td></tr><tr><td><kbd>exec 9&gt;f; flock -n 9 || exit 0</kbd></td><td>whole script</td><td><code>top</code></td></tr><tr><td><kbd>flock -w 60 f cmd</kbd></td><td>wait ≤ 60 s</td><td><code>queue</code></td></tr><tr><td><kbd>timeout -k 10 300 cmd</kbd></td><td>limit + kill</td><td><code>any step</code></td></tr><tr><td><kbd>(( rc == 124 ))</kbd></td><td>timed out</td><td><code>retry</code></td></tr><tr><td><kbd>grep -qxF l f || echo l &gt;&gt; f</kbd></td><td>add once</td><td><code>idempotent</code></td></tr></tbody></table></div>
+  <h3 id="scriptit">Script it: safe-job.sh</h3>
+  <p>A cron-safe job: a flock on the whole script (skip quietly if already running), a timeout on the slow step, and idempotent setup, so overlaps, hangs and reruns are all harmless.</p>
+  <div class="code" data-lang="bash" data-file="script.sh"><pre><code>#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p run out
+exec 9&gt; run/safe-job.lock
+flock -n 9 || { echo &quot;safe-job: already running, skipping&quot; &gt;&amp;2; exit 0; }
+
+mkdir -p out/reports                                   # idempotent
+grep -qxF &#x27;retention=30&#x27; out/settings 2&gt;/dev/null || echo &#x27;retention=30&#x27; &gt;&gt; out/settings
+
+if timeout -k 1 2 bash -c &#x27;sleep 0.3; echo &quot;report built&quot;&#x27;; then
+  echo &quot;safe-job: ok&quot;
+else
+  rc=$?
+  (( rc == 124 )) &amp;&amp; echo &quot;safe-job: report step timed out&quot; &gt;&amp;2 || echo &quot;safe-job: report step failed ($rc)&quot; &gt;&amp;2
+  exit &quot;$rc&quot;
+fi</code></pre><div class="output">report built
+safe-job: ok</div></div>
+  <p>Run it twice at once and the second copy only says it is skipping.</p>
+<details class="puzzle puzzle--ans"><summary><span class="puzzle__tag">Puzzle answer</span> Remember the question from the story? Open to check your guess.</summary><p><b>1.</b> The check (<code>[[ -e job.lock ]]</code>) and the create (<code>touch job.lock</code>) are two separate steps: two copies can both see “no lock” before either creates it, which is the same race as the counter. <b>2.</b> The <code>rm job.lock</code> at the end never runs after a crash or kill -9, so the file stays and every later run thinks the job is still running. <code>flock</code> fixes both: checking and taking the lock is one atomic kernel operation, and the kernel releases it when the process ends, however it ends.</p></details>
+  <details class="qc"><summary><span class="qc__tag">Quick check</span> Where should lock files live?</summary>
+    <div class="qc__a"><b>Answer:</b> On a local disk, e.g. /run/lock or /var/lock (or a folder of your own), not on network file systems.</div></details>
+
+</section>
+
+
+<div class="ad-slot" data-slot="mid"></div>
+
+<section class="part" id="run">
+  <span class="part-label"><b>7</b> Run the code</span>
+  <h2>Read-modify-write and a deadline</h2>
+  <p>The browser runs one copy, so no race here; the steps show the pattern and a simple deadline. The real race and flock run in the cards below.</p>
+  <div class="code" data-lang="bash" data-file="script.sh"><pre><code>counter=0
+work() {          # read, think, write: a read-modify-write
+  local n=$counter
+  sleep 0.05
+  counter=$(( n + 1 ))
+}
+for i in 1 2 3; do work; done
+echo &quot;one after another: $counter&quot;
+
+# a time limit for a slow step (simulated with a loop and SECONDS)
+SECONDS=0; limit=1
+until (( SECONDS &gt;= limit )); do sleep 0.2; done
+echo &quot;stopped after the $limit s limit&quot;</code></pre><div class="output">one after another: 3
+stopped after the 1 s limit</div></div>
+  <ul class="anno"><li><code>local n=$counter</code><span>Read.</span></li><li><code>counter=$(( n + 1 ))</code><span>Write: another copy could have written in between.</span></li><li><code>SECONDS</code><span>Bash counts seconds for you.</span></li></ul>
+  <div class="runner">
+    <script type="application/json">{
+ "lang": "bash",
+ "file": "script.sh",
+ "tasks": [
+  {
+   "label": "1 · Run it",
+   "hint": "Press <b>Run<\/b>.",
+   "code": "counter=0\nwork() {          # read, think, write: a read-modify-write\n  local n=$counter\n  sleep 0.05\n  counter=$(( n + 1 ))\n}\nfor i in 1 2 3; do work; done\necho \"one after another: $counter\"\n\n# a time limit for a slow step (simulated with a loop and SECONDS)\nSECONDS=0; limit=1\nuntil (( SECONDS >= limit )); do sleep 0.2; done\necho \"stopped after the $limit s limit\"\n"
+  },
+  {
+   "label": "2 · Predict first",
+   "hint": "<b>Predict first:<\/b> what does a mkdir lock print the second time?",
+   "code": "mkdir lockdir && echo 'got the lock'\nmkdir lockdir 2>/dev/null || echo 'busy'\nrmdir lockdir\n"
+  },
+  {
+   "label": "3 · Spot the error",
+   "hint": "<b>Spot the error:<\/b> check-then-create is two steps. Use mkdir (atomic) instead.",
+   "code": "[[ -e my.lock ]] || touch my.lock\necho 'two copies could both reach this line'\nrm -f my.lock\n"
+  },
+  {
+   "label": "4 · Your turn",
+   "hint": "Make the step idempotent: add the line only once.",
+   "code": "for run in 1 2 3; do grep -qxF 'retention=30' s.conf 2>/dev/null || echo 'retention=30' >> s.conf; done\nwc -l < s.conf\n"
+  },
+  {
+   "label": "5 · Challenge",
+   "hint": "Use noclobber as a lock.",
+   "code": "set -C\n( echo $$ > n.lock ) 2>/dev/null && echo 'lock taken'\n( echo $$ > n.lock ) 2>/dev/null || echo 'busy'\nset +C; rm -f n.lock\n"
+  }
+ ]
+}</script>
+  </div>
+  <h3 id="pc">Run on your PC</h3>
+  <p>Try flock in two terminals. Outputs below are from our build machine unless marked typical.</p>
+  <div class="pcrun"><h4>1 · Two terminals</h4>
+  <div class="code" data-lang="bash" data-file="Terminal"><pre><code># terminal 1
+flock /tmp/demo.lock -c &#x27;echo got it; sleep 30&#x27;
+# terminal 2
+flock -n /tmp/demo.lock -c &#x27;echo got it&#x27; || echo busy</code></pre><div class="output">got it          (terminal 1)
+busy            (terminal 2)</div></div>
+  <p class="muted">Real behaviour.</p></div>
+  <div class="pcrun"><h4>2 · Who holds it?</h4>
+  <div class="code" data-lang="bash" data-file="Terminal"><pre><code>fuser -v /tmp/demo.lock</code></pre><div class="output">                     USER        PID ACCESS COMMAND
+/tmp/demo.lock:      riya       4211 F.... flock</div></div>
+  <p class="muted">Typical.</p></div>
+  <div class="pcrun"><h4>3 · cron line</h4>
+  <div class="code" data-lang="bash" data-file="Terminal"><pre><code>crontab -l</code></pre><div class="output">*/5 * * * * flock -n /run/lock/report.lock timeout -k 30 270 /home/riya/ops/bin/report.sh &gt;&gt; /home/riya/ops/out/cron.log 2&gt;&amp;1</div></div>
+  <p class="muted">Typical.</p></div>
+  <div class="pcrun"><h4>4 · apt’s lock</h4>
+  <div class="code" data-lang="bash" data-file="Terminal"><pre><code>sudo apt install htop   # while another apt runs</code></pre><div class="output">E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 3311 (apt)</div></div>
+  <p class="muted">Typical: the same idea inside apt.</p></div>
+</section>
+
+<div class="ad-slot ad-slot--inarticle" data-slot="inarticle"></div>
+<section class="part" id="tracer">
+  <span class="part-label"><b>8</b> Line by line</span>
+  <h2>A mkdir lock with clean-up, line by line</h2>
+  <p>Take, use and release a portable lock.</p>
+  <div class="tracer">
+    <script type="application/json">{
+ "lang": "bash",
+ "code": [
+  "lock=job.lockdir",
+  "if mkdir \"$lock\" 2>/dev/null; then",
+  "  echo \"lock taken\"",
+  "  echo $$ > \"$lock/pid\"",
+  "  echo \"working...\"",
+  "  rm -rf \"$lock\"",
+  "  echo \"lock released\"",
+  "else",
+  "  echo \"busy\"",
+  "fi"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Shell",
+   "note": "Variable <code>lock<\/code> is created: <code>job.lockdir<\/code>.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "lock",
+       "job.lockdir"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "lock"
+  },
+  {
+   "line": 2,
+   "phase": "Shell",
+   "note": "Atomic: create or fail. New folder <code>job.lockdir<\/code> appears in ~/lab.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "lock",
+       "job.lockdir"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>job.lockdir/<\/b> folder"
+   ]
+  },
+  {
+   "line": 3,
+   "phase": "Shell",
+   "note": "The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "lock",
+       "job.lockdir"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>job.lockdir/<\/b> folder"
+   ],
+   "out": "lock taken\n"
+  },
+  {
+   "line": 4,
+   "phase": "Shell",
+   "note": "New file <code>job.lockdir/pid<\/code> appears in ~/lab.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "lock",
+       "job.lockdir"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>job.lockdir/<\/b> folder",
+    "<b>job.lockdir/pid<\/b> file · 5 bytes"
+   ]
+  },
+  {
+   "line": 5,
+   "phase": "Shell",
+   "note": "The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "lock",
+       "job.lockdir"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>job.lockdir/<\/b> folder",
+    "<b>job.lockdir/pid<\/b> file · 5 bytes"
+   ],
+   "out": "working...\n"
+  },
+  {
+   "line": 6,
+   "phase": "Shell",
+   "note": "In a script: do this in trap … EXIT. <code>job.lockdir<\/code> is gone. <code>job.lockdir/pid<\/code> is gone.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "lock",
+       "job.lockdir"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 7,
+   "phase": "Shell",
+   "note": "The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "lock",
+       "job.lockdir"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "lock released\n"
+  }
+ ],
+ "labels": {
+  "stack": [
+   "Shell",
+   "variables, current folder, $?"
+  ],
+  "heap": [
+   "Files",
+   "inside ~/lab"
+  ],
+  "emptyStack": "the shell has not started",
+  "emptyHeap": "~/lab is empty"
+ }
+}</script>
+  </div>
+
+<h3 id="worked">Worked examples: real problems, solved and traced in memory</h3>
+  <p class="wx-intro">Three jobs made safe against overlap and hangs.</p>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 1</span><span class="lvl lvl--b">Beginner</span><span class="wx__tag">Ops</span></div>
+    <h4>Skip when already running</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Make a script exit quietly if another copy holds the lock.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>nothing</pre></div><div><small>Expected output</small><pre>first: working
+second: busy, skipping</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>exec 9> + flock -n.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "bash",
+ "file": "script.sh",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Use flock -w 1 so second waits.",
+   "code": "job() { ( exec 9> job.lock; flock -n 9 || { echo \"$1: busy, skipping\"; exit 0; }; echo \"$1: working\"; sleep 0.4 ); }\njob first & sleep 0.1; job second; wait\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Bash run on Linux: press <b>Next</b> to run one line at a time. Watch the shell’s variables, the current folder, the exit status <code>$?</code> and the files in <code>~/lab</code> change.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "bash",
+ "code": [
+  "job() { ( exec 9> job.lock; flock -n 9 || { echo \"$1: busy, skipping\"; exit 0; }; echo \"$1: working\"; sleep 0.4 ); }",
+  "job first & sleep 0.1; job second; wait"
+ ],
+ "steps": [
+  {
+   "line": 2,
+   "phase": "Shell",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 1,
+   "phase": "Shell",
+   "note": "Each call is a subshell holding fd 9. New file <code>job.lock<\/code> appears in ~/lab.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>job.lock<\/b> file · 158 bytes"
+   ],
+   "out": "first: working\n"
+  },
+  {
+   "line": 2,
+   "phase": "Shell",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>job.lock<\/b> file · 158 bytes"
+   ]
+  },
+  {
+   "line": 1,
+   "phase": "Shell",
+   "note": "<code>job.lock<\/code> now has 160 bytes.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>job.lock<\/b> file · 160 bytes"
+   ],
+   "out": "second: busy, skipping\n"
+  },
+  {
+   "line": 2,
+   "phase": "Shell",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>job.lock<\/b> file · 160 bytes"
+   ]
+  }
+ ],
+ "labels": {
+  "stack": [
+   "Shell",
+   "variables, current folder, $?"
+  ],
+  "heap": [
+   "Files",
+   "inside ~/lab"
+  ],
+  "emptyStack": "the shell has not started",
+  "emptyHeap": "~/lab is empty"
+ }
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 2</span><span class="lvl lvl--i">Intermediate</span><span class="wx__tag">Data</span></div>
+    <h4>Serialise writers, allow readers</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>Readers share the lock; a writer needs it alone.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>nothing</pre></div><div><small>Expected output</small><pre>reader 2: allowed
+writer: must wait
+writer: allowed now</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>flock -s / -x.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "bash",
+ "file": "script.sh",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Add -w 1 to the writer.",
+   "code": "( flock -s data.lock sleep 0.5 ) & sleep 0.1\nflock -s -n data.lock true && echo \"reader 2: allowed\"\nflock -x -n data.lock true || echo \"writer: must wait\"\nwait; flock -x -n data.lock true && echo \"writer: allowed now\"\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Bash run on Linux: press <b>Next</b> to run one line at a time. Watch the shell’s variables, the current folder, the exit status <code>$?</code> and the files in <code>~/lab</code> change.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "bash",
+ "code": [
+  "( flock -s data.lock sleep 0.5 ) & sleep 0.1",
+  "flock -s -n data.lock true && echo \"reader 2: allowed\"",
+  "flock -x -n data.lock true || echo \"writer: must wait\"",
+  "wait; flock -x -n data.lock true && echo \"writer: allowed now\""
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Shell",
+   "note": "New file <code>data.lock<\/code> appears in ~/lab.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>data.lock<\/b> file · 0 bytes"
+   ]
+  },
+  {
+   "line": 2,
+   "phase": "Shell",
+   "note": "Shared + shared = ok. The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>data.lock<\/b> file · 0 bytes"
+   ],
+   "out": "reader 2: allowed\n"
+  },
+  {
+   "line": 3,
+   "phase": "Shell",
+   "note": "Exclusive waits for all readers. The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>data.lock<\/b> file · 0 bytes"
+   ],
+   "out": "writer: must wait\n"
+  },
+  {
+   "line": 4,
+   "phase": "Shell",
+   "note": "The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [
+    "<b>data.lock<\/b> file · 0 bytes"
+   ],
+   "out": "writer: allowed now\n"
+  }
+ ],
+ "labels": {
+  "stack": [
+   "Shell",
+   "variables, current folder, $?"
+  ],
+  "heap": [
+   "Files",
+   "inside ~/lab"
+  ],
+  "emptyStack": "the shell has not started",
+  "emptyHeap": "~/lab is empty"
+ }
+}</script>
+    </div>
+  </article>
+  <article class="wx">
+    <div class="wx__head"><span class="wx__num">Example 3</span><span class="lvl lvl--a">Advanced</span><span class="wx__tag">SRE</span></div>
+    <h4>Timeout plus retry</h4>
+    <div class="wx__problem"><p class="wx__label">Problem statement</p><p>A step sometimes hangs; give each attempt 0.3 s and retry twice.</p></div>
+    <div class="prob__io"><div><small>Input</small><pre>nothing</pre></div><div><small>Expected output</small><pre>try 1: timed out (124)
+try 2: timed out (124)
+step finished on call 3</pre></div></div>
+    <div class="wx__approach"><p class="wx__label">Approach</p><ol><li>timeout inside a loop, 124 = temporary.</li></ol></div>
+    <p class="wx__label">Solution: run it live</p>
+    <div class="runner">
+    <script type="application/json">{
+ "lang": "bash",
+ "file": "script.sh",
+ "tasks": [
+  {
+   "label": "Solution",
+   "hint": "Stop after the first success only.",
+   "code": "calls=0\nstep() { (( ++calls )); (( calls < 3 )) && sleep 2; echo \"step finished on call $calls\"; }\nexport -f step\nfor try in 1 2 3; do\n  timeout 0.3 bash -c \"calls=$((try-1)); step\" && break\n  echo \"try $try: timed out ($?)\"\ndone\n"
+  }
+ ]
+}</script>
+    </div>
+    <p class="wx__label">What happens in memory, step by step</p>
+    <p class="wx__how">Recorded from a real Bash run on Linux: press <b>Next</b> to run one line at a time. Watch the shell’s variables, the current folder, the exit status <code>$?</code> and the files in <code>~/lab</code> change.</p>
+    <div class="tracer">
+    <script type="application/json">{
+ "lang": "bash",
+ "code": [
+  "calls=0",
+  "step() { (( ++calls )); (( calls < 3 )) && sleep 2; echo \"step finished on call $calls\"; }",
+  "export -f step",
+  "for try in 1 2 3; do",
+  "  timeout 0.3 bash -c \"calls=$((try-1)); step\" && break",
+  "  echo \"try $try: timed out ($?)\"",
+  "done"
+ ],
+ "steps": [
+  {
+   "line": 1,
+   "phase": "Shell",
+   "note": "Variable <code>calls<\/code> is created: <code>0<\/code>.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "calls",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "calls"
+  },
+  {
+   "line": 3,
+   "phase": "Shell",
+   "note": "This line runs.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "calls",
+       "0"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 4,
+   "phase": "Shell",
+   "note": "Variable <code>try<\/code> is created: <code>1<\/code>.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "calls",
+       "0"
+      ],
+      [
+       "try",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "try"
+  },
+  {
+   "line": 5,
+   "phase": "Shell",
+   "note": "Each attempt has its own limit. The command <b>failed<\/b>: exit status <b>124<\/b>.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "124"
+      ],
+      [
+       "calls",
+       "0"
+      ],
+      [
+       "try",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 6,
+   "phase": "Shell",
+   "note": "The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "calls",
+       "0"
+      ],
+      [
+       "try",
+       "1"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "try 1: timed out (124)\n"
+  },
+  {
+   "line": 4,
+   "phase": "Shell",
+   "note": "<code>try<\/code> changes to <code>2<\/code>.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "calls",
+       "0"
+      ],
+      [
+       "try",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "try"
+  },
+  {
+   "line": 5,
+   "phase": "Shell",
+   "note": "The command <b>failed<\/b>: exit status <b>124<\/b>.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "124"
+      ],
+      [
+       "calls",
+       "0"
+      ],
+      [
+       "try",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": []
+  },
+  {
+   "line": 6,
+   "phase": "Shell",
+   "note": "The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "calls",
+       "0"
+      ],
+      [
+       "try",
+       "2"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "try 2: timed out (124)\n"
+  },
+  {
+   "line": 4,
+   "phase": "Shell",
+   "note": "<code>try<\/code> changes to <code>3<\/code>.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "calls",
+       "0"
+      ],
+      [
+       "try",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "newVar": "try"
+  },
+  {
+   "line": 5,
+   "phase": "Shell",
+   "note": "The output appears in the terminal.",
+   "stack": [
+    {
+     "frame": "bash · your script",
+     "vars": [
+      [
+       "folder (PWD)",
+       "~/lab"
+      ],
+      [
+       "$? exit status",
+       "0"
+      ],
+      [
+       "calls",
+       "0"
+      ],
+      [
+       "try",
+       "3"
+      ]
+     ]
+    }
+   ],
+   "heap": [],
+   "out": "step finished on call 3\n"
+  }
+ ],
+ "labels": {
+  "stack": [
+   "Shell",
+   "variables, current folder, $?"
+  ],
+  "heap": [
+   "Files",
+   "inside ~/lab"
+  ],
+  "emptyStack": "the shell has not started",
+  "emptyHeap": "~/lab is empty"
+ }
+}</script>
+    </div>
+  </article>
+</section>
+
+<section class="part" id="quiz">
+  <span class="part-label"><b>9</b> Quiz and revision</span>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <script type="application/json">[
+ {
+  "q": "Five copies add 1 to a counter of 0 at the same moment. Result?",
+  "options": [
+   "always 5",
+   "always 1",
+   "often less than 5",
+   "an error"
+  ],
+  "answer": 2,
+  "why": "Lost updates."
+ },
+ {
+  "q": "flock -n means…",
+  "options": [
+   "wait forever",
+   "fail at once if locked",
+   "no lock",
+   "new file"
+  ],
+  "answer": 1,
+  "why": "Non-blocking."
+ },
+ {
+  "q": "A flock lock after kill -9 of its holder is…",
+  "options": [
+   "released by the kernel",
+   "stale forever",
+   "converted",
+   "kept 1 h"
+  ],
+  "answer": 0,
+  "why": "Tied to the open file."
+ },
+ {
+  "q": "Why is mkdir a good portable lock?",
+  "options": [
+   "fast",
+   "hidden",
+   "root only",
+   "atomic create-or-fail"
+  ],
+  "answer": 3,
+  "why": "One system call."
+ },
+ {
+  "q": "timeout exit code when the limit is reached:",
+  "options": [
+   "1",
+   "137",
+   "124",
+   "143"
+  ],
+  "answer": 2,
+  "why": "124."
+ },
+ {
+  "q": "timeout -k 5 30 cmd does…",
+  "options": [
+   "kill after 5 s",
+   "TERM at 30 s, KILL 5 s later",
+   "retry 5 times",
+   "wait 35 s first"
+  ],
+  "answer": 1,
+  "why": "Grace period."
+ },
+ {
+  "q": "Idempotent means…",
+  "options": [
+   "same result when repeated",
+   "fast",
+   "runs once a day",
+   "locked"
+  ],
+  "answer": 0,
+  "why": "Safe reruns."
+ },
+ {
+  "q": "Lock files should live…",
+  "options": [
+   "on NFS",
+   "in /etc",
+   "anywhere",
+   "on a local disk like /run/lock"
+  ],
+  "answer": 3,
+  "why": "flock is unreliable on some NFS."
+ }
+]</script>
+  </div>
+
+  <h3 id="mindmap">Mind map: the whole lesson on one page</h3>
+  <p>Revise from the centre outwards. Each branch is one idea from the lesson; the boxes hold the facts to remember. Try to redraw it from memory on paper.</p>
+  <div class="scene scene--wide mm"><svg viewBox="0 0 760 460" role="img" aria-label="Run once, run safe: Race: read-modify-write, lost update, check-then-create; flock: -n / -w, exec 9&gt;, auto release; Portable: mkdir, noclobber, stale check; timeout: 124, -k KILL, deadline; Idempotent: mkdir -p, add once, markers; Cron: flock + timeout, logs, alerts"><path d="M380 230 Q350 155 380 80" style="fill:none;stroke:#D64545;stroke-width:3;opacity:.7"/><path d="M380 230 Q473 167 597 155" style="fill:none;stroke:var(--blue);stroke-width:3;opacity:.7"/><path d="M380 230 Q503 242 597 305" style="fill:none;stroke:#E0A100;stroke-width:3;opacity:.7"/><path d="M380 230 Q410 305 380 380" style="fill:none;stroke:var(--green);stroke-width:3;opacity:.7"/><path d="M380 230 Q287 293 163 305" style="fill:none;stroke:var(--violet);stroke-width:3;opacity:.7"/><path d="M380 230 Q257 218 163 155" style="fill:none;stroke:var(--track);stroke-width:3;opacity:.7"/><ellipse cx="380" cy="230" rx="92" ry="34" class="s-board"/><text x="380" y="235" text-anchor="middle" font-size="12" font-weight="700" class="s-chalk">Run once, run safe</text><rect x="325" y="65" width="110" height="30" rx="15" class="s-soft-acc" style="stroke:#D64545"/><text x="380" y="85" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">Race</text><rect x="320" y="11" width="120" height="53" rx="8" class="s-card2" style="stroke:#D64545;stroke-width:1"/><text x="328" y="27" font-size="9.4" class="s-ink2">• read-modify-write</text><text x="328" y="42" font-size="9.4" class="s-ink2">• lost update</text><text x="328" y="57" font-size="9.4" class="s-ink2">• check-then-create</text><rect x="542" y="140" width="110" height="30" rx="15" class="s-soft-blue" style="stroke:var(--blue)"/><text x="597" y="160" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">flock</text><rect x="552" y="86" width="89" height="53" rx="8" class="s-card2" style="stroke:var(--blue);stroke-width:1"/><text x="560" y="102" font-size="9.4" class="s-ink2">• -n / -w</text><text x="560" y="117" font-size="9.4" class="s-ink2">• exec 9></text><text x="560" y="132" font-size="9.4" class="s-ink2">• auto release</text><rect x="542" y="290" width="110" height="30" rx="15" class="s-soft-acc" style="stroke:#E0A100"/><text x="597" y="310" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">Portable</text><rect x="555" y="329" width="83" height="53" rx="8" class="s-card2" style="stroke:#E0A100;stroke-width:1"/><text x="563" y="345" font-size="9.4" class="s-ink2">• mkdir</text><text x="563" y="360" font-size="9.4" class="s-ink2">• noclobber</text><text x="563" y="375" font-size="9.4" class="s-ink2">• stale check</text><rect x="325" y="365" width="110" height="30" rx="15" class="s-soft-green" style="stroke:var(--green)"/><text x="380" y="385" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">timeout</text><rect x="348" y="404" width="65" height="53" rx="8" class="s-card2" style="stroke:var(--green);stroke-width:1"/><text x="356" y="420" font-size="9.4" class="s-ink2">• 124</text><text x="356" y="435" font-size="9.4" class="s-ink2">• -k KILL</text><text x="356" y="450" font-size="9.4" class="s-ink2">• deadline</text><rect x="108" y="290" width="110" height="30" rx="15" class="s-soft-violet" style="stroke:var(--violet)"/><text x="163" y="310" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">Idempotent</text><rect x="131" y="329" width="65" height="53" rx="8" class="s-card2" style="stroke:var(--violet);stroke-width:1"/><text x="139" y="345" font-size="9.4" class="s-ink2">• mkdir -p</text><text x="139" y="360" font-size="9.4" class="s-ink2">• add once</text><text x="139" y="375" font-size="9.4" class="s-ink2">• markers</text><rect x="108" y="140" width="110" height="30" rx="15" class="s-soft-acc" style="stroke:var(--track)"/><text x="163" y="160" text-anchor="middle" font-size="10.5" font-weight="700" class="s-ink">Cron</text><rect x="110" y="86" width="108" height="53" rx="8" class="s-card2" style="stroke:var(--track);stroke-width:1"/><text x="118" y="102" font-size="9.4" class="s-ink2">• flock + timeout</text><text x="118" y="117" font-size="9.4" class="s-ink2">• logs</text><text x="118" y="132" font-size="9.4" class="s-ink2">• alerts</text><text x="752" y="454" text-anchor="end" class="s-wm">myphatshala.in</text></svg></div>
+
+  <section class="cs" id="cheatsheet" aria-label="Cheat sheet">
+    <div class="cs__top"><h3>Cheat sheet: Locks and timeouts</h3><button type="button" class="cs__print" onclick="document.body.classList.add('print-cs');window.print();setTimeout(function(){document.body.classList.remove('print-cs')},500)">Print this sheet</button></div>
+    <div class="cs__grid"><div class="cs__g"><h4>flock</h4><dl><dt><code>flock -n f cmd</code></dt><dd>skip</dd><dt><code>flock -w 60 f cmd</code></dt><dd>wait</dd><dt><code>exec 9&gt;f; flock -n 9</code></dt><dd>script</dd><dt><code>-s / -x / -u</code></dt><dd>modes</dd></dl></div><div class="cs__g"><h4>Portable</h4><dl><dt><code>mkdir d</code></dt><dd>atomic</dd><dt><code>trap rm -rf d EXIT</code></dt><dd>release</dd><dt><code>kill -0 PID</code></dt><dd>stale?</dd><dt><code>set -C; &gt; f</code></dt><dd>noclobber</dd></dl></div><div class="cs__g"><h4>timeout</h4><dl><dt><code>timeout 30 cmd</code></dt><dd>limit</dd><dt><code>124</code></dt><dd>timed out</dd><dt><code>-k 5</code></dt><dd>then KILL</dd><dt><code>SECONDS</code></dt><dd>deadline</dd></dl></div><div class="cs__g"><h4>Idempotent</h4><dl><dt><code>mkdir -p</code></dt><dd>folders</dd><dt><code>ln -sfn</code></dt><dd>links</dd><dt><code>grep -q || &gt;&gt;</code></dt><dd>add once</dd><dt><code>done markers</code></dt><dd>resume</dd></dl></div></div>
+    <p class="cs__wm">myphatshala.in · Linux</p>
+  </section>
+
+  <h3>Quick revision</h3>
+  <div class="revision">
+    <h3>Lesson 3.2 in one screen</h3>
+    <ul><li>Race condition: copies read the same old value and overwrite each other’s updates; check-then-create locks race too.</li><li>flock does check-and-take atomically and the kernel releases it on exit (even kill -9).</li><li>flock -n (skip), -w N (wait with a limit), -s/-x (shared/exclusive), -u (unlock early); exec 9>file; flock -n 9 for a whole script.</li><li>mkdir and set -C are atomic portable locks but need a trap and stale checks (kill -0 PID).</li><li>timeout N cmd → 124 on timeout; -k adds KILL; SECONDS for whole-script deadlines.</li><li>Make steps idempotent: mkdir -p, ln -sfn, add-once, done-markers, > not >>.</li></ul>
+  </div>
+
+  <h3>Interview and viva questions</h3>
+  <div class="faq">
+    <details><summary>How do I prevent a cron job from running twice?</summary><p>Wrap it with flock: flock -n /run/lock/job.lock /path/job.sh.</p></details>
+    <details><summary>What is flock in Linux?</summary><p>A command (and system call) that takes an advisory lock on a file; the kernel releases it when the process exits.</p></details>
+    <details><summary>How do I make a script run only one instance?</summary><p>At the top: exec 9>/run/lock/name.lock; flock -n 9 || exit 0.</p></details>
+    <details><summary>How do I stop a command after a time limit?</summary><p>timeout 30 cmd; it exits 124 if the limit was reached; add -k to force KILL.</p></details>
+    <details><summary>Why is my lock file not removed after a crash?</summary><p>File-existence locks are not released automatically; use flock, or check the owner PID and remove stale locks.</p></details>
+    <details><summary>What is a race condition?</summary><p>A bug where the result depends on timing between processes, such as two copies updating the same file.</p></details>
+    <details><summary>What does idempotent mean in scripting?</summary><p>Running the step again gives the same result, so reruns are safe.</p></details>
+    
+  </div>
+
+<div class="ad-slot ad-slot--inarticle" data-slot="inarticle"></div>
+  <h3 id="practice">Practice problems</h3>
+  <p class="prob-intro">Small lock, timeout and idempotence tasks. Expected outputs come from real runs on our build machine.</p>
+  <div class="lab" id="lab"><h3>Practice lab: one copy, limited time</h3><p>Build the lab (it creates <code>~/lab32</code> with a slow step), write <code>~/lab32/job.sh</code>, then run the checker.</p>
+    <p class="wx__label">Step 1 · Build the lab (copy into your terminal)</p>
+    <div class="code" data-lang="bash" data-file="setup.sh"><pre><code>rm -rf ~/lab32; mkdir -p ~/lab32 &amp;&amp; cd ~/lab32
+cat &gt; slow.sh &lt;&lt;&#x27;EOF&#x27;
+#!/usr/bin/env bash
+sleep &quot;${SLOW:-0.5}&quot;
+n=$(cat counter 2&gt;/dev/null || echo 0); echo $(( n + 1 )) &gt; counter
+EOF
+chmod +x slow.sh</code></pre></div>
+    <p class="wx__label">Step 2 · Your tasks</p><ol><li><code>job.sh</code> runs <code>./slow.sh</code> under an exclusive <b>flock</b> on <code>~/lab32/job.lock</code>; if another copy holds the lock it prints a line containing <code>busy</code> and exits <b>0</b> without running slow.sh.</li><li>Started 4 times at once (with SLOW=0.5), exactly <b>one</b> copy may run: the counter goes up by exactly 1.</li><li>slow.sh must be limited to <b>1 second</b> with timeout; when <code>SLOW=3</code> the job must exit <b>124</b> after about one second.</li><li>Every run also makes sure <code>~/lab32/out</code> exists and contains exactly one line <code>ready</code>, however many times the job runs (idempotent).</li></ol>
+    <p class="wx__label">Step 3 · Check your work (save as check.sh, run <code>bash check.sh</code>)</p>
+    <div class="code" data-lang="bash" data-file="check.sh"><pre><code>cd ~/lab32; echo 0 &gt; counter; rm -rf out
+ok(){ if eval &quot;$2&quot;; then echo &quot;PASS  $1&quot;; else echo &quot;FAIL  $1&quot;; fi; }
+ok &quot;1 busy&quot;      &#x27;( exec 8&gt; job.lock; flock 8; out=$(./job.sh); r=$?; echo &quot;$out&quot; | grep -q busy &amp;&amp; [ $r -eq 0 ] ) &amp;&amp; [ &quot;$(cat counter)&quot; = 0 ]&#x27;
+ok &quot;2 one copy&quot;  &#x27;echo 0 &gt; counter; for i in 1 2 3 4; do SLOW=0.5 ./job.sh &gt;/dev/null &amp; done; wait; [ &quot;$(cat counter)&quot; = 1 ]&#x27;
+ok &quot;3 timeout&quot;   &#x27;SECONDS=0; SLOW=3 ./job.sh &gt;/dev/null 2&gt;&amp;1; r=$?; [ $r -eq 124 ] &amp;&amp; (( SECONDS &lt;= 2 ))&#x27;
+ok &quot;4 idempotent&quot; &#x27;for i in 1 2 3; do ./job.sh &gt;/dev/null 2&gt;&amp;1; done; [ -d out ] &amp;&amp; [ &quot;$(grep -cx ready out/*)&quot; = 1 ] &amp;&amp; [ &quot;$(cat out/* | wc -l)&quot; = 1 ]&#x27;</code></pre><div class="output">PASS  1 busy
+PASS  2 one copy
+PASS  3 timeout
+PASS  4 idempotent</div></div>
+    <p class="muted">The output above is what you see when every task is right (recorded). Before you start, every line says FAIL.</p>
+    <details class="lab__sol"><summary>Show one possible solution</summary><div class="code" data-lang="bash" data-file="solution.sh"><pre><code>cat &gt; job.sh &lt;&lt;&#x27;EOF&#x27;
+#!/usr/bin/env bash
+set -uo pipefail
+cd ~/lab32
+exec 9&gt; job.lock
+flock -n 9 || { echo &quot;job: busy, skipping&quot;; exit 0; }
+mkdir -p out
+grep -qx ready out/state 2&gt;/dev/null || echo ready &gt;&gt; out/state
+timeout 1 ./slow.sh
+EOF
+chmod +x job.sh</code></pre></div></details>
+  </div>
+
+  <div class="probs">
+    <article class="prob"><div class="prob__head"><span class="prob__num">P1</span><span class="prob__tag prob__tag--easy">Easy</span><h4>Timeout code</h4></div>
+      <p>Show the exit code when timeout fires.</p>
+      <div class="prob__io"><div><small>Input</small><pre>nothing</pre></div><div><small>Expected output</small><pre>124</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>timeout 0.2 sleep 1; echo $?</code></pre><div class="output">124</div></div>
+        <p><b>How it works:</b> 124.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P2</span><span class="prob__tag prob__tag--easy">Easy</span><h4>mkdir lock</h4></div>
+      <p>Take a mkdir lock twice; print busy the second time.</p>
+      <div class="prob__io"><div><small>Input</small><pre>nothing</pre></div><div><small>Expected output</small><pre>ok
+busy</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>mkdir L &amp;&amp; echo ok; mkdir L 2&gt;/dev/null || echo busy; rmdir L</code></pre><div class="output">ok
+busy</div></div>
+        <p><b>How it works:</b> ok, busy.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P3</span><span class="prob__tag prob__tag--easy">Easy</span><h4>flock probe</h4></div>
+      <p>Show a free lock with flock -n true.</p>
+      <div class="prob__io"><div><small>Input</small><pre>nothing</pre></div><div><small>Expected output</small><pre>free</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>flock -n x.lock true &amp;&amp; echo free</code></pre><div class="output">free</div></div>
+        <p><b>How it works:</b> free.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P4</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Busy</h4></div>
+      <p>Hold a lock on fd 9 and probe it.</p>
+      <div class="prob__io"><div><small>Input</small><pre>nothing</pre></div><div><small>Expected output</small><pre>busy</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>exec 9&gt; h.lock; flock 9; flock -n h.lock true || echo busy</code></pre><div class="output">busy</div></div>
+        <p><b>How it works:</b> busy.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P5</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Add once</h4></div>
+      <p>Run an add-once line three times; count lines.</p>
+      <div class="prob__io"><div><small>Input</small><pre>nothing</pre></div><div><small>Expected output</small><pre>1</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>for i in 1 2 3; do grep -qx a f 2&gt;/dev/null || echo a &gt;&gt; f; done; wc -l &lt; f</code></pre><div class="output">1</div></div>
+        <p><b>How it works:</b> 1.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P6</span><span class="prob__tag prob__tag--medium">Medium</span><h4>Alive?</h4></div>
+      <p>Check whether PID 1 exists with kill -0.</p>
+      <div class="prob__io"><div><small>Input</small><pre>nothing</pre></div><div><small>Expected output</small><pre>exists (no permission to signal)</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>kill -0 1 2&gt;/dev/null &amp;&amp; echo alive || echo &#x27;exists (no permission to signal)&#x27;</code></pre><div class="output">exists (no permission to signal)</div></div>
+        <p><b>How it works:</b> Either answer means it exists; a missing PID gives “No such process”.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P7</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Deadline</h4></div>
+      <p>Stop a loop after 1 second using SECONDS.</p>
+      <div class="prob__io"><div><small>Input</small><pre>nothing</pre></div><div><small>Expected output</small><pre>stopped</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>SECONDS=0; n=0; until (( SECONDS &gt;= 1 )); do ((++n)); sleep 0.25; done; echo stopped</code></pre><div class="output">stopped</div></div>
+        <p><b>How it works:</b> stopped.</p>
+      </details>
+    </article>
+    <article class="prob"><div class="prob__head"><span class="prob__num">P8</span><span class="prob__tag prob__tag--business">Business problem</span><h4>Timeout to word</h4></div>
+      <p>Map 124 to timed out.</p>
+      <div class="prob__io"><div><small>Input</small><pre>a code</pre></div><div><small>Expected output</small><pre>timed out</pre></div></div>
+      <details class="prob__sol"><summary>Show solution and explanation</summary>
+        <div class="code" data-lang="bash" data-file="script.sh"><pre><code>rc=124; (( rc == 124 )) &amp;&amp; echo &#x27;timed out&#x27;</code></pre><div class="output">timed out</div></div>
+        <p><b>How it works:</b> timed out.</p>
+      </details>
+    </article>
+  </div>
+
+  <h3 id="scenarios">Real-world scenario questions (asked in company interviews)</h3>
+  <p class="scn-intro">Interview questions about concurrency and hangs in scripts.</p>
+  <div class="scenarios">
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Any company · basics</span><span class="scn__tag scn__tag--level">Fresher</span></div>
+      <h4>“How do you stop a cron job overlapping?”</h4>
+      <p class="scn__situation">Common.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> command?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>flock -n /run/lock/job.lock job.sh</li>
+          <li>Skips if the previous run is still going.</li>
+          <li>Released automatically when it ends.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> a touch/rm lock file.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Service company</span><span class="scn__tag scn__tag--level">Junior</span></div>
+      <h4>Job stopped running after a crash</h4>
+      <p class="scn__situation">Lock file present.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> why + fix?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ol>
+          <li>File-existence lock never released.</li>
+          <li>Remove it after checking the owner is dead.</li>
+          <li>Switch to flock.</li>
+        </ol>
+        <p class="scn__avoid"><b>Avoid:</b> deleting locks blindly every time.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Product company</span><span class="scn__tag scn__tag--level">Mid-level</span></div>
+      <h4>Report totals sometimes wrong</h4>
+      <p class="scn__situation">Two writers.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> diagnose?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>Race: overlapping read-modify-write.</li>
+          <li>flock around the update, or one writer.</li>
+          <li>Atomic replace with temp + mv.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> adding sleep between steps.</p>
+      </div></details>
+    </article>
+    <article class="scn">
+      <div class="scn__head"><span class="scn__tag">Platform</span><span class="scn__tag scn__tag--level">Senior</span></div>
+      <h4>Nightly job blocked for a week</h4>
+      <p class="scn__situation">Hung rsync + lock.</p>
+      <p class="scn__look"><b>The interviewer is checking:</b> design?</p>
+      <details><summary>Show a strong answer</summary><div class="scn__answer">
+        <ul>
+          <li>timeout -k on every network step.</li>
+          <li>Alert on lock age / job duration.</li>
+          <li>Idempotent, resumable steps.</li>
+        </ul>
+        <p class="scn__avoid"><b>Avoid:</b> rebooting the server.</p>
+      </div></details>
+    </article>
+  <h3 id="interview">Interview and certification corner</h3>
+  <div class="ivs"><details class="iv"><summary>Race condition?</summary><div>Timing-dependent wrong result.</div></details><details class="iv"><summary>flock -n vs -w?</summary><div>Fail now vs wait with a limit.</div></details><details class="iv"><summary>Why exec 9>?</summary><div>Keep the lock for the whole script.</div></details><details class="iv"><summary>mkdir as lock?</summary><div>Atomic but needs clean-up.</div></details><details class="iv"><summary>PID file problem?</summary><div>PID reuse, stale files.</div></details><details class="iv"><summary>timeout 124?</summary><div>Limit reached.</div></details><details class="iv"><summary>Idempotent?</summary><div>Repeat-safe.</div></details></div>
+  <div class="certs"><b>Where this appears in certification exams</b><ul><li><b>LFCS:</b> Schedule and manage jobs safely.</li><li><b>RHCSA:</b> Schedule tasks; manage processes.</li><li><b>CompTIA Linux+:</b> Locks, signals, timeouts.</li></ul></div>
+  <h3 id="distro">Distro and OS differences</h3>
+  <p>Tools per system.</p>
+  <div class="table-wrap"><table class="compare" style="min-width:720px"><thead><tr><th>Topic</th><th>Ubuntu / Debian</th><th>RHEL / Rocky / Fedora</th><th>macOS (BSD tools)</th><th>WSL / Git Bash</th></tr></thead><tbody><tr><td>flock</td><td>util-linux</td><td>util-linux</td><td>util-linux</td><td>macOS: not built in</td></tr><tr><td>timeout</td><td>coreutils</td><td>coreutils</td><td>coreutils</td><td>macOS: gtimeout (brew)</td></tr><tr><td>/run/lock</td><td>yes</td><td>yes</td><td>yes</td><td>-</td></tr><tr><td>mkdir lock</td><td>everywhere</td><td>everywhere</td><td>everywhere</td><td>everywhere</td></tr><tr><td>systemd</td><td>yes</td><td>yes</td><td>yes</td><td>launchd</td></tr></tbody></table></div>
+<aside class="teaser"><span class="teaser__tag">Next up · Lesson 3.3</span><p class="teaser__q">How do you know your error handling, retries and locks really work? Next: testing and debugging scripts with bash -x, PS4 and small automated tests.</p><a href="../../#m3">Testing and debugging scripts: bash -x, PS4 and simple tests →</a></aside>
+  </div>
+</section>
+
+<nav class="lesson-nav" id="lesson-nav" aria-label="Lesson navigation"></nav>
+<div class="ad-slot" data-slot="bottom"></div>
+</article>
+
+<aside class="lesson-side">
+  <nav class="toc" aria-label="In this lesson">
+    <h4>In this lesson</h4>
+    <ol>
+      <li><a href="#map">Where this fits</a></li>
+      <li><a href="#story">The story</a></li>
+      <li><a href="#definition">Definition</a></li><li><a href="#levels">Very basic → Advanced</a></li>
+      <li><a href="#names">Why is it called that?</a></li>
+      <li><a href="#types">Types and ways to use it</a></li>
+      <li><a href="#commands">Commands by field</a></li>
+      <li><a href="#steps">Step by step</a></li>
+      <li><a href="#animation">See it happen</a></li>
+      <li><a href="#errors">Error messages decoded</a></li>
+      <li><a href="#dissect">Layer by layer</a></li>
+      <li><a href="#real-world">Real-world use</a></li>
+      <li><a href="#oneliners">One-liner corner</a></li>
+      <li><a href="#which">Which command when?</a></li>
+      <li><a href="#run">Run the code</a></li><li><a href="#pc">Run on your PC</a></li>
+      <li><a href="#tracer">Line by line</a></li>
+      <li><a href="#worked">Worked examples</a></li>
+      <li><a href="#quiz">Quiz and revision</a></li>
+      <li><a href="#cheatsheet">Cheat sheet</a></li>
+      <li><a href="#mindmap">Mind map</a></li>
+      <li><a href="#lab">Practice lab</a></li>
+      <li><a href="#practice">Practice problems</a></li>
+      <li><a href="#scenarios">Industry scenarios</a></li>
+    </ol>
+  </nav>
+  <div class="ad-slot" data-slot="side"></div>
+  <div class="outline" id="outline"></div>
+</aside>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div><h4>MyPhatshala</h4><p>Free programming and IT lessons that show what happens behind the screen.</p></div>
+    <div><h4>Learn</h4><a href="../../../../#tracks">All courses</a><a href="../../">Shell Scripting (Bash) syllabus</a></div>
+    <div><h4>Site</h4><a href="../../../../about.html">About</a><a href="../../../../contact.html">Contact</a><a href="../../../../privacy.html">Privacy policy</a><a href="../../../../disclaimer.html">Disclaimer</a></div>
+    <div class="copyright">© MyPhatshala. All lesson content, diagrams and animations are original. Please do not copy without permission.</div>
+  </div>
+</footer>
+
+<script src="../../../../data/courses/shell-scripting.js"></script>
+<script src="../../../../assets/js/lesson.js"></script>
+<script src="../../../../assets/js/ads.js"></script>
+<script src="../../../../assets/js/site.js"></script>
+</body>
+</html>
